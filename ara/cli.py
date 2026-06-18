@@ -76,6 +76,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         print(json.dumps(asdict(m), indent=2))
         return
 
+    a = m.accel
+
     c.emit()
     c.emit(c.section("  SYSTEM"))
     c.emit(c.field("chip", m.chip))
@@ -85,28 +87,64 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         cores = f"{m.cpu_physical} cores"
         if c.verbose and m.cpu_logical:
             cores = f"{m.cpu_physical} physical · {m.cpu_logical} logical"
+        if m.cpu_features:
+            cores += "   " + " · ".join(m.cpu_features)
         c.emit(c.field("cpu", cores))
+    if m.python_version:
+        c.emit(c.field("python", m.python_version, "ambient python3"))
     c.emit()
 
     c.emit(c.section("  MEMORY"))
     c.emit(c.field("total", _fmt_gb(m.ram_total_gb)))
     if m.ram_available_gb is not None:
         c.emit(c.field("available", _fmt_gb(m.ram_available_gb, 1), "free right now"))
+    if m.swap_gb:
+        c.emit(c.field("swap", _fmt_gb(m.swap_gb, 1)))
     c.emit()
 
     c.emit(c.section("  ACCELERATOR"))
-    a = m.accel
     if a.kind == "nvidia":
-        gloss = f"{a.vram_gb:.0f} GB VRAM · {a.api}" if a.vram_gb else (a.api or "")
+        bits = []
+        if a.vram_gb:
+            bits.append(f"{a.vram_gb:.0f} GB VRAM")
+        if a.compute:
+            bits.append(f"SM {a.compute}")
+        if a.cuda_version:
+            bits.append(f"CUDA {a.cuda_version}")
+        gloss = " · ".join(bits)
+        name = f"{a.name}  (x{a.count})" if a.count > 1 else a.name
+        c.emit(c.field("gpu", name, gloss))
     elif a.kind == "apple":
-        gloss = "Metal · unified memory (shared with system)"
+        cores = f"{a.cores}-core " if a.cores else ""
+        c.emit(c.field("gpu", a.name, f"{cores}Metal · unified memory (shared with system)"))
     else:
-        gloss = "no GPU detected"
-    c.emit(c.field("gpu", a.name, gloss, value_role="metric" if a.kind != "none" else "warn"))
+        c.emit(c.field("gpu", a.name, "no GPU detected", value_role="warn"))
     c.emit()
 
     c.emit(c.section("  STORAGE"))
     c.emit(c.field("disk free", _fmt_gb(m.disk_free_gb), "on the home volume"))
+    c.emit()
+
+    c.emit(c.section("  RUNTIMES"))
+    for rt in m.runtimes:
+        if rt.present:
+            val = f"{rt.name} {rt.version}" if rt.version else rt.name
+            c.emit(c.field("·", val, "found", value_role="good"))
+        elif c.verbose:
+            c.emit(c.field("·", rt.name, "not found", value_role="dim"))
+    if not any(rt.present for rt in m.runtimes):
+        c.emit(c.style("dim", "  none detected"))
+    c.emit()
+
+    c.emit(c.section("  MODELS"))
+    for store in m.model_stores:
+        if store.present and store.count:
+            c.emit(c.field(store.name, f"{store.count} models",
+                           f"{store.size_gb:.0f} GB", value_role="good"))
+        elif store.present:
+            c.emit(c.field(store.name, "empty", value_role="dim"))
+        elif c.verbose:
+            c.emit(c.field(store.name, "not found", value_role="dim"))
     c.emit()
 
     c.emit(c.section("  ARA"))
@@ -120,13 +158,10 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         None if m.engine_ready else ("install: uv sync" if m.supported else None),
         value_role="good" if m.engine_ready else "warn",
     ))
-    c.emit()
-
-    c.emit(c.section("  ALREADY HERE"))
-    c.emit(c.field("hf cache", "found" if m.hf_cache else "not found",
-                   value_role="good" if m.hf_cache else "dim"))
-    c.emit(c.field("ollama", "found" if m.ollama else "not found",
-                   value_role="good" if m.ollama else "dim"))
+    c.emit(c.field("hf token", "present" if m.hf_token else "none",
+                   None if m.hf_token else "needed for gated models",
+                   value_role="good" if m.hf_token else "dim"))
+    c.emit(c.field("power", m.power))
     c.emit()
 
     if not m.supported:
