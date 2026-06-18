@@ -173,7 +173,34 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 # profile (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
-def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False) -> int:
+def _emit_limits(c: Console, m: dict) -> None:
+    c.emit()
+    c.emit(c.section("  SAFE LIMITS")
+           + c.style("dim", "" if m["calibrated"] else "  (estimated — not calibrated)"))
+    c.emit(c.field("device", f"{m['device']} · {m['total_gb']:.0f} GB"))
+    c.emit(c.field("crash wall", _fmt_gb(m["wall_gb"], 1),
+                   "the hard ceiling — never cross", value_role="bad"))
+    c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
+                   f"wall − {m['margin_gb']:.0f} GB margin", value_role="good"))
+    c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
+    if m["overhead_gb"] is not None:
+        gloss = "default estimate" if not m["calibrated"] else \
+            f"measured cold-start · calibrated {m['calibrated_at']}"
+        c.emit(c.field("overhead", _fmt_gb(m["overhead_gb"], 1), gloss))
+    if m["swap_free_gb"] is not None:
+        c.emit(c.field("swap", f"{m['swap_free_gb']:.1f} GB free"))
+    c.emit()
+
+
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"  {question} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
+                   assume_yes: bool = False) -> int:
     backend = detect.backend_name()
     if backend == "unsupported":
         c.emit(c.style("warn", "  profiling needs an ARA backend — none for this hardware yet."))
@@ -184,41 +211,59 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
                + c.style("accent", "uv sync"))
         return 1
 
+    bk = get_backend()
     try:
-        m = get_backend().machine_profile(recalibrate=recalibrate)
-    except SystemExit:
-        return 1  # engine already printed a clean reason (e.g. no cached model)
+        m = bk.safe_limits()
     except Exception as exc:
-        c.emit(c.style("bad", f"  profiling failed: {exc}"))
+        c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
 
     if as_json:
         print(json.dumps(m, indent=2))
         return 0
 
-    c.emit()
-    c.emit(c.section("  SAFE LIMITS"))
-    c.emit(c.field("device", f"{m['device']} · {m['total_gb']:.0f} GB"))
-    c.emit(c.field("crash wall", _fmt_gb(m["wall_gb"], 1),
-                   "the hard ceiling — never cross", value_role="bad"))
-    c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
-                   f"wall − {m['margin_gb']:.0f} GB margin", value_role="good"))
-    c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
-    if m["overhead_gb"] is not None:
-        c.emit(c.field("overhead", _fmt_gb(m["overhead_gb"], 1),
-                       f"measured cold-start · calibrated {m['calibrated_at']}"))
-    if m["swap_free_gb"] is not None:
-        c.emit(c.field("swap", f"{m['swap_free_gb']:.1f} GB free"))
-    c.emit()
+    _emit_limits(c, m)
 
-    if not m["calibrated"]:
-        c.emit(c.style("warn", "  estimated only — not calibrated. run ")
-               + c.style("accent", "ara profile --recalibrate"))
-    elif not m["just_measured"]:
-        c.emit(c.style("dim", "  cached from a prior run — ")
-               + c.style("accent", "ara profile --recalibrate")
+    # Calibration is opt-in: offered only when it'd help, and only interactively.
+    if m["calibrated"] and not recalibrate:
+        c.emit(c.style("dim", "  cached — ") + c.style("accent", "ara profile --recalibrate")
                + c.style("dim", " to re-measure"))
-    c.emit()
+        c.emit()
+        return 0
+
+    interactive = assume_yes or sys.stdin.isatty()
+    if not interactive:
+        c.emit(c.style("dim", "  estimated — run ") + c.style("accent", "ara profile")
+               + c.style("dim", " in a terminal (or pass ") + c.style("accent", "--yes")
+               + c.style("dim", ") to calibrate against a real model"))
+        c.emit()
+        return 0
+
+    model = bk.CALIBRATION_MODEL
+    cached = bk.calibration_model_cached(model)
+    if cached:
+        q = f"Calibrate now against {model}?  (loads it, ~30s, stays under the safe budget)"
+    else:
+        q = f"Download {model} from Hugging Face and calibrate?  (a few GB)"
+
+    if not (assume_yes or _confirm(q)):
+        c.emit(c.style("dim", "  skipped — showing estimated limits."))
+        c.emit()
+        return 0
+
+    try:
+        if not cached:
+            c.emit(c.style("dim", f"  downloading {model} …"))
+            bk.download_calibration_model(model)
+        m = bk.calibrate(model)
+    except SystemExit:
+        return 1  # engine printed a clean reason
+    except Exception as exc:
+        c.emit(c.style("bad", f"  calibration failed: {exc}"))
+        return 1
+
+    c.emit(c.style("good", "  calibrated."))
+    _emit_limits(c, m)
     return 0
 
 
@@ -230,7 +275,9 @@ def main() -> int:
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     recalibrate = "--recalibrate" in argv
-    rest = [a for a in argv if a not in ("--verbose", "-v", "--json", "--recalibrate")]
+    assume_yes = "--yes" in argv or "-y" in argv
+    rest = [a for a in argv
+            if a not in ("--verbose", "-v", "--json", "--recalibrate", "--yes", "-y")]
     c = Console.from_env(verbose=verbose)
 
     if not rest or rest[0] in ("-h", "--help"):
@@ -242,7 +289,7 @@ def main() -> int:
         return 0
 
     if rest[0] == "profile":
-        return render_profile(c, recalibrate=recalibrate, as_json=as_json)
+        return render_profile(c, recalibrate=recalibrate, as_json=as_json, assume_yes=assume_yes)
 
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(

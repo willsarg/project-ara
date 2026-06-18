@@ -7,30 +7,21 @@ a Mac, nothing MLX-shaped loads until ARA actually runs the engine.
 from __future__ import annotations
 
 
-def machine_profile(*, recalibrate: bool = False) -> dict:
-    """Measure (or read) this machine's safe memory limits via wmx-suite.
+# Model ARA calibrates against — smallest Gemma 4 (Will's pick). Calibration only
+# measures memory overhead, so a small instruct model is plenty.
+CALIBRATION_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
 
-    Calibrates when this machine has no stored profile (or when *recalibrate*),
-    then reads the live limits. Calibration loads a small cached model and watches
-    memory — wmx-suite owns that crash-safe measurement; ARA just invokes it.
 
-    Returns a backend-neutral dict for ARA to render. Heavy engine imports happen
-    here, inside the call — not at module load.
+def safe_limits() -> dict:
+    """Read this machine's safe memory limits. Pure read — no stress, no model.
+
+    Always returns usable numbers: a stored calibration refines the overhead,
+    but uncalibrated machines still get an estimated budget. Heavy engine imports
+    happen here, inside the call — not at module load.
     """
-    from wmx_suite import config, db, probe, profiles, system
-    from wmx_suite.ui import Console as EngineConsole
+    from wmx_suite import config, db, profiles, system
 
     con = db.connect()
-    already = db.get_profile(con, profiles.machine_key()) is not None
-
-    measured = False
-    if recalibrate or not already:
-        # streams wmx-suite's own live calibration view; may SystemExit if no
-        # cached model is available to calibrate against (clean message there).
-        probe.calibrate(margin_gb=None, console=EngineConsole.from_args())
-        measured = True
-        con = db.connect()  # re-read after the profile is stored
-
     s = system.read_limits()
     margin = config.margin_gb(None)
     safe = s.safe_threshold_gb(margin)
@@ -47,5 +38,34 @@ def machine_profile(*, recalibrate: bool = False) -> dict:
         "overhead_gb": prof["fixed_overhead_gb"] if prof else None,
         "calibrated": prof is not None,
         "calibrated_at": prof["calibrated_at"][:10] if prof else None,
-        "just_measured": measured,
     }
+
+
+def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
+    """Is the calibration model already in the HF cache? (cheap, no load)."""
+    from wmx_suite import models
+
+    try:
+        return models.describe(model) is not None
+    except Exception:
+        return False
+
+
+def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
+    """Fetch the calibration model into the HF cache. Network + disk only."""
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(model)
+
+
+def calibrate(model: str = CALIBRATION_MODEL) -> dict:
+    """Run wmx-suite's crash-safe calibration against *model*, return fresh limits.
+
+    Loads the model and watches memory under wmx-suite's predictive safety ramp,
+    which aborts before approaching the safe budget. ARA only invokes it.
+    """
+    from wmx_suite import probe
+    from wmx_suite.ui import Console as EngineConsole
+
+    probe.calibrate(model, margin_gb=None, console=EngineConsole.from_args())
+    return safe_limits()
