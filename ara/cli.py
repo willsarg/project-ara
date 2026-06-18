@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict
 
 from ara import detect
-from ara.registry import engine_status
+from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
 _CMD_W = 16
@@ -54,7 +54,8 @@ def render_landing(c: Console) -> None:
     )
     c.emit()
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
-    c.emit(_cmd(c, "detect", "inspect this machine and choose a safe backend"))
+    c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
+    c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit()
@@ -170,13 +171,66 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# profile (measures — crosses the seam into the engine)
+# --------------------------------------------------------------------------- #
+def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False) -> int:
+    backend = detect.backend_name()
+    if backend == "unsupported":
+        c.emit(c.style("warn", "  profiling needs an ARA backend — none for this hardware yet."))
+        return 1
+    engine_ok, engine = engine_status()
+    if not engine_ok:
+        c.emit(c.style("warn", f"  the {engine} engine isn't installed here — run: ")
+               + c.style("accent", "uv sync"))
+        return 1
+
+    try:
+        m = get_backend().machine_profile(recalibrate=recalibrate)
+    except SystemExit:
+        return 1  # engine already printed a clean reason (e.g. no cached model)
+    except Exception as exc:
+        c.emit(c.style("bad", f"  profiling failed: {exc}"))
+        return 1
+
+    if as_json:
+        print(json.dumps(m, indent=2))
+        return 0
+
+    c.emit()
+    c.emit(c.section("  SAFE LIMITS"))
+    c.emit(c.field("device", f"{m['device']} · {m['total_gb']:.0f} GB"))
+    c.emit(c.field("crash wall", _fmt_gb(m["wall_gb"], 1),
+                   "the hard ceiling — never cross", value_role="bad"))
+    c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
+                   f"wall − {m['margin_gb']:.0f} GB margin", value_role="good"))
+    c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
+    if m["overhead_gb"] is not None:
+        c.emit(c.field("overhead", _fmt_gb(m["overhead_gb"], 1),
+                       f"measured cold-start · calibrated {m['calibrated_at']}"))
+    if m["swap_free_gb"] is not None:
+        c.emit(c.field("swap", f"{m['swap_free_gb']:.1f} GB free"))
+    c.emit()
+
+    if not m["calibrated"]:
+        c.emit(c.style("warn", "  estimated only — not calibrated. run ")
+               + c.style("accent", "ara profile --recalibrate"))
+    elif not m["just_measured"]:
+        c.emit(c.style("dim", "  cached from a prior run — ")
+               + c.style("accent", "ara profile --recalibrate")
+               + c.style("dim", " to re-measure"))
+    c.emit()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # entry
 # --------------------------------------------------------------------------- #
 def main() -> int:
     argv = sys.argv[1:]
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
-    rest = [a for a in argv if a not in ("--verbose", "-v", "--json")]
+    recalibrate = "--recalibrate" in argv
+    rest = [a for a in argv if a not in ("--verbose", "-v", "--json", "--recalibrate")]
     c = Console.from_env(verbose=verbose)
 
     if not rest or rest[0] in ("-h", "--help"):
@@ -186,6 +240,9 @@ def main() -> int:
     if rest[0] == "detect":
         render_detect(c, as_json=as_json)
         return 0
+
+    if rest[0] == "profile":
+        return render_profile(c, recalibrate=recalibrate, as_json=as_json)
 
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(
