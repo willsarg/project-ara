@@ -1,0 +1,32 @@
+[project]
+name = "project-ara"
+version = "0.0.1"
+description = "AI Runs Anywhere — backend-agnostic local inference that fits any hardware safely."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Will Sarg" }]
+requires-python = ">=3.12"
+dependencies = [
+    # core is pure-python; the Apple engine auto-installs ONLY on Apple Silicon
+    "wmx-suite ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+apple = ["wmx-suite"]                 # manual override / cross-target dev
+# cuda = [...]                        # added when the CUDA backend lands
+
+[project.scripts]
+ara = "ara.cli:main"
+
+[tool.uv.sources]
+# solo-dev default: use the sibling checkout, editable. Swap to a git URL
+# ({ git = "https://github.com/willsarg/wmx-suite" }) for clone-and-go.
+wmx-suite = { path = "../wmx-suite", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ara"]
