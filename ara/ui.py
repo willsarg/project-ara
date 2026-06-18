@@ -50,5 +50,13 @@ class Console:
     def section(self, title: str) -> str:
         return self.style("header", title)
 
+    def field(self, label: str, value: str, gloss: str | None = None, *,
+              label_width: int = 12, value_role: str = "metric") -> str:
+        """One aligned 'label   value   gloss' row."""
+        line = "  " + self.style("dim", f"{label:<{label_width}}") + self.style(value_role, value)
+        if gloss:
+            line += "   " + self.style("gloss", gloss)
+        return line
+
     def emit(self, text: str = "") -> None:
         print(text, file=self.stream)
