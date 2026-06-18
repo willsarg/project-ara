@@ -8,7 +8,9 @@ license-files = ["LICENSE"]
 authors = [{ name = "Will Sarg" }]
 requires-python = ">=3.12"
 dependencies = [
-    # core is pure-python; the Apple engine auto-installs ONLY on Apple Silicon
+    # cross-platform system recon for `ara detect` (read-only; runs on any box)
+    "psutil>=5.9",
+    # core is otherwise pure-python; the Apple engine auto-installs ONLY on Apple Silicon
     "wmx-suite ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
