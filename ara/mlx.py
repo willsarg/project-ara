@@ -35,7 +35,12 @@ class MlxInterpreter:
     path: str
     origin: str
     version: str | None
+    externally_managed: bool = False  # PEP 668 — MLX shouldn't have been installed here
     packages: dict[str, str] = field(default_factory=dict)  # present MLX pkg -> version
+
+    @property
+    def caution(self) -> str | None:
+        return pythons.caution_for(self.origin, self.externally_managed)
 
 
 def _run(cmd: list[str], timeout: float = 8) -> str | None:
@@ -45,26 +50,28 @@ def _run(cmd: list[str], timeout: float = 8) -> str | None:
         return None
 
 
-def _probe(real: str) -> tuple[str | None, dict[str, str]]:
-    """(python version, {present MLX package: version}) for one interpreter."""
+def _probe(real: str) -> tuple[str | None, dict[str, str], bool]:
+    """(python version, {present MLX package: version}, externally_managed) for one interp."""
     code = (
-        "import sys, json\n"
+        "import sys, json, os, sysconfig\n"
         "import importlib.metadata as m\n"
         f"names = {list(_ALL)!r}\n"
         "out = {}\n"
         "for n in names:\n"
         "    try: out[n] = m.version(n)\n"
         "    except Exception: pass\n"
-        "print(json.dumps({'v': '.'.join(map(str, sys.version_info[:3])), 'pkgs': out}))\n"
+        "stdlib = sysconfig.get_paths().get('stdlib', '')\n"
+        "em = bool(stdlib) and os.path.exists(os.path.join(stdlib, 'EXTERNALLY-MANAGED'))\n"
+        "print(json.dumps({'v': '.'.join(map(str, sys.version_info[:3])), 'pkgs': out, 'em': em}))\n"
     )
     raw = _run([real, "-c", code])
     if not raw:
-        return None, {}
+        return None, {}, False
     try:
         data = json.loads(raw.strip().splitlines()[-1])
-        return data.get("v"), data.get("pkgs", {})
+        return data.get("v"), data.get("pkgs", {}), bool(data.get("em", False))
     except Exception:
-        return None, {}
+        return None, {}, False
 
 
 def scan() -> list[MlxInterpreter]:
@@ -72,8 +79,9 @@ def scan() -> list[MlxInterpreter]:
     ints = pythons.discover(probe=False)
     with ThreadPoolExecutor(max_workers=8) as pool:
         probed = list(pool.map(lambda i: _probe(i.real), ints))
-    out = [MlxInterpreter(path=i.path, origin=i.origin, version=ver or i.version, packages=pkgs)
-           for i, (ver, pkgs) in zip(ints, probed) if pkgs]
+    out = [MlxInterpreter(path=i.path, origin=i.origin, version=ver or i.version,
+                          externally_managed=em, packages=pkgs)
+           for i, (ver, pkgs, em) in zip(ints, probed) if pkgs]
     out.sort(key=lambda m: len(m.packages), reverse=True)
     return out
 

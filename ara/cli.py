@@ -389,6 +389,8 @@ def render_mlx(c: Console, *, as_json: bool = False) -> None:
         c.emit()
         c.emit("  " + c.style("good", f"{mi.origin} {mi.version or ''}".strip())
                + c.style("dim", "  ·  ") + c.style("accent", _tilde(mi.path)))
+        if mi.caution:  # MLX shouldn't be installed in a managed interpreter
+            c.emit("      " + c.style("warn", f"⚠ MLX installed here, but {mi.caution}"))
         for label, pkgs in mlx.GROUPS:
             got = [(p, mi.packages[p]) for p in pkgs if p in mi.packages]
             if got:
