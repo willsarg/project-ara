@@ -435,6 +435,23 @@ def test_user_python_strips_venv_bin(monkeypatch):
     assert "/usr/bin" in seen["path"]
 
 
+def test_venv_stripped_path_strips_windows_scripts(monkeypatch):
+    # On Windows the venv interpreter/tools live in <env>\Scripts, not <env>/bin.
+    monkeypatch.setattr(detect.os, "name", "nt")
+    sep = detect.os.pathsep
+    monkeypatch.setenv("PATH", sep.join(["/venv/Scripts", "/usr/bin"]))
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    stripped = detect._venv_stripped_path()
+    assert "/venv/Scripts" not in stripped
+    assert "/usr/bin" in stripped
+
+
+def test_venv_stripped_path_no_venv_returns_path_unchanged(monkeypatch):
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert detect._venv_stripped_path() == "/usr/bin:/bin"
+
+
 def test_user_python_none_when_resolves_back_to_ara(monkeypatch):
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)

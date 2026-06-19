@@ -126,6 +126,22 @@ def _disk_free_gb() -> float | None:
         return None
 
 
+def _venv_stripped_path() -> str:
+    """The user's PATH with ARA's active venv bin dir removed.
+
+    Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH; removing its bin
+    dir lets us resolve the USER's python/tools, not ARA's bundled ones. That bin dir
+    is ``Scripts`` on Windows, ``bin`` everywhere else.
+    """
+    path = os.environ.get("PATH", "")
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        vbin = os.path.normpath(os.path.join(venv, "Scripts" if os.name == "nt" else "bin"))
+        path = os.pathsep.join(p for p in path.split(os.pathsep)
+                               if os.path.normpath(p) != vbin)
+    return path
+
+
 def _user_python() -> str | None:
     """The python3 a user reaches for in their OWN shell — not ARA's venv.
 
@@ -134,12 +150,7 @@ def _user_python() -> str | None:
     they were the user's. Strip the venv's bin and re-resolve to find the real one.
     Returns None when the only python available is ARA's own.
     """
-    path = os.environ.get("PATH", "")
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
-        vbin = os.path.normpath(os.path.join(venv, "bin"))
-        path = os.pathsep.join(p for p in path.split(os.pathsep)
-                               if os.path.normpath(p) != vbin)
+    path = _venv_stripped_path()
     py = shutil.which("python3", path=path) or shutil.which("python", path=path)
     if py and os.path.realpath(py) == os.path.realpath(sys.executable):
         return None  # resolved straight back to ARA's interpreter
@@ -468,13 +479,7 @@ def _hf_token_present() -> bool:
 def _user_which(cmd: str) -> str | None:
     """Resolve *cmd* on the user's PATH, with ARA's active venv stripped (so we report the
     user's tool, not ARA's bundled one — same reasoning as _user_python)."""
-    path = os.environ.get("PATH", "")
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
-        vbin = os.path.normpath(os.path.join(venv, "bin"))
-        path = os.pathsep.join(p for p in path.split(os.pathsep)
-                               if os.path.normpath(p) != vbin)
-    return shutil.which(cmd, path=path)
+    return shutil.which(cmd, path=_venv_stripped_path())
 
 
 def _hf_cli() -> tuple[bool, str | None]:
