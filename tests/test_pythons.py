@@ -288,3 +288,14 @@ def test_candidates_swallows_per_entry_errors(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pythons.os.path, "realpath", boom_on_candidate)
     assert pythons._candidates() == {}
+
+
+# --------------------------------------------------------------------------- #
+# manager_of (who owns the interpreter, for "don't install here" guidance)
+# --------------------------------------------------------------------------- #
+def test_manager_of():
+    assert pythons.manager_of("macOS system", False) == "Apple"
+    assert pythons.manager_of("Homebrew", True) == "Homebrew"
+    assert pythons.manager_of("uv", True) == "uv"
+    assert pythons.manager_of("other", True) == "the system"   # unknown managed origin
+    assert pythons.manager_of("pyenv", False) is None          # user-managed → free to use

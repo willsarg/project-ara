@@ -77,8 +77,11 @@ def _capture_dispatch(monkeypatch):
     """Replace the render_* entry points with recorders; return the record dict."""
     rec = {}
     monkeypatch.setattr(cli, "render_landing", lambda c: rec.update(landing=True))
-    monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False: rec.update(detect=as_json))
-    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False: rec.update(status=as_json))
+    monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False, want=None: rec.update(detect=as_json, detect_want=want))
+    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False, want=None: rec.update(status=as_json))
+    monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
+    monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
+    monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     return rec
@@ -154,7 +157,7 @@ def test_main_unknown_command_returns_1(monkeypatch, capsys):
 def test_main_verbose_flag_sets_console(monkeypatch):
     captured = {}
     monkeypatch.setattr(cli, "render_detect",
-                        lambda c, as_json=False: captured.update(verbose=c.verbose))
+                        lambda c, as_json=False, want=None: captured.update(verbose=c.verbose))
     _run_main(monkeypatch, ["detect", "--verbose"])
     assert captured["verbose"] is True
 
@@ -580,7 +583,7 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pytho
     assert "has no AI frameworks" in out                  # default python is bare
     assert "ARA's env (no separate user python)" in out   # framework_python is None
     assert "None found in any interpreter" in out         # discover surfaced nothing
-    assert "not found" not in out                         # non-verbose hides absent rows
+    assert "HF cache" not in out                           # absent store hidden (non-verbose)
 
 
 def test_render_detect_frameworks_surfaced_from_other_interpreter(
@@ -667,7 +670,7 @@ def _interp(**over):
 
 def test_main_python_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    monkeypatch.setattr(cli, "render_python", lambda c, as_json=False: rec.update(python=as_json))
+    monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
     _run_main(monkeypatch, ["python", "--json"])
     assert rec["python"] is True
 
@@ -725,3 +728,320 @@ def test_render_python_groups_consecutive_same_origin(make_console, monkeypatch)
     out = buf.getvalue()
     assert out.count("  Homebrew\n") == 1   # header emitted once for the group
     assert "3.12.4" in out and "3.11.9" in out
+
+
+# =========================================================================== #
+# section filtering (--include / --exclude)
+# =========================================================================== #
+def test_csv_splits_and_trims():
+    assert cli._csv("a, b ,,c") == ["a", "b", "c"]
+    assert cli._csv("") == []
+
+
+def test_section_filter_include_is_whitelist():
+    pred = cli._section_filter(["system"], [])
+    assert pred("system") is True and pred("memory") is False
+
+
+def test_section_filter_exclude_is_blacklist():
+    pred = cli._section_filter([], ["memory"])
+    assert pred("memory") is False and pred("system") is True
+
+
+def test_section_filter_neither_allows_all():
+    pred = cli._section_filter([], [])
+    assert pred("anything") is True
+
+
+def test_resolve_want_aliases(make_console):
+    c, _ = make_console()
+    pred = cli._resolve_want("detect", ["gpu"], [], c)   # gpu → accelerator
+    assert pred("accelerator") is True and pred("system") is False
+
+
+def test_resolve_want_unknown_section_warns(make_console):
+    c, buf = make_console()
+    cli._resolve_want("detect", ["bogus"], [], c)
+    out = buf.getvalue()
+    assert "unknown section" in out and "valid:" in out
+
+
+def test_resolve_want_command_without_sections_warns(make_console):
+    c, buf = make_console()
+    assert cli._resolve_want("profile", ["x"], [], c) is None
+    assert "don't apply to 'profile'" in buf.getvalue()
+
+
+# =========================================================================== #
+# render_apps
+# =========================================================================== #
+def _capp(**over):
+    from ara.apps import App
+    base = dict(label="X", category="runner", in_app=False, cask=False, formula=False,
+                version=None, brew_recorded=None, cask_token=None, installed_at=1.0)
+    base.update(over)
+    return App(**base)
+
+
+def test_render_apps_text_with_drift_and_duplicate(make_console, monkeypatch):
+    inv = [
+        _capp(label="LM Studio", category="runner", cask=True, in_app=True,
+              version="0.3.5", brew_recorded="0.3.0", cask_token="lm-studio"),  # clueless drift
+        _capp(label="ollama", category="runner", cask=True, formula=True,
+              version="0.1.2", cask_token="ollama"),                            # duplicate
+    ]
+    monkeypatch.setattr(cli.apps, "scan", lambda: inv)
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})  # no auto_updates known
+    c, buf = make_console()
+    cli.render_apps(c)
+    out = buf.getvalue()
+    assert "AI/ML APPS" in out and "model runners" in out
+    assert "LM Studio 0.3.5" in out
+    assert "self-updated past brew" in out and "clobber" in out   # clueless drift
+    assert "likely duplicate" in out                              # ollama dup
+
+
+def test_render_apps_drift_with_auto_updates_is_benign(make_console, monkeypatch):
+    inv = [_capp(label="Claude", category="assistant", cask=True, in_app=True,
+                 version="2.0", brew_recorded="1.0", cask_token="claude")]
+    monkeypatch.setattr(cli.apps, "scan", lambda: inv)
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {"claude": True})
+    c, buf = make_console()
+    cli.render_apps(c)
+    out = buf.getvalue()
+    # benign drift: "brew defers", not the clueless "will clobber" gloss (the footer
+    # legend's "can clobber" is always present, so assert on the per-app wording).
+    assert "brew defers" in out and "will clobber it" not in out
+
+
+def test_render_apps_empty(make_console, monkeypatch):
+    monkeypatch.setattr(cli.apps, "scan", lambda: [])
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})
+    c, buf = make_console()
+    cli.render_apps(c)
+    assert "none detected" in buf.getvalue()
+
+
+def test_render_apps_want_filters_category(make_console, monkeypatch):
+    inv = [_capp(label="Ollama", category="runner", cask=True, cask_token="ollama"),
+           _capp(label="Cursor", category="coding", cask=True, cask_token="cursor")]
+    monkeypatch.setattr(cli.apps, "scan", lambda: inv)
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})
+    c, buf = make_console()
+    cli.render_apps(c, want=lambda k: k == "coding")
+    out = buf.getvalue()
+    assert "Cursor" in out and "Ollama" not in out
+
+
+def test_render_apps_json(monkeypatch, capsys):
+    inv = [_capp(label="LM Studio", cask=True, in_app=True, version="0.3.5",
+                 brew_recorded="0.3.0", cask_token="lm-studio")]
+    monkeypatch.setattr(cli.apps, "scan", lambda: inv)
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {"lm-studio": False})
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_apps(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["label"] == "LM Studio" and payload[0]["drift"] is True
+    assert payload[0]["auto_updates"] is False
+
+
+# =========================================================================== #
+# render_mlx
+# =========================================================================== #
+def test_render_mlx_non_apple(make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
+    c, buf = make_console()
+    cli.render_mlx(c)
+    assert "Apple-Silicon only" in buf.getvalue()
+
+
+def _mlx_setup(monkeypatch, interps=(), runtimes=(), models=0):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
+    monkeypatch.setattr(cli.detect, "accelerator",
+                        lambda chip: Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16))
+    monkeypatch.setattr(cli.mlx, "scan", lambda: list(interps))
+    monkeypatch.setattr(cli.mlx, "lmstudio_mlx_runtimes", lambda: list(runtimes))
+    monkeypatch.setattr(cli.mlx, "mlx_community_model_count", lambda: models)
+
+
+def test_render_mlx_readiness(make_console, monkeypatch):
+    _mlx_setup(monkeypatch, runtimes=["0.3.1", "0.2.0"], models=5)
+    c, buf = make_console()
+    cli.render_mlx(c)
+    out = buf.getvalue()
+    assert "READINESS" in out and "Apple M4 Pro GPU" in out
+    assert "5 cached" in out
+    assert "MLX runtime 0.3.1" in out and "+1 older" in out
+
+
+def test_render_mlx_no_runtime_no_libs(make_console, monkeypatch):
+    _mlx_setup(monkeypatch, interps=[], runtimes=[], models=0)
+    c, buf = make_console()
+    cli.render_mlx(c)
+    out = buf.getvalue()
+    assert "no MLX runtime" in out
+    assert "No MLX packages installed" in out
+
+
+def test_render_mlx_libraries_with_managed_caution(make_console, monkeypatch):
+    from ara.mlx import MlxInterpreter
+    mi = MlxInterpreter(path="/opt/homebrew/bin/python3", origin="Homebrew", version="3.12.4",
+                        externally_managed=True, packages={"mlx": "0.18", "mlx-lm": "0.20"})
+    _mlx_setup(monkeypatch, interps=[mi], models=2)
+    c, buf = make_console()
+    cli.render_mlx(c)
+    out = buf.getvalue()
+    assert "Homebrew 3.12.4" in out
+    assert "managed by Homebrew" in out          # manager_of caution
+    assert "mlx 0.18" in out and "mlx-lm 0.20" in out
+    assert "not installed:" in out               # the missing-modalities line
+
+
+def test_render_mlx_want_libraries_only(make_console, monkeypatch):
+    _mlx_setup(monkeypatch, interps=[], models=1)
+    c, buf = make_console()
+    cli.render_mlx(c, want=lambda k: k == "libraries")
+    out = buf.getvalue()
+    assert "READINESS" not in out and "LIBRARIES" in out
+
+
+def test_render_mlx_json(monkeypatch, capsys):
+    from ara.mlx import MlxInterpreter
+    mi = MlxInterpreter(path="/x", origin="venv", version="3.12", packages={"mlx": "0.18"})
+    _mlx_setup(monkeypatch, interps=[mi], runtimes=["0.3.1"], models=3)
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_mlx(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["apple_silicon"] is True and payload["mlx_community_models"] == 3
+    assert payload["interpreters"][0]["packages"] == {"mlx": "0.18"}
+
+
+# =========================================================================== #
+# _det_apps summary (inside render_detect)
+# =========================================================================== #
+def test_det_apps_summary(make_console, monkeypatch):
+    m = _machine(apps=[
+        _capp(label="LM Studio", category="runner"),
+        _capp(label="Ollama", category="runner"),
+        _capp(label="GPT4All", category="runner"),
+        _capp(label="Jan", category="runner"),
+    ])
+    stub = lambda count=1, discover=(): None
+    monkeypatch.setattr(cli.pythons, "count", lambda: 1)
+    c, buf = make_console()
+    cli._det_apps(c, m)
+    out = buf.getvalue()
+    assert "AI/ML APPS" in out and "model runners" in out
+    assert "(+1 more)" in out   # 4 runners, top 3 shown
+
+
+def test_det_apps_empty(make_console):
+    m = _machine(apps=[])
+    c, buf = make_console()
+    cli._det_apps(c, m)
+    assert "none detected" in buf.getvalue()
+
+
+# =========================================================================== #
+# main dispatch: apps / mlx + include/exclude parsing
+# =========================================================================== #
+def test_main_apps_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["apps", "--json"])
+    assert rec["apps"] is True
+
+
+def test_main_mlx_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["mlx"])
+    assert rec["mlx"] is False
+
+
+def test_main_include_builds_want(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--include", "system,memory"])
+    want = rec["detect_want"]
+    assert want is not None and want("system") and not want("accelerator")
+
+
+def test_main_include_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--include=system"])
+    assert rec["detect_want"]("system") and not rec["detect_want"]("memory")
+
+
+def test_main_exclude_builds_want(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--exclude=memory"])
+    want = rec["detect_want"]
+    assert not want("memory") and want("system")
+
+
+def test_main_no_filter_means_no_want(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect"])
+    assert rec["detect_want"] is None
+
+
+# =========================================================================== #
+# remaining want-filter / branch corners
+# =========================================================================== #
+def test_resolve_want_no_filter_returns_none_quietly(make_console):
+    c, buf = make_console()
+    assert cli._resolve_want("profile", [], [], c) is None   # no include/exclude → no warn
+    assert buf.getvalue() == ""
+
+
+def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pythons):
+    stub_pythons(count=1)
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
+    c, buf = make_console()
+    cli.render_detect(c, want=lambda k: k == "system")
+    out = buf.getvalue()
+    assert "SYSTEM" in out and "MEMORY" not in out and "ACCELERATOR" not in out
+
+
+def test_render_status_want_excludes_processes(make_console, monkeypatch):
+    monkeypatch.setattr(cli.status, "scan", lambda: [])
+    c, buf = make_console()
+    cli.render_status(c, want=lambda k: k != "processes")   # filtered out → early return
+    assert buf.getvalue() == ""
+
+
+def test_render_python_want_excludes_interpreters(make_console, monkeypatch):
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: [])
+    c, buf = make_console()
+    cli.render_python(c, want=lambda k: k != "interpreters")
+    assert buf.getvalue() == ""
+
+
+def test_det_apps_single_item_no_more_suffix(make_console, monkeypatch):
+    m = _machine(apps=[_capp(label="Cursor", category="coding")])
+    monkeypatch.setattr(cli.pythons, "count", lambda: 1)
+    c, buf = make_console()
+    cli._det_apps(c, m)
+    out = buf.getvalue()
+    assert "Cursor" in out and "more)" not in out   # 1 item → no "(+N more)"
+
+
+def test_render_mlx_readiness_only(make_console, monkeypatch):
+    _mlx_setup(monkeypatch, interps=[], models=1)
+    c, buf = make_console()
+    cli.render_mlx(c, want=lambda k: k == "readiness")
+    out = buf.getvalue()
+    assert "READINESS" in out and "LIBRARIES" not in out
+
+
+def test_render_mlx_unmanaged_interp_with_all_packages(make_console, monkeypatch):
+    from ara.mlx import MlxInterpreter
+    # a venv (unmanaged → no caution) holding at least one package from every group
+    full = {pkgs[0]: "1.0" for _label, pkgs in cli.mlx.GROUPS}
+    mi = MlxInterpreter(path="/venv/bin/python", origin="venv", version="3.12",
+                        externally_managed=False, packages=full)
+    _mlx_setup(monkeypatch, interps=[mi], models=0)
+    c, buf = make_console()
+    cli.render_mlx(c)
+    out = buf.getvalue()
+    assert "managed by" not in out        # venv → no caution (570->573 false branch)
+    assert "not installed:" not in out    # every group covered (581->585 false branch)

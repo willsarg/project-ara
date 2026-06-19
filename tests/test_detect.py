@@ -578,3 +578,44 @@ def test_dir_size_gb_skips_subdirectories(tmp_path):
     (tmp_path / "sub").mkdir()                 # not a file → skipped, loop continues
     (tmp_path / "f").write_bytes(b"x" * 10)
     assert detect._dir_size_gb(tmp_path) == 10 / detect.GB
+
+
+# --------------------------------------------------------------------------- #
+# user-PATH command resolution + hf CLI probe
+# --------------------------------------------------------------------------- #
+def test_user_which_strips_venv(monkeypatch):
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    seen = {}
+
+    def fake_which(cmd, path=None):
+        seen["path"] = path
+        return f"/usr/bin/{cmd}"
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    assert detect._user_which("hf") == "/usr/bin/hf"
+    assert "/venv/bin" not in seen["path"]
+
+
+def test_user_which_none(monkeypatch):
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr("shutil.which", lambda cmd, path=None: None)
+    assert detect._user_which("hf") is None
+
+
+def test_hf_cli_present_with_version(monkeypatch, run_stub):
+    monkeypatch.setattr(detect, "_user_which", lambda cmd: "/usr/bin/hf" if cmd == "hf" else None)
+    run_stub.add("version", "huggingface_hub version: 0.23.4\n")
+    assert detect._hf_cli() == (True, "0.23.4")
+
+
+def test_hf_cli_present_without_parseable_version(monkeypatch, run_stub):
+    monkeypatch.setattr(detect, "_user_which", lambda cmd: "/usr/bin/hf")
+    run_stub.add("version", "no version here")
+    assert detect._hf_cli() == (True, None)
+
+
+def test_hf_cli_absent(monkeypatch):
+    monkeypatch.setattr(detect, "_user_which", lambda cmd: None)
+    assert detect._hf_cli() == (False, None)
