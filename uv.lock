@@ -427,6 +427,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "platformdirs" },
     { name = "psutil" },
 ]
 
@@ -440,6 +441,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.23" },
+    { name = "platformdirs", specifier = ">=4" },
     { name = "psutil", specifier = ">=5.9" },
 ]
 

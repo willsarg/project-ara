@@ -35,6 +35,14 @@ def _clear_version_caches():
 # console capture
 # --------------------------------------------------------------------------- #
 @pytest.fixture
+def store(tmp_path, monkeypatch):
+    """A fresh on-disk ARA db in a tmp dir (via the ARA_DB_PATH override)."""
+    from ara import db
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "ara.db"))
+    return db.connect()
+
+
+@pytest.fixture
 def make_console():
     """Factory: build a Console writing to an in-memory buffer.
 
