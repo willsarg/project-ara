@@ -35,6 +35,59 @@ def _fmt_size(gb: float | None) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# section filtering — shared across the recon commands (--include / --exclude)
+# --------------------------------------------------------------------------- #
+# The sections each recon command can show, in display order. Single-section
+# commands list one key so the flags behave consistently everywhere.
+_RECON_SECTIONS: dict[str, tuple[str, ...]] = {
+    "detect": ("system", "memory", "accelerator", "storage",
+               "engines", "frameworks", "models", "apps", "ara"),
+    "mlx": ("readiness", "libraries"),
+    "status": ("processes",),
+    "python": ("interpreters",),
+}
+_SECTION_ALIASES = {
+    "gpu": "accelerator", "app": "apps", "framework": "frameworks", "engine": "engines",
+    "model": "models", "lib": "libraries", "libs": "libraries", "library": "libraries",
+    "ready": "readiness", "proc": "processes", "procs": "processes", "process": "processes",
+    "interpreter": "interpreters", "interps": "interpreters", "interp": "interpreters",
+}
+
+
+def _csv(value: str) -> list[str]:
+    """Split a comma-separated flag value into trimmed, non-empty parts."""
+    return [s.strip() for s in value.split(",") if s.strip()]
+
+
+def _section_filter(include, exclude):
+    """A predicate over section keys: a whitelist if *include* is given, else a blacklist."""
+    inc, exc = set(include or []), set(exclude or [])
+    return (lambda k: k in inc) if inc else (lambda k: k not in exc)
+
+
+def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console):
+    """Build the section predicate for *cmd*, normalizing aliases and warning on unknowns.
+    Returns None when the command has no sections to filter."""
+    valid = _RECON_SECTIONS.get(cmd)
+    if valid is None:
+        if include or exclude:
+            c.emit(c.style("warn", f"  --include/--exclude don't apply to '{cmd}'"))
+            c.emit()
+        return None
+
+    def norm(xs):
+        return [_SECTION_ALIASES.get(x.lower().strip(), x.lower().strip()) for x in xs]
+
+    inc, exc = norm(include), norm(exclude)
+    unknown = [s for s in (*inc, *exc) if s not in valid]
+    if unknown:
+        c.emit(c.style("warn", f"  unknown section(s) for {cmd}: {', '.join(dict.fromkeys(unknown))}"))
+        c.emit(c.style("dim", f"  valid: {', '.join(valid)}"))
+        c.emit()
+    return _section_filter([s for s in inc if s in valid], [s for s in exc if s in valid])
+
+
+# --------------------------------------------------------------------------- #
 # landing
 # --------------------------------------------------------------------------- #
 def render_landing(c: Console) -> None:
@@ -82,16 +135,7 @@ def render_landing(c: Console) -> None:
 # --------------------------------------------------------------------------- #
 # detect (recon only — never profiles or loads an engine)
 # --------------------------------------------------------------------------- #
-def render_detect(c: Console, *, as_json: bool = False) -> None:
-    m = detect.profile()
-
-    if as_json:
-        print(json.dumps(asdict(m), indent=2))
-        return
-
-    a = m.accel
-
-    c.emit()
+def _det_system(c: Console, m) -> None:
     c.emit(c.section("  SYSTEM"))
     c.emit(c.field("chip", m.chip))
     c.emit(c.field("os", m.os_version))
@@ -111,6 +155,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         c.emit(c.field("pythons", str(n_py), "interpreters on this machine — run: ara python"))
     c.emit()
 
+
+def _det_memory(c: Console, m) -> None:
     c.emit(c.section("  MEMORY"))
     c.emit(c.field("total", _fmt_gb(m.ram_total_gb)))
     if m.ram_available_gb is not None:
@@ -119,6 +165,9 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         c.emit(c.field("swap", _fmt_gb(m.swap_gb, 1)))
     c.emit()
 
+
+def _det_accelerator(c: Console, m) -> None:
+    a = m.accel
     c.emit(c.section("  ACCELERATOR"))
     if a.kind == "nvidia":
         bits = []
@@ -138,13 +187,15 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         c.emit(c.field("gpu", a.name, "no GPU detected", value_role="warn"))
     c.emit()
 
+
+def _det_storage(c: Console, m) -> None:
     c.emit(c.section("  STORAGE"))
     c.emit(c.field("disk free", _fmt_gb(m.disk_free_gb), "on the home volume"))
     c.emit()
 
-    engines = [rt for rt in m.runtimes if rt.kind == "engine"]
-    frameworks = [rt for rt in m.runtimes if rt.kind == "framework"]
 
+def _det_engines(c: Console, m) -> None:
+    engines = [rt for rt in m.runtimes if rt.kind == "engine"]
     c.emit(c.section("  ENGINES") + c.style("dim", "  (what ARA can launch models through)"))
     for rt in engines:
         if rt.present:
@@ -159,7 +210,10 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         c.emit(c.style("dim", "  none detected"))
     c.emit()
 
+
+def _det_frameworks(c: Console, m) -> None:
     # Frameworks reflect the USER's own python, not ARA's bundled deps.
+    frameworks = [rt for rt in m.runtimes if rt.kind == "framework"]
     c.emit(c.section("  FRAMEWORKS"))
     present_fw = [rt for rt in frameworks if rt.present]
     default_py = m.framework_python or "ARA's env (no separate user python)"
@@ -194,6 +248,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             c.emit(c.style("dim", "  None found in any interpreter on this machine."))
     c.emit()
 
+
+def _det_models(c: Console, m) -> None:
     c.emit(c.section("  MODELS"))
     for store in m.model_stores:
         if store.present and store.count:
@@ -205,6 +261,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             c.emit(c.field(store.name, "not found", value_role="dim"))
     c.emit()
 
+
+def _det_apps(c: Console, m) -> None:
     c.emit(c.section("  AI/ML APPS"))
     if not m.apps:
         c.emit(c.style("dim", "  none detected"))
@@ -221,6 +279,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
                                 "so cask + app is one install, not a duplicate."))
     c.emit()
 
+
+def _det_ara(c: Console, m) -> None:
     c.emit(c.section("  ARA"))
     c.emit(c.field(
         "backend", m.backend,
@@ -237,10 +297,34 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
                    value_role="good" if m.hf_token else "dim"))
     c.emit(c.field("power", m.power))
     c.emit()
-
     if not m.supported:
         c.emit(c.style("warn", "  no ARA backend for this hardware yet — recon works, running comes later"))
         c.emit()
+
+
+_DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
+    ("system", _det_system),
+    ("memory", _det_memory),
+    ("accelerator", _det_accelerator),
+    ("storage", _det_storage),
+    ("engines", _det_engines),
+    ("frameworks", _det_frameworks),
+    ("models", _det_models),
+    ("apps", _det_apps),
+    ("ara", _det_ara),
+)
+
+
+def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
+    m = detect.profile()
+    if as_json:
+        print(json.dumps(asdict(m), indent=2))
+        return
+    want = want or (lambda _key: True)
+    c.emit()
+    for key, fn in _DETECT_RENDERERS:
+        if want(key):
+            fn(c, m)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,13 +346,15 @@ def _fmt_mem(gb: float) -> str:
     return f"{gb * 1024:.0f} MB" if gb < 1 else f"{gb:.1f} GB"
 
 
-def render_status(c: Console, *, as_json: bool = False) -> None:
+def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
     procs = status.scan()
 
     if as_json:
         print(json.dumps([asdict(p) for p in procs], indent=2))
         return
 
+    if not (want or (lambda _key: True))("processes"):
+        return
     c.emit()
     c.emit(c.section("  RUNNING AI/ML"))
     if not procs:
@@ -302,13 +388,15 @@ def _tilde(p: str) -> str:
     return "~" + p[len(home):] if p.startswith(home) else p
 
 
-def render_python(c: Console, *, as_json: bool = False) -> None:
+def render_python(c: Console, *, as_json: bool = False, want=None) -> None:
     ints = pythons.discover()
 
     if as_json:
         print(json.dumps([asdict(i) for i in ints], indent=2))
         return
 
+    if not (want or (lambda _key: True))("interpreters"):
+        return
     c.emit()
     c.emit(c.section("  PYTHON INTERPRETERS"))
     sub = " " * 13  # aligns continuation lines under the path column
@@ -352,7 +440,7 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 # mlx (the MLX ecosystem — libraries by modality + Apple readiness; Apple-only)
 # --------------------------------------------------------------------------- #
-def render_mlx(c: Console, *, as_json: bool = False) -> None:
+def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
     is_apple = detect.backend_name() == "apple"
     interps = mlx.scan() if is_apple else []
     runtimes = mlx.lmstudio_mlx_runtimes() if is_apple else []
@@ -378,51 +466,50 @@ def render_mlx(c: Console, *, as_json: bool = False) -> None:
         c.emit(c.style("warn", "  MLX is Apple-Silicon only — not applicable on this machine."))
         c.emit()
         return
+    want = want or (lambda _key: True)
 
-    # readiness
-    c.emit()
-    c.emit(c.style("dim", "  READINESS"))
-    cores = f"{accel.cores}-core " if accel and accel.cores else ""
-    c.emit(c.field("GPU", accel.name, f"{cores}Metal · unified memory"))
-    c.emit(c.field("models", f"{n_models} cached", "mlx-community models in your HF cache"))
-    if runtimes:
-        extra = f"  (+{len(runtimes) - 1} older)" if len(runtimes) > 1 else ""
-        c.emit(c.field("LM Studio", f"MLX runtime {runtimes[0]}{extra}", "Apple MLX engine"))
-    else:
-        c.emit(c.field("LM Studio", "no MLX runtime", value_role="dim"))
-
-    # libraries, grouped by modality
-    c.emit()
-    c.emit(c.style("dim", "  LIBRARIES"))
-    if not interps:
-        c.emit("  " + c.style("dim", "No MLX packages installed in any interpreter."))
-        c.emit("  " + c.style("dim", "Install into a venv, e.g. ") + c.style("accent", "pip install mlx-lm"))
+    if want("readiness"):
         c.emit()
-        return
+        c.emit(c.style("dim", "  READINESS"))
+        cores = f"{accel.cores}-core " if accel and accel.cores else ""
+        c.emit(c.field("GPU", accel.name, f"{cores}Metal · unified memory"))
+        c.emit(c.field("models", f"{n_models} cached", "mlx-community models in your HF cache"))
+        if runtimes:
+            extra = f"  (+{len(runtimes) - 1} older)" if len(runtimes) > 1 else ""
+            c.emit(c.field("LM Studio", f"MLX runtime {runtimes[0]}{extra}", "Apple MLX engine"))
+        else:
+            c.emit(c.field("LM Studio", "no MLX runtime", value_role="dim"))
 
-    present: set[str] = set()
-    for mi in interps:
+    if want("libraries"):
         c.emit()
-        c.emit("  " + c.style("good", f"{mi.origin} {mi.version or ''}".strip())
-               + c.style("dim", "  ·  ") + c.style("accent", _tilde(mi.path)))
-        mgr = pythons.manager_of(mi.origin, mi.externally_managed)
-        if mgr:  # MLX was pip-installed into an interpreter managed by someone else
-            c.emit("      " + c.style("warn", f"⚠ this interpreter is managed by {mgr} — "
-                                              f"MLX shouldn't be installed into it; use a venv"))
-        for label, pkgs in mlx.GROUPS:
-            got = [(p, mi.packages[p]) for p in pkgs if p in mi.packages]
-            if got:
-                present.update(p for p, _ in got)
-                c.emit("      " + c.style("metric", f"{label:14}")
-                       + c.style("good", " · ".join(f"{p} {v}" for p, v in got)))
-
-    missing = [(label, pkgs) for label, pkgs in mlx.GROUPS
-               if not any(p in present for p in pkgs)]
-    if missing:
+        c.emit(c.style("dim", "  LIBRARIES"))
+        if not interps:
+            c.emit("  " + c.style("dim", "No MLX packages installed in any interpreter."))
+            c.emit("  " + c.style("dim", "Install into a venv, e.g. ")
+                   + c.style("accent", "pip install mlx-lm"))
+        else:
+            present: set[str] = set()
+            for mi in interps:
+                c.emit()
+                c.emit("  " + c.style("good", f"{mi.origin} {mi.version or ''}".strip())
+                       + c.style("dim", "  ·  ") + c.style("accent", _tilde(mi.path)))
+                mgr = pythons.manager_of(mi.origin, mi.externally_managed)
+                if mgr:  # MLX was pip-installed into an interpreter managed by someone else
+                    c.emit("      " + c.style("warn", f"⚠ this interpreter is managed by {mgr} — "
+                                                      f"MLX shouldn't be installed into it; use a venv"))
+                for label, pkgs in mlx.GROUPS:
+                    got = [(p, mi.packages[p]) for p in pkgs if p in mi.packages]
+                    if got:
+                        present.update(p for p, _ in got)
+                        c.emit("      " + c.style("metric", f"{label:14}")
+                               + c.style("good", " · ".join(f"{p} {v}" for p, v in got)))
+            missing = [(label, pkgs) for label, pkgs in mlx.GROUPS
+                       if not any(p in present for p in pkgs)]
+            if missing:
+                c.emit()
+                items = " · ".join(f"{label} ({'/'.join(pkgs)})" for label, pkgs in missing)
+                c.emit("  " + c.style("dim", "not installed: " + items))
         c.emit()
-        items = " · ".join(f"{label} ({'/'.join(pkgs)})" for label, pkgs in missing)
-        c.emit("  " + c.style("dim", "not installed: " + items))
-    c.emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -566,8 +653,10 @@ def main() -> int:
     recalibrate = "--recalibrate" in argv
     assume_yes = "--yes" in argv or "-y" in argv
 
-    # --model <id> takes a value; pull it (and its value) out before the rest.
+    # --model / --include / --exclude take values; pull them out before the rest.
     model: str | None = None
+    include: list[str] = []
+    exclude: list[str] = []
     rest: list[str] = []
     skip = False
     for i, a in enumerate(argv):
@@ -581,6 +670,17 @@ def main() -> int:
         if a.startswith("--model="):
             model = a.split("=", 1)[1] or None
             continue
+        if a in ("--include", "--exclude"):
+            (include if a == "--include" else exclude).extend(
+                _csv(argv[i + 1] if i + 1 < len(argv) else ""))
+            skip = True
+            continue
+        if a.startswith("--include="):
+            include.extend(_csv(a.split("=", 1)[1]))
+            continue
+        if a.startswith("--exclude="):
+            exclude.extend(_csv(a.split("=", 1)[1]))
+            continue
         if a in ("--verbose", "-v", "--json", "--recalibrate", "--yes", "-y"):
             continue
         rest.append(a)
@@ -590,23 +690,27 @@ def main() -> int:
         render_landing(c)
         return 0
 
-    if rest[0] == "detect":
-        render_detect(c, as_json=as_json)
+    cmd = rest[0]
+    # Section filtering is shared across the recon commands; build the predicate once.
+    want = _resolve_want(cmd, include, exclude, c) if (include or exclude) else None
+
+    if cmd == "detect":
+        render_detect(c, as_json=as_json, want=want)
         return 0
 
-    if rest[0] == "status":
-        render_status(c, as_json=as_json)
+    if cmd == "status":
+        render_status(c, as_json=as_json, want=want)
         return 0
 
-    if rest[0] == "python":
-        render_python(c, as_json=as_json)
+    if cmd == "python":
+        render_python(c, as_json=as_json, want=want)
         return 0
 
-    if rest[0] == "mlx":
-        render_mlx(c, as_json=as_json)
+    if cmd == "mlx":
+        render_mlx(c, as_json=as_json, want=want)
         return 0
 
-    if rest[0] == "profile":
+    if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,
                               assume_yes=assume_yes, model=model)
 
