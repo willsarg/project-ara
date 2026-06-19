@@ -100,7 +100,8 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             cores += "   " + " · ".join(m.cpu_features)
         c.emit(c.field("cpu", cores))
     if m.python_version:
-        c.emit(c.field("python", m.python_version, "ambient python3"))
+        gloss = "your default python3" if m.framework_python else "ARA's python (no user env found)"
+        c.emit(c.field("python", m.python_version, gloss))
     c.emit()
 
     c.emit(c.section("  MEMORY"))
@@ -134,8 +135,11 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     c.emit(c.field("disk free", _fmt_gb(m.disk_free_gb), "on the home volume"))
     c.emit()
 
-    c.emit(c.section("  RUNTIMES"))
-    for rt in m.runtimes:
+    engines = [rt for rt in m.runtimes if rt.kind == "engine"]
+    frameworks = [rt for rt in m.runtimes if rt.kind == "framework"]
+
+    c.emit(c.section("  ENGINES") + c.style("dim", "  (what ARA can launch models through)"))
+    for rt in engines:
         if rt.present:
             val = f"{rt.name} {rt.version}" if rt.version else rt.name
             if rt.requires:  # installed, but can't accelerate on this hardware
@@ -144,8 +148,22 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
                 c.emit(c.field("·", val, "found", value_role="good"))
         elif c.verbose:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
-    if not any(rt.present for rt in m.runtimes):
+    if not any(rt.present for rt in engines) and not c.verbose:
         c.emit(c.style("dim", "  none detected"))
+    c.emit()
+
+    # Frameworks reflect the USER's own python, not ARA's bundled deps.
+    fw_gloss = f"  ({m.framework_python})" if m.framework_python \
+        else "  (no separate user python — ARA's env only)"
+    c.emit(c.section("  FRAMEWORKS") + c.style("dim", fw_gloss))
+    for rt in frameworks:
+        if rt.present:
+            val = f"{rt.name} {rt.version}" if rt.version else rt.name
+            c.emit(c.field("·", val, "found", value_role="good"))
+        elif c.verbose:
+            c.emit(c.field("·", rt.name, "not found", value_role="dim"))
+    if not any(rt.present for rt in frameworks) and not c.verbose:
+        c.emit(c.style("dim", "  none in this env"))
     c.emit()
 
     c.emit(c.section("  MODELS"))
