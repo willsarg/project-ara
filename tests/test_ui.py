@@ -3,7 +3,26 @@ from __future__ import annotations
 
 import io
 
-from ara.ui import RESET, ROLES, Console
+from ara.ui import RESET, ROLES, Console, _ensure_utf8
+
+
+class FakeReconfigurable:
+    """A stream stand-in that records reconfigure() calls and a writable encoding.
+
+    (Real io.StringIO has a read-only ``encoding``, so it can't model a legacy
+    codepage; ``_ensure_utf8`` only touches ``.encoding`` and ``.reconfigure``.)
+    """
+
+    def __init__(self, encoding: str = "cp1252", raises: Exception | None = None):
+        self.encoding = encoding
+        self._raises = raises
+        self.reconfigured: dict | None = None
+
+    def reconfigure(self, **kwargs):
+        if self._raises is not None:
+            raise self._raises
+        self.reconfigured = kwargs
+        self.encoding = kwargs.get("encoding", self.encoding)
 
 
 class FakeTTY(io.StringIO):
@@ -67,6 +86,35 @@ def test_field_without_gloss_has_no_trailing_separator():
 def test_section_uses_header_role_when_color():
     c = Console(color=True, stream=io.StringIO())
     assert c.section("SYSTEM") == f"\033[{ROLES['header']}mSYSTEM{RESET}"
+
+
+def test_ensure_utf8_reconfigures_a_legacy_codepage_stream():
+    s = FakeReconfigurable(encoding="cp1252")
+    _ensure_utf8(s)
+    assert s.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+
+
+def test_ensure_utf8_skips_a_stream_already_on_utf8():
+    s = FakeReconfigurable(encoding="utf-8")
+    _ensure_utf8(s)
+    assert s.reconfigured is None
+
+
+def test_ensure_utf8_noop_when_stream_cannot_reconfigure():
+    # Plain StringIO has no reconfigure attribute — must not raise.
+    _ensure_utf8(io.StringIO())
+
+
+def test_ensure_utf8_swallows_reconfigure_failure():
+    s = FakeReconfigurable(encoding="cp1252", raises=ValueError("nope"))
+    _ensure_utf8(s)  # must not propagate
+    assert s.reconfigured is None
+
+
+def test_console_reconfigures_its_stream_to_utf8_on_construction():
+    s = FakeReconfigurable(encoding="cp1252")
+    Console(color=False, stream=s)
+    assert s.reconfigured == {"encoding": "utf-8", "errors": "replace"}
 
 
 def test_emit_writes_line_to_stream():

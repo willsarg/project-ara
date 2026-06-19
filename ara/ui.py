@@ -11,6 +11,27 @@ import sys
 
 RESET = "\033[0m"
 
+
+def _ensure_utf8(stream) -> None:
+    """Best-effort: make *stream* emit UTF-8 without ever crashing on a glyph.
+
+    Windows consoles default to a legacy codepage (e.g. cp1252), where ARA's
+    bullets and separators (``●``, ``·``, ``▸``) raise ``UnicodeEncodeError`` on
+    a plain ``print``. Reconfiguring to UTF-8 with ``errors="replace"`` makes
+    output crash-proof; on a capable terminal (Windows Terminal, modern SSH) the
+    glyphs also render correctly. No-op on streams that don't support it (e.g.
+    an already-UTF-8 stream, or a plain buffer with no ``reconfigure``).
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    encoding = (getattr(stream, "encoding", "") or "").lower()
+    if reconfigure is None or encoding.startswith("utf"):
+        return
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, LookupError):
+        # A stream may refuse mid-flight reconfiguration; leave it as-is.
+        pass
+
 # Semantic role -> ANSI SGR code.
 ROLES: dict[str, str] = {
     "accent": "35",   # magenta
@@ -31,6 +52,7 @@ class Console:
         self.color = color
         self.verbose = verbose
         self.stream = stream if stream is not None else sys.stdout
+        _ensure_utf8(self.stream)
 
     @classmethod
     def from_env(cls, *, stream=None, verbose: bool = False) -> "Console":
