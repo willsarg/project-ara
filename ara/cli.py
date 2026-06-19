@@ -913,6 +913,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         return 1
 
     _persist_calibration(m, engine_key)   # ARA remembers it, so next run is cached
+    _overlay_stored_calibration(m, engine_key)  # reflect the stored timestamp in the readout
     c.emit(c.style("good", "  calibrated."))
     _emit_calibration(c, m, model)
     _emit_limits(c, m)
