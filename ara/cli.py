@@ -383,8 +383,8 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
         if app.drift and auto:
             gloss += f"  · self-updates; brew defers (records {app.brew_recorded})"
         elif app.drift:
-            gloss += (f"  ⚠ self-updated past brew (records {app.brew_recorded}) → "
-                      f"brew uninstall --cask {app.cask_token} to let it self-manage")
+            gloss += (f"  ⚠ self-updated past brew (records {app.brew_recorded}); "
+                      f"brew upgrade may overwrite it")
         if app.duplicate:
             gloss += "  ⚠ likely duplicate"
         c.emit(c.field("·", name, gloss, value_role="warn" if problem else "good"))

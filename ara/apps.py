@@ -65,7 +65,10 @@ CATALOG: list[tuple[str, str, list[str], list[str]]] = [
     ("Cursor", "coding", ["Cursor"], ["cursor"]),
     ("Windsurf", "coding", ["Windsurf"], ["windsurf"]),
     ("Antigravity", "coding", ["Antigravity"], []),
-    ("Codex", "coding", ["Codex"], ["codex"]),
+    # Codex ships as two distinct artifacts — keep them separate so their independent
+    # versions aren't compared as "drift" (the .app is com.openai.codex; the cask is the CLI).
+    ("Codex", "coding", ["Codex"], []),
+    ("Codex CLI", "coding", [], ["codex"]),
     ("CodexBar", "coding", ["CodexBar"], ["codexbar"]),
     ("Claude Code", "coding", [], ["claude-code"]),
     ("GitHub Copilot", "coding", ["GitHub Copilot"], ["copilot"]),
@@ -92,8 +95,9 @@ class App:
     @property
     def drift(self) -> bool:
         """A cask GUI app whose installed (.app) version has self-updated past Homebrew's
-        frozen receipt — so `brew` no longer reflects reality (and `brew upgrade` may clobber)."""
-        return bool(self.cask and self.brew_recorded and self.version
+        frozen receipt — so `brew` no longer reflects reality (and `brew upgrade` may clobber).
+        Requires an actual installed .app, so a CLI-only cask never counts as drift."""
+        return bool(self.cask and self.in_app and self.brew_recorded and self.version
                     and self.version != self.brew_recorded)
 
     @property
