@@ -12,7 +12,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, catalog, db, detect, engines, mlx, profiles,
+from ara import (acquire, apps, catalog, db, detect, engines, hub, mlx, profiles,
                  pythons, status, versions)
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
@@ -126,6 +126,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
     if supported:  # MLX ecosystem view is Apple-Silicon only
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
+    c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
@@ -643,6 +644,54 @@ def _emit_calibration(c: Console, m: dict, fallback_model: str) -> None:
     c.emit(c.style("dim", f"  overhead: {verdict}{rungs} · {short}"))
 
 
+def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
+    """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
+    meta = catalog.describe(model_id)
+    if meta is None:
+        c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
+        return 1
+    engine_key = engines.for_backend(detect.backend_name())
+    ch = (db.get_characterization(db.connect(), profiles.machine_key(), engine_key, model_id)
+          if engine_key else None)
+    ceiling = ch["safe_context"] if ch else None
+    if as_json:
+        print(json.dumps({"model_id": model_id, **meta, "safe_context": ceiling}, indent=2))
+        return 0
+    kvh, hd = meta["kv_heads"], meta["head_dim"]
+    c.emit()
+    c.emit(c.section(f"  {model_id}"))
+    c.emit(c.field("modality", meta["modality"] or "?"))
+    c.emit(c.field("layers", str(meta["n_layers"]) if meta["n_layers"] else "?"))
+    c.emit(c.field("kv cache", f"{kvh} heads × {hd} dim" if (kvh and hd) else "?"))
+    c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
+    c.emit(c.field("quant", meta["quant"] or "none"))
+    c.emit(c.field("ceiling",
+                   f"~{ceiling} tokens" if ceiling else "not characterized"))
+    c.emit()
+    return 0
+
+
+def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
+    """Search the Hugging Face Hub for models (engine-agnostic)."""
+    results = hub.search(query)
+    if results is None:
+        c.emit(c.style("warn", "  couldn't search — is the hf CLI installed? ")
+               + c.style("accent", "pip install huggingface_hub"))
+        return 1
+    if as_json:
+        print(json.dumps(results, indent=2))
+        return 0
+    c.emit()
+    c.emit(c.section(f"  HUB SEARCH: {query}"))
+    for r in results:
+        c.emit("  " + c.style("metric", r["id"])
+               + c.style("dim", f"  ↓{r['downloads']} · ♥{r['likes']}"))
+    if not results:
+        c.emit(c.style("dim", "  no models found"))
+    c.emit()
+    return 0
+
+
 def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     """The model catalog: scan the HF cache, then list each model + its safe ceiling here."""
     con = db.connect()
@@ -950,8 +999,16 @@ def main() -> int:
         return 0
 
     if cmd == "models":
+        if len(rest) > 1:                       # `ara models <id>` → one model's detail
+            return render_model_detail(c, rest[1], as_json=as_json)
         render_models(c, as_json=as_json, want=want)
         return 0
+
+    if cmd == "search":
+        if len(rest) < 2:
+            c.emit(c.style("warn", "  usage: ara search <query>"))
+            return 1
+        return render_search(c, " ".join(rest[1:]), as_json=as_json)
 
     if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,

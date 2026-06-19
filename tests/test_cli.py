@@ -1375,3 +1375,110 @@ def test_main_models_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["models", "--json"])
     assert rec["models"] is True
+
+
+# --------------------------------------------------------------------------- #
+# ara search — Hub search (engine-agnostic)
+# --------------------------------------------------------------------------- #
+def test_render_search_lists_results(make_console, monkeypatch):
+    monkeypatch.setattr(cli.hub, "search",
+                        lambda q: [{"id": "org/Smol", "downloads": 1000, "likes": 5}])
+    c, buf = make_console()
+    assert cli.render_search(c, "smol") == 0
+    out = buf.getvalue()
+    assert "HUB SEARCH: smol" in out and "org/Smol" in out and "1000" in out
+
+
+def test_render_search_empty(make_console, monkeypatch):
+    monkeypatch.setattr(cli.hub, "search", lambda q: [])
+    c, buf = make_console()
+    assert cli.render_search(c, "zzz") == 0
+    assert "no models found" in buf.getvalue()
+
+
+def test_render_search_hf_missing(make_console, monkeypatch):
+    monkeypatch.setattr(cli.hub, "search", lambda q: None)
+    c, buf = make_console()
+    assert cli.render_search(c, "x") == 1
+    assert "hf CLI" in buf.getvalue()
+
+
+def test_render_search_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "a", "downloads": 1, "likes": 0}])
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_search(c, "a", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)[0]["id"] == "a"
+
+
+def test_main_search_dispatch(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "render_search",
+                        lambda c, q, as_json=False: (seen.update(q=q, json=as_json) or 0))
+    _run_main(monkeypatch, ["search", "smol", "lm", "--json"])
+    assert seen == {"q": "smol lm", "json": True}
+
+
+def test_main_search_no_query(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["search"]) == 1
+    assert "usage: ara search" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# ara models <id> — single-model detail (wmx's `show`)
+# --------------------------------------------------------------------------- #
+def _meta(**over):
+    base = dict(modality="text", n_layers=30, hidden_size=576, kv_heads=3,
+                head_dim=64, max_context=8192, quant="mlx-4bit")
+    base.update(over)
+    return base
+
+
+def test_model_detail_full(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 16000})
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    out = buf.getvalue()
+    assert "org/Smol" in out and "3 heads × 64 dim" in out
+    assert "8192" in out and "mlx-4bit" in out and "16000" in out
+
+
+def test_model_detail_sparse_no_engine(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda mid: _meta(modality=None, n_layers=None, kv_heads=None,
+                                          head_dim=None, max_context=None, quant=None))
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")  # engine_key None
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "x") == 0
+    out = buf.getvalue()
+    assert "?" in out and "none" in out and "not characterized" in out
+
+
+def test_model_detail_not_found(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: None)
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "nope") == 1
+    assert "couldn't describe" in buf.getvalue()
+
+
+def test_model_detail_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 9000})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/A", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["model_id"] == "org/A" and data["safe_context"] == 9000
+
+
+def test_main_models_id_dispatch(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "render_model_detail",
+                        lambda c, mid, as_json=False: (seen.update(mid=mid) or 0))
+    _run_main(monkeypatch, ["models", "org/Smol"])
+    assert seen["mid"] == "org/Smol"
