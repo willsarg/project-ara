@@ -176,9 +176,10 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         if others:
             top = others[0]
             libs = " · ".join(f"{k} {v}" for k, v in top.ai_present.items())
-            c.emit(c.style("dim", "  none in your default — but another interpreter has them:"))
+            c.emit(c.style("dim", "  none in your default — found in another interpreter:"))
             c.emit("  " + c.style("good", f"{top.origin} {top.version or ''}".strip())
-                   + c.style("dim", "  ·  ") + c.style("good", libs))
+                   + "   " + c.style("accent", _tilde(top.path)))
+            c.emit("       " + c.style("good", libs))
             more = len(others) - 1
             c.emit(c.style("dim", "  run ") + c.style("accent", "ara python")
                    + c.style("dim", " for the full list" + (f" (+{more} more)" if more else "")))
