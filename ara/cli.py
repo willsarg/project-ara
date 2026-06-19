@@ -159,34 +159,37 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
 
     # Frameworks reflect the USER's own python, not ARA's bundled deps.
     c.emit(c.section("  FRAMEWORKS"))
-    if m.framework_python:
-        c.emit(c.style("dim", f"  in your default python · {m.framework_python}"))
+    present_fw = [rt for rt in frameworks if rt.present]
+    default_py = m.framework_python or "ARA's env (no separate user python)"
+
+    if present_fw:
+        libs = " · ".join(f"{rt.name} {rt.version}".strip() for rt in present_fw)
+        c.emit(c.style("dim", "  Your default python has AI frameworks:"))
+        c.emit("      " + c.style("accent", default_py))
+        c.emit("      " + c.style("good", libs))
     else:
-        c.emit(c.style("dim", "  no separate user python — ARA's env only"))
-    for rt in frameworks:
-        if rt.present:
-            val = f"{rt.name} {rt.version}" if rt.version else rt.name
-            c.emit(c.field("·", val, "found", value_role="good"))
-        elif c.verbose:
-            c.emit(c.field("·", rt.name, "not found", value_role="dim"))
-    if not any(rt.present for rt in frameworks):
-        # The default python is bare — an empty section is misleading if the AI stack
-        # actually lives in another interpreter, so surface the richest one (only pay the
-        # interpreter probe in this already-empty case; full list via `ara python`).
+        c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
+        c.emit("      " + c.style("accent", default_py))
+        # An empty section is misleading when the stack actually lives in another
+        # interpreter — surface the richest one (probe paid only in this empty case).
         others = sorted((i for i in pythons.discover() if i.ai_present and not i.is_default),
                         key=lambda i: len(i.ai_present), reverse=True)
         if others:
             top = others[0]
             libs = " · ".join(f"{k} {v}" for k, v in top.ai_present.items())
-            c.emit(c.style("dim", "  none here — found in another interpreter:"))
-            c.emit("  " + c.style("good", f"{top.origin} {top.version or ''}".strip())
-                   + "   " + c.style("accent", _tilde(top.path)))
-            c.emit("       " + c.style("good", libs))
+            c.emit()
+            c.emit(c.style("dim", "  But you've got them in ")
+                   + c.style("good", f"{top.origin} {top.version or ''}".strip())
+                   + c.style("dim", ":"))
+            c.emit("      " + c.style("accent", _tilde(top.path)))
+            c.emit("      " + c.style("good", libs))
+            c.emit()
             more = len(others) - 1
-            c.emit(c.style("dim", "  run ") + c.style("accent", "ara python")
-                   + c.style("dim", " for the full list" + (f" (+{more} more)" if more else "")))
-        elif not c.verbose:
-            c.emit(c.style("dim", "  none in this env"))
+            tail = f" ({more} more with AI libraries)" if more else ""
+            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara python")
+                   + c.style("dim", f" to see every interpreter{tail}."))
+        else:
+            c.emit(c.style("dim", "  None found in any interpreter on this machine."))
     c.emit()
 
     c.emit(c.section("  MODELS"))
