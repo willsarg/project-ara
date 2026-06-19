@@ -83,6 +83,7 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
+    monkeypatch.setattr(cli, "render_characterize", lambda c, m, as_json=False: (rec.update(characterize=m) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
@@ -1482,3 +1483,77 @@ def test_main_models_id_dispatch(monkeypatch):
                         lambda c, mid, as_json=False: (seen.update(mid=mid) or 0))
     _run_main(monkeypatch, ["models", "org/Smol"])
     assert seen["mid"] == "org/Smol"
+
+
+# --------------------------------------------------------------------------- #
+# ara characterize <model> — measure + store a model's ceiling (any engine)
+# --------------------------------------------------------------------------- #
+def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
+    monkeypatch.setattr(cli, "engine_status", lambda: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    if characterize is not None:
+        monkeypatch.setattr(cli, "get_backend",
+                            lambda: types.SimpleNamespace(characterize=characterize))
+
+
+def test_render_characterize_persists_and_shows(make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000, "points": [[512, 1.4]]})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert "20000" in buf.getvalue()
+    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
+
+
+def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": None, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Big") == 0
+    assert "couldn't fit" in buf.getvalue()
+    assert cli.db.get_characterization(store, "mkey", "wmx", "org/Big")["safe_context"] is None
+
+
+def test_render_characterize_unsupported(make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "x") == 1
+    assert "no ARA backend" in buf.getvalue()
+
+
+def test_render_characterize_engine_not_installed(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, engine_ok=False)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "x") == 1
+    assert "ara install" in buf.getvalue()
+
+
+def test_render_characterize_engine_error(make_console, monkeypatch):
+    def boom(m):
+        raise RuntimeError("OOM guard tripped")
+    _wire_characterize(monkeypatch, characterize=boom)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "x") == 1
+    assert "characterization failed" in buf.getvalue()
+
+
+def test_render_characterize_json(monkeypatch, capsys, store):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 9000, "points": []})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/M", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["safe_context"] == 9000
+
+
+def test_main_characterize_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/Model"])
+    assert rec["characterize"] == "org/Model"
+
+
+def test_main_characterize_no_model(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["characterize"]) == 1
+    assert "usage: ara characterize" in capsys.readouterr().out

@@ -128,6 +128,7 @@ def render_landing(c: Console) -> None:
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
     c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
+    c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
@@ -671,6 +672,45 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     return 0
 
 
+def render_characterize(c: Console, model: str, *, as_json: bool = False) -> int:
+    """Measure a model's safe context ceiling on this machine's engine, and store it.
+
+    Works for whichever engine is active (Apple/MLX or CUDA) — ARA owns the result, so it
+    then shows up in `ara models` regardless of engine."""
+    backend = detect.backend_name()
+    if backend == "unsupported":
+        c.emit(c.style("warn", "  no ARA backend for this hardware yet"))
+        return 1
+    engine_ok, engine_pkg = engine_status()
+    if not engine_ok:
+        c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
+               + c.style("accent", "ara install"))
+        return 1
+    c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+    try:
+        result = get_backend().characterize(model)
+    except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
+        c.emit(c.style("bad", f"  characterization failed: {exc}"))
+        return 1
+
+    ceiling = result["safe_context"]
+    con = db.connect()
+    db.save_characterization(con, profiles.machine_key(), engines.for_backend(backend),
+                             model, safe_context=ceiling, points=result["points"])
+    catalog.remember(con, model)
+
+    if as_json:
+        print(json.dumps({"model": model, "safe_context": ceiling}, indent=2))
+        return 0
+    if ceiling:
+        c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
+               + c.style("dim", "  · stored (see ara models)"))
+    else:
+        c.emit(c.style("warn", "  couldn't fit a ceiling — the model may be too big or borderline"))
+    c.emit()
+    return 0
+
+
 def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     """Search the Hugging Face Hub for models (engine-agnostic)."""
     results = hub.search(query)
@@ -1010,6 +1050,12 @@ def main() -> int:
             c.emit(c.style("warn", "  usage: ara search <query>"))
             return 1
         return render_search(c, " ".join(rest[1:]), as_json=as_json)
+
+    if cmd == "characterize":
+        if len(rest) < 2:
+            c.emit(c.style("warn", "  usage: ara characterize <model>"))
+            return 1
+        return render_characterize(c, rest[1], as_json=as_json)
 
     if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,

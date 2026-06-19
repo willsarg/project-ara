@@ -61,5 +61,18 @@ def test_calibrate_overhead_none_when_no_measurement(fake_wmx):
     assert m["overhead_gb"] is None
 
 
+def test_characterize_returns_safe_context(fake_wmx):
+    fake_wmx.characterize_return = {"fit": {"safe_ceiling_ctx": 20000}, "refused": False}
+    r = apple.characterize("org/model")
+    assert r["model"] == "org/model"
+    assert r["safe_context"] == 20000
+    assert fake_wmx.characterize_calls == ["org/model"]
+
+
+def test_characterize_none_when_no_fit(fake_wmx):
+    fake_wmx.characterize_return = {"refused": True}   # too big — no fit
+    assert apple.characterize("org/model")["safe_context"] is None
+
+
 def test_calibration_model_constant_is_small_instruct():
     assert apple.CALIBRATION_MODEL == "mlx-community/SmolLM-135M-Instruct-4bit"

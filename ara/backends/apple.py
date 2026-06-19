@@ -77,3 +77,16 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     limits["calibrated"] = True
     limits["calibration"] = result
     return limits
+
+
+def characterize(model: str) -> dict:
+    """Measure *model*'s safe context ceiling on this Mac via wmx-suite — measurement only.
+
+    Runs wmx's crash-safe ramp with a null recorder (ARA persists the result, not wmx),
+    returning ``{model, safe_context, points}``; ``safe_context`` is None if it won't fit.
+    """
+    from wmx_suite import probe
+
+    result = probe.characterize(model, allow_min_probe=True, verbose=False)
+    fit = result.get("fit") or {}
+    return {"model": model, "safe_context": fit.get("safe_ceiling_ctx"), "points": []}

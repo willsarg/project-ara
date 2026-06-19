@@ -58,22 +58,24 @@ def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
     acquire.download(model)
 
 
-def calibrate(model: str = CALIBRATION_MODEL) -> dict:
-    """Characterize *model* on the GPU → safe context ceiling, enriching the limits.
-
-    Loads the model under wcx-suite's isolated probe (small safe ramp, stops before OOM),
-    then attaches a ``"characterization"`` sub-dict to the limits so the caller can show
-    what was measured.
-    """
+def characterize(model: str) -> dict:
+    """Measure *model*'s safe VRAM context ceiling via wcx-suite's isolated probe (small safe
+    ramp, stops before OOM). Returns ``{model, safe_context, points}``; None ceiling if it
+    couldn't fit/measure."""
     from wcx_suite import config, probe, system
 
     lim = system.read_limits()
     budget = lim.safe_threshold_gb(config.margin_gb(None))
     result = probe.characterize(model, budget_gb=budget)
-    limits = safe_limits()
-    limits["characterization"] = {
+    return {
         "model": model,
         "safe_context": result.safe_context if result else None,
         "points": result.points if result else [],
     }
+
+
+def calibrate(model: str = CALIBRATION_MODEL) -> dict:
+    """Characterize *model* on the GPU and attach it to the limits (for the profile flow)."""
+    limits = safe_limits()
+    limits["characterization"] = characterize(model)
     return limits

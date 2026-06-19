@@ -156,6 +156,9 @@ class FakeWmx:
         }
         self.calibrate_raises: BaseException | None = None
         self.calibrate_calls: list[str] = []
+        # probe.characterize()
+        self.characterize_return = {"fit": {"safe_ceiling_ctx": 20000}, "refused": False}
+        self.characterize_calls: list[str] = []
 
 
 def _build_fake_wmx_modules(state: FakeWmx) -> dict[str, types.ModuleType]:
@@ -196,7 +199,11 @@ def _build_fake_wmx_modules(state: FakeWmx) -> dict[str, types.ModuleType]:
             raise state.calibrate_raises
         return state.calibrate_return
 
-    probe = mod("wmx_suite.probe", calibrate=_calibrate)
+    def _characterize(model, **kw):
+        state.characterize_calls.append(model)
+        return state.characterize_return
+
+    probe = mod("wmx_suite.probe", calibrate=_calibrate, characterize=_characterize)
 
     class _EngineConsole:
         @classmethod

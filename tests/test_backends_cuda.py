@@ -77,6 +77,19 @@ def test_calibrate_handles_failed_characterize(fake_wcx):
     assert m["characterization"]["points"] == []
 
 
+def test_characterize_returns_ceiling(fake_wcx):
+    r = cuda.characterize("smol")
+    assert r["model"] == "smol"
+    assert r["safe_context"] == 16000
+    assert r["points"] == [(512, 1.4), (2048, 2.0)]
+
+
+def test_characterize_none_when_failed(fake_wcx):
+    fake_wcx.characterize_result = None
+    r = cuda.characterize("smol")
+    assert r["safe_context"] is None and r["points"] == []
+
+
 def test_calibration_model_cached_true(monkeypatch):
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache",
                         lambda model, fn: "/path/to/config.json")
