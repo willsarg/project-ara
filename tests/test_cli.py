@@ -84,6 +84,8 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
+    monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
+    monkeypatch.setattr(cli, "render_uninstall", lambda c, **kw: (rec.update(uninstall=kw) or 0))
     return rec
 
 
@@ -1060,3 +1062,150 @@ def test_render_mlx_unmanaged_interp_with_all_packages(make_console, monkeypatch
     out = buf.getvalue()
     assert "managed by" not in out        # venv → no caution (570->573 false branch)
     assert "not installed:" not in out    # every group covered (581->585 false branch)
+
+
+# --------------------------------------------------------------------------- #
+# ara install / ara uninstall — engine bootstrap commands
+# --------------------------------------------------------------------------- #
+def test_render_install_installs_resolved_engine(make_console, monkeypatch):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: "wmx")
+    monkeypatch.setattr(cli.engines, "install",
+                        lambda k: cli.engines.InstallResult("wmx", "installed", "ok"))
+    c, buf = make_console()
+    rc = cli.render_install(c, engine="auto")
+    assert rc == 0
+    assert "wmx-suite" in buf.getvalue()
+    assert "installed" in buf.getvalue().lower()
+
+
+def _stub_install(monkeypatch, key, status, detail=""):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: key)
+    monkeypatch.setattr(cli.engines, "install",
+                        lambda k: cli.engines.InstallResult(k, status, detail))
+
+
+def test_render_install_already_present_is_success(make_console, monkeypatch):
+    _stub_install(monkeypatch, "wmx", "already")
+    c, buf = make_console()
+    assert cli.render_install(c, engine="wmx") == 0
+    assert "already" in buf.getvalue().lower()
+
+
+def test_render_install_coming_soon_exits_nonzero(make_console, monkeypatch):
+    _stub_install(monkeypatch, "wcx", "coming_soon", "wcx_suite isn't available yet")
+    c, buf = make_console()
+    assert cli.render_install(c, engine="wcx") == 1
+    assert "coming soon" in buf.getvalue().lower()
+
+
+def test_render_install_failed_shows_detail_and_exits_nonzero(make_console, monkeypatch):
+    _stub_install(monkeypatch, "wmx", "failed", "git clone exploded")
+    c, buf = make_console()
+    assert cli.render_install(c, engine="wmx") == 1
+    assert "git clone exploded" in buf.getvalue()
+
+
+def test_render_install_no_hardware_match_exits_nonzero(make_console, monkeypatch):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: None)
+    c, buf = make_console()
+    assert cli.render_install(c, engine="auto") == 1
+    assert "no engine" in buf.getvalue().lower()
+
+
+def test_render_install_json(monkeypatch, capsys):
+    _stub_install(monkeypatch, "wmx", "installed", "ok")
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_install(c, engine="wmx", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "installed" and out["key"] == "wmx" and rc == 0
+
+
+def _stub_uninstall(monkeypatch, key, status, detail=""):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: key)
+    monkeypatch.setattr(cli.engines, "uninstall",
+                        lambda k: cli.engines.InstallResult(k, status, detail))
+
+
+def test_render_uninstall_removes_engine(make_console, monkeypatch):
+    _stub_uninstall(monkeypatch, "wmx", "removed")
+    c, buf = make_console()
+    assert cli.render_uninstall(c, engine="wmx") == 0
+    assert "removed" in buf.getvalue().lower() and "wmx-suite" in buf.getvalue()
+
+
+def test_render_uninstall_absent_is_success(make_console, monkeypatch):
+    _stub_uninstall(monkeypatch, "wmx", "absent")
+    c, buf = make_console()
+    assert cli.render_uninstall(c, engine="wmx") == 0
+    assert "not installed" in buf.getvalue().lower()
+
+
+def test_render_uninstall_failed_exits_nonzero(make_console, monkeypatch):
+    _stub_uninstall(monkeypatch, "wmx", "failed", "permission denied")
+    c, buf = make_console()
+    assert cli.render_uninstall(c, engine="wmx") == 1
+    assert "permission denied" in buf.getvalue()
+
+
+def test_render_uninstall_no_match_exits_nonzero(make_console, monkeypatch):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: None)
+    c, buf = make_console()
+    assert cli.render_uninstall(c, engine="auto") == 1
+    assert "no engine" in buf.getvalue().lower()
+
+
+def test_render_uninstall_json(monkeypatch, capsys):
+    _stub_uninstall(monkeypatch, "wmx", "removed")
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_uninstall(c, engine="wmx", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "removed" and rc == 0
+
+
+def test_main_install_defaults_to_auto(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["install"]) == 0
+    assert rec["install"] == {"engine": "auto", "as_json": False}
+
+
+def test_main_install_with_engine_flag(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install", "--engine", "wmx"])
+    assert rec["install"]["engine"] == "wmx"
+
+
+def test_main_install_engine_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install", "--engine=wcx", "--json"])
+    assert rec["install"] == {"engine": "wcx", "as_json": True}
+
+
+def test_main_uninstall_with_engine_flag(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["uninstall", "--engine", "wmx"])
+    assert rec["uninstall"]["engine"] == "wmx"
+
+
+def test_render_install_no_match_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: None)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_install(c, engine="auto", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "no_match" and rc == 1
+
+
+def test_render_uninstall_no_match_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: None)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_uninstall(c, engine="auto", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "no_match" and rc == 1
+
+
+def test_render_landing_lists_install_command(make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda: (False, "wmx-suite"))
+    c, buf = make_console()
+    cli.render_landing(c)
+    assert "install the engine" in buf.getvalue()

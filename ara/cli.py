@@ -12,7 +12,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import acquire, apps, detect, mlx, pythons, status, versions
+from ara import acquire, apps, detect, engines, mlx, pythons, status, versions
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -125,6 +125,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
     if supported:  # MLX ecosystem view is Apple-Silicon only
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
+    c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
@@ -640,6 +641,63 @@ def _emit_calibration(c: Console, m: dict, fallback_model: str) -> None:
     c.emit(c.style("dim", f"  overhead: {verdict}{rungs} · {short}"))
 
 
+def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
+    """Install the matched engine. ``--engine`` is the consent; exit 0 once the
+    engine is present (installed or already), nonzero otherwise."""
+    key = engines.resolve(engine)
+    if key is None:
+        if as_json:
+            print(json.dumps({"status": "no_match", "engine": engine}))
+        else:
+            c.emit(c.style("warn", f"  no engine matches '{engine}' on this hardware"))
+        return 1
+
+    result = engines.install(key)
+    if as_json:
+        print(json.dumps({"key": result.key, "status": result.status,
+                          "detail": result.detail}))
+        return 0 if result.status in ("installed", "already") else 1
+
+    pkg = engines.ENGINES[key]["package"]
+    if result.status == "installed":
+        c.emit(c.style("good", f"  installed {pkg}"))
+    elif result.status == "already":
+        c.emit(c.style("dim", f"  {pkg} already installed"))
+    elif result.status == "coming_soon":
+        c.emit(c.style("warn", f"  {pkg} — coming soon (not installable yet)"))
+    else:  # failed
+        c.emit(c.style("bad", f"  installing {pkg} failed:"))
+        c.emit(c.style("dim", f"  {result.detail}"))
+    return 0 if result.status in ("installed", "already") else 1
+
+
+def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
+    """Remove the matched engine. Exit 0 once it's gone (removed or already absent)."""
+    key = engines.resolve(engine)
+    if key is None:
+        if as_json:
+            print(json.dumps({"status": "no_match", "engine": engine}))
+        else:
+            c.emit(c.style("warn", f"  no engine matches '{engine}' on this hardware"))
+        return 1
+
+    result = engines.uninstall(key)
+    if as_json:
+        print(json.dumps({"key": result.key, "status": result.status,
+                          "detail": result.detail}))
+        return 0 if result.status in ("removed", "absent") else 1
+
+    pkg = engines.ENGINES[key]["package"]
+    if result.status == "removed":
+        c.emit(c.style("good", f"  removed {pkg}"))
+    elif result.status == "absent":
+        c.emit(c.style("dim", f"  {pkg} not installed"))
+    else:  # failed
+        c.emit(c.style("bad", f"  removing {pkg} failed:"))
+        c.emit(c.style("dim", f"  {result.detail}"))
+    return 0 if result.status in ("removed", "absent") else 1
+
+
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
                    assume_yes: bool = False, model: str | None = None) -> int:
     backend = detect.backend_name()
@@ -731,8 +789,9 @@ def main() -> int:
     recalibrate = "--recalibrate" in argv
     assume_yes = "--yes" in argv or "-y" in argv
 
-    # --model / --include / --exclude take values; pull them out before the rest.
+    # --model / --engine / --include / --exclude take values; pull them out first.
     model: str | None = None
+    engine: str | None = None
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -747,6 +806,13 @@ def main() -> int:
             continue
         if a.startswith("--model="):
             model = a.split("=", 1)[1] or None
+            continue
+        if a == "--engine":
+            engine = argv[i + 1] if i + 1 < len(argv) else None
+            skip = True
+            continue
+        if a.startswith("--engine="):
+            engine = a.split("=", 1)[1] or None
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -795,6 +861,12 @@ def main() -> int:
     if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,
                               assume_yes=assume_yes, model=model)
+
+    if cmd == "install":
+        return render_install(c, engine=engine or "auto", as_json=as_json)
+
+    if cmd == "uninstall":
+        return render_uninstall(c, engine=engine or "auto", as_json=as_json)
 
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(
