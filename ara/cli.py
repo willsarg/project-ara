@@ -214,9 +214,11 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             if app.category != last_cat:
                 c.emit(c.style("dim", f"  {apps.CATEGORY_LABEL[app.category]}"))
                 last_cat = app.category
-            c.emit(c.field("·", app.label, " + ".join(app.sources), value_role="good"))
-        c.emit(c.style("gloss", "  matched against a curated catalog of known AI/ML apps "
-                                "+ Homebrew packages — others may exist."))
+            gloss = app.source + ("   ⚠ two installs — likely duplicate" if app.duplicate else "")
+            c.emit(c.field("·", app.label, gloss,
+                           value_role="warn" if app.duplicate else "good"))
+        c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
+                                "so cask + app is one install, not a duplicate."))
     c.emit()
 
     c.emit(c.section("  ARA"))
