@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import acquire, detect, pythons, status
+from ara import acquire, detect, mlx, pythons, status
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -65,6 +65,8 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
     c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
+    if supported:  # MLX ecosystem view is Apple-Silicon only
+        c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
@@ -332,6 +334,78 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# mlx (the MLX ecosystem — libraries by modality + Apple readiness; Apple-only)
+# --------------------------------------------------------------------------- #
+def render_mlx(c: Console, *, as_json: bool = False) -> None:
+    is_apple = detect.backend_name() == "apple"
+    interps = mlx.scan() if is_apple else []
+    runtimes = mlx.lmstudio_mlx_runtimes() if is_apple else []
+    n_models = mlx.mlx_community_model_count() if is_apple else 0
+    accel = detect.accelerator(detect.chip_name()) if is_apple else None
+
+    if as_json:
+        print(json.dumps({
+            "apple_silicon": is_apple,
+            "gpu": {"name": accel.name, "cores": accel.cores} if accel else None,
+            "mlx_community_models": n_models,
+            "lmstudio_mlx_runtimes": runtimes,
+            "interpreters": [
+                {"path": m.path, "origin": m.origin, "version": m.version, "packages": m.packages}
+                for m in interps
+            ],
+        }, indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  MLX"))
+    if not is_apple:
+        c.emit(c.style("warn", "  MLX is Apple-Silicon only — not applicable on this machine."))
+        c.emit()
+        return
+
+    # readiness
+    c.emit()
+    c.emit(c.style("dim", "  READINESS"))
+    cores = f"{accel.cores}-core " if accel and accel.cores else ""
+    c.emit(c.field("GPU", accel.name, f"{cores}Metal · unified memory"))
+    c.emit(c.field("models", f"{n_models} cached", "mlx-community models in your HF cache"))
+    if runtimes:
+        extra = f"  (+{len(runtimes) - 1} older)" if len(runtimes) > 1 else ""
+        c.emit(c.field("LM Studio", f"MLX runtime {runtimes[0]}{extra}", "Apple MLX engine"))
+    else:
+        c.emit(c.field("LM Studio", "no MLX runtime", value_role="dim"))
+
+    # libraries, grouped by modality
+    c.emit()
+    c.emit(c.style("dim", "  LIBRARIES"))
+    if not interps:
+        c.emit("  " + c.style("dim", "No MLX packages installed in any interpreter."))
+        c.emit("  " + c.style("dim", "Install into a venv, e.g. ") + c.style("accent", "pip install mlx-lm"))
+        c.emit()
+        return
+
+    present: set[str] = set()
+    for mi in interps:
+        c.emit()
+        c.emit("  " + c.style("good", f"{mi.origin} {mi.version or ''}".strip())
+               + c.style("dim", "  ·  ") + c.style("accent", _tilde(mi.path)))
+        for label, pkgs in mlx.GROUPS:
+            got = [(p, mi.packages[p]) for p in pkgs if p in mi.packages]
+            if got:
+                present.update(p for p, _ in got)
+                c.emit("      " + c.style("metric", f"{label:14}")
+                       + c.style("good", " · ".join(f"{p} {v}" for p, v in got)))
+
+    missing = [(label, pkgs) for label, pkgs in mlx.GROUPS
+               if not any(p in present for p in pkgs)]
+    if missing:
+        c.emit()
+        items = " · ".join(f"{label} ({'/'.join(pkgs)})" for label, pkgs in missing)
+        c.emit("  " + c.style("dim", "not installed: " + items))
+    c.emit()
+
+
+# --------------------------------------------------------------------------- #
 # profile (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
@@ -506,6 +580,10 @@ def main() -> int:
 
     if rest[0] == "python":
         render_python(c, as_json=as_json)
+        return 0
+
+    if rest[0] == "mlx":
+        render_mlx(c, as_json=as_json)
         return 0
 
     if rest[0] == "profile":
