@@ -11,6 +11,13 @@ import ara.cli as cli
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
 
 
+def _raise_input(exc):
+    """A fake builtins.input that raises — for EOF/Ctrl-C at the prompt."""
+    def _f(prompt=""):
+        raise exc
+    return _f
+
+
 # --------------------------------------------------------------------------- #
 # formatters
 # --------------------------------------------------------------------------- #
@@ -460,7 +467,8 @@ def test_render_detect_verbose_and_unsupported(monkeypatch, make_console):
         backend="unsupported", engine="unsupported", engine_ready=False,
         cpu_logical=24, hf_token=False,
         accel=Accelerator("none", "none detected", None, None),
-        runtimes=[Runtime("Ollama", False, None)],
+        runtimes=[Runtime("Ollama", False, None, kind="engine"),
+                  Runtime("PyTorch", False, None, kind="framework")],
         model_stores=[ModelStore("HF cache", False)],
     )
     monkeypatch.setattr(cli.detect, "profile", lambda: m)
@@ -469,8 +477,33 @@ def test_render_detect_verbose_and_unsupported(monkeypatch, make_console):
     out = buf.getvalue()
     assert "physical" in out and "logical" in out      # verbose cpu line
     assert "no GPU detected" in out                     # accel none branch
-    assert "not found" in out                           # verbose shows absent runtime/store
+    # verbose lists absent engine, absent framework, and absent store as "not found"
+    assert out.count("not found") >= 3
     assert "no ARA backend for this hardware yet" in out  # unsupported footer
+
+
+def test_render_detect_minimal_non_verbose(make_console, monkeypatch):
+    # Drive every "skip the optional line" branch: missing cpu/features, no available
+    # RAM, no swap, an nvidia GPU with none of its detail bits, and empty/absent stores.
+    m = _machine(
+        cpu_physical=None, cpu_logical=None, cpu_features=[],
+        ram_available_gb=None, swap_gb=0.0,
+        accel=Accelerator("nvidia", "Mystery GPU", None, "CUDA", count=1,
+                          compute=None, cuda_version=None),
+        runtimes=[Runtime("MLX", False, None, kind="engine", accels=("apple",), usable=False),
+                  Runtime("PyTorch", False, None, kind="framework")],
+        framework_python=None,
+        model_stores=[ModelStore("HF cache", False)],
+    )
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "Mystery GPU" in out and "VRAM" not in out   # nvidia, but no detail bits
+    assert "none detected" in out                        # no engines present, non-verbose
+    assert "none in this env" in out                     # no frameworks present
+    assert "no separate user python" in out              # framework_python is None
+    assert "not found" not in out                        # non-verbose hides absent rows
 
 
 def test_render_status_gpu_and_no_port(make_console, monkeypatch):
@@ -496,3 +529,26 @@ def test_profile_through_real_apple_backend(make_console, monkeypatch, set_platf
     assert "SAFE LIMITS" in out
     assert "calibrated." in out
     assert fake_wmx.calibrate_calls  # real apple.calibrate hit the fake probe
+
+
+# --------------------------------------------------------------------------- #
+# _confirm — the interactive y/N prompt
+# --------------------------------------------------------------------------- #
+def test_confirm_accepts_yes(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "  Yes ")
+    assert cli._confirm("proceed?") is True
+
+
+def test_confirm_rejects_other(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "nope")
+    assert cli._confirm("proceed?") is False
+
+
+def test_confirm_false_on_eof(monkeypatch):
+    monkeypatch.setattr("builtins.input", _raise_input(EOFError()))
+    assert cli._confirm("proceed?") is False
+
+
+def test_confirm_false_on_keyboard_interrupt(monkeypatch):
+    monkeypatch.setattr("builtins.input", _raise_input(KeyboardInterrupt()))
+    assert cli._confirm("proceed?") is False

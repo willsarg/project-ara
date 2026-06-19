@@ -1,6 +1,9 @@
 """detect.py — read-only host recon: backend choice, parsers, inventories."""
 from __future__ import annotations
 
+import sys
+import types
+
 import ara.detect as detect
 from ara.detect import (
     Accelerator,
@@ -9,6 +12,13 @@ from ara.detect import (
     accelerator,
     backend_name,
 )
+
+
+def _raise(exc=RuntimeError("boom")):
+    """A callable that ignores its args and raises — for forcing except branches."""
+    def _f(*a, **k):
+        raise exc
+    return _f
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +173,19 @@ def test_accelerator_nvidia_garbage_falls_through(monkeypatch, run_stub, set_pla
 def test_apple_gpu_cores_non_integer_returns_none(run_stub):
     run_stub.add("system_profiler", "      Total Number of Cores: many\n")
     assert detect._apple_gpu_cores() is None
+
+
+def test_apple_gpu_cores_no_cores_line_returns_none(run_stub):
+    run_stub.add("system_profiler", "Graphics/Displays:\n    Apple M4 Pro:\n      Vendor: Apple\n")
+    assert detect._apple_gpu_cores() is None
+
+
+def test_accelerator_nvidia_blank_output_falls_through(monkeypatch, run_stub, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    run_stub.add("nvidia-smi", "   \n")  # present but whitespace-only → skip, don't crash
+    a = accelerator("Apple M4 Pro")
+    assert a.kind == "apple"
 
 
 def test_accelerator_dataclass_defaults():
@@ -421,3 +444,90 @@ def test_profile_unsupported(set_platform, run_stub, fake_home, monkeypatch):
     assert m.backend == "unsupported"
     assert m.supported is False
     assert m.engine == "unsupported"
+
+
+# --------------------------------------------------------------------------- #
+# defensive fallbacks — system reads that return None/empty when the OS throws
+# --------------------------------------------------------------------------- #
+def test_memory_gb_none_on_error(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "virtual_memory", _raise())
+    assert detect._memory_gb() == (None, None)
+
+
+def test_swap_gb_none_on_error(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "swap_memory", _raise())
+    assert detect._swap_gb() is None
+
+
+def test_cpu_counts_none_on_error(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "cpu_count", _raise())
+    assert detect._cpu_counts() == (None, None)
+
+
+def test_disk_free_none_on_error(monkeypatch):
+    monkeypatch.setattr("shutil.disk_usage", _raise(OSError("no volume")))
+    assert detect._disk_free_gb() is None
+
+
+def test_power_no_battery_when_unavailable(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "sensors_battery", lambda: None, raising=False)
+    assert detect._power() == "AC (no battery)"
+
+
+def test_power_exception_treated_as_no_battery(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "sensors_battery", _raise(), raising=False)
+    assert detect._power() == "AC (no battery)"
+
+
+def test_power_ac_vs_battery(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "sensors_battery",
+                        lambda: types.SimpleNamespace(power_plugged=True, percent=80.0),
+                        raising=False)
+    assert detect._power() == "AC power"
+    monkeypatch.setattr(detect.psutil, "sensors_battery",
+                        lambda: types.SimpleNamespace(power_plugged=False, percent=80.0),
+                        raising=False)
+    assert detect._power() == "battery 80%"
+
+
+def test_dir_size_gb_swallows_stat_errors(tmp_path, monkeypatch):
+    (tmp_path / "f").write_bytes(b"x")
+    monkeypatch.setattr(detect.Path, "is_file", _raise(OSError()))
+    assert detect._dir_size_gb(tmp_path) == 0.0
+
+
+def test_scan_weight_store_swallows_stat_errors(tmp_path, monkeypatch):
+    _write(tmp_path / "a.gguf", 10)
+    monkeypatch.setattr(detect.Path, "is_file", _raise(OSError()))
+    store = detect._scan_weight_store("X", [tmp_path], group_depth=0)
+    assert store.count == 0
+
+
+def test_scan_weight_store_file_shallower_than_group_depth(tmp_path):
+    # rel length 1 but group_depth 2 → too shallow to form a group, yet bytes still count.
+    _write(tmp_path / "loose.gguf", detect.GB)
+    store = detect._scan_weight_store("X", [tmp_path], group_depth=2)
+    assert store.count == 0
+    assert store.size_gb == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# HF_HOME overrides + live python-version probe
+# --------------------------------------------------------------------------- #
+def test_hf_hub_dir_uses_hf_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    assert detect._hf_hub_dir() == tmp_path / "hf" / "hub"
+
+
+def test_hf_token_from_hf_home_token_file(fake_home, monkeypatch, tmp_path):
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    (hf / "token").write_text("hf_xxx")
+    monkeypatch.setenv("HF_HOME", str(hf))
+    assert detect._hf_token_present() is True
+
+
+def test_python_version_live_against_real_interpreter():
+    # No run_stub here: actually shells out to `<py> --version` and parses it.
+    ver = detect._python_version(sys.executable)
+    assert ver and ver[0].isdigit()
