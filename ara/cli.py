@@ -167,8 +167,23 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             c.emit(c.field("·", val, "found", value_role="good"))
         elif c.verbose:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
-    if not any(rt.present for rt in frameworks) and not c.verbose:
-        c.emit(c.style("dim", "  none in this env"))
+    if not any(rt.present for rt in frameworks):
+        # The default python is bare — an empty section is misleading if the AI stack
+        # actually lives in another interpreter, so surface the richest one (only pay the
+        # interpreter probe in this already-empty case; full list via `ara python`).
+        others = sorted((i for i in pythons.discover() if i.ai_present and not i.is_default),
+                        key=lambda i: len(i.ai_present), reverse=True)
+        if others:
+            top = others[0]
+            libs = " · ".join(f"{k} {v}" for k, v in top.ai_present.items())
+            c.emit(c.style("dim", "  none in your default — but another interpreter has them:"))
+            c.emit("  " + c.style("good", f"{top.origin} {top.version or ''}".strip())
+                   + c.style("dim", "  ·  ") + c.style("good", libs))
+            more = len(others) - 1
+            c.emit(c.style("dim", "  run ") + c.style("accent", "ara python")
+                   + c.style("dim", " for the full list" + (f" (+{more} more)" if more else "")))
+        elif not c.verbose:
+            c.emit(c.style("dim", "  none in this env"))
     c.emit()
 
     c.emit(c.section("  MODELS"))
