@@ -12,6 +12,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
@@ -122,9 +123,62 @@ def _disk_free_gb() -> float | None:
         return None
 
 
-def _python_version() -> str | None:
-    """Ambient python3 version (what a user in this shell would reach for)."""
-    py = shutil.which("python3") or shutil.which("python")
+def _user_python() -> str | None:
+    """The python3 a user reaches for in their OWN shell — not ARA's venv.
+
+    Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH, so a naive
+    ``which python3`` returns ARA's interpreter and reports ARA's bundled deps as if
+    they were the user's. Strip the venv's bin and re-resolve to find the real one.
+    Returns None when the only python available is ARA's own.
+    """
+    path = os.environ.get("PATH", "")
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        vbin = os.path.normpath(os.path.join(venv, "bin"))
+        path = os.pathsep.join(p for p in path.split(os.pathsep)
+                               if os.path.normpath(p) != vbin)
+    py = shutil.which("python3", path=path) or shutil.which("python", path=path)
+    if py and os.path.realpath(py) == os.path.realpath(sys.executable):
+        return None  # resolved straight back to ARA's interpreter
+    return py
+
+
+def _python_packages(py: str | None, names: tuple[str, ...]) -> dict[str, str | None]:
+    """Versions of *names* installed in interpreter *py* — metadata only, no heavy
+    import. Reflects whatever environment *py* belongs to."""
+    blank = {n: None for n in names}
+    if not py:
+        return blank
+    code = (
+        "import importlib.metadata as m, json\n"
+        f"names = {list(names)!r}\n"
+        "out = {}\n"
+        "for n in names:\n"
+        "    try: out[n] = m.version(n)\n"
+        "    except Exception: out[n] = None\n"
+        "print(json.dumps(out))\n"
+    )
+    raw = _run([py, "-c", code], timeout=6)
+    if not raw:
+        return blank
+    try:
+        return json.loads(raw)
+    except Exception:
+        return blank
+
+
+def _ara_pkg_version(name: str) -> str | None:
+    """Version of a package in ARA's OWN environment (for engines ARA bundles)."""
+    try:
+        import importlib.metadata as md
+        return md.version(name)
+    except Exception:
+        return None
+
+
+def _python_version(py: str | None = None) -> str | None:
+    """Version string of interpreter *py* (defaults to whatever's first on PATH)."""
+    py = py or shutil.which("python3") or shutil.which("python")
     if py:
         out = _run([py, "--version"])
         if out:
@@ -199,6 +253,7 @@ class Runtime:
     name: str
     present: bool
     version: str | None = None
+    kind: str = "engine"             # "engine" (launch target) | "framework" (library)
     accels: tuple[str, ...] = ()     # accelerator kinds it's built for; () = cross-platform
     usable: bool | None = None       # resolved against this machine; None = not gated
 
@@ -212,56 +267,45 @@ class Runtime:
 
 _ACCEL_LABEL = {"nvidia": "CUDA", "apple": "Apple Silicon"}
 
-_PY_PKGS = ("torch", "transformers", "vllm", "mlx-lm")
+# Probed in the USER's python (frameworks/libraries) — engines also fall back to CLIs/ARA.
+_FRAMEWORK_PKGS = ("torch", "transformers", "tensorflow")
+_ENGINE_PKGS = ("mlx-lm", "vllm")
 
 
-def _ambient_python_packages() -> dict[str, str | None]:
-    """Versions of known ML packages in the ambient python3 — metadata only,
-    no heavy import. Reflects this shell's python3, best-effort."""
-    py = shutil.which("python3") or shutil.which("python")
-    if not py:
-        return {}
-    code = (
-        "import importlib.metadata as m, json\n"
-        f"names = {list(_PY_PKGS)!r}\n"
-        "out = {}\n"
-        "for n in names:\n"
-        "    try: out[n] = m.version(n)\n"
-        "    except Exception: out[n] = None\n"
-        "print(json.dumps(out))\n"
-    )
-    raw = _run([py, "-c", code], timeout=6)
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+def runtimes(accel_kind: str = "none", user_py: str | None = None) -> list[Runtime]:
+    """Inference engines (launch targets) and ML frameworks (libraries underneath).
 
-
-def runtimes(accel_kind: str = "none") -> list[Runtime]:
-    amb = _ambient_python_packages()
+    Frameworks are probed in the *user's* python (``user_py``) so they report the user's
+    environment, not ARA's bundled deps. Engines also consult PATH CLIs and — for the MLX
+    engine ARA ships — ARA's own env, since that's a real capability on this machine.
+    """
+    pkgs = _python_packages(user_py, _FRAMEWORK_PKGS + _ENGINE_PKGS)
     llama = shutil.which("llama-cli") or shutil.which("llama-server")
     lms = shutil.which("lms") or Path("/Applications/LM Studio.app").exists()
-    mlx_ver = amb.get("mlx-lm")
-    # vLLM ships a `vllm` CLI; check PATH too, since the ambient-python import reflects
-    # ARA's own venv (not the user's CUDA env) and would usually miss a real install.
-    vllm_present = amb.get("vllm") is not None or shutil.which("vllm") is not None
 
-    # (name, present, version, accels) — accels=() means cross-platform (CPU/Metal/CUDA).
-    specs: list[tuple[str, bool, str | None, tuple[str, ...]]] = [
-        ("PyTorch", amb.get("torch") is not None, amb.get("torch"), ()),
-        ("transformers", amb.get("transformers") is not None, amb.get("transformers"), ()),
-        ("vLLM", vllm_present, amb.get("vllm"), ("nvidia",)),
-        ("MLX", mlx_ver is not None or find_spec("mlx_lm") is not None, mlx_ver, ("apple",)),
-        ("llama.cpp", llama is not None, None, ()),
-        ("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists(), None, ()),
-        ("LM Studio", bool(lms), None, ()),
+    mlx_ver = pkgs.get("mlx-lm") or _ara_pkg_version("mlx-lm")  # ARA bundles the MLX engine
+    mlx_present = mlx_ver is not None or find_spec("mlx_lm") is not None
+    # vLLM ships a `vllm` CLI; check PATH too — the user may have it outside any probed env.
+    vllm_present = pkgs.get("vllm") is not None or shutil.which("vllm") is not None
+
+    # (name, present, version, kind, accels) — accels=() means cross-platform.
+    specs: list[tuple[str, bool, str | None, str, tuple[str, ...]]] = [
+        ("MLX", mlx_present, mlx_ver, "engine", ("apple",)),
+        ("llama.cpp", llama is not None, None, "engine", ()),
+        ("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists(),
+         None, "engine", ()),
+        ("LM Studio", bool(lms), None, "engine", ()),
+        ("vLLM", vllm_present, pkgs.get("vllm"), "engine", ("nvidia",)),
+        ("PyTorch", pkgs.get("torch") is not None, pkgs.get("torch"), "framework", ()),
+        ("transformers", pkgs.get("transformers") is not None, pkgs.get("transformers"),
+         "framework", ()),
+        ("TensorFlow", pkgs.get("tensorflow") is not None, pkgs.get("tensorflow"),
+         "framework", ()),
     ]
     out: list[Runtime] = []
-    for name, present, version, accels in specs:
+    for name, present, version, kind, accels in specs:
         usable = None if not accels else (accel_kind in accels)
-        out.append(Runtime(name, present, version, accels=accels, usable=usable))
+        out.append(Runtime(name, present, version, kind=kind, accels=accels, usable=usable))
     return out
 
 
@@ -419,6 +463,7 @@ class Machine:
     accel: Accelerator
     disk_free_gb: float | None
     runtimes: list[Runtime] = field(default_factory=list)
+    framework_python: str | None = None  # interpreter the FRAMEWORKS group was probed in
     model_stores: list[ModelStore] = field(default_factory=list)
     hf_token: bool = False
     power: str = "unknown"
@@ -440,6 +485,7 @@ def profile() -> Machine:
     total, available = _memory_gb()
     physical, logical = _cpu_counts()
     accel = accelerator(chip)
+    user_py = _user_python()
     return Machine(
         system=platform.system(),
         os_version=os_version(),
@@ -448,13 +494,14 @@ def profile() -> Machine:
         cpu_physical=physical,
         cpu_logical=logical,
         cpu_features=_cpu_features(),
-        python_version=_python_version(),
+        python_version=_python_version(user_py),
         ram_total_gb=total,
         ram_available_gb=available,
         swap_gb=_swap_gb(),
         accel=accel,
         disk_free_gb=_disk_free_gb(),
-        runtimes=runtimes(accel.kind),
+        runtimes=runtimes(accel.kind, user_py),
+        framework_python=user_py,
         model_stores=model_stores(),
         hf_token=_hf_token_present(),
         power=_power(),
