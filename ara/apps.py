@@ -7,10 +7,10 @@ macOS-focused (scans /Applications + Homebrew); degrades to whatever it can find
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from ara import versions
 
 # Category keys in display order, with their section sub-headers.
 CATEGORY_LABEL = {
@@ -80,6 +80,8 @@ class App:
     in_app: bool        # a .app bundle is present in an Applications folder
     cask: bool          # installed as a Homebrew cask (which IS how its .app got there)
     formula: bool       # installed as a Homebrew formula (CLI)
+    version: str | None = None
+    installed_at: float | None = None   # epoch mtime/birthtime, for "recently installed"
 
     @property
     def homebrew(self) -> bool:
@@ -105,46 +107,47 @@ class App:
         return "app (not via Homebrew)"
 
 
-def _app_stems() -> set[str]:
-    """Lowercased names (without .app) of bundles in the Applications folders."""
-    found: set[str] = set()
-    for d in (Path("/Applications"), Path.home() / "Applications"):
-        try:
-            for p in d.iterdir():
-                if p.name.endswith(".app"):
-                    found.add(p.name[:-4].lower())
-        except Exception:
-            pass
-    return found
+_APP_DIRS = (Path("/Applications"), Path.home() / "Applications")
+_BREW_PREFIX = Path("/opt/homebrew") if Path("/opt/homebrew").exists() else Path("/usr/local")
 
 
-def _brew_lists() -> tuple[set[str], set[str]]:
-    """(formulae, casks) installed via Homebrew — lowercased, @version stripped. Kept
-    separate because casks install GUI apps into /Applications, formulae don't."""
-    if not shutil.which("brew"):
-        return set(), set()
-
-    def listing(kind: str) -> set[str]:
-        try:
-            out = subprocess.run(["brew", "list", kind, "-1"],
-                                 capture_output=True, text=True, timeout=15).stdout
-        except Exception:
-            out = ""
-        return {ln.strip().lower().split("@", 1)[0] for ln in (out or "").splitlines() if ln.strip()}
-
-    return listing("--formula"), listing("--cask")
+def _install_time(bundles: list[str], tokens: list[str], in_app: bool) -> float | None:
+    """Best-effort install/update time: a .app's filesystem time, else a Homebrew dir's.
+    Uses max(mtime, birthtime) — some bundles report a bogus birthtime."""
+    if in_app:
+        for b in bundles:
+            for base in _APP_DIRS:
+                app = base / f"{b}.app"
+                if app.is_dir():
+                    st = app.stat()
+                    return max(st.st_mtime, getattr(st, "st_birthtime", 0) or 0)
+    for t in tokens:
+        for sub in ("Caskroom", "Cellar"):
+            d = _BREW_PREFIX / sub / t
+            if d.is_dir():
+                try:
+                    return max((p.stat().st_mtime for p in d.iterdir()), default=d.stat().st_mtime)
+                except Exception:
+                    return None
+    return None
 
 
 def scan() -> list[App]:
     """Installed AI/ML apps from the curated catalog, ordered by category then name."""
-    apps = _app_stems()
-    formulae, casks = _brew_lists()
+    formulae, casks = versions.brew_formulae(), versions.brew_casks()
     out: list[App] = []
     for label, category, bundles, tokens in CATALOG:
-        in_app = any(b.lower() in apps for b in bundles)
+        in_app, app_ver = versions.find_app(bundles)
         cask = any(t in casks for t in tokens)
         formula = any(t in formulae for t in tokens)
-        if in_app or cask or formula:
-            out.append(App(label, category, in_app=in_app, cask=cask, formula=formula))
+        if not (in_app or cask or formula):
+            continue
+        # Prefer the brew-tracked version when Homebrew manages it (matches the source
+        # label); fall back to the .app's own Info.plist version for manual installs.
+        version = (next((casks[t] for t in tokens if casks.get(t)), None)
+                   or next((formulae[t] for t in tokens if formulae.get(t)), None)
+                   or app_ver)
+        out.append(App(label, category, in_app=in_app, cask=cask, formula=formula,
+                       version=version, installed_at=_install_time(bundles, tokens, in_app)))
     out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
     return out

@@ -42,6 +42,7 @@ def _fmt_size(gb: float | None) -> str:
 _RECON_SECTIONS: dict[str, tuple[str, ...]] = {
     "detect": ("system", "memory", "accelerator", "storage",
                "engines", "frameworks", "models", "apps", "ara"),
+    "apps": ("runner", "image", "speech", "toolkit", "assistant", "coding"),
     "mlx": ("readiness", "libraries"),
     "status": ("processes",),
     "python": ("interpreters",),
@@ -51,6 +52,8 @@ _SECTION_ALIASES = {
     "model": "models", "lib": "libraries", "libs": "libraries", "library": "libraries",
     "ready": "readiness", "proc": "processes", "procs": "processes", "process": "processes",
     "interpreter": "interpreters", "interps": "interpreters", "interp": "interpreters",
+    "runners": "runner", "toolkits": "toolkit", "assistants": "assistant",
+    "models-runner": "runner",
 }
 
 
@@ -118,6 +121,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
     c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
+    c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
     if supported:  # MLX ecosystem view is Apple-Silicon only
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
@@ -263,20 +267,28 @@ def _det_models(c: Console, m) -> None:
 
 
 def _det_apps(c: Console, m) -> None:
+    # Detect shows a per-category summary; `ara apps` has the full list with versions.
     c.emit(c.section("  AI/ML APPS"))
     if not m.apps:
         c.emit(c.style("dim", "  none detected"))
-    else:
-        last_cat = None
-        for app in m.apps:
-            if app.category != last_cat:
-                c.emit(c.style("dim", f"  {apps.CATEGORY_LABEL[app.category]}"))
-                last_cat = app.category
-            gloss = app.source + ("   ⚠ two installs — likely duplicate" if app.duplicate else "")
-            c.emit(c.field("·", app.label, gloss,
-                           value_role="warn" if app.duplicate else "good"))
-        c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
-                                "so cask + app is one install, not a duplicate."))
+        c.emit()
+        return
+    by_cat: dict[str, list] = {}
+    for app in m.apps:
+        by_cat.setdefault(app.category, []).append(app)
+    for cat in apps._ORDER:
+        items = by_cat.get(cat)
+        if not items:
+            continue
+        recent = sorted(items, key=lambda a: a.installed_at or 0.0, reverse=True)
+        names = ", ".join(a.label for a in recent[:3])
+        extra = len(items) - len(recent[:3])
+        if extra:
+            names += f"  (+{extra} more)"
+        c.emit("  " + c.style("metric", f"{apps.CATEGORY_LABEL[cat]:17}")
+               + c.style("good", f"{len(items):>2}") + c.style("dim", f"   {names}"))
+    c.emit(c.style("dim", "  newest first per category — run ")
+           + c.style("accent", "ara apps") + c.style("dim", " for the full list with versions"))
     c.emit()
 
 
@@ -292,6 +304,11 @@ def _det_ara(c: Console, m) -> None:
         None if m.engine_ready else ("install: uv sync" if m.supported else None),
         value_role="good" if m.engine_ready else "warn",
     ))
+    c.emit(c.field("hf cli",
+                   ("not found" if not m.hf_cli
+                    else f"present {m.hf_cli_version}" if m.hf_cli_version else "present"),
+                   "the hf command" if m.hf_cli else "pip install huggingface_hub",
+                   value_role="good" if m.hf_cli else "dim"))
     c.emit(c.field("hf token", "present" if m.hf_token else "none",
                    None if m.hf_token else "needed for gated models",
                    value_role="good" if m.hf_token else "dim"))
@@ -325,6 +342,42 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     for key, fn in _DETECT_RENDERERS:
         if want(key):
             fn(c, m)
+
+
+# --------------------------------------------------------------------------- #
+# apps (full AI/ML software inventory — the detailed list detect summarizes)
+# --------------------------------------------------------------------------- #
+def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
+    inventory = apps.scan()
+    if as_json:
+        print(json.dumps([{
+            "label": a.label, "category": a.category, "version": a.version,
+            "source": a.source, "duplicate": a.duplicate,
+            "in_app": a.in_app, "cask": a.cask, "formula": a.formula,
+            "installed_at": a.installed_at,
+        } for a in inventory], indent=2))
+        return
+    want = want or (lambda _key: True)
+    c.emit()
+    c.emit(c.section("  AI/ML APPS"))
+    shown = [a for a in inventory if want(a.category)]
+    if not shown:
+        c.emit(c.style("dim", "  none detected"))
+        c.emit()
+        return
+    last_cat = None
+    for app in shown:
+        if app.category != last_cat:
+            c.emit()
+            c.emit(c.style("accent", f"  {apps.CATEGORY_LABEL[app.category]}"))
+            last_cat = app.category
+        name = f"{app.label} {app.version}".strip() if app.version else app.label
+        gloss = app.source + ("   ⚠ likely duplicate" if app.duplicate else "")
+        c.emit(c.field("·", name, gloss, value_role="warn" if app.duplicate else "good"))
+    c.emit()
+    c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
+                            "so cask + app is one install, not a duplicate."))
+    c.emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -704,6 +757,10 @@ def main() -> int:
 
     if cmd == "python":
         render_python(c, as_json=as_json, want=want)
+        return 0
+
+    if cmd == "apps":
+        render_apps(c, as_json=as_json, want=want)
         return 0
 
     if cmd == "mlx":
