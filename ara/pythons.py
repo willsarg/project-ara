@@ -85,6 +85,19 @@ def caution_for(origin: str, externally_managed: bool) -> str | None:
     return None
 
 
+_MANAGER = {"macOS system": "Apple", "Homebrew": "Homebrew", "uv": "uv"}
+
+
+def manager_of(origin: str, externally_managed: bool) -> str | None:
+    """Who manages this *interpreter* (not its packages): 'Apple' | 'Homebrew' | 'uv' | …
+    None when it's a user-managed interpreter you can freely install into."""
+    if origin == "macOS system":
+        return "Apple"
+    if externally_managed:
+        return _MANAGER.get(origin, "the system")
+    return None
+
+
 def _run(cmd: list[str], timeout: float = 8) -> str | None:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
