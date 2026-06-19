@@ -199,7 +199,18 @@ class Runtime:
     name: str
     present: bool
     version: str | None = None
+    accels: tuple[str, ...] = ()     # accelerator kinds it's built for; () = cross-platform
+    usable: bool | None = None       # resolved against this machine; None = not gated
 
+    @property
+    def requires(self) -> str | None:
+        """Human accelerator requirement when this runtime can't accelerate here."""
+        if self.usable is not False:
+            return None
+        return "needs " + " / ".join(_ACCEL_LABEL.get(a, a) for a in self.accels)
+
+
+_ACCEL_LABEL = {"nvidia": "CUDA", "apple": "Apple Silicon"}
 
 _PY_PKGS = ("torch", "transformers", "vllm", "mlx-lm")
 
@@ -228,20 +239,30 @@ def _ambient_python_packages() -> dict[str, str | None]:
         return {}
 
 
-def runtimes() -> list[Runtime]:
+def runtimes(accel_kind: str = "none") -> list[Runtime]:
     amb = _ambient_python_packages()
     llama = shutil.which("llama-cli") or shutil.which("llama-server")
     lms = shutil.which("lms") or Path("/Applications/LM Studio.app").exists()
     mlx_ver = amb.get("mlx-lm")
-    return [
-        Runtime("PyTorch", amb.get("torch") is not None, amb.get("torch")),
-        Runtime("transformers", amb.get("transformers") is not None, amb.get("transformers")),
-        Runtime("vLLM", amb.get("vllm") is not None, amb.get("vllm")),
-        Runtime("MLX", mlx_ver is not None or find_spec("mlx_lm") is not None, mlx_ver),
-        Runtime("llama.cpp", llama is not None),
-        Runtime("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists()),
-        Runtime("LM Studio", bool(lms)),
+    # vLLM ships a `vllm` CLI; check PATH too, since the ambient-python import reflects
+    # ARA's own venv (not the user's CUDA env) and would usually miss a real install.
+    vllm_present = amb.get("vllm") is not None or shutil.which("vllm") is not None
+
+    # (name, present, version, accels) — accels=() means cross-platform (CPU/Metal/CUDA).
+    specs: list[tuple[str, bool, str | None, tuple[str, ...]]] = [
+        ("PyTorch", amb.get("torch") is not None, amb.get("torch"), ()),
+        ("transformers", amb.get("transformers") is not None, amb.get("transformers"), ()),
+        ("vLLM", vllm_present, amb.get("vllm"), ("nvidia",)),
+        ("MLX", mlx_ver is not None or find_spec("mlx_lm") is not None, mlx_ver, ("apple",)),
+        ("llama.cpp", llama is not None, None, ()),
+        ("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists(), None, ()),
+        ("LM Studio", bool(lms), None, ()),
     ]
+    out: list[Runtime] = []
+    for name, present, version, accels in specs:
+        usable = None if not accels else (accel_kind in accels)
+        out.append(Runtime(name, present, version, accels=accels, usable=usable))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -295,8 +316,75 @@ def _ollama_inventory() -> ModelStore:
     return ModelStore("Ollama", present, count, size)
 
 
+_WEIGHT_SUFFIXES = (".gguf", ".safetensors")
+
+
+def _scan_weight_store(name: str, dirs: list[Path], *, group_depth: int,
+                       app_present: bool = False) -> ModelStore:
+    """Generic on-disk model store: the first existing dir in *dirs* is scanned for weight
+    files. ``group_depth`` decides what counts as one model: N groups weights by their first
+    N path components (e.g. publisher/repo at depth 2, model-folder at depth 1); 0 counts
+    each weight file individually (flat stores). Sizes sum all weights, binary GiB.
+    """
+    base = next((d for d in dirs if d.exists()), None)
+    present = base is not None or app_present
+    if base is None:
+        return ModelStore(name, present)
+
+    models: set[tuple[str, ...]] = set()
+    total = 0
+    for f in base.rglob("*"):
+        try:
+            if f.is_file() and f.suffix in _WEIGHT_SUFFIXES:
+                rel = f.relative_to(base).parts
+                if group_depth == 0:
+                    models.add(rel)            # each weight file is its own model
+                elif len(rel) >= group_depth:
+                    models.add(rel[:group_depth])
+                total += f.stat().st_size
+        except Exception:
+            pass
+    return ModelStore(name, True, len(models), round(total / GB, 1))
+
+
+def _lmstudio_inventory() -> ModelStore:
+    # ~/.lmstudio/models/<publisher>/<repo>/<weights> (older: ~/.cache/lm-studio/models).
+    # Bundled models under .internal/ are excluded — like HF/Ollama, count user downloads.
+    return _scan_weight_store(
+        "LM Studio",
+        [Path.home() / ".lmstudio" / "models",
+         Path.home() / ".cache" / "lm-studio" / "models"],
+        group_depth=2,
+        app_present=Path("/Applications/LM Studio.app").exists(),
+    )
+
+
+def _jan_inventory() -> ModelStore:
+    # Jan keeps one folder per model: <data>/models/<model-id>/<weights> + model.json.
+    return _scan_weight_store(
+        "Jan",
+        [Path.home() / "jan" / "models",
+         Path.home() / "Library" / "Application Support" / "Jan" / "data" / "models",
+         Path.home() / ".jan" / "models"],
+        group_depth=1,
+        app_present=Path("/Applications/Jan.app").exists(),
+    )
+
+
+def _gpt4all_inventory() -> ModelStore:
+    # GPT4All stores flat .gguf files in its model directory (no per-repo nesting).
+    return _scan_weight_store(
+        "GPT4All",
+        [Path.home() / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
+         Path.home() / ".cache" / "gpt4all"],
+        group_depth=0,
+        app_present=Path("/Applications/GPT4All.app").exists(),
+    )
+
+
 def model_stores() -> list[ModelStore]:
-    return [_hf_inventory(), _ollama_inventory()]
+    return [_hf_inventory(), _ollama_inventory(), _lmstudio_inventory(),
+            _jan_inventory(), _gpt4all_inventory()]
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +439,7 @@ def profile() -> Machine:
     engine_ready = backend == "apple" and find_spec("wmx_suite") is not None
     total, available = _memory_gb()
     physical, logical = _cpu_counts()
+    accel = accelerator(chip)
     return Machine(
         system=platform.system(),
         os_version=os_version(),
@@ -363,9 +452,9 @@ def profile() -> Machine:
         ram_total_gb=total,
         ram_available_gb=available,
         swap_gb=_swap_gb(),
-        accel=accelerator(chip),
+        accel=accel,
         disk_free_gb=_disk_free_gb(),
-        runtimes=runtimes(),
+        runtimes=runtimes(accel.kind),
         model_stores=model_stores(),
         hf_token=_hf_token_present(),
         power=_power(),

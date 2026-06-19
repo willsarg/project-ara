@@ -1774,6 +1774,7 @@ name = "project-ara"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "psutil" },
     { name = "wmx-suite", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
@@ -1785,6 +1786,7 @@ apple = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "wmx-suite", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", editable = "../wmx-suite" },
     { name = "wmx-suite", marker = "extra == 'apple'", editable = "../wmx-suite" },

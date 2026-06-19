@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # Model ARA calibrates against — smallest Gemma 4 (Will's pick). Calibration only
 # measures memory overhead, so a small instruct model is plenty.
-CALIBRATION_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
+CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
 
 def safe_limits() -> dict:
@@ -53,9 +53,9 @@ def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
 
 def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
     """Fetch the calibration model into the HF cache. Network + disk only."""
-    from huggingface_hub import snapshot_download
+    from ara import acquire
 
-    snapshot_download(model)
+    acquire.download(model)
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
@@ -63,9 +63,15 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
 
     Loads the model and watches memory under wmx-suite's predictive safety ramp,
     which aborts before approaching the safe budget. ARA only invokes it.
+
+    The returned limits carry a ``"calibration"`` sub-dict — what was actually
+    measured (overhead, fit rungs, the default it's compared against) — so the
+    caller can show what calibration bought instead of silently swallowing it.
     """
     from wmx_suite import probe
     from wmx_suite.ui import Console as EngineConsole
 
-    probe.calibrate(model, margin_gb=None, console=EngineConsole.from_args())
-    return safe_limits()
+    result = probe.calibrate(model, margin_gb=None, console=EngineConsole.from_args())
+    limits = safe_limits()
+    limits["calibration"] = result
+    return limits

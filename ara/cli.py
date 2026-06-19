@@ -10,7 +10,7 @@ import json
 import sys
 from dataclasses import asdict
 
-from ara import detect
+from ara import acquire, detect, status
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -24,6 +24,13 @@ def _cmd(c: Console, name: str, why: str) -> str:
 
 def _fmt_gb(v: float | None, decimals: int = 0) -> str:
     return f"{v:.{decimals}f} GB" if v is not None else "unknown"
+
+
+def _fmt_size(gb: float | None) -> str:
+    """Human download size: MB under a gigabyte, GB above. 'size unknown' if None."""
+    if gb is None:
+        return "size unknown"
+    return f"~{gb * 1000:.0f} MB" if gb < 1 else f"~{gb:.1f} GB"
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +62,7 @@ def render_landing(c: Console) -> None:
     c.emit()
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
+    c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
@@ -130,7 +138,10 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     for rt in m.runtimes:
         if rt.present:
             val = f"{rt.name} {rt.version}" if rt.version else rt.name
-            c.emit(c.field("·", val, "found", value_role="good"))
+            if rt.requires:  # installed, but can't accelerate on this hardware
+                c.emit(c.field("·", val, f"installed · {rt.requires}", value_role="warn"))
+            else:
+                c.emit(c.field("·", val, "found", value_role="good"))
         elif c.verbose:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
     if not any(rt.present for rt in m.runtimes):
@@ -171,6 +182,57 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# status (live recon — running AI/ML processes; never crosses the engine seam)
+# --------------------------------------------------------------------------- #
+def _fmt_uptime(s: float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _fmt_mem(gb: float) -> str:
+    """Process RSS, MB under a gigabyte and GB above (binary, matching detect)."""
+    return f"{gb * 1024:.0f} MB" if gb < 1 else f"{gb:.1f} GB"
+
+
+def render_status(c: Console, *, as_json: bool = False) -> None:
+    procs = status.scan()
+
+    if as_json:
+        print(json.dumps([asdict(p) for p in procs], indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  RUNNING AI/ML"))
+    if not procs:
+        c.emit(c.style("dim", "  nothing running right now"))
+        c.emit()
+        return
+
+    for p in procs:
+        bits = [f"pid {p.pid}", f"up {_fmt_uptime(p.uptime_s)}"]
+        if p.port:
+            bits.append(f":{p.port}")
+        if p.gpu_mb:
+            bits.append(f"{p.gpu_mb:.0f} MB GPU")
+        if p.detail:
+            bits.append(p.detail)
+        c.emit(c.field(p.label, _fmt_mem(p.rss_gb), " · ".join(bits), value_role="metric"))
+
+    total = sum(p.rss_gb for p in procs)
+    plural = "process" if len(procs) == 1 else "processes"
+    c.emit()
+    c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
+                   value_role="good"))
+    c.emit()
+
+
+# --------------------------------------------------------------------------- #
 # profile (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
@@ -199,8 +261,29 @@ def _confirm(question: str) -> bool:
         return False
 
 
+def _emit_calibration(c: Console, m: dict, fallback_model: str) -> None:
+    """One honest line on what calibration measured vs the built-in default."""
+    cal = m.get("calibration") or {}
+    measured = cal.get("measured_overhead_gb")
+    default = cal.get("default_overhead_gb")
+    n = cal.get("n_points")
+    short = cal.get("hf_id", fallback_model).split("/")[-1]
+    if measured is None or default is None:
+        return
+    if measured < default:
+        verdict = (f"hardware is lean — measured overhead under the {default:.0f} GB "
+                   f"default, keeping the default")
+    elif measured > default:
+        verdict = (f"measured {measured:.1f} GB → {measured - default:.1f} GB more "
+                   f"conservative than the {default:.0f} GB default")
+    else:
+        verdict = f"measured {measured:.1f} GB, matching the default"
+    rungs = f" · {n} rungs" if n else ""
+    c.emit(c.style("dim", f"  overhead: {verdict}{rungs} · {short}"))
+
+
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
-                   assume_yes: bool = False) -> int:
+                   assume_yes: bool = False, model: str | None = None) -> int:
     backend = detect.backend_name()
     if backend == "unsupported":
         c.emit(c.style("warn", "  profiling needs an ARA backend — none for this hardware yet."))
@@ -224,8 +307,13 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
 
     _emit_limits(c, m)
 
+    # Naming an explicit --model means "calibrate against this", so it bypasses the
+    # cached early-return the way --recalibrate does.
+    explicit_model = model is not None
+    model = model or bk.CALIBRATION_MODEL
+
     # Calibration is opt-in: offered only when it'd help, and only interactively.
-    if m["calibrated"] and not recalibrate:
+    if m["calibrated"] and not recalibrate and not explicit_model:
         c.emit(c.style("dim", "  cached — ") + c.style("accent", "ara profile --recalibrate")
                + c.style("dim", " to re-measure"))
         c.emit()
@@ -239,12 +327,19 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         c.emit()
         return 0
 
-    model = bk.CALIBRATION_MODEL
     cached = bk.calibration_model_cached(model)
     if cached:
-        q = f"Calibrate now against {model}?  (loads it, ~30s, stays under the safe budget)"
+        q = f"Calibrate now against {model}?  (loads it, stays under the safe budget)"
     else:
-        q = f"Download {model} from Hugging Face and calibrate?  (a few GB)"
+        size_gb = acquire.repo_size_gb(model)
+        free_gb = acquire.free_disk_gb()
+        if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
+            c.emit(c.style("bad",
+                           f"  not enough disk for {model}: needs ~{size_gb:.1f} GB + "
+                           f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free."))
+            c.emit()
+            return 1
+        q = f"Download {model} from Hugging Face and calibrate?  ({_fmt_size(size_gb)})"
 
     if not (assume_yes or _confirm(q)):
         c.emit(c.style("dim", "  skipped — showing estimated limits."))
@@ -263,6 +358,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         return 1
 
     c.emit(c.style("good", "  calibrated."))
+    _emit_calibration(c, m, model)
     _emit_limits(c, m)
     return 0
 
@@ -276,8 +372,25 @@ def main() -> int:
     as_json = "--json" in argv
     recalibrate = "--recalibrate" in argv
     assume_yes = "--yes" in argv or "-y" in argv
-    rest = [a for a in argv
-            if a not in ("--verbose", "-v", "--json", "--recalibrate", "--yes", "-y")]
+
+    # --model <id> takes a value; pull it (and its value) out before the rest.
+    model: str | None = None
+    rest: list[str] = []
+    skip = False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a == "--model":
+            model = argv[i + 1] if i + 1 < len(argv) else None
+            skip = True
+            continue
+        if a.startswith("--model="):
+            model = a.split("=", 1)[1] or None
+            continue
+        if a in ("--verbose", "-v", "--json", "--recalibrate", "--yes", "-y"):
+            continue
+        rest.append(a)
     c = Console.from_env(verbose=verbose)
 
     if not rest or rest[0] in ("-h", "--help"):
@@ -288,8 +401,13 @@ def main() -> int:
         render_detect(c, as_json=as_json)
         return 0
 
+    if rest[0] == "status":
+        render_status(c, as_json=as_json)
+        return 0
+
     if rest[0] == "profile":
-        return render_profile(c, recalibrate=recalibrate, as_json=as_json, assume_yes=assume_yes)
+        return render_profile(c, recalibrate=recalibrate, as_json=as_json,
+                              assume_yes=assume_yes, model=model)
 
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(
