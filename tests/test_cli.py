@@ -82,6 +82,7 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
+    monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
@@ -1324,3 +1325,53 @@ def test_render_landing_lists_install_command(make_console, monkeypatch):
     c, buf = make_console()
     cli.render_landing(c)
     assert "install the engine" in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# ara models — the catalog view (scan HF cache + list with characterization)
+# --------------------------------------------------------------------------- #
+def test_render_models_lists_catalog(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"},
+                                     {"model_id": "org/B", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000}])
+    c, buf = make_console()
+    cli.render_models(c)
+    out = buf.getvalue()
+    assert "MODEL CATALOG" in out
+    assert "org/A" in out and "16000" in out
+    assert "org/B" in out and "not characterized" in out
+    assert "2 cataloged" in out
+
+
+def test_render_models_empty_and_no_engine(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")  # engine_key None
+    c, buf = make_console()
+    cli.render_models(c)
+    assert "empty" in buf.getvalue()
+
+
+def test_render_models_json(monkeypatch, capsys, store):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 9000}])
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert data[0]["safe_context"] == 9000
+
+
+def test_main_models_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["models", "--json"])
+    assert rec["models"] is True

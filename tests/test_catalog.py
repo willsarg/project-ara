@@ -72,3 +72,34 @@ def test_read_config_none_on_error(monkeypatch):
         raise RuntimeError("no network")
     monkeypatch.setattr("huggingface_hub.hf_hub_download", boom)
     assert catalog._read_config("m") is None
+
+
+def test_scan_catalogs_cached_models(store, monkeypatch):
+    monkeypatch.setattr(catalog, "_hf_cache_models", lambda: ["a/m1", "b/m2"])
+    monkeypatch.setattr(catalog, "describe", lambda mid: {"modality": "text"})
+    assert catalog.scan(store) == 2
+    assert {m["model_id"] for m in catalog.all_models(store)} == {"a/m1", "b/m2"}
+
+
+def test_scan_skips_undescribable(store, monkeypatch):
+    monkeypatch.setattr(catalog, "_hf_cache_models", lambda: ["a/m1", "bad/m"])
+    monkeypatch.setattr(catalog, "describe",
+                        lambda mid: {"modality": "text"} if mid == "a/m1" else None)
+    assert catalog.scan(store) == 1
+
+
+def test_hf_cache_models_filters_to_models(monkeypatch):
+    import types
+    cache = types.SimpleNamespace(repos=[
+        types.SimpleNamespace(repo_id="org/model", repo_type="model"),
+        types.SimpleNamespace(repo_id="org/data", repo_type="dataset"),
+    ])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: cache)
+    assert catalog._hf_cache_models() == ["org/model"]
+
+
+def test_hf_cache_models_empty_on_error(monkeypatch):
+    def boom():
+        raise RuntimeError("no cache")
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", boom)
+    assert catalog._hf_cache_models() == []

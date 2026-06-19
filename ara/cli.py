@@ -126,6 +126,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
     if supported:  # MLX ecosystem view is Apple-Silicon only
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
+    c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
@@ -642,6 +643,38 @@ def _emit_calibration(c: Console, m: dict, fallback_model: str) -> None:
     c.emit(c.style("dim", f"  overhead: {verdict}{rungs} · {short}"))
 
 
+def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
+    """The model catalog: scan the HF cache, then list each model + its safe ceiling here."""
+    con = db.connect()
+    catalog.scan(con)
+    models = catalog.all_models(con)
+    engine_key = engines.for_backend(detect.backend_name())
+    ceilings = {}
+    if engine_key:
+        ceilings = {r["model_id"]: r["safe_context"]
+                    for r in db.list_characterizations(con, profiles.machine_key(), engine_key)}
+
+    if as_json:
+        print(json.dumps([{**m, "safe_context": ceilings.get(m["model_id"])} for m in models],
+                         indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  MODEL CATALOG"))
+    for m in models:
+        ceiling = ceilings.get(m["model_id"])
+        tail = f"~{ceiling} tokens" if ceiling else "not characterized"
+        c.emit("  " + c.style("metric", m["model_id"])
+               + c.style("dim", f"  {m['modality'] or '?'}  →  ")
+               + c.style("good" if ceiling else "dim", tail))
+    if not models:
+        c.emit(c.style("dim", "  empty — download a model and it'll be cataloged here"))
+    c.emit()
+    n_char = sum(1 for m in models if ceilings.get(m["model_id"]))
+    c.emit(c.style("dim", f"  {len(models)} cataloged · {n_char} characterized on this machine"))
+    c.emit()
+
+
 def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
     """Install the matched engine. ``--engine`` is the consent; exit 0 once the
     engine is present (installed or already), nonzero otherwise."""
@@ -914,6 +947,10 @@ def main() -> int:
 
     if cmd == "mlx":
         render_mlx(c, as_json=as_json, want=want)
+        return 0
+
+    if cmd == "models":
+        render_models(c, as_json=as_json, want=want)
         return 0
 
     if cmd == "profile":

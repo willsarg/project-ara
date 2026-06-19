@@ -58,3 +58,22 @@ def get(con, model_id: str) -> dict | None:
 
 def all_models(con) -> list[dict]:
     return db.list_models(con)
+
+
+def _hf_cache_models() -> list[str]:
+    """Model repo ids currently in the local Hugging Face cache (no network)."""
+    from huggingface_hub import scan_cache_dir
+
+    try:
+        return [r.repo_id for r in scan_cache_dir().repos if r.repo_type == "model"]
+    except Exception:
+        return []
+
+
+def scan(con) -> int:
+    """Catalog every describable model in the HF cache; return how many were added/updated."""
+    n = 0
+    for model_id in _hf_cache_models():
+        if remember(con, model_id) is not None:
+            n += 1
+    return n
