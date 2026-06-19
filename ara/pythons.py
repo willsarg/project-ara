@@ -38,11 +38,34 @@ class Interpreter:
     origin: str                   # macOS system | Homebrew | python.org | pyenv | conda | uv | asdf | venv | other
     version: str | None = None    # "3.12.4" (None until probed)
     is_default: bool = False      # your shell's default python3 (ARA's venv excluded)
+    externally_managed: bool = False  # PEP 668 marker — pip installs are blocked here
     ai_libs: dict[str, str | None] = field(default_factory=dict)
 
     @property
     def ai_present(self) -> dict[str, str | None]:
         return {k: v for k, v in self.ai_libs.items() if v is not None}
+
+    @property
+    def caution(self) -> str | None:
+        """A heads-up for interpreters you shouldn't install into or upgrade directly.
+
+        The macOS system python is Apple-managed by definition (don't touch it), even
+        though it predates PEP 668's ``EXTERNALLY-MANAGED`` marker. Everything else warns
+        only when that marker is actually present — detected, not assumed.
+        """
+        if self.origin == "macOS system":
+            return _CAUTION["macOS system"]
+        if self.externally_managed:
+            return _CAUTION.get(self.origin,
+                                "externally managed — install into a venv, not directly")
+        return None
+
+
+_CAUTION = {
+    "macOS system": "Apple-managed — don't install into or upgrade it; make a venv instead",
+    "Homebrew": "externally managed — use a venv or pipx, not pip here; upgrade via brew",
+    "uv": "uv-managed — let uv handle versions/packages, or use a venv",
+}
 
 
 def _run(cmd: list[str], timeout: float = 8) -> str | None:
@@ -149,25 +172,28 @@ def _display_path(invocations: set[str], path_dirs: set[str]) -> str:
     return min(invocations, key=lambda p: (os.path.dirname(p) not in path_dirs, len(p)))
 
 
-def _probe(real: str) -> tuple[str | None, dict[str, str | None]]:
+def _probe(real: str) -> tuple[str | None, dict[str, str | None], bool]:
     code = (
-        "import sys, json\n"
+        "import sys, json, os, sysconfig\n"
         "import importlib.metadata as m\n"
         f"names = {list(_AI_LIBS)!r}\n"
         "libs = {}\n"
         "for n in names:\n"
         "    try: libs[n] = m.version(n)\n"
         "    except Exception: libs[n] = None\n"
-        "print(json.dumps({'v': '.'.join(map(str, sys.version_info[:3])), 'libs': libs}))\n"
+        "stdlib = sysconfig.get_paths().get('stdlib', '')\n"
+        "em = bool(stdlib) and os.path.exists(os.path.join(stdlib, 'EXTERNALLY-MANAGED'))\n"
+        "print(json.dumps({'v': '.'.join(map(str, sys.version_info[:3])), 'libs': libs, 'em': em}))\n"
     )
     out = _run([real, "-c", code])
+    blank = {n: None for n in _AI_LIBS}
     if not out:
-        return None, {n: None for n in _AI_LIBS}
+        return None, blank, False
     try:
         data = json.loads(out.strip().splitlines()[-1])
-        return data.get("v"), data.get("libs", {})
+        return data.get("v"), data.get("libs", blank), bool(data.get("em", False))
     except Exception:
-        return None, {n: None for n in _AI_LIBS}
+        return None, blank, False
 
 
 def discover(probe: bool = True) -> list[Interpreter]:
@@ -182,10 +208,11 @@ def discover(probe: bool = True) -> list[Interpreter]:
 
     versions: dict[str, str | None] = {}
     libs: dict[str, dict[str, str | None]] = {}
+    managed: dict[str, bool] = {}
     if probe:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            for real, (v, lb) in zip(groups, pool.map(_probe, groups)):
-                versions[real], libs[real] = v, lb
+            for real, (v, lb, em) in zip(groups, pool.map(_probe, groups)):
+                versions[real], libs[real], managed[real] = v, lb, em
 
     out: list[Interpreter] = []
     for real, invocations in groups.items():
@@ -195,6 +222,7 @@ def discover(probe: bool = True) -> list[Interpreter]:
             origin=_origin(real, list(invocations)),
             version=versions.get(real),
             is_default=(real == default_real),
+            externally_managed=managed.get(real, False),
             ai_libs=libs.get(real, {}),
         ))
 

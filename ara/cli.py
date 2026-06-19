@@ -285,6 +285,8 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
             c.emit("       " + c.style("good", " · ".join(f"{k} {v}" for k, v in present.items())))
         else:
             c.emit("       " + c.style("dim", "no AI libraries"))
+        if i.caution:
+            c.emit("       " + c.style("warn", f"⚠ {i.caution}"))
     c.emit()
     c.emit(c.style("dim", f"  {len(ints)} interpreters · {with_ai} with AI libraries · ")
            + c.style("good", "●") + c.style("dim", " = your default python3"))
