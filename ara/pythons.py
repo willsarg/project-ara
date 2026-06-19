@@ -63,11 +63,7 @@ class Interpreter:
         though it predates PEP 668's ``EXTERNALLY-MANAGED`` marker. Everything else warns
         only when that marker is actually present — detected, not assumed.
         """
-        if self.origin == "macOS system":
-            return _CAUTION["macOS system"]
-        if self.externally_managed:
-            return _CAUTION.get(self.origin, "externally managed — use a venv, not here")
-        return None
+        return caution_for(self.origin, self.externally_managed)
 
 
 # All share one rule — "use a venv, not here" — with a truthful per-manager tail.
@@ -76,6 +72,30 @@ _CAUTION = {
     "Homebrew": "managed by Homebrew — use a venv or pipx, not here; upgrade via brew",
     "uv": "managed by uv — packages go in a venv (uv add), not here; uv may replace it",
 }
+
+
+def caution_for(origin: str, externally_managed: bool) -> str | None:
+    """Shared caution rule for interpreters you shouldn't install into directly.
+    macOS system is Apple-managed by definition; the rest warn on the PEP 668 marker.
+    """
+    if origin == "macOS system":
+        return _CAUTION["macOS system"]
+    if externally_managed:
+        return _CAUTION.get(origin, "externally managed — use a venv, not here")
+    return None
+
+
+_MANAGER = {"macOS system": "Apple", "Homebrew": "Homebrew", "uv": "uv"}
+
+
+def manager_of(origin: str, externally_managed: bool) -> str | None:
+    """Who manages this *interpreter* (not its packages): 'Apple' | 'Homebrew' | 'uv' | …
+    None when it's a user-managed interpreter you can freely install into."""
+    if origin == "macOS system":
+        return "Apple"
+    if externally_managed:
+        return _MANAGER.get(origin, "the system")
+    return None
 
 
 def _run(cmd: list[str], timeout: float = 8) -> str | None:

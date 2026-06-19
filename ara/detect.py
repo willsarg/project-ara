@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import psutil
+
+from ara import apps as _apps, versions as _versions
 
 GB = 1024 ** 3
 
@@ -288,13 +291,16 @@ def runtimes(accel_kind: str = "none", user_py: str | None = None) -> list[Runti
     # vLLM ships a `vllm` CLI; check PATH too — the user may have it outside any probed env.
     vllm_present = pkgs.get("vllm") is not None or shutil.which("vllm") is not None
 
+    # Versions for the non-python engines, from the reliable sources (brew / .app plist).
+    _, lms_ver = _versions.find_app(["LM Studio"])
+
     # (name, present, version, kind, accels) — accels=() means cross-platform.
     specs: list[tuple[str, bool, str | None, str, tuple[str, ...]]] = [
         ("MLX", mlx_present, mlx_ver, "engine", ("apple",)),
-        ("llama.cpp", llama is not None, None, "engine", ()),
+        ("llama.cpp", llama is not None, _versions.brew_version("llama.cpp"), "engine", ()),
         ("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists(),
-         None, "engine", ()),
-        ("LM Studio", bool(lms), None, "engine", ()),
+         _versions.brew_version("ollama"), "engine", ()),
+        ("LM Studio", bool(lms), lms_ver, "engine", ()),
         ("vLLM", vllm_present, pkgs.get("vllm"), "engine", ("nvidia",)),
         ("PyTorch", pkgs.get("torch") is not None, pkgs.get("torch"), "framework", ()),
         ("transformers", pkgs.get("transformers") is not None, pkgs.get("transformers"),
@@ -444,6 +450,28 @@ def _hf_token_present() -> bool:
     return any(p.exists() for p in candidates)
 
 
+def _user_which(cmd: str) -> str | None:
+    """Resolve *cmd* on the user's PATH, with ARA's active venv stripped (so we report the
+    user's tool, not ARA's bundled one — same reasoning as _user_python)."""
+    path = os.environ.get("PATH", "")
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        vbin = os.path.normpath(os.path.join(venv, "bin"))
+        path = os.pathsep.join(p for p in path.split(os.pathsep)
+                               if os.path.normpath(p) != vbin)
+    return shutil.which(cmd, path=path)
+
+
+def _hf_cli() -> tuple[bool, str | None]:
+    """Is the Hugging Face CLI (`hf` / `huggingface-cli`) on the user's PATH, and its version."""
+    exe = _user_which("hf") or _user_which("huggingface-cli")
+    if not exe:
+        return False, None
+    out = _run([exe, "version"]) or ""
+    m = re.search(r"\d+\.\d+(?:\.\d+)?", out)
+    return True, (m.group(0) if m else None)
+
+
 # --------------------------------------------------------------------------- #
 # the machine snapshot
 # --------------------------------------------------------------------------- #
@@ -465,7 +493,10 @@ class Machine:
     runtimes: list[Runtime] = field(default_factory=list)
     framework_python: str | None = None  # interpreter the FRAMEWORKS group was probed in
     model_stores: list[ModelStore] = field(default_factory=list)
+    apps: list = field(default_factory=list)  # installed AI/ML apps (ara.apps.App)
     hf_token: bool = False
+    hf_cli: bool = False
+    hf_cli_version: str | None = None
     power: str = "unknown"
     backend: str = "unsupported"
     engine: str = "unsupported"
@@ -486,6 +517,7 @@ def profile() -> Machine:
     physical, logical = _cpu_counts()
     accel = accelerator(chip)
     user_py = _user_python()
+    hf_cli, hf_cli_version = _hf_cli()
     return Machine(
         system=platform.system(),
         os_version=os_version(),
@@ -503,7 +535,10 @@ def profile() -> Machine:
         runtimes=runtimes(accel.kind, user_py),
         framework_python=user_py,
         model_stores=model_stores(),
+        apps=_apps.scan(),
         hf_token=_hf_token_present(),
+        hf_cli=hf_cli,
+        hf_cli_version=hf_cli_version,
         power=_power(),
         backend=backend,
         engine=engine,
