@@ -377,20 +377,24 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
             c.emit(c.style("accent", f"  {apps.CATEGORY_LABEL[app.category]}"))
             last_cat = app.category
         name = f"{app.label} {app.version}".strip() if app.version else app.label
-        auto = bool(defers.get(app.cask_token))
-        problem = app.duplicate or (app.drift and not auto)
+        auto = defers.get(app.cask_token)            # True / False / None(unknown)
+        missing_auto = bool(app.cask and defers and not auto)
+        problem = app.duplicate or missing_auto
         gloss = app.source
-        if app.drift and auto:
+        if missing_auto:
+            gloss += "  ⚠ cask omits auto_updates"
+            if app.drift:
+                gloss += f" — self-updated past brew (records {app.brew_recorded})"
+        elif app.drift:  # auto_updates is declared, so the version moving is expected
             gloss += f"  · self-updates; brew defers (records {app.brew_recorded})"
-        elif app.drift:
-            gloss += (f"  ⚠ self-updated past brew (records {app.brew_recorded}); "
-                      f"brew upgrade may overwrite it")
         if app.duplicate:
             gloss += "  ⚠ likely duplicate"
         c.emit(c.field("·", name, gloss, value_role="warn" if problem else "good"))
     c.emit()
     c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
                             "so cask + app is one install, not a duplicate."))
+    c.emit(c.style("gloss", "  ⚠ cask omits auto_updates = brew manages its version, so a "
+                            "brew upgrade can overwrite the app's own self-update."))
     c.emit()
 
 
