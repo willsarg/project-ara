@@ -18,6 +18,16 @@ def _raise_input(exc):
     return _f
 
 
+@pytest.fixture
+def stub_pythons(monkeypatch):
+    """Stub pythons.count()/discover() so render_detect never touches the real
+    filesystem. Call with the count and the interpreter list you want surfaced."""
+    def _stub(count=1, discover=()):
+        monkeypatch.setattr(cli.pythons, "count", lambda: count)
+        monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: list(discover))
+    return _stub
+
+
 # --------------------------------------------------------------------------- #
 # formatters
 # --------------------------------------------------------------------------- #
@@ -184,7 +194,8 @@ def _machine(**over) -> Machine:
     return Machine(**base)
 
 
-def test_render_detect_text(make_console, monkeypatch):
+def test_render_detect_text(make_console, monkeypatch, stub_pythons):
+    stub_pythons(count=3)
     monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
     c, buf = make_console()
     cli.render_detect(c)
@@ -195,13 +206,15 @@ def test_render_detect_text(make_console, monkeypatch):
     assert "Apple M4 Pro" in out
     assert "Metal" in out
     assert "MLX" in out                  # engine
-    assert "PyTorch" in out              # framework
+    assert "PyTorch" in out              # framework on the default python
     assert "needs CUDA" in out          # vLLM unusable reason rendered
-    assert "/usr/bin/python3" in out    # framework probe interpreter labelled
+    assert "/usr/bin/python3" in out    # default interpreter shown under FRAMEWORKS
+    assert "interpreters on this machine" in out  # count > 1 → pointer to `ara python`
     assert "3 models" in out
 
 
-def test_render_detect_nvidia_accel(make_console, monkeypatch):
+def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
+    stub_pythons(count=1)
     m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1,
                                    compute="8.9", cuda_version="550"))
     monkeypatch.setattr(cli.detect, "profile", lambda: m)
@@ -209,6 +222,7 @@ def test_render_detect_nvidia_accel(make_console, monkeypatch):
     cli.render_detect(c)
     out = buf.getvalue()
     assert "RTX 4090" in out and "24 GB VRAM" in out and "SM 8.9" in out
+    assert "interpreters on this machine" not in out  # count == 1 → no pointer line
 
 
 def test_render_detect_json(monkeypatch, capsys):
@@ -461,8 +475,9 @@ def test_emit_calibration_silent_without_measurements(make_console):
 # --------------------------------------------------------------------------- #
 # render_detect verbose + unsupported branches
 # --------------------------------------------------------------------------- #
-def test_render_detect_verbose_and_unsupported(monkeypatch, make_console):
+def test_render_detect_verbose_and_unsupported(monkeypatch, make_console, stub_pythons):
     # `supported` is a property, not a ctor arg — drive it via backend="unsupported".
+    stub_pythons(count=1, discover=[])
     m = _machine(
         backend="unsupported", engine="unsupported", engine_ready=False,
         cpu_logical=24, hf_token=False,
@@ -477,14 +492,16 @@ def test_render_detect_verbose_and_unsupported(monkeypatch, make_console):
     out = buf.getvalue()
     assert "physical" in out and "logical" in out      # verbose cpu line
     assert "no GPU detected" in out                     # accel none branch
-    # verbose lists absent engine, absent framework, and absent store as "not found"
-    assert out.count("not found") >= 3
+    # verbose lists absent engine and absent store as "not found"
+    assert out.count("not found") >= 2
     assert "no ARA backend for this hardware yet" in out  # unsupported footer
 
 
-def test_render_detect_minimal_non_verbose(make_console, monkeypatch):
+def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pythons):
     # Drive every "skip the optional line" branch: missing cpu/features, no available
-    # RAM, no swap, an nvidia GPU with none of its detail bits, and empty/absent stores.
+    # RAM, no swap, an nvidia GPU with none of its detail bits, empty/absent stores,
+    # and no AI frameworks anywhere (discover → []).
+    stub_pythons(count=1, discover=[])
     m = _machine(
         cpu_physical=None, cpu_logical=None, cpu_features=[],
         ram_available_gb=None, swap_gb=0.0,
@@ -499,11 +516,35 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch):
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     out = buf.getvalue()
-    assert "Mystery GPU" in out and "VRAM" not in out   # nvidia, but no detail bits
-    assert "none detected" in out                        # no engines present, non-verbose
-    assert "none in this env" in out                     # no frameworks present
-    assert "no separate user python" in out              # framework_python is None
-    assert "not found" not in out                        # non-verbose hides absent rows
+    assert "Mystery GPU" in out and "VRAM" not in out    # nvidia, but no detail bits
+    assert "none detected" in out                         # no engines present, non-verbose
+    assert "has no AI frameworks" in out                  # default python is bare
+    assert "ARA's env (no separate user python)" in out   # framework_python is None
+    assert "None found in any interpreter" in out         # discover surfaced nothing
+    assert "not found" not in out                         # non-verbose hides absent rows
+
+
+def test_render_detect_frameworks_surfaced_from_other_interpreter(
+        make_console, monkeypatch, stub_pythons):
+    # Default python is bare, but another interpreter has the AI stack → surface it.
+    from ara.pythons import Interpreter
+    other = Interpreter(
+        path="/opt/homebrew/bin/python3.12", real="/opt/homebrew/Cellar/python3.12",
+        origin="Homebrew", version="3.12.4", is_default=False,
+        ai_libs={"torch": "2.1.0", "transformers": "4.40.0"},
+    )
+    stub_pythons(count=2, discover=[other])
+    m = _machine(runtimes=[Runtime("PyTorch", False, None, kind="framework")],
+                 framework_python="/usr/bin/python3")
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console()
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "has no AI frameworks" in out
+    assert "But you've got them in" in out
+    assert "Homebrew 3.12.4" in out
+    assert "torch 2.1.0" in out and "transformers 4.40.0" in out
+    assert "ara python" in out
 
 
 def test_render_status_gpu_and_no_port(make_console, monkeypatch):
@@ -552,3 +593,62 @@ def test_confirm_false_on_eof(monkeypatch):
 def test_confirm_false_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr("builtins.input", _raise_input(KeyboardInterrupt()))
     assert cli._confirm("proceed?") is False
+
+
+# --------------------------------------------------------------------------- #
+# python (render_python) + dispatch
+# --------------------------------------------------------------------------- #
+def _interp(**over):
+    from ara.pythons import Interpreter
+    base = dict(path="/usr/bin/python3", real="/usr/bin/python3", origin="macOS system",
+                version="3.9.6", is_default=False, externally_managed=False, ai_libs={})
+    base.update(over)
+    return Interpreter(**base)
+
+
+def test_main_python_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_python", lambda c, as_json=False: rec.update(python=as_json))
+    _run_main(monkeypatch, ["python", "--json"])
+    assert rec["python"] is True
+
+
+def test_render_python_text(make_console, monkeypatch):
+    ints = [
+        _interp(path="/opt/homebrew/bin/python3.12", real="/opt/homebrew/bin/python3.12",
+                origin="Homebrew", version="3.12.4", is_default=True,
+                ai_libs={"torch": "2.1.0", "transformers": None}),
+        _interp(path="/usr/bin/python3", origin="macOS system", version="3.9.6"),
+    ]
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
+    c, buf = make_console()
+    cli.render_python(c)
+    out = buf.getvalue()
+    assert "PYTHON INTERPRETERS" in out
+    assert "Homebrew" in out and "macOS system" in out      # origin group headers
+    assert "torch 2.1.0" in out                              # present lib (None one hidden)
+    assert "transformers" not in out                         # version None → not shown
+    assert "no AI libraries" in out                          # the bare interpreter
+    assert "2 interpreters · 1 with AI libraries" in out     # summary
+    assert "managed" in out                                  # macOS system carries a caution
+    assert "your default python3" in out                     # legend
+
+
+def test_render_python_shows_symlink_real_path(make_console, monkeypatch):
+    ints = [_interp(path="/usr/local/bin/python3", real="/opt/homebrew/Cellar/python@3.12/3.12.4/bin/python3.12",
+                    origin="Homebrew", version="3.12.4")]
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
+    c, buf = make_console()
+    cli.render_python(c)
+    out = buf.getvalue()
+    assert "→" in out and "python@3.12" in out  # symlink target surfaced
+
+
+def test_render_python_json(monkeypatch, capsys):
+    ints = [_interp(ai_libs={"torch": "2.1.0"})]
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_python(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["origin"] == "macOS system"
+    assert payload[0]["ai_libs"] == {"torch": "2.1.0"}
