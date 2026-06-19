@@ -36,8 +36,12 @@ is present. Apple Silicon is the first running backend; recon works everywhere.
 - **Apple backend wraps [`wmx-suite`](https://github.com/willsarg/wmx-suite).** The engine
   import happens *inside* the adapter's functions, not at module load — so nothing
   MLX-shaped loads until ARA actually runs the engine.
-- **Platform-correct dependencies.** The engine is pulled in only on the platform that needs
-  it (via `uv` environment markers). Never ship MLX to non-Apple machines.
+- **Engines install on demand, not as dependencies.** The hardware engine is **not** in
+  `pyproject.toml`. ARA probes the machine and installs the matched suite at runtime via
+  `ara install` (`ara/engines.py` is the catalog + `uv pip install git+<spec>` logic). This
+  keeps the core universal, the lock engine-free, and `uv sync` identical on every OS — and
+  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|auto}` is the consent surface
+  (the flag itself authorizes the install, so it stays scriptable).
 
 ## Hard rules
 

@@ -45,12 +45,15 @@ knows your machine's real limits. The design values, in order:
 ## 🚀 Quick start
 
 ```bash
-uv sync                # install into .venv
+uv sync                # install the pure-Python core into .venv (works on any OS)
 uv run ara             # the landing screen + getting-started path
 uv run ara detect      # read-only recon of this machine
+uv run ara install     # add the engine matched to this machine (Apple Silicon today)
 ```
 
 No arguments shows what ARA can do for this machine. Everything below is a subcommand.
+The hardware engine isn't a dependency — `ara install` adds it on demand, so `uv sync`
+stays lean and works the same on every platform.
 
 ---
 
@@ -63,7 +66,8 @@ No arguments shows what ARA can do for this machine. Everything below is a subco
 | `ara python` | Every Python interpreter on the system (macOS / Homebrew / python.org / pyenv / conda / uv / asdf), which has which AI libraries, and which you shouldn't `pip install` into. |
 | `ara apps` | Full inventory of installed AI/ML apps with versions and install source (App / Homebrew cask / formula), flagging real duplicates and self-update-vs-Homebrew drift. |
 | `ara mlx` | The MLX ecosystem (Apple Silicon): libraries by modality + readiness (Metal GPU, cached `mlx-community` models, LM Studio's MLX runtime). |
-| `ara profile` | Measure this machine's **safe memory limits** — opt-in calibration against a tiny model, crossing into the [`wmx-suite`](https://github.com/willsarg/wmx-suite) engine. |
+| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {wmx\|wcx\|auto}` picks it (`auto` = whatever fits this hardware); the flag is the consent, so it's scriptable. Today: `wmx` ([`wmx-suite`](https://github.com/willsarg/wmx-suite), Apple Silicon); `wcx` (CUDA) is coming. |
+| `ara profile` | Measure this machine's **safe memory limits** — opt-in calibration against a tiny model, crossing into the engine. Installs the engine first if you pass `--engine`. |
 | `ara recommend` | *(planned)* Best model per modality that fits this machine — curated catalog × measured wall. |
 | `ara run <model>` | *(planned)* Launch a model safely — right up to the edge, never over. |
 
@@ -82,9 +86,11 @@ hardware-specific engine; it picks a backend for the machine and loads only that
 - **Other hardware** → recon works everywhere; running support arrives as backends land
   (NVIDIA / CUDA is next).
 
-The engine is pulled in **only on the platform that needs it** (via `uv` environment
-markers), so you never download MLX onto an NVIDIA box or vice-versa. See
-[AGENTS.md](./AGENTS.md) for the design boundary and conventions.
+The engine is **not a dependency**. ARA probes the machine and installs the matched suite
+on demand (`ara install`) — so the core stays universal, `uv sync` is identical on every
+OS, and you never download MLX onto an NVIDIA box or vice-versa. The catalog of engines and
+the install logic live in [`ara/engines.py`](./ara/engines.py). See [AGENTS.md](./AGENTS.md)
+for the design boundary and conventions.
 
 ---
 
