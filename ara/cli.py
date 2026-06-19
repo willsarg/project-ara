@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import acquire, apps, detect, mlx, pythons, status
+from ara import acquire, apps, detect, mlx, pythons, status, versions
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -349,11 +349,15 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
 # --------------------------------------------------------------------------- #
 def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
     inventory = apps.scan()
+    # auto_updates lookup (one batched brew call) lives here, in the dedicated command —
+    # never in the detect summary. True = brew defers, so drift is expected, not a conflict.
+    defers = versions.cask_auto_updates()
     if as_json:
         print(json.dumps([{
             "label": a.label, "category": a.category, "version": a.version,
             "source": a.source, "duplicate": a.duplicate, "drift": a.drift,
-            "brew_recorded": a.brew_recorded,
+            "brew_recorded": a.brew_recorded, "cask_token": a.cask_token,
+            "auto_updates": defers.get(a.cask_token),
             "in_app": a.in_app, "cask": a.cask, "formula": a.formula,
             "installed_at": a.installed_at,
         } for a in inventory], indent=2))
@@ -373,13 +377,17 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
             c.emit(c.style("accent", f"  {apps.CATEGORY_LABEL[app.category]}"))
             last_cat = app.category
         name = f"{app.label} {app.version}".strip() if app.version else app.label
+        auto = bool(defers.get(app.cask_token))
+        problem = app.duplicate or (app.drift and not auto)
         gloss = app.source
-        if app.drift:
-            gloss += f"  ⚠ self-updated past brew (records {app.brew_recorded})"
+        if app.drift and auto:
+            gloss += f"  · self-updates; brew defers (records {app.brew_recorded})"
+        elif app.drift:
+            gloss += (f"  ⚠ self-updated past brew (records {app.brew_recorded}) → "
+                      f"brew uninstall --cask {app.cask_token} to let it self-manage")
         if app.duplicate:
             gloss += "  ⚠ likely duplicate"
-        c.emit(c.field("·", name, gloss,
-                       value_role="warn" if (app.drift or app.duplicate) else "good"))
+        c.emit(c.field("·", name, gloss, value_role="warn" if problem else "good"))
     c.emit()
     c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
                             "so cask + app is one install, not a duplicate."))

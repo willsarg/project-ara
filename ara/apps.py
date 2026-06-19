@@ -82,6 +82,7 @@ class App:
     formula: bool       # installed as a Homebrew formula (CLI)
     version: str | None = None          # what's actually installed (.app plist for GUIs)
     brew_recorded: str | None = None     # Homebrew's receipt version, when it manages this
+    cask_token: str | None = None        # the matched brew cask token (for drift remediation)
     installed_at: float | None = None    # epoch mtime/birthtime, for "recently installed"
 
     @property
@@ -155,6 +156,7 @@ def scan() -> list[App]:
         # The installed truth is the .app's own version; show that. For a cask we also keep
         # brew's receipt so we can flag self-update drift. A formula (CLI) has no .app, so
         # its brew version IS the truth.
+        cask_token = next((t for t in tokens if t in casks), None)
         if cask:
             version, brew_recorded = (app_ver or cask_ver), cask_ver
         elif formula:
@@ -162,7 +164,7 @@ def scan() -> list[App]:
         else:  # hand-installed .app
             version, brew_recorded = app_ver, None
         out.append(App(label, category, in_app=in_app, cask=cask, formula=formula,
-                       version=version, brew_recorded=brew_recorded,
+                       version=version, brew_recorded=brew_recorded, cask_token=cask_token,
                        installed_at=_install_time(bundles, tokens, in_app)))
     out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
     return out

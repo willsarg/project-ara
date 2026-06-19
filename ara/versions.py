@@ -7,6 +7,7 @@ inventory and the engines list ask for versions.
 from __future__ import annotations
 
 import functools
+import json
 import plistlib
 import shutil
 import subprocess
@@ -51,6 +52,28 @@ def brew_version(*tokens: str) -> str | None:
         if v:
             return v
     return None
+
+
+@functools.lru_cache(maxsize=1)
+def cask_auto_updates() -> dict[str, bool]:
+    """{cask token: auto_updates} for installed casks — True when the cask declares that the
+    app updates itself, so brew defers version management (drift is expected, not a conflict).
+    One batched `brew info` call. Tokens lowercased, @version stripped."""
+    casks = list(brew_casks())
+    if not casks:
+        return {}
+    try:
+        out = subprocess.run(["brew", "info", "--json=v2", "--cask", *casks],
+                             capture_output=True, text=True, timeout=30).stdout
+        data = json.loads(out)
+    except Exception:
+        return {}
+    result: dict[str, bool] = {}
+    for c in data.get("casks", []):
+        token = (c.get("token") or "").lower().split("@", 1)[0]
+        if token:
+            result[token] = bool(c.get("auto_updates"))
+    return result
 
 
 def _plist_version(app: Path) -> str | None:
