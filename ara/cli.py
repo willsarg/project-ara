@@ -279,6 +279,10 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
         head = (f"  {mark} " + c.style("metric", f"{i.version or '?':8}")
                 + c.style("dim", f"{i.origin:13} ") + c.style("accent", _tilde(i.path)))
         c.emit(head)
+        # When the path you'd type is a symlink, show where it really lives — this is
+        # what explains the origin label and untangles symlink chains.
+        if _tilde(i.real) != _tilde(i.path):
+            c.emit("       " + c.style("dim", f"→ {_tilde(i.real)}"))
         present = i.ai_present
         if present:
             with_ai += 1
