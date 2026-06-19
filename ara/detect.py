@@ -19,6 +19,8 @@ from pathlib import Path
 
 import psutil
 
+from ara import apps as _apps
+
 GB = 1024 ** 3
 
 
@@ -465,6 +467,7 @@ class Machine:
     runtimes: list[Runtime] = field(default_factory=list)
     framework_python: str | None = None  # interpreter the FRAMEWORKS group was probed in
     model_stores: list[ModelStore] = field(default_factory=list)
+    apps: list = field(default_factory=list)  # installed AI/ML apps (ara.apps.App)
     hf_token: bool = False
     power: str = "unknown"
     backend: str = "unsupported"
@@ -503,6 +506,7 @@ def profile() -> Machine:
         runtimes=runtimes(accel.kind, user_py),
         framework_python=user_py,
         model_stores=model_stores(),
+        apps=_apps.scan(),
         hf_token=_hf_token_present(),
         power=_power(),
         backend=backend,

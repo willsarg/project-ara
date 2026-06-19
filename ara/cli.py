@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import acquire, detect, mlx, pythons, status
+from ara import acquire, apps, detect, mlx, pythons, status
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -203,6 +203,20 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
             c.emit(c.field(store.name, "empty", value_role="dim"))
         elif c.verbose:
             c.emit(c.field(store.name, "not found", value_role="dim"))
+    c.emit()
+
+    c.emit(c.section("  AI/ML APPS"))
+    if not m.apps:
+        c.emit(c.style("dim", "  none detected"))
+    else:
+        last_cat = None
+        for app in m.apps:
+            if app.category != last_cat:
+                c.emit(c.style("dim", f"  {apps.CATEGORY_LABEL[app.category]}"))
+                last_cat = app.category
+            c.emit(c.field("·", app.label, " + ".join(app.sources), value_role="good"))
+        c.emit(c.style("gloss", "  matched against a curated catalog of known AI/ML apps "
+                                "+ Homebrew packages — others may exist."))
     c.emit()
 
     c.emit(c.section("  ARA"))
