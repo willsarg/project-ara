@@ -225,6 +225,21 @@ def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     assert "interpreters on this machine" not in out  # count == 1 → no pointer line
 
 
+def test_render_detect_cpu_without_features_and_no_python_version(
+        make_console, monkeypatch, stub_pythons):
+    # cpu present but no SIMD features (skip the features append), and no python_version
+    # at all (skip the whole python row).
+    stub_pythons(count=1)
+    m = _machine(cpu_features=[], python_version=None)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "12 cores" in out                  # cpu row emitted, no features tail
+    assert "your default python3" not in out  # python row skipped entirely
+    assert "ARA's python" not in out
+
+
 def test_render_detect_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
     c = cli.Console(color=False, stream=sys.stderr)
@@ -453,6 +468,14 @@ def test_emit_limits_omits_overhead_when_none(make_console):
     assert "overhead" not in out
 
 
+def test_emit_limits_omits_swap_when_none(make_console):
+    c, buf = make_console()
+    cli._emit_limits(c, _limits(calibrated=True, swap_free_gb=None))
+    out = buf.getvalue()
+    assert "SAFE LIMITS" in out
+    assert "swap" not in out
+
+
 @pytest.mark.parametrize("measured,default,phrase", [
     (5.0, 6.0, "lean"),                 # under the default → keep default
     (8.0, 6.0, "more conservative"),    # over the default → tighten
@@ -652,3 +675,17 @@ def test_render_python_json(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["origin"] == "macOS system"
     assert payload[0]["ai_libs"] == {"torch": "2.1.0"}
+
+
+def test_render_python_groups_consecutive_same_origin(make_console, monkeypatch):
+    # two Homebrew interpreters in a row → the origin header prints once, not twice.
+    ints = [
+        _interp(path="/opt/homebrew/bin/python3.12", origin="Homebrew", version="3.12.4"),
+        _interp(path="/opt/homebrew/bin/python3.11", origin="Homebrew", version="3.11.9"),
+    ]
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
+    c, buf = make_console()
+    cli.render_python(c)
+    out = buf.getvalue()
+    assert out.count("  Homebrew\n") == 1   # header emitted once for the group
+    assert "3.12.4" in out and "3.11.9" in out

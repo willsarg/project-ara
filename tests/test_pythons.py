@@ -7,6 +7,13 @@ import ara.pythons as pythons
 from ara.pythons import Interpreter
 
 
+def _raise(exc=RuntimeError("boom")):
+    """A callable that ignores its args and raises — for forcing except branches."""
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
 # --------------------------------------------------------------------------- #
 # version sort key
 # --------------------------------------------------------------------------- #
@@ -247,3 +254,29 @@ def test_discover_probe_false_skips_subprocess(monkeypatch):
     out = pythons.discover(probe=False)
     assert len(out) == 1
     assert out[0].version is None and out[0].ai_libs == {}
+
+
+# --------------------------------------------------------------------------- #
+# defensive guards — python is fickle; bad input must degrade, not crash
+# --------------------------------------------------------------------------- #
+def test_ver_desc_swallows_non_string_input():
+    # a non-str version (type says str|None, but reality leaks) → () not a crash
+    assert pythons._ver_desc(3.14) == ()
+
+
+def test_is_venv_false_when_path_raises(monkeypatch):
+    monkeypatch.setattr(pythons, "Path", _raise(OSError("symlink loop")))
+    assert pythons._is_venv("/x/bin/python") is False
+
+
+def test_candidates_swallows_per_entry_errors(tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    py = bindir / "python3"
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.setattr(pythons, "_known_patterns", lambda: [])
+    # realpath blows up on the one candidate → dropped silently, no crash
+    monkeypatch.setattr(pythons.os.path, "realpath", _raise(OSError("boom")))
+    assert pythons._candidates() == {}

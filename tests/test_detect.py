@@ -531,3 +531,22 @@ def test_python_version_live_against_real_interpreter():
     # No run_stub here: actually shells out to `<py> --version` and parses it.
     ver = detect._python_version(sys.executable)
     assert ver and ver[0].isdigit()
+
+
+# --------------------------------------------------------------------------- #
+# remaining branch corners
+# --------------------------------------------------------------------------- #
+def test_python_version_falls_back_when_unreadable(run_stub):
+    # py given but `<py> --version` yields nothing (run_stub → None) → platform fallback.
+    ver = detect._python_version("/usr/bin/python3")
+    assert ver and ver[0].isdigit()
+
+
+def test_dir_size_gb_missing_dir_is_zero(tmp_path):
+    assert detect._dir_size_gb(tmp_path / "nope") == 0.0
+
+
+def test_dir_size_gb_skips_subdirectories(tmp_path):
+    (tmp_path / "sub").mkdir()                 # not a file → skipped, loop continues
+    (tmp_path / "f").write_bytes(b"x" * 10)
+    assert detect._dir_size_gb(tmp_path) == 10 / detect.GB

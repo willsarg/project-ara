@@ -50,6 +50,8 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+# Full statement + branch coverage is the standing bar — new code lands with tests.
+fail_under = 100
 # The lazy `from wmx_suite import ...` lines inside apple.py only execute when a real
 # engine is present; the seam's behavior is covered via a fake wmx_suite instead.
 exclude_also = ["if TYPE_CHECKING:"]
