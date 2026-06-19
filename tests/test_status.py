@@ -31,6 +31,16 @@ def test_classify_matches(name, cmd, expected):
     assert _classify(name, cmd) == expected
 
 
+def test_classify_matches_by_name_only():
+    # name matches the rule but the cmdline doesn't → pins the `or` (not `and`).
+    assert _classify("ollama", "serve --port 11434") == "Ollama"
+
+
+def test_classify_python_ml_by_name_only():
+    # "python" appears in the process name but not the cmdline; an ML token is on cmd.
+    assert _classify("python3.12", "train.py --backend torch") == "Python ML"
+
+
 def test_classify_returns_none_for_unrelated():
     assert _classify("bash", "bash -c ls") is None
     assert _classify("python", "python manage.py runserver") is None
@@ -73,6 +83,11 @@ def test_detail_weights_path_fallback():
 
 def test_detail_none_when_no_hint():
     assert _detail(["python", "server.py"]) is None
+
+
+def test_detail_flag_as_last_token_is_safe():
+    # boundary: `--model` with nothing after it must not index past the end → no hint.
+    assert _detail(["llama-server", "--model"]) is None
 
 
 def test_detail_dash_m_collides_with_python_module_flag():

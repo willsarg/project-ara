@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Mutation testing (mutmut) — generated workspace + cache, never commit
+mutants/
+.mutmut-cache

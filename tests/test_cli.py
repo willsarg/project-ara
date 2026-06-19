@@ -43,6 +43,7 @@ def test_fmt_gb(v, dec, out):
 @pytest.mark.parametrize("gb,out", [
     (None, "size unknown"),
     (0.5, "~500 MB"),
+    (1.0, "~1.0 GB"),   # boundary: gb == 1 takes the GB branch (gb < 1 is exclusive)
     (2.5, "~2.5 GB"),
 ])
 def test_fmt_size(gb, out):
@@ -50,7 +51,11 @@ def test_fmt_size(gb, out):
 
 
 @pytest.mark.parametrize("secs,out", [
-    (5, "5s"), (59, "59s"), (90, "1m"), (3600, "1h"), (90000, "1d"),
+    (5, "5s"), (59, "59s"),
+    (60, "1m"),       # boundary: 60s rolls over to minutes (s < 60 is exclusive)
+    (90, "1m"), (3600, "1h"),
+    (86400, "1d"),    # boundary: 86400s rolls over to days (s < 86400 is exclusive)
+    (90000, "1d"),
 ])
 def test_fmt_uptime(secs, out):
     assert cli._fmt_uptime(secs) == out
@@ -58,6 +63,7 @@ def test_fmt_uptime(secs, out):
 
 @pytest.mark.parametrize("gb,out", [
     (0.5, "512 MB"),   # binary MB under a gigabyte
+    (1.0, "1.0 GB"),   # boundary: gb == 1 takes the GB branch (gb < 1 is exclusive)
     (2.0, "2.0 GB"),
 ])
 def test_fmt_mem(gb, out):
@@ -117,6 +123,13 @@ def test_main_profile_model_separate_value(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["profile", "--model", "org/repo"])
     assert rec["profile"]["model"] == "org/repo"
+
+
+def test_main_profile_model_flag_as_last_arg(monkeypatch):
+    # boundary: `--model` with no following value must yield None, not IndexError.
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["profile", "--model"]) == 0
+    assert rec["profile"]["model"] is None
 
 
 def test_main_profile_model_equals_form(monkeypatch):
@@ -223,6 +236,18 @@ def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     out = buf.getvalue()
     assert "RTX 4090" in out and "24 GB VRAM" in out and "SM 8.9" in out
     assert "interpreters on this machine" not in out  # count == 1 → no pointer line
+    assert "(x" not in out  # single GPU → no "(xN)" multiplicity suffix
+
+
+def test_render_detect_multi_gpu_shows_count(make_console, monkeypatch, stub_pythons):
+    stub_pythons(count=1)
+    m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2,
+                                   compute="8.9", cuda_version="550"))
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console()
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "(x2)" in out  # count > 1 → multiplicity shown
 
 
 def test_render_detect_cpu_without_features_and_no_python_version(
@@ -394,6 +419,17 @@ def test_profile_insufficient_disk(make_console, monkeypatch, set_platform):
     c, buf = make_console()
     assert cli.render_profile(c, assume_yes=True) == 1
     assert "not enough disk" in buf.getvalue()
+
+
+def test_profile_disk_exactly_at_threshold_proceeds(make_console, monkeypatch, set_platform):
+    # boundary: free == size + buffer is NOT "insufficient" (the check is strict <).
+    bk = FakeBackend(_limits(calibrated=False), cached=False)
+    _wire_profile(monkeypatch, set_platform, bk)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 10.0)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 10.0 + cli.acquire.DISK_BUFFER_GB)
+    c, buf = make_console()
+    assert cli.render_profile(c, assume_yes=True) == 0   # proceeds to calibrate, no disk error
+    assert "not enough disk" not in buf.getvalue()
 
 
 def test_profile_confirm_declined(make_console, monkeypatch, set_platform):

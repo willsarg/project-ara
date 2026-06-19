@@ -38,7 +38,7 @@ packages = ["ara"]
 # Test/dev tooling. The suite runs WITHOUT wmx-suite on purpose — it proves the
 # core stays engine-free — so it never needs the (Apple-only, path-sourced) engine.
 [dependency-groups]
-dev = ["pytest>=8", "pytest-cov>=5"]
+dev = ["pytest>=8", "pytest-cov>=5", "mutmut>=3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,3 +55,10 @@ fail_under = 100
 # The lazy `from wmx_suite import ...` lines inside apple.py only execute when a real
 # engine is present; the seam's behavior is covered via a fake wmx_suite instead.
 exclude_also = ["if TYPE_CHECKING:"]
+
+[tool.mutmut]
+source_paths = ["ara"]
+# Clear the project's addopts so --cov / fail_under=100 don't make every mutant
+# run exit non-zero (which would corrupt kill/survive detection).
+pytest_add_cli_args = ["-o", "addopts=", "-p", "no:cacheprovider"]
+also_copy = ["tests", "pyproject.toml", "uv.lock"]

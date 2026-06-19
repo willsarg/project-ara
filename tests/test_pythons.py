@@ -103,7 +103,7 @@ def test_is_venv_true_and_false(tmp_path):
 def test_user_default_real_strips_venv(monkeypatch):
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
     monkeypatch.setenv("VIRTUAL_ENV", "/venv")
-    monkeypatch.setattr(pythons.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr(pythons.os.path, "realpath", lambda p, *a, **k: p)
     seen = {}
 
     def fake_which(name, path=None):
@@ -277,6 +277,14 @@ def test_candidates_swallows_per_entry_errors(tmp_path, monkeypatch):
     py.chmod(0o755)
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.setattr(pythons, "_known_patterns", lambda: [])
-    # realpath blows up on the one candidate → dropped silently, no crash
-    monkeypatch.setattr(pythons.os.path, "realpath", _raise(OSError("boom")))
+    # realpath blows up on our candidate specifically (scoped so we don't break
+    # unrelated path resolution) → the entry is dropped silently, no crash.
+    real_realpath = pythons.os.path.realpath
+
+    def boom_on_candidate(p, *a, **k):
+        if str(p) == str(py):
+            raise OSError("boom")
+        return real_realpath(p, *a, **k)
+
+    monkeypatch.setattr(pythons.os.path, "realpath", boom_on_candidate)
     assert pythons._candidates() == {}

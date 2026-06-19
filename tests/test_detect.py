@@ -228,6 +228,21 @@ def test_runtimes_usability_and_kind_split(monkeypatch, fake_home):
     assert rts["MLX"].requires is None
 
 
+def test_runtimes_detected_via_second_or_signal(monkeypatch, fake_home):
+    # Each engine is detectable via either of two signals; here only the SECOND is
+    # present, pinning the `or` (an `and` mutation would drop them).
+    monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
+    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
+    present = {"llama-server", "vllm"}   # llama-cli absent / llama-server present; vllm via CLI
+    monkeypatch.setattr("shutil.which", lambda n, path=None: f"/x/{n}" if n in present else None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: object() if n == "mlx_lm" else None)
+
+    rts = {rt.name: rt for rt in detect.runtimes("apple")}
+    assert rts["llama.cpp"].present is True   # via llama-server (2nd operand of the or)
+    assert rts["vLLM"].present is True         # via the vllm CLI (2nd operand)
+    assert rts["MLX"].present is True          # via find_spec("mlx_lm") (2nd operand)
+
+
 def test_runtimes_mlx_falls_back_to_ara_env(monkeypatch, fake_home):
     # The user's python has no mlx-lm, but ARA bundles the MLX engine → still present.
     monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
@@ -253,8 +268,12 @@ def test_runtime_requires_property():
 # model store inventories
 # --------------------------------------------------------------------------- #
 def _write(path, nbytes=1024):
+    # Sparse file: stat().st_size reports nbytes, but no blocks are actually written,
+    # so "1 GiB" inventory fixtures cost ~nothing on disk (and don't fill it under
+    # repeated runs like mutation testing).
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\0" * nbytes)
+    with open(path, "wb") as f:
+        f.truncate(nbytes)
 
 
 def test_hf_inventory_counts_blobs(fake_home):
@@ -280,6 +299,15 @@ def test_ollama_inventory(fake_home):
     assert store.name == "Ollama" and store.present is True
     assert store.count == 1
     assert store.size_gb == 1.0
+
+
+def test_scan_weight_store_depth_equals_path_length(fake_home, tmp_path):
+    # boundary: a weight file whose path depth == group_depth still forms a group
+    # (the check is >=, not >). rel = ("pub", "model.gguf") has length 2 at depth 2.
+    base = tmp_path / "store"
+    _write(base / "pub" / "model.gguf", detect.GB)
+    store = detect._scan_weight_store("S", [base], group_depth=2)
+    assert store.count == 1
 
 
 def test_scan_weight_store_depth_two_groups_by_publisher_repo(fake_home, tmp_path):
@@ -378,7 +406,7 @@ def test_user_python_strips_venv_bin(monkeypatch):
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
     monkeypatch.setenv("VIRTUAL_ENV", "/venv")
     monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
-    monkeypatch.setattr(detect.os.path, "realpath", lambda p: p)  # identity
+    monkeypatch.setattr(detect.os.path, "realpath", lambda p, *a, **k: p)  # identity
     seen = {}
 
     def fake_which(name, path=None):
@@ -395,7 +423,7 @@ def test_user_python_none_when_resolves_back_to_ara(monkeypatch):
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
-    monkeypatch.setattr(detect.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr(detect.os.path, "realpath", lambda p, *a, **k: p)
     monkeypatch.setattr("shutil.which", lambda name, path=None: "/venv/bin/python3")
     assert detect._user_python() is None
 
