@@ -378,14 +378,16 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
             last_cat = app.category
         name = f"{app.label} {app.version}".strip() if app.version else app.label
         auto = defers.get(app.cask_token)            # True / False / None(unknown)
-        missing_auto = bool(app.cask and defers and not auto)
-        problem = app.duplicate or missing_auto
+        # The real problem = the app self-updated outside brew (drift) AND brew has no
+        # auto_updates to account for it. Omitting auto_updates alone is fine — an app
+        # that updates THROUGH brew (e.g. Claude Code) correctly omits it and won't drift.
+        clueless = bool(app.drift and not auto)
+        problem = app.duplicate or clueless
         gloss = app.source
-        if missing_auto:
-            gloss += "  ⚠ cask omits auto_updates"
-            if app.drift:
-                gloss += f" — self-updated past brew (records {app.brew_recorded})"
-        elif app.drift:  # auto_updates is declared, so the version moving is expected
+        if clueless:
+            gloss += (f"  ⚠ self-updated past brew (records {app.brew_recorded}); "
+                      f"no auto_updates, so brew upgrade will clobber it")
+        elif app.drift:  # auto_updates declared → expected, brew won't fight it
             gloss += f"  · self-updates; brew defers (records {app.brew_recorded})"
         if app.duplicate:
             gloss += "  ⚠ likely duplicate"
@@ -393,8 +395,8 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
     c.emit()
     c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
                             "so cask + app is one install, not a duplicate."))
-    c.emit(c.style("gloss", "  ⚠ cask omits auto_updates = brew manages its version, so a "
-                            "brew upgrade can overwrite the app's own self-update."))
+    c.emit(c.style("gloss", "  ⚠ = the app self-updated past Homebrew's record and the cask "
+                            "has no auto_updates, so brew upgrade can clobber it."))
     c.emit()
 
 
