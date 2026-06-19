@@ -414,6 +414,52 @@ def test_main_profile_passes_engine(monkeypatch):
     assert rec["profile"]["engine"] == "wmx"
 
 
+# --- persistence wiring: overlay a stored calibration / persist a fresh one ---
+def test_overlay_stored_calibration_applies(store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    cli.profiles.save_calibration(store, "wmx", fixed_overhead_gb=5.5,
+                                  calibrated_at="2026-06-18T09:30:00Z")
+    m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
+    cli._overlay_stored_calibration(m, "wmx")
+    assert m["overhead_gb"] == 5.5 and m["calibrated"] is True
+    assert m["calibrated_at"] == "2026-06-18"
+
+
+def test_overlay_no_stored_leaves_limits(store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
+    cli._overlay_stored_calibration(m, "wmx")     # nothing stored
+    assert m["calibrated"] is False
+
+
+def test_overlay_none_engine_key_is_noop():
+    m = {"overhead_gb": None, "calibrated": False}
+    cli._overlay_stored_calibration(m, None)
+    assert m["calibrated"] is False
+
+
+def test_persist_saves_overhead(store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    cli._persist_calibration({"overhead_gb": 1.2}, "wmx")
+    assert cli.profiles.get_calibration(store, "wmx")["fixed_overhead_gb"] == 1.2
+
+
+def test_persist_saves_characterization_and_catalogs(store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    seen = {}
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, mid: seen.setdefault("model", mid))
+    m = {"overhead_gb": None,
+         "characterization": {"model": "smol", "safe_context": 16000, "points": [[512, 1.4]]}}
+    cli._persist_calibration(m, "wcx")
+    row = cli.db.get_characterization(store, "mkey", "wcx", "smol")
+    assert row["safe_context"] == 16000 and seen["model"] == "smol"
+
+
+def test_persist_none_engine_key_is_noop(store):
+    cli._persist_calibration({"overhead_gb": 1.0}, None)
+    assert cli.db.get_machine(store, "any", "wmx") is None
+
+
 def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):
     bk = FakeBackend(_limits())
     bk.safe_limits_exc = RuntimeError("sysctl exploded")

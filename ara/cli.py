@@ -12,7 +12,8 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import acquire, apps, detect, engines, mlx, pythons, status, versions
+from ara import (acquire, apps, catalog, db, detect, engines, mlx, profiles,
+                 pythons, status, versions)
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -698,6 +699,32 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
     return 0 if result.status in ("removed", "absent") else 1
 
 
+def _overlay_stored_calibration(m: dict, engine_key: str | None) -> None:
+    """Reuse ARA's stored overhead for this machine+engine, if any. ARA owns this record
+    now — so a machine calibrated once shows as calibrated without re-measuring."""
+    if engine_key is None:
+        return
+    stored = profiles.get_calibration(db.connect(), engine_key)
+    if stored and stored.get("fixed_overhead_gb") is not None:
+        m["overhead_gb"] = stored["fixed_overhead_gb"]
+        m["calibrated"] = True
+        m["calibrated_at"] = (stored.get("calibrated_at") or "")[:10] or None
+
+
+def _persist_calibration(m: dict, engine_key: str | None) -> None:
+    """Remember what the engine just measured: an overhead and/or a characterization."""
+    if engine_key is None:
+        return
+    con = db.connect()
+    if m.get("overhead_gb") is not None:
+        profiles.save_calibration(con, engine_key, fixed_overhead_gb=m["overhead_gb"])
+    ch = m.get("characterization")
+    if ch and ch.get("safe_context") is not None:
+        db.save_characterization(con, profiles.machine_key(), engine_key, ch["model"],
+                                 safe_context=ch["safe_context"], points=ch["points"])
+        catalog.remember(con, ch["model"])
+
+
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
                    assume_yes: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
@@ -723,6 +750,9 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
     except Exception as exc:
         c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
+
+    engine_key = engines.for_backend(backend)
+    _overlay_stored_calibration(m, engine_key)   # reuse a stored measurement if we have one
 
     if as_json:
         print(json.dumps(m, indent=2))
@@ -783,6 +813,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         c.emit(c.style("bad", f"  calibration failed: {exc}"))
         return 1
 
+    _persist_calibration(m, engine_key)   # ARA remembers it, so next run is cached
     c.emit(c.style("good", "  calibrated."))
     _emit_calibration(c, m, model)
     _emit_limits(c, m)

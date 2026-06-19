@@ -34,6 +34,12 @@ def _clear_version_caches():
 # --------------------------------------------------------------------------- #
 # console capture
 # --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _isolate_db(tmp_path_factory, monkeypatch):
+    """Point ARA's store at a throwaway db for EVERY test — never the real ~/.ara."""
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path_factory.mktemp("aradb") / "ara.db"))
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     """A fresh on-disk ARA db in a tmp dir (via the ARA_DB_PATH override)."""
