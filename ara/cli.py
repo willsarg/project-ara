@@ -273,12 +273,15 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
     c.emit()
     c.emit(c.section("  PYTHON INTERPRETERS"))
     sub = " " * 13  # aligns continuation lines under the path column
-    with_ai = managed = 0
+    with_ai = 0
     last_origin = None
     for i in ints:
-        if i.origin != last_origin:          # group header per origin
+        if i.origin != last_origin:          # group header per origin (caution is group-level)
             c.emit()
-            c.emit(c.style("accent", f"  {i.origin}"))
+            head = c.style("accent", f"  {i.origin}")
+            if i.caution:
+                head += c.style("warn", f"   ⚠ {i.caution}")
+            c.emit(head)
             last_origin = i.origin
         mark = c.style("good", "●") if i.is_default else " "
         c.emit(f"  {mark} " + c.style("metric", f"{i.version or '?':8} ") + _tilde(i.path))
@@ -292,14 +295,12 @@ def render_python(c: Console, *, as_json: bool = False) -> None:
             c.emit(sub + c.style("good", " · ".join(f"{k} {v}" for k, v in present.items())))
         else:
             c.emit(sub + c.style("dim", "no AI libraries"))
-        if i.caution:
-            managed += 1
-            c.emit(sub + c.style("warn", f"⚠ {i.caution}"))
 
     c.emit()
+    managed = sum(1 for i in ints if i.caution)
     summary = f"  {len(ints)} interpreters · {with_ai} with AI libraries"
     if managed:
-        summary += f" · {managed} you shouldn't install into"
+        summary += f" · {managed} managed (install into a venv, not the interpreter)"
     c.emit(c.style("dim", summary))
     c.emit(c.style("dim", "  ") + c.style("good", "●") + c.style("dim", " = your default python3"))
     c.emit()

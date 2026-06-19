@@ -66,15 +66,15 @@ class Interpreter:
         if self.origin == "macOS system":
             return _CAUTION["macOS system"]
         if self.externally_managed:
-            return _CAUTION.get(self.origin,
-                                "externally managed — install into a venv, not directly")
+            return _CAUTION.get(self.origin, "externally managed — use a venv, not here")
         return None
 
 
+# All share one rule — "use a venv, not here" — with a truthful per-manager tail.
 _CAUTION = {
-    "macOS system": "Apple-managed — don't install into or upgrade it; make a venv instead",
-    "Homebrew": "externally managed — use a venv or pipx, not pip here; upgrade via brew",
-    "uv": "uv-managed — let uv handle versions/packages, or use a venv",
+    "macOS system": "managed by Apple — use a venv, never here; don't upgrade it",
+    "Homebrew": "managed by Homebrew — use a venv or pipx, not here; upgrade via brew",
+    "uv": "managed by uv — packages go in a venv (uv add), not here; uv may replace it",
 }
 
 
