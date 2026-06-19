@@ -722,7 +722,8 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     for r in rows:
         name = r["model_id"].split("/")[-1]
         ceiling = f"~{r['safe_context']} tokens" if r["safe_context"] else "—"
-        c.emit(c.field(name, ceiling, "safe context ceiling"))
+        c.emit("  " + c.style("metric", name) + c.style("dim", "  →  ")
+               + c.style("good", ceiling) + c.style("dim", "  safe context ceiling"))
     c.emit()
 
 
