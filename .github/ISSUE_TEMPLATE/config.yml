@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/willsarg/project-ara/blob/main/CONTRIBUTING.md
+    about: Setup, conventions, the read-only/advisory rules, and how to land a change.
+  - name: Security report (private)
+    url: https://github.com/willsarg/project-ara/security
+    about: Please report vulnerabilities privately, not as a public issue.

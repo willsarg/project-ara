@@ -1,0 +1,47 @@
+name: "🐞 Bug report"
+description: Something didn't behave as expected — wrong detection, a crash, or bad output.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! ARA is recon-first, so the most useful thing is the **exact
+        command and its output** (use `--json` if the text rendering is the issue), plus what
+        you expected instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what actually occurred?
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command + output
+      description: The exact `uv run ara ...` command and its output (`--json` welcome).
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Chip / OS (the top of `ara detect` is perfect), e.g. "Apple M4 Pro, macOS 15.7".
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: ARA + Python + uv versions
+      description: Commit/version of ARA, `python3 --version`, `uv --version`.
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, screenshots, or context that might help.
+    validations:
+      required: false

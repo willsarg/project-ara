@@ -1,0 +1,38 @@
+name: "✨ Feature request"
+description: Suggest a command, recon coverage, a backend, or an improvement.
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas welcome — especially **recon coverage** (a tool/app/model store/interpreter ARA
+        doesn't know about), **new backends** (e.g. CUDA), or sharper readouts. Please keep
+        ARA's boundaries in mind ([AGENTS.md](https://github.com/willsarg/project-ara/blob/main/AGENTS.md)):
+        recon is read-only, `profile` is consent-gated, and ARA stays advisory.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - New command
+        - Recon coverage (tool / app / model store / interpreter)
+        - New backend (e.g. CUDA)
+        - Output / UX
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem / what's missing
+      description: What can't you do today, or what does ARA get wrong or fail to surface?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should ARA do? If it's coverage, how would ARA detect it reliably?
+    validations:
+      required: false

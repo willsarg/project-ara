@@ -220,3 +220,6 @@ __marimo__/
 # Mutation testing (mutmut) — generated workspace + cache, never commit
 mutants/
 .mutmut-cache
+
+# Claude Code local agent workspace (not part of the project)
+.claude/
