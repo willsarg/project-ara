@@ -211,7 +211,8 @@ class Accelerator:
     count: int = 1             # number of GPUs
     cores: int | None = None   # GPU core count (Apple)
     compute: str | None = None # NVIDIA compute capability, e.g. "7.5"
-    cuda_version: str | None = None
+    cuda_version: str | None = None   # max CUDA the driver supports, e.g. "13.1"
+    driver_version: str | None = None # NVIDIA driver version, e.g. "591.86"
 
 
 def _apple_gpu_cores() -> int | None:
@@ -227,6 +228,19 @@ def _apple_gpu_cores() -> int | None:
     return None
 
 
+def _nvidia_cuda_version(smi: str) -> str | None:
+    """Max CUDA runtime the driver supports, from the nvidia-smi header.
+
+    ``--query-gpu`` exposes no CUDA-version field — it appears only in the table
+    header as ``CUDA Version: 13.1``. This is distinct from the driver version.
+    """
+    out = _run([smi])
+    if not out:
+        return None
+    m = re.search(r"CUDA Version:\s*([0-9.]+)", out)
+    return m.group(1) if m else None
+
+
 def accelerator(chip: str) -> Accelerator:
     """Identify the GPU from what the system already reports — no probing."""
     smi = shutil.which("nvidia-smi")
@@ -239,7 +253,8 @@ def accelerator(chip: str) -> Accelerator:
                 name, mem_mib, cc, drv = (x.strip() for x in lines[0].split(","))
                 return Accelerator(
                     "nvidia", name, round(float(mem_mib) / 1024, 1), "CUDA",
-                    count=len(lines), compute=cc or None, cuda_version=drv or None,
+                    count=len(lines), compute=cc or None,
+                    cuda_version=_nvidia_cuda_version(smi), driver_version=drv or None,
                 )
             except Exception:
                 pass

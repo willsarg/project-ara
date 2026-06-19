@@ -232,12 +232,13 @@ def test_render_detect_text(make_console, monkeypatch, stub_pythons):
 def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1,
-                                   compute="8.9", cuda_version="550"))
+                                   compute="8.9", cuda_version="12.4", driver_version="550.00"))
     monkeypatch.setattr(cli.detect, "profile", lambda: m)
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
     assert "RTX 4090" in out and "24 GB VRAM" in out and "SM 8.9" in out
+    assert "CUDA 12.4" in out and "driver 550.00" in out
     assert "interpreters on this machine" not in out  # count == 1 → no pointer line
     assert "(x" not in out  # single GPU → no "(xN)" multiplicity suffix
 

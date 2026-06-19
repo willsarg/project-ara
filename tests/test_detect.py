@@ -124,7 +124,9 @@ def test_cpu_features_x86_from_proc_cpuinfo(set_platform, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_accelerator_nvidia_single(monkeypatch, run_stub):
     monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
-    run_stub.add("nvidia-smi", "NVIDIA GeForce RTX 4090, 24576, 8.9, 550.00\n")
+    # the --query-gpu CSV carries the driver version; CUDA lives only in the header.
+    run_stub.add("--query-gpu", "NVIDIA GeForce RTX 4090, 24576, 8.9, 550.00\n")
+    run_stub.add("nvidia-smi", "| NVIDIA-SMI 550.00   Driver Version: 550.00   CUDA Version: 12.4 |\n")
     a = accelerator("ignored")
     assert a.kind == "nvidia"
     assert a.name == "NVIDIA GeForce RTX 4090"
@@ -132,14 +134,28 @@ def test_accelerator_nvidia_single(monkeypatch, run_stub):
     assert a.api == "CUDA"
     assert a.count == 1
     assert a.compute == "8.9"
-    assert a.cuda_version == "550.00"
+    assert a.cuda_version == "12.4"      # parsed from the header, not the driver
+    assert a.driver_version == "550.00"
 
 
 def test_accelerator_nvidia_multi_gpu(monkeypatch, run_stub):
     monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    # one stub serves both calls; the header (here just the CSV) has no CUDA line.
     run_stub.add("nvidia-smi", "A100, 81920, 8.0, 535\nA100, 81920, 8.0, 535\n")
     a = accelerator("ignored")
     assert a.kind == "nvidia" and a.count == 2
+    assert a.cuda_version is None        # no 'CUDA Version:' in the header → None
+    assert a.driver_version == "535"
+
+
+def test_accelerator_nvidia_no_header_cuda_version(monkeypatch, run_stub):
+    monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    # query succeeds but the bare-binary header call returns nothing.
+    run_stub.add("--query-gpu", "RTX 2070, 8192, 7.5, 591.86\n")
+    a = accelerator("ignored")
+    assert a.kind == "nvidia"
+    assert a.cuda_version is None
+    assert a.driver_version == "591.86"
 
 
 def test_accelerator_apple(monkeypatch, run_stub, set_platform):

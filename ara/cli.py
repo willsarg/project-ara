@@ -181,6 +181,8 @@ def _det_accelerator(c: Console, m) -> None:
             bits.append(f"SM {a.compute}")
         if a.cuda_version:
             bits.append(f"CUDA {a.cuda_version}")
+        if a.driver_version:
+            bits.append(f"driver {a.driver_version}")
         gloss = " · ".join(bits)
         name = f"{a.name}  (x{a.count})" if a.count > 1 else a.name
         c.emit(c.field("gpu", name, gloss))
