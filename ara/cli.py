@@ -699,14 +699,21 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
 
 
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
-                   assume_yes: bool = False, model: str | None = None) -> int:
+                   assume_yes: bool = False, model: str | None = None,
+                   engine: str | None = None) -> int:
     backend = detect.backend_name()
     if backend == "unsupported":
         c.emit(c.style("warn", "  profiling needs an ARA backend — none for this hardware yet."))
         return 1
-    engine_ok, engine = engine_status()
+    engine_ok, engine_pkg = engine_status()
     if not engine_ok:
-        c.emit(c.style("warn", f"  the {engine} engine isn't installed here — run: ")
+        # --engine is consent to install. We can't import a just-installed package
+        # in this process, so install then ask for a re-run rather than fake it.
+        if engine is not None:
+            if render_install(c, engine=engine) == 0:
+                c.emit(c.style("accent", "  re-run ara profile") + c.style("dim", " to measure"))
+            return 1
+        c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed here — run: ")
                + c.style("accent", "ara install"))
         return 1
 
@@ -860,7 +867,7 @@ def main() -> int:
 
     if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,
-                              assume_yes=assume_yes, model=model)
+                              assume_yes=assume_yes, model=model, engine=engine)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)

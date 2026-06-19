@@ -378,11 +378,40 @@ def test_profile_unsupported_backend(make_console, monkeypatch, set_platform):
 def test_profile_engine_not_installed(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
     c, buf = make_console()
-    assert cli.render_profile(c) == 1
+    assert cli.render_profile(c) == 1            # no --engine → report the gap
     out = buf.getvalue()
     assert "isn't installed" in out
     assert "ara install" in out      # the engine is installed on demand now,
     assert "uv sync" not in out      # not pulled in by `uv sync`
+
+
+def test_profile_engine_flag_installs_then_asks_rerun(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
+
+    def fake_install(c, *, engine, as_json=False):
+        c.emit("  installed wmx-suite")
+        return 0   # freshly installed — can't import it in THIS process
+
+    monkeypatch.setattr(cli, "render_install", fake_install)
+    c, buf = make_console()
+    assert cli.render_profile(c, engine="wmx") == 1   # not measured this run
+    out = buf.getvalue()
+    assert "installed wmx-suite" in out
+    assert "re-run ara profile" in out
+
+
+def test_profile_engine_flag_install_fails_no_rerun(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
+    monkeypatch.setattr(cli, "render_install", lambda c, *, engine, as_json=False: 1)
+    c, buf = make_console()
+    assert cli.render_profile(c, engine="wcx") == 1
+    assert "re-run ara profile" not in buf.getvalue()
+
+
+def test_main_profile_passes_engine(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["profile", "--engine", "wmx"])
+    assert rec["profile"]["engine"] == "wmx"
 
 
 def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):
