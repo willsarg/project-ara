@@ -90,11 +90,41 @@ def test_install_unknown_engine_reports_unknown():
 
 
 def test_install_unavailable_engine_is_coming_soon(monkeypatch):
+    monkeypatch.setitem(engines.ENGINES["wcx"], "available", False)   # force coming-soon
     called = []
     monkeypatch.setattr(engines, "_run_pip", lambda args: called.append(args) or (0, ""))
     r = engines.install("wcx")
     assert r.status == "coming_soon"
     assert called == []   # never shelled out for a not-yet-available engine
+
+
+def test_install_wcx_uses_cuda_extra_and_torch_backend(monkeypatch):
+    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    seen = {}
+
+    def fake_pip(args):
+        seen["args"] = args
+        return 0, "ok"
+
+    monkeypatch.setattr(engines, "_run_pip", fake_pip)
+    engines.install("wcx")
+    assert seen["args"] == ["install", "--torch-backend=auto",
+                            "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
+
+
+def test_install_wcx_local_source_is_editable_with_extra(monkeypatch):
+    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../wcx-suite")
+    seen = {}
+
+    def fake_pip(args):
+        seen["args"] = args
+        return 0, ""
+
+    monkeypatch.setattr(engines, "_run_pip", fake_pip)
+    engines.install("wcx")
+    assert seen["args"] == ["install", "--torch-backend=auto", "-e", "../wcx-suite[cuda]"]
 
 
 def test_install_already_present_is_noop(monkeypatch):

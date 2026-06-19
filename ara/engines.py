@@ -30,8 +30,12 @@ ENGINES: dict[str, dict] = {
         "backend": "cuda",
         "module": "wcx_suite",
         "package": "wcx-suite",
-        "available": False,  # coming soon — repo is a stub
+        "available": True,
         "spec": "git+https://github.com/willsarg/wcx-suite",
+        "extras": "cuda",                        # pulls torch + transformers
+        # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default
+        # PyPI torch on Windows/Linux is CPU-only).
+        "pip_args": ["--torch-backend=auto"],
     },
 }
 
@@ -81,12 +85,22 @@ class InstallResult:
     detail: str = ""
 
 
-def _install_args(source: str) -> list[str]:
-    """uv-pip args for installing *source*. A local path → editable (``-e``) for dev;
-    a git/remote spec → a plain install."""
+def _install_args(key: str, source: str) -> list[str]:
+    """uv-pip args for installing engine *key* from *source*.
+
+    A local path installs editable (``-e``) for dev; a git/remote spec installs plainly.
+    An engine's ``extras`` (e.g. wcx's ``[cuda]``) and any ``pip_args`` (e.g.
+    ``--torch-backend=auto`` to fetch the right CUDA torch wheel) are folded in.
+    """
+    engine = ENGINES[key]
+    pip_args = list(engine.get("pip_args", []))
+    extras = engine.get("extras")
+    suffix = f"[{extras}]" if extras else ""
     if source.startswith(("git+", "http://", "https://")):
-        return ["install", source]
-    return ["install", "-e", source]
+        # PEP 508 direct reference: ``name[extra] @ git+url``
+        target = f"{engine['package']}{suffix} @ {source}" if extras else source
+        return ["install", *pip_args, target]
+    return ["install", *pip_args, "-e", f"{source}{suffix}"]
 
 
 def _run_pip(args: list[str]) -> tuple[int, str]:
@@ -109,7 +123,7 @@ def install(key: str) -> InstallResult:
         return InstallResult(key, "coming_soon", f"{engine['module']} isn't available yet")
     if is_installed(key):
         return InstallResult(key, "already")
-    rc, out = _run_pip(_install_args(source_for(key)))
+    rc, out = _run_pip(_install_args(key, source_for(key)))
     return InstallResult(key, "installed" if rc == 0 else "failed", out)
 
 

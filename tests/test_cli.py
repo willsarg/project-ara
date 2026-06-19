@@ -441,6 +441,19 @@ def test_profile_cached_early_return(make_console, monkeypatch, set_platform):
     assert "cached" in out and "--recalibrate" in out
 
 
+def test_profile_calibrated_without_overhead_skips_recalibrate_hint(
+        make_console, monkeypatch, set_platform):
+    # The cuda case: the VRAM wall is exact (calibrated) but there's no measured
+    # cold-start overhead to redo — so no "recalibrate" hint, just the limits.
+    bk = FakeBackend(_limits(calibrated=True, overhead_gb=None))
+    _wire_profile(monkeypatch, set_platform, bk)
+    c, buf = make_console()
+    assert cli.render_profile(c) == 0
+    out = buf.getvalue()
+    assert "SAFE LIMITS" in out
+    assert "--recalibrate" not in out
+
+
 def test_profile_non_interactive_estimated(make_console, monkeypatch, set_platform):
     bk = FakeBackend(_limits(calibrated=False))
     _wire_profile(monkeypatch, set_platform, bk, isatty=False)

@@ -36,7 +36,8 @@ def backend_name() -> str:
     """
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "apple"
-    # later: NVIDIA detection -> "cuda"
+    if shutil.which("nvidia-smi"):       # any NVIDIA GPU with the driver installed
+        return "cuda"
     return "unsupported"
 
 

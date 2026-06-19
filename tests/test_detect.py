@@ -29,13 +29,21 @@ def test_backend_name_apple(set_platform):
     assert backend_name() == "apple"
 
 
-def test_backend_name_unsupported_on_linux(set_platform):
+def test_backend_name_cuda_on_nvidia(set_platform, monkeypatch):
     set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    assert backend_name() == "cuda"
+
+
+def test_backend_name_unsupported_on_linux(set_platform, monkeypatch):
+    set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n: None)   # no nvidia-smi
     assert backend_name() == "unsupported"
 
 
-def test_backend_name_unsupported_on_intel_mac(set_platform):
+def test_backend_name_unsupported_on_intel_mac(set_platform, monkeypatch):
     set_platform("Darwin", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n: None)
     assert backend_name() == "unsupported"
 
 

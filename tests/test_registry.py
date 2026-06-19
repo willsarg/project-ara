@@ -12,9 +12,17 @@ def test_get_backend_returns_apple_module(set_platform):
     assert mod.__name__ == "ara.backends.apple"
 
 
-def test_get_backend_unsupported_raises_import(set_platform):
+def test_get_backend_returns_cuda_module(set_platform, monkeypatch):
+    set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    mod = registry.get_backend()
+    assert mod.__name__ == "ara.backends.cuda"
+
+
+def test_get_backend_unsupported_raises_import(set_platform, monkeypatch):
     # Non-Apple, non-CUDA → backend_name() == "unsupported", which has no module.
     set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n: None)   # no nvidia-smi
     try:
         registry.get_backend()
     except ModuleNotFoundError as exc:

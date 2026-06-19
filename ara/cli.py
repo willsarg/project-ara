@@ -737,8 +737,11 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
 
     # Calibration is opt-in: offered only when it'd help, and only interactively.
     if m["calibrated"] and not recalibrate and not explicit_model:
-        c.emit(c.style("dim", "  cached — ") + c.style("accent", "ara profile --recalibrate")
-               + c.style("dim", " to re-measure"))
+        # Offer a re-measure only when there's a measured overhead to redo. An exactly-read
+        # wall (e.g. CUDA VRAM) is calibrated with nothing to recalibrate.
+        if m["overhead_gb"] is not None:
+            c.emit(c.style("dim", "  cached — ") + c.style("accent", "ara profile --recalibrate")
+                   + c.style("dim", " to re-measure"))
         c.emit()
         return 0
 
