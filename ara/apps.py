@@ -80,12 +80,20 @@ class App:
     in_app: bool        # a .app bundle is present in an Applications folder
     cask: bool          # installed as a Homebrew cask (which IS how its .app got there)
     formula: bool       # installed as a Homebrew formula (CLI)
-    version: str | None = None
-    installed_at: float | None = None   # epoch mtime/birthtime, for "recently installed"
+    version: str | None = None          # what's actually installed (.app plist for GUIs)
+    brew_recorded: str | None = None     # Homebrew's receipt version, when it manages this
+    installed_at: float | None = None    # epoch mtime/birthtime, for "recently installed"
 
     @property
     def homebrew(self) -> bool:
         return self.cask or self.formula
+
+    @property
+    def drift(self) -> bool:
+        """A cask GUI app whose installed (.app) version has self-updated past Homebrew's
+        frozen receipt — so `brew` no longer reflects reality (and `brew upgrade` may clobber)."""
+        return bool(self.cask and self.brew_recorded and self.version
+                    and self.version != self.brew_recorded)
 
     @property
     def duplicate(self) -> bool:
@@ -138,16 +146,23 @@ def scan() -> list[App]:
     out: list[App] = []
     for label, category, bundles, tokens in CATALOG:
         in_app, app_ver = versions.find_app(bundles)
+        cask_ver = next((casks[t] for t in tokens if casks.get(t)), None)
+        formula_ver = next((formulae[t] for t in tokens if formulae.get(t)), None)
         cask = any(t in casks for t in tokens)
         formula = any(t in formulae for t in tokens)
         if not (in_app or cask or formula):
             continue
-        # Prefer the brew-tracked version when Homebrew manages it (matches the source
-        # label); fall back to the .app's own Info.plist version for manual installs.
-        version = (next((casks[t] for t in tokens if casks.get(t)), None)
-                   or next((formulae[t] for t in tokens if formulae.get(t)), None)
-                   or app_ver)
+        # The installed truth is the .app's own version; show that. For a cask we also keep
+        # brew's receipt so we can flag self-update drift. A formula (CLI) has no .app, so
+        # its brew version IS the truth.
+        if cask:
+            version, brew_recorded = (app_ver or cask_ver), cask_ver
+        elif formula:
+            version, brew_recorded = formula_ver, None
+        else:  # hand-installed .app
+            version, brew_recorded = app_ver, None
         out.append(App(label, category, in_app=in_app, cask=cask, formula=formula,
-                       version=version, installed_at=_install_time(bundles, tokens, in_app)))
+                       version=version, brew_recorded=brew_recorded,
+                       installed_at=_install_time(bundles, tokens, in_app)))
     out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
     return out

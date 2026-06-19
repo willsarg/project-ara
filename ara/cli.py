@@ -352,7 +352,8 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
     if as_json:
         print(json.dumps([{
             "label": a.label, "category": a.category, "version": a.version,
-            "source": a.source, "duplicate": a.duplicate,
+            "source": a.source, "duplicate": a.duplicate, "drift": a.drift,
+            "brew_recorded": a.brew_recorded,
             "in_app": a.in_app, "cask": a.cask, "formula": a.formula,
             "installed_at": a.installed_at,
         } for a in inventory], indent=2))
@@ -372,8 +373,13 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
             c.emit(c.style("accent", f"  {apps.CATEGORY_LABEL[app.category]}"))
             last_cat = app.category
         name = f"{app.label} {app.version}".strip() if app.version else app.label
-        gloss = app.source + ("   ⚠ likely duplicate" if app.duplicate else "")
-        c.emit(c.field("·", name, gloss, value_role="warn" if app.duplicate else "good"))
+        gloss = app.source
+        if app.drift:
+            gloss += f"  ⚠ self-updated past brew (records {app.brew_recorded})"
+        if app.duplicate:
+            gloss += "  ⚠ likely duplicate"
+        c.emit(c.field("·", name, gloss,
+                       value_role="warn" if (app.drift or app.duplicate) else "good"))
     c.emit()
     c.emit(c.style("gloss", "  curated catalog; a Homebrew cask installs the .app, "
                             "so cask + app is one install, not a duplicate."))
