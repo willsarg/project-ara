@@ -379,7 +379,10 @@ def test_profile_engine_not_installed(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
     c, buf = make_console()
     assert cli.render_profile(c) == 1
-    assert "isn't installed" in buf.getvalue()
+    out = buf.getvalue()
+    assert "isn't installed" in out
+    assert "ara install" in out      # the engine is installed on demand now,
+    assert "uv sync" not in out      # not pulled in by `uv sync`
 
 
 def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):

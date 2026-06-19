@@ -707,7 +707,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
     engine_ok, engine = engine_status()
     if not engine_ok:
         c.emit(c.style("warn", f"  the {engine} engine isn't installed here — run: ")
-               + c.style("accent", "uv sync"))
+               + c.style("accent", "ara install"))
         return 1
 
     bk = get_backend()

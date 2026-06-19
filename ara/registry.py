@@ -7,8 +7,8 @@ never touches MLX — even if it somehow got installed.
 from __future__ import annotations
 
 import importlib
-from importlib.util import find_spec
 
+from ara import engines
 from ara.detect import backend_name
 
 
@@ -21,10 +21,12 @@ def get_backend():
 def engine_status() -> tuple[bool, str]:
     """Is the active backend's engine installed? Cheap — no import of it.
 
-    Returns ``(installed, engine_name)``. Uses ``find_spec`` so we can report
-    the engine without paying the cost of importing it (and pulling MLX).
+    Returns ``(installed, engine_name)``, both sourced from the engine table so
+    there's one place that maps hardware → engine. Uses ``find_spec`` under the
+    hood, so it never imports the engine (and never pulls MLX).
     """
     name = backend_name()
-    if name == "apple":
-        return find_spec("wmx_suite") is not None, "wmx-suite"
-    return False, name
+    key = next((k for k, e in engines.ENGINES.items() if e["backend"] == name), None)
+    if key is None:
+        return False, name
+    return engines.is_installed(key), engines.ENGINES[key]["package"]

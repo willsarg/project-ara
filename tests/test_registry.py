@@ -25,14 +25,14 @@ def test_get_backend_unsupported_raises_import(set_platform):
 
 def test_engine_status_apple_reports_wmx(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(registry, "find_spec", lambda name: object())
+    monkeypatch.setattr(registry.engines, "is_installed", lambda k: True)
     installed, name = registry.engine_status()
     assert installed is True and name == "wmx-suite"
 
 
 def test_engine_status_apple_missing_engine(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(registry, "find_spec", lambda name: None)
+    monkeypatch.setattr(registry.engines, "is_installed", lambda k: False)
     installed, name = registry.engine_status()
     assert installed is False and name == "wmx-suite"
 
@@ -45,6 +45,6 @@ def test_engine_status_non_apple(set_platform):
 
 def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(registry, "find_spec", lambda name: object())
+    monkeypatch.setattr(registry.engines, "find_spec", lambda name: object())
     registry.engine_status()
     assert "wmx_suite" not in sys.modules
