@@ -158,9 +158,11 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     c.emit()
 
     # Frameworks reflect the USER's own python, not ARA's bundled deps.
-    fw_gloss = f"  ({m.framework_python})" if m.framework_python \
-        else "  (no separate user python — ARA's env only)"
-    c.emit(c.section("  FRAMEWORKS") + c.style("dim", fw_gloss))
+    c.emit(c.section("  FRAMEWORKS"))
+    if m.framework_python:
+        c.emit(c.style("dim", f"  in your default python · {m.framework_python}"))
+    else:
+        c.emit(c.style("dim", "  no separate user python — ARA's env only"))
     for rt in frameworks:
         if rt.present:
             val = f"{rt.name} {rt.version}" if rt.version else rt.name
@@ -176,7 +178,7 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
         if others:
             top = others[0]
             libs = " · ".join(f"{k} {v}" for k, v in top.ai_present.items())
-            c.emit(c.style("dim", "  none in your default — found in another interpreter:"))
+            c.emit(c.style("dim", "  none here — found in another interpreter:"))
             c.emit("  " + c.style("good", f"{top.origin} {top.version or ''}".strip())
                    + "   " + c.style("accent", _tilde(top.path)))
             c.emit("       " + c.style("good", libs))
