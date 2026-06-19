@@ -50,6 +50,12 @@ def test_resolve_unknown_is_none():
     assert engines.resolve("nonsense") is None
 
 
+def test_for_backend_maps_backend_to_engine():
+    assert engines.for_backend("apple") == "wmx"
+    assert engines.for_backend("cuda") == "wcx"
+    assert engines.for_backend("unsupported") is None
+
+
 # --------------------------------------------------------------------------- #
 # is_installed() — is the engine's module importable? (cheap, no import)
 # --------------------------------------------------------------------------- #

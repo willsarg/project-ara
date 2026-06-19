@@ -26,7 +26,7 @@ def engine_status() -> tuple[bool, str]:
     hood, so it never imports the engine (and never pulls MLX).
     """
     name = backend_name()
-    key = next((k for k, e in engines.ENGINES.items() if e["backend"] == name), None)
+    key = engines.for_backend(name)
     if key is None:
         return False, name
     return engines.is_installed(key), engines.ENGINES[key]["package"]

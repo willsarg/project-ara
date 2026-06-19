@@ -20,7 +20,7 @@ from pathlib import Path
 
 import psutil
 
-from ara import apps as _apps, versions as _versions
+from ara import apps as _apps, engines as _engines, versions as _versions
 
 GB = 1024 ** 3
 
@@ -532,8 +532,9 @@ def profile() -> Machine:
     """Observe the host and choose a backend. Read-only — no engine import."""
     chip = chip_name()
     backend = backend_name()
-    engine = "wmx-suite" if backend == "apple" else backend
-    engine_ready = backend == "apple" and find_spec("wmx_suite") is not None
+    key = _engines.for_backend(backend)
+    engine = _engines.ENGINES[key]["package"] if key else backend
+    engine_ready = key is not None and _engines.is_installed(key)
     total, available = _memory_gb()
     physical, logical = _cpu_counts()
     accel = accelerator(chip)

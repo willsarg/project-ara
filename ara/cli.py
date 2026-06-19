@@ -305,7 +305,7 @@ def _det_ara(c: Console, m) -> None:
     ))
     c.emit(c.field(
         "engine", f"{m.engine} {'ready' if m.engine_ready else 'not installed'}",
-        None if m.engine_ready else ("install: uv sync" if m.supported else None),
+        None if m.engine_ready else ("install: ara install" if m.supported else None),
         value_role="good" if m.engine_ready else "warn",
     ))
     c.emit(c.field("hf cli",

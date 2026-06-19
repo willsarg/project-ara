@@ -53,6 +53,12 @@ def for_hardware() -> str | None:
     return None
 
 
+def for_backend(backend: str) -> str | None:
+    """The engine key whose backend matches *backend* (e.g. 'cuda' → 'wcx'), or None.
+    One place maps hardware backends to engines, shared by detect and the registry."""
+    return next((k for k, e in ENGINES.items() if e["backend"] == backend), None)
+
+
 def resolve(value: str) -> str | None:
     """Map an ``--engine`` value to a concrete engine key, or None if it doesn't
     name one. ``auto`` defers to :func:`for_hardware`; ``wmx``/``wcx`` pass through."""

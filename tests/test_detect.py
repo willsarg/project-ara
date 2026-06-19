@@ -398,7 +398,8 @@ def test_hf_token_absent(fake_home):
 def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)  # wmx_suite "not installed"
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)            # mlx_lm absent
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)  # engine absent
     run_stub.add("machdep.cpu.brand_string", "Apple M4 Pro\n")
 
     m = detect.profile()
@@ -418,7 +419,7 @@ def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
 def test_profile_engine_ready_when_spec_found(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: object())
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: True)
     m = detect.profile()
     assert m.engine_ready is True
 
