@@ -27,8 +27,18 @@ _AI_LIBS = ("torch", "transformers", "tensorflow", "jax", "mlx-lm", "vllm", "onn
 # A python executable name: python, python3, python3.12 — not python3-config etc.
 _PY_NAME = re.compile(r"^python(3(\.\d+)?)?$")
 
-_ORIGIN_ORDER = ["macOS system", "Homebrew", "python.org", "pyenv",
-                 "conda", "uv", "asdf", "venv", "other"]
+# Render order: freely-usable / user-managed first, then the tool-managed and
+# system interpreters you shouldn't install into (uv, Homebrew, macOS) clustered last.
+_ORIGIN_ORDER = ["python.org", "pyenv", "conda", "asdf", "venv", "other",
+                 "uv", "Homebrew", "macOS system"]
+
+
+def _ver_desc(v: str | None) -> tuple[int, ...]:
+    """Sort key putting newer versions first (3.14 before 3.9)."""
+    try:
+        return tuple(-int(x) for x in (v or "").split(".") if x.isdigit())
+    except Exception:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -226,9 +236,8 @@ def discover(probe: bool = True) -> list[Interpreter]:
             ai_libs=libs.get(real, {}),
         ))
 
-    out.sort(key=lambda i: (not i.is_default,
-                            _ORIGIN_ORDER.index(i.origin) if i.origin in _ORIGIN_ORDER else 99,
-                            i.version or "", i.path))
+    out.sort(key=lambda i: (_ORIGIN_ORDER.index(i.origin) if i.origin in _ORIGIN_ORDER else 99,
+                            not i.is_default, _ver_desc(i.version), i.path))
     return out
 
 
