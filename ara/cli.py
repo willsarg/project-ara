@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
-from ara import acquire, detect, status
+from ara import acquire, detect, pythons, status
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -63,6 +64,7 @@ def render_landing(c: Console) -> None:
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
+    c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
@@ -102,6 +104,9 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     if m.python_version:
         gloss = "your default python3" if m.framework_python else "ARA's python (no user env found)"
         c.emit(c.field("python", m.python_version, gloss))
+    n_py = pythons.count()
+    if n_py > 1:
+        c.emit(c.field("pythons", str(n_py), "interpreters on this machine — run: ara python"))
     c.emit()
 
     c.emit(c.section("  MEMORY"))
@@ -153,17 +158,38 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     c.emit()
 
     # Frameworks reflect the USER's own python, not ARA's bundled deps.
-    fw_gloss = f"  ({m.framework_python})" if m.framework_python \
-        else "  (no separate user python — ARA's env only)"
-    c.emit(c.section("  FRAMEWORKS") + c.style("dim", fw_gloss))
-    for rt in frameworks:
-        if rt.present:
-            val = f"{rt.name} {rt.version}" if rt.version else rt.name
-            c.emit(c.field("·", val, "found", value_role="good"))
-        elif c.verbose:
-            c.emit(c.field("·", rt.name, "not found", value_role="dim"))
-    if not any(rt.present for rt in frameworks) and not c.verbose:
-        c.emit(c.style("dim", "  none in this env"))
+    c.emit(c.section("  FRAMEWORKS"))
+    present_fw = [rt for rt in frameworks if rt.present]
+    default_py = m.framework_python or "ARA's env (no separate user python)"
+
+    if present_fw:
+        libs = " · ".join(f"{rt.name} {rt.version}".strip() for rt in present_fw)
+        c.emit(c.style("dim", "  Your default python has AI frameworks:"))
+        c.emit("      " + c.style("accent", default_py))
+        c.emit("      " + c.style("good", libs))
+    else:
+        c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
+        c.emit("      " + c.style("accent", default_py))
+        # An empty section is misleading when the stack actually lives in another
+        # interpreter — surface the richest one (probe paid only in this empty case).
+        others = sorted((i for i in pythons.discover() if i.ai_present and not i.is_default),
+                        key=lambda i: len(i.ai_present), reverse=True)
+        if others:
+            top = others[0]
+            libs = " · ".join(f"{k} {v}" for k, v in top.ai_present.items())
+            c.emit()
+            c.emit(c.style("dim", "  But you've got them in ")
+                   + c.style("good", f"{top.origin} {top.version or ''}".strip())
+                   + c.style("dim", ":"))
+            c.emit("      " + c.style("accent", _tilde(top.path)))
+            c.emit("      " + c.style("good", libs))
+            c.emit()
+            more = len(others) - 1
+            tail = f" ({more} more with AI libraries)" if more else ""
+            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara python")
+                   + c.style("dim", f" to see every interpreter{tail}."))
+        else:
+            c.emit(c.style("dim", "  None found in any interpreter on this machine."))
     c.emit()
 
     c.emit(c.section("  MODELS"))
@@ -247,6 +273,61 @@ def render_status(c: Console, *, as_json: bool = False) -> None:
     c.emit()
     c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
                    value_role="good"))
+    c.emit()
+
+
+# --------------------------------------------------------------------------- #
+# python (interpreter discovery — read-only; which pythons, which have AI libs)
+# --------------------------------------------------------------------------- #
+def _tilde(p: str) -> str:
+    home = str(Path.home())
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+def render_python(c: Console, *, as_json: bool = False) -> None:
+    ints = pythons.discover()
+
+    if as_json:
+        print(json.dumps([asdict(i) for i in ints], indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  PYTHON INTERPRETERS"))
+    sub = " " * 13  # aligns continuation lines under the path column
+    with_ai = 0
+    last_origin = None
+    for i in ints:
+        if i.origin != last_origin:          # group header per origin
+            c.emit()
+            c.emit(c.style("accent", f"  {i.origin}"))
+            last_origin = i.origin
+        mark = c.style("good", "●") if i.is_default else " "
+        c.emit(f"  {mark} " + c.style("metric", f"{i.version or '?':8} ") + _tilde(i.path))
+        # When the path you'd type is a symlink, show where it really lives — this is
+        # what explains the origin label and untangles symlink chains.
+        if _tilde(i.real) != _tilde(i.path):
+            c.emit(sub + c.style("dim", f"→ {_tilde(i.real)}"))
+        present = i.ai_present
+        if present:
+            with_ai += 1
+            c.emit(sub + c.style("good", " · ".join(f"{k} {v}" for k, v in present.items())))
+        else:
+            c.emit(sub + c.style("dim", "no AI libraries"))
+        if i.caution:
+            c.emit(sub + c.style("warn", f"⚠ {i.caution}"))
+
+    c.emit()
+    managed = sum(1 for i in ints if i.caution)
+    summary = f"  {len(ints)} interpreters · {with_ai} with AI libraries"
+    if managed:
+        summary += f" · {managed} managed (install into a venv, not the interpreter)"
+    c.emit(c.style("dim", summary))
+    c.emit(c.style("dim", "  ") + c.style("good", "●") + c.style("dim", " = your default python3"))
+    c.emit()
+    c.emit(c.style("gloss", "  how this was found: your PATH + standard install homes "
+                            "(Homebrew, python.org, pyenv, conda, uv, asdf, macOS)."))
+    c.emit(c.style("gloss", "  missing one? it's likely a virtualenv or a custom folder "
+                            "not on PATH — add its directory to PATH and re-run."))
     c.emit()
 
 
@@ -421,6 +502,10 @@ def main() -> int:
 
     if rest[0] == "status":
         render_status(c, as_json=as_json)
+        return 0
+
+    if rest[0] == "python":
+        render_python(c, as_json=as_json)
         return 0
 
     if rest[0] == "profile":
