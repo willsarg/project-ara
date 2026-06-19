@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
-from ara import acquire, detect, status
+from ara import acquire, detect, pythons, status
 from ara.registry import engine_status, get_backend
 from ara.ui import Console
 
@@ -63,6 +64,7 @@ def render_landing(c: Console) -> None:
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
+    c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
     c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
@@ -102,6 +104,9 @@ def render_detect(c: Console, *, as_json: bool = False) -> None:
     if m.python_version:
         gloss = "your default python3" if m.framework_python else "ARA's python (no user env found)"
         c.emit(c.field("python", m.python_version, gloss))
+    n_py = pythons.count()
+    if n_py > 1:
+        c.emit(c.field("pythons", str(n_py), "interpreters on this machine — run: ara python"))
     c.emit()
 
     c.emit(c.section("  MEMORY"))
@@ -247,6 +252,47 @@ def render_status(c: Console, *, as_json: bool = False) -> None:
     c.emit()
     c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
                    value_role="good"))
+    c.emit()
+
+
+# --------------------------------------------------------------------------- #
+# python (interpreter discovery — read-only; which pythons, which have AI libs)
+# --------------------------------------------------------------------------- #
+def _tilde(p: str) -> str:
+    home = str(Path.home())
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+def render_python(c: Console, *, as_json: bool = False) -> None:
+    ints = pythons.discover()
+
+    if as_json:
+        print(json.dumps([asdict(i) for i in ints], indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  PYTHON INTERPRETERS"))
+    c.emit()
+    with_ai = 0
+    for i in ints:
+        mark = c.style("good", "●") if i.is_default else " "
+        head = (f"  {mark} " + c.style("metric", f"{i.version or '?':8}")
+                + c.style("dim", f"{i.origin:13} ") + c.style("accent", _tilde(i.path)))
+        c.emit(head)
+        present = i.ai_present
+        if present:
+            with_ai += 1
+            c.emit("       " + c.style("good", " · ".join(f"{k} {v}" for k, v in present.items())))
+        else:
+            c.emit("       " + c.style("dim", "no AI libraries"))
+    c.emit()
+    c.emit(c.style("dim", f"  {len(ints)} interpreters · {with_ai} with AI libraries · ")
+           + c.style("good", "●") + c.style("dim", " = your default python3"))
+    c.emit()
+    c.emit(c.style("gloss", "  how this was found: your PATH + standard install homes "
+                            "(Homebrew, python.org, pyenv, conda, uv, asdf, macOS)."))
+    c.emit(c.style("gloss", "  missing one? it's likely a virtualenv or a custom folder "
+                            "not on PATH — add its directory to PATH and re-run."))
     c.emit()
 
 
@@ -421,6 +467,10 @@ def main() -> int:
 
     if rest[0] == "status":
         render_status(c, as_json=as_json)
+        return 0
+
+    if rest[0] == "python":
+        render_python(c, as_json=as_json)
         return 0
 
     if rest[0] == "profile":
