@@ -164,8 +164,10 @@ def _machine(**over) -> Machine:
         python_version="3.12.8", ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
         disk_free_gb=500.0,
-        runtimes=[Runtime("MLX", True, "0.18", accels=("apple",), usable=True),
-                  Runtime("vLLM", True, "0.5", accels=("nvidia",), usable=False)],
+        runtimes=[Runtime("MLX", True, "0.18", kind="engine", accels=("apple",), usable=True),
+                  Runtime("vLLM", True, "0.5", kind="engine", accels=("nvidia",), usable=False),
+                  Runtime("PyTorch", True, "2.1", kind="framework")],
+        framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0),
                       ModelStore("Ollama", True, 0, 0.0)],
         hf_token=True, power="AC power", backend="apple", engine="wmx-suite",
@@ -180,12 +182,15 @@ def test_render_detect_text(make_console, monkeypatch):
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
-    for section in ("SYSTEM", "MEMORY", "ACCELERATOR", "STORAGE", "RUNTIMES", "MODELS", "ARA"):
+    for section in ("SYSTEM", "MEMORY", "ACCELERATOR", "STORAGE", "ENGINES",
+                    "FRAMEWORKS", "MODELS", "ARA"):
         assert section in out
     assert "Apple M4 Pro" in out
     assert "Metal" in out
-    assert "MLX" in out
+    assert "MLX" in out                  # engine
+    assert "PyTorch" in out              # framework
     assert "needs CUDA" in out          # vLLM unusable reason rendered
+    assert "/usr/bin/python3" in out    # framework probe interpreter labelled
     assert "3 models" in out
 
 

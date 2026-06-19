@@ -151,6 +151,20 @@ def test_accelerator_none(monkeypatch, set_platform):
     assert a.kind == "none" and a.api is None
 
 
+def test_accelerator_nvidia_garbage_falls_through(monkeypatch, run_stub, set_platform):
+    # nvidia-smi present but unparseable → don't crash; fall back to the host's real GPU.
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+    run_stub.add("nvidia-smi", "garbage with no commas\n")
+    a = accelerator("Apple M4 Pro")
+    assert a.kind == "apple"  # not nvidia — the bad row was swallowed
+
+
+def test_apple_gpu_cores_non_integer_returns_none(run_stub):
+    run_stub.add("system_profiler", "      Total Number of Cores: many\n")
+    assert detect._apple_gpu_cores() is None
+
+
 def test_accelerator_dataclass_defaults():
     a = Accelerator("none", "x", None, None)
     assert a.count == 1 and a.cores is None and a.compute is None
@@ -159,29 +173,48 @@ def test_accelerator_dataclass_defaults():
 # --------------------------------------------------------------------------- #
 # runtimes + usability resolution
 # --------------------------------------------------------------------------- #
-def test_runtimes_usability_resolution(monkeypatch, fake_home):
-    monkeypatch.setattr(detect, "_ambient_python_packages", lambda: {
-        "torch": "2.1.0", "transformers": "4.40.0", "vllm": "0.5.0", "mlx-lm": "0.18",
+def test_runtimes_usability_and_kind_split(monkeypatch, fake_home):
+    monkeypatch.setattr(detect, "_python_packages", lambda py, names: {
+        "torch": "2.1.0", "transformers": "4.40.0", "tensorflow": None,
+        "vllm": "0.5.0", "mlx-lm": "0.18",
     })
-    monkeypatch.setattr("shutil.which", lambda n: None)
+    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect, "find_spec", lambda n: None)
 
-    rts = {rt.name: rt for rt in detect.runtimes(accel_kind="apple")}
+    rts = {rt.name: rt for rt in detect.runtimes(accel_kind="apple", user_py="/usr/bin/python3")}
 
-    # cross-platform runtime: no accelerator gate
+    # frameworks are libraries: no accelerator gate, tagged "framework"
+    assert rts["PyTorch"].kind == "framework"
     assert rts["PyTorch"].present is True
     assert rts["PyTorch"].usable is None
     assert rts["PyTorch"].requires is None
+    assert rts["TensorFlow"].kind == "framework"
+    assert rts["TensorFlow"].present is False  # version was None
 
-    # vLLM needs CUDA → not usable on an Apple box, with a human reason
+    # vLLM is an engine that needs CUDA → not usable on an Apple box, with a reason
+    assert rts["vLLM"].kind == "engine"
     assert rts["vLLM"].present is True
     assert rts["vLLM"].usable is False
     assert rts["vLLM"].requires == "needs CUDA"
 
-    # MLX needs Apple Silicon → usable here
+    # MLX engine needs Apple Silicon → usable here
+    assert rts["MLX"].kind == "engine"
     assert rts["MLX"].present is True
     assert rts["MLX"].usable is True
     assert rts["MLX"].requires is None
+
+
+def test_runtimes_mlx_falls_back_to_ara_env(monkeypatch, fake_home):
+    # The user's python has no mlx-lm, but ARA bundles the MLX engine → still present.
+    monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
+    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: "0.18" if name == "mlx-lm" else None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+
+    rts = {rt.name: rt for rt in detect.runtimes("apple", user_py=None)}
+    assert rts["MLX"].present is True
+    assert rts["MLX"].version == "0.18"
 
 
 def test_runtime_requires_property():
@@ -289,7 +322,7 @@ def test_hf_token_absent(fake_home):
 # --------------------------------------------------------------------------- #
 def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr("shutil.which", lambda n: None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect, "find_spec", lambda n: None)  # wmx_suite "not installed"
     run_stub.add("machdep.cpu.brand_string", "Apple M4 Pro\n")
 
@@ -302,40 +335,88 @@ def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     assert m.arch == "arm64"
     assert len(m.model_stores) == 5
     assert m.runtimes  # non-empty
+    # which → None means no user python resolved; framework probe falls back to none
+    assert m.framework_python is None
+    assert {rt.kind for rt in m.runtimes} == {"engine", "framework"}
 
 
 def test_profile_engine_ready_when_spec_found(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr("shutil.which", lambda n: None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect, "find_spec", lambda n: object())
     m = detect.profile()
     assert m.engine_ready is True
 
 
 # --------------------------------------------------------------------------- #
-# ambient python package probe
+# user-python resolution (the real shell python, not ARA's venv)
 # --------------------------------------------------------------------------- #
-def test_ambient_python_packages_parses_json(run_stub, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/python3")
-    run_stub.add("importlib", '{"torch": "2.1.0", "vllm": null}')
-    out = detect._ambient_python_packages()
-    assert out == {"torch": "2.1.0", "vllm": None}
+def test_user_python_strips_venv_bin(monkeypatch):
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
+    monkeypatch.setattr(detect.os.path, "realpath", lambda p: p)  # identity
+    seen = {}
+
+    def fake_which(name, path=None):
+        seen["path"] = path
+        return "/usr/bin/python3" if name == "python3" else None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    assert detect._user_python() == "/usr/bin/python3"
+    assert "/venv/bin" not in seen["path"]   # the venv's bin was stripped
+    assert "/usr/bin" in seen["path"]
 
 
-def test_ambient_python_packages_empty_without_python(monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda n: None)
-    assert detect._ambient_python_packages() == {}
+def test_user_python_none_when_resolves_back_to_ara(monkeypatch):
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
+    monkeypatch.setattr(detect.os.path, "realpath", lambda p: p)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/venv/bin/python3")
+    assert detect._user_python() is None
 
 
-def test_ambient_python_packages_empty_on_bad_output(run_stub, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/python3")
-    run_stub.add("importlib", "not json")
-    assert detect._ambient_python_packages() == {}
+def test_user_python_none_when_no_python(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    assert detect._user_python() is None
+
+
+# --------------------------------------------------------------------------- #
+# python package probes
+# --------------------------------------------------------------------------- #
+def test_python_packages_parses_json(run_stub):
+    run_stub.add("importlib", '{"torch": "2.1.0", "tensorflow": null}')
+    out = detect._python_packages("/usr/bin/python3", ("torch", "tensorflow"))
+    assert out == {"torch": "2.1.0", "tensorflow": None}
+
+
+def test_python_packages_blank_without_interpreter():
+    assert detect._python_packages(None, ("torch", "vllm")) == {"torch": None, "vllm": None}
+
+
+def test_python_packages_blank_on_run_failure(run_stub):
+    # run_stub returns None for an unmatched command → all-None dict, not a crash.
+    assert detect._python_packages("/usr/bin/python3", ("torch",)) == {"torch": None}
+
+
+def test_python_packages_blank_on_bad_output(run_stub):
+    run_stub.add("importlib", "not json at all")
+    assert detect._python_packages("/usr/bin/python3", ("torch", "vllm")) == {
+        "torch": None, "vllm": None}
+
+
+def test_ara_pkg_version_reads_own_env():
+    # psutil is a real dependency in ARA's own environment.
+    assert detect._ara_pkg_version("psutil") is not None
+    assert detect._ara_pkg_version("definitely-not-installed-xyz") is None
 
 
 def test_profile_unsupported(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Linux", "x86_64")
-    monkeypatch.setattr("shutil.which", lambda n: None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     m = detect.profile()
     assert m.backend == "unsupported"
     assert m.supported is False
