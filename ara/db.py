@@ -140,3 +140,17 @@ def get_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
     d = dict(row)
     d["points"] = json.loads(d["points_json"]) if d["points_json"] else []
     return d
+
+
+def list_characterizations(con: sqlite3.Connection, machine_key: str,
+                           engine: str) -> list[dict]:
+    """Every model characterized on this machine + engine, newest fields parsed."""
+    rows = con.execute(
+        "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
+        (machine_key, engine)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["points"] = json.loads(d["points_json"]) if d["points_json"] else []
+        out.append(d)
+    return out

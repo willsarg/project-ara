@@ -460,6 +460,30 @@ def test_persist_none_engine_key_is_noop(store):
     assert cli.db.get_machine(store, "any", "wmx") is None
 
 
+def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    cli.db.save_characterization(store, "mkey", "wcx", "org/SmolLM", safe_context=16000, points=[])
+    cli.db.save_characterization(store, "mkey", "wcx", "org/Unbound", safe_context=None, points=[])
+    c, buf = make_console()
+    cli._emit_characterized(c, "wcx")
+    out = buf.getvalue()
+    assert "CHARACTERIZED" in out and "SmolLM" in out and "16000" in out
+    assert "—" in out               # the None-ceiling model
+
+
+def test_emit_characterized_empty_shows_nothing(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    c, buf = make_console()
+    cli._emit_characterized(c, "wcx")
+    assert buf.getvalue() == ""
+
+
+def test_emit_characterized_none_engine_key(make_console):
+    c, buf = make_console()
+    cli._emit_characterized(c, None)
+    assert buf.getvalue() == ""
+
+
 def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):
     bk = FakeBackend(_limits())
     bk.safe_limits_exc = RuntimeError("sysctl exploded")

@@ -711,6 +711,21 @@ def _overlay_stored_calibration(m: dict, engine_key: str | None) -> None:
         m["calibrated_at"] = (stored.get("calibrated_at") or "")[:10] or None
 
 
+def _emit_characterized(c: Console, engine_key: str | None) -> None:
+    """Show models ARA has characterized on this machine + engine (from the store)."""
+    if engine_key is None:
+        return
+    rows = db.list_characterizations(db.connect(), profiles.machine_key(), engine_key)
+    if not rows:
+        return
+    c.emit(c.section("  CHARACTERIZED MODELS"))
+    for r in rows:
+        name = r["model_id"].split("/")[-1]
+        ceiling = f"~{r['safe_context']} tokens" if r["safe_context"] else "—"
+        c.emit(c.field(name, ceiling, "safe context ceiling"))
+    c.emit()
+
+
 def _persist_calibration(m: dict, engine_key: str | None) -> None:
     """Remember what the engine just measured: an overhead and/or a characterization."""
     if engine_key is None:
@@ -759,6 +774,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         return 0
 
     _emit_limits(c, m)
+    _emit_characterized(c, engine_key)   # models ARA has already measured here
 
     # Naming an explicit --model means "calibrate against this", so it bypasses the
     # cached early-return the way --recalibrate does.

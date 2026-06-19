@@ -76,3 +76,12 @@ def test_characterization_save_and_get(store):
 
 def test_characterization_missing_is_none(store):
     assert db.get_characterization(store, "m", "wcx", "x") is None
+
+
+def test_list_characterizations_for_machine_and_engine(store):
+    db.save_characterization(store, "m", "wcx", "a", safe_context=1000, points=[[1, 2.0]])
+    db.save_characterization(store, "m", "wcx", "b", safe_context=2000, points=[])
+    db.save_characterization(store, "m", "wmx", "c", safe_context=3000, points=[])  # other engine
+    rows = db.list_characterizations(store, "m", "wcx")
+    assert {r["model_id"] for r in rows} == {"a", "b"}
+    assert rows[0]["points"] == [[1, 2.0]]   # JSON parsed back
