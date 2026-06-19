@@ -697,6 +697,20 @@ def test_render_python_text(make_console, monkeypatch):
     assert "your default python3" in out                     # legend
 
 
+def test_render_python_help_text_is_windows_aware(make_console, monkeypatch):
+    monkeypatch.setattr(cli.os, "name", "nt")
+    # os.name='nt' breaks pathlib on posix; _tilde only needs Path.home() → stub it.
+    monkeypatch.setattr(cli, "Path", types.SimpleNamespace(home=lambda: r"C:\Users\Will"))
+    ints = [_interp(path=r"C:\Python312\python.exe", real=r"C:\Python312\python.exe",
+                    origin="python.org", version="3.12.5")]
+    monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
+    c, buf = make_console()
+    cli.render_python(c)
+    out = buf.getvalue()
+    assert "pyenv-win" in out and "the Store" in out   # Windows homes, not macOS
+    assert "Homebrew" not in out
+
+
 def test_render_python_shows_symlink_real_path(make_console, monkeypatch):
     ints = [_interp(path="/usr/local/bin/python3", real="/opt/homebrew/Cellar/python@3.12/3.12.4/bin/python3.12",
                     origin="Homebrew", version="3.12.4")]

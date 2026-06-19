@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import types
 
 import ara.pythons as pythons
 from ara.pythons import Interpreter
@@ -73,6 +74,20 @@ def test_origin_classification():
         assert pythons._origin(real, [real]) == expected, real
 
 
+def test_origin_classification_windows_paths():
+    # Backslash paths normalize to '/', so the same rules classify Windows installs.
+    cases = {
+        r"C:\Users\Will\AppData\Local\Programs\Python\Python312\python.exe": "python.org",
+        r"C:\Program Files\Python313\python.exe": "python.org",
+        r"C:\Program Files (x86)\Python311\python.exe": "python.org",
+        r"C:\Users\Will\.pyenv\pyenv-win\versions\3.12.0\python.exe": "pyenv",
+        r"C:\Users\Will\miniconda3\python.exe": "conda",
+        r"C:\Users\Will\AppData\Roaming\uv\python\cpython-3.12\python.exe": "uv",
+    }
+    for real, expected in cases.items():
+        assert pythons._origin(real, [real]) == expected, real
+
+
 def test_origin_venv_via_pyvenv_cfg(tmp_path):
     env = tmp_path / "myenv"
     (env / "bin").mkdir(parents=True)
@@ -113,6 +128,24 @@ def test_user_default_real_strips_venv(monkeypatch):
     monkeypatch.setattr("shutil.which", fake_which)
     assert pythons._user_default_real() == "/usr/bin/python3"
     assert "/venv/bin" not in seen["path"]
+
+
+def test_user_default_real_strips_windows_scripts_dir(monkeypatch):
+    # On Windows the venv interpreter lives in <env>\Scripts, not <env>/bin.
+    monkeypatch.setattr(pythons.os, "name", "nt")
+    sep = os.pathsep
+    monkeypatch.setenv("PATH", sep.join(["/venv/Scripts", "/usr/bin"]))
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setattr(pythons.os.path, "realpath", lambda p, *a, **k: p)
+    seen = {}
+
+    def fake_which(name, path=None):
+        seen["path"] = path
+        return "/usr/bin/python" if name == "python" else None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    assert pythons._user_default_real() == "/usr/bin/python"
+    assert "/venv/Scripts" not in seen["path"]
 
 
 def test_user_default_real_none_when_no_python(monkeypatch):
@@ -175,6 +208,40 @@ def test_known_patterns_covers_standard_homes():
     assert any("/.pyenv/" in p for p in pats)
     assert any("/opt/homebrew/" in p for p in pats)
     assert any(("conda" in p or "miniforge" in p) for p in pats)
+
+
+def test_py_name_matches_windows_exe():
+    assert pythons._PY_NAME.match("python.exe")
+    assert pythons._PY_NAME.match("python3.exe")
+    assert pythons._PY_NAME.match("python3.12.exe")
+    assert not pythons._PY_NAME.match("pythonw.exe")     # windowed interpreter — excluded
+    assert not pythons._PY_NAME.match("python3-config")
+
+
+def test_windows_patterns_content(monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Will\AppData\Local")
+    monkeypatch.setenv("APPDATA", r"C:\Users\Will\AppData\Roaming")
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)   # unset → its entry is dropped
+    pats = pythons._windows_patterns(r"C:\Users\Will")
+    assert all(p.endswith("python.exe") for p in pats)
+    assert any(r"Programs\Python" in p for p in pats)
+    assert any(r"pyenv-win" in p for p in pats)
+    assert any(r"uv\python" in p for p in pats)
+    # no entry collapsed to a leading backslash from an empty env var
+    assert all(not p.startswith("\\") for p in pats)
+    # the ProgramFiles(x86) entry was dropped entirely
+    assert not any("(x86)" in p for p in pats)
+
+
+def test_known_patterns_dispatches_to_windows(monkeypatch):
+    # os.name='nt' flips pathlib to WindowsPath (uninstantiable on posix), so stub Path.
+    monkeypatch.setattr(pythons.os, "name", "nt")
+    monkeypatch.setattr(pythons, "Path",
+                        types.SimpleNamespace(home=lambda: r"C:\Users\Will"))
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Will\AppData\Local")
+    pats = pythons._known_patterns()
+    assert pats and all(p.endswith("python.exe") for p in pats)
 
 
 def test_candidates_filters_globs_and_skips(tmp_path, monkeypatch):

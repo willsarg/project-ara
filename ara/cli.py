@@ -7,6 +7,7 @@ built yet — this is an early scaffold.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -505,8 +506,10 @@ def render_python(c: Console, *, as_json: bool = False, want=None) -> None:
     c.emit(c.style("dim", summary))
     c.emit(c.style("dim", "  ") + c.style("good", "●") + c.style("dim", " = your default python3"))
     c.emit()
+    homes = ("python.org (Programs\\Python), conda, uv, pyenv-win, the Store"
+             if os.name == "nt" else "Homebrew, python.org, pyenv, conda, uv, asdf, macOS")
     c.emit(c.style("gloss", "  how this was found: your PATH + standard install homes "
-                            "(Homebrew, python.org, pyenv, conda, uv, asdf, macOS)."))
+                            f"({homes})."))
     c.emit(c.style("gloss", "  missing one? it's likely a virtualenv or a custom folder "
                             "not on PATH — add its directory to PATH and re-run."))
     c.emit()

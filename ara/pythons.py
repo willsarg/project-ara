@@ -24,8 +24,9 @@ from pathlib import Path
 # AI libraries we report per interpreter (presence + version). Ordered by relevance.
 _AI_LIBS = ("torch", "transformers", "tensorflow", "jax", "mlx-lm", "vllm", "onnxruntime")
 
-# A python executable name: python, python3, python3.12 — not python3-config etc.
-_PY_NAME = re.compile(r"^python(3(\.\d+)?)?$")
+# A python executable name: python, python3, python3.12 (+ Windows .exe) — not
+# python3-config, pythonw.exe, etc. Case-insensitive for Windows' case-blind FS.
+_PY_NAME = re.compile(r"^python(3(\.\d+)?)?(\.exe)?$", re.IGNORECASE)
 
 # Render order: freely-usable / user-managed first, then the tool-managed and
 # system interpreters you shouldn't install into (uv, Homebrew, macOS) clustered last.
@@ -105,8 +106,37 @@ def _run(cmd: list[str], timeout: float = 8) -> str | None:
         return None
 
 
+def _windows_patterns(home: str) -> list[str]:
+    """Standard interpreter install homes on Windows (none of which are POSIX paths).
+
+    The python.org/Windows installers land under ``…\\Programs\\Python`` (per-user) or
+    ``Program Files`` (system); conda puts python at the env root (not ``/bin``); uv,
+    pyenv-win and the Microsoft Store each have their own home. Entries whose anchoring
+    env var is unset collapse to a leading ``\\`` and are dropped.
+    """
+    local = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    pf = os.environ.get("ProgramFiles", "")
+    pf86 = os.environ.get("ProgramFiles(x86)", "")
+    pats = [
+        rf"{local}\Programs\Python\Python*\python.exe",
+        rf"{pf}\Python*\python.exe",
+        rf"{pf86}\Python*\python.exe",
+        rf"{local}\Microsoft\WindowsApps\python.exe",   # Store app-exec alias
+        rf"{home}\.pyenv\pyenv-win\versions\*\python.exe",
+        rf"{home}\miniconda3\python.exe", rf"{home}\anaconda3\python.exe",
+        rf"{home}\miniforge3\python.exe", rf"{home}\mambaforge\python.exe",
+        rf"{home}\miniconda3\envs\*\python.exe", rf"{home}\anaconda3\envs\*\python.exe",
+        rf"{home}\miniforge3\envs\*\python.exe",
+        rf"{appdata}\uv\python\*\python.exe", rf"{local}\uv\python\*\python.exe",
+    ]
+    return [p for p in pats if not p.startswith("\\")]
+
+
 def _known_patterns() -> list[str]:
     home = str(Path.home())
+    if os.name == "nt":
+        return _windows_patterns(home)
     return [
         "/usr/bin/python3",
         "/Library/Developer/CommandLineTools/usr/bin/python3",
@@ -133,7 +163,8 @@ def _is_venv(real: str) -> bool:
 
 
 def _origin(real: str, invocations: list[str]) -> str:
-    joined = " ".join([real, *invocations]).lower()
+    # Normalize Windows backslashes to '/' so one set of substring rules covers both.
+    joined = " ".join([real, *invocations]).lower().replace("\\", "/")
 
     def has(*subs: str) -> bool:
         return any(s in joined for s in subs)
@@ -146,7 +177,9 @@ def _origin(real: str, invocations: list[str]) -> str:
         return "asdf"
     if has("/uv/python", "/.local/share/uv"):
         return "uv"
-    if has("/library/frameworks/python.framework"):
+    # python.org installer homes: macOS framework, or Windows Programs\Python / Program Files.
+    if has("/library/frameworks/python.framework", "/programs/python/",
+           "/program files/python", "/program files (x86)/python"):
         return "python.org"
     if has("/opt/homebrew/", "/usr/local/cellar", "/homebrew/"):
         return "Homebrew"
@@ -163,7 +196,8 @@ def _user_default_real() -> str | None:
     path = os.environ.get("PATH", "")
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:
-        vbin = os.path.normpath(os.path.join(venv, "bin"))
+        # venvs put the interpreter in Scripts\ on Windows, bin/ elsewhere.
+        vbin = os.path.normpath(os.path.join(venv, "Scripts" if os.name == "nt" else "bin"))
         path = os.pathsep.join(p for p in path.split(os.pathsep)
                                if os.path.normpath(p) != vbin)
     py = shutil.which("python3", path=path) or shutil.which("python", path=path)
