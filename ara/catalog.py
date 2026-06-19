@@ -24,6 +24,19 @@ def _read_config(model_id: str) -> dict | None:
         return None
 
 
+def _infer_modality(cfg: dict, model_id: str = "") -> str:
+    """Best-effort modality from a model's config + id — defaults to text (causal LM)."""
+    blob = ((cfg.get("model_type") or "") + " "
+            + " ".join(cfg.get("architectures") or []) + " " + model_id).lower()
+    if any(k in blob for k in ("vl", "vision", "image", "llava", "clip")):
+        return "vision"
+    if any(k in blob for k in ("whisper", "wav2vec", "audio", "speech", "kokoro", "tts")):
+        return "speech"
+    if any(k in blob for k in ("bert", "embed", "roberta")):
+        return "embedding"
+    return "text"
+
+
 def describe(model_id: str) -> dict | None:
     """Architecture metadata for *model_id* from its HF config, or None if unavailable."""
     cfg = _read_config(model_id)
@@ -33,7 +46,7 @@ def describe(model_id: str) -> dict | None:
     hidden = cfg.get("hidden_size")
     quant = cfg.get("quantization_config") or {}
     return {
-        "modality": "text",   # MVP: causal LM; infer other modalities later
+        "modality": _infer_modality(cfg, model_id),
         "n_layers": cfg.get("num_hidden_layers"),
         "hidden_size": hidden,
         "kv_heads": cfg.get("num_key_value_heads", n_heads),

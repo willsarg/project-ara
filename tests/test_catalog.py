@@ -15,6 +15,36 @@ def test_describe_parses_config(monkeypatch):
     assert d["quant"] is None
 
 
+def test_describe_modality_text_by_default(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {
+        "model_type": "llama", "architectures": ["LlamaForCausalLM"]})
+    assert catalog.describe("m")["modality"] == "text"
+
+
+def test_describe_modality_vision(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {
+        "model_type": "qwen2_5_vl", "architectures": ["Qwen2_5_VLForConditionalGeneration"]})
+    assert catalog.describe("m")["modality"] == "vision"
+
+
+def test_describe_modality_speech(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {
+        "model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"]})
+    assert catalog.describe("m")["modality"] == "speech"
+
+
+def test_describe_modality_embedding(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {
+        "model_type": "modernbert", "architectures": ["ModernBertModel"]})
+    assert catalog.describe("m")["modality"] == "embedding"
+
+
+def test_describe_modality_from_model_id(monkeypatch):
+    # config lacks a modality signal, but the repo name carries one (e.g. Kokoro TTS).
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {"model_type": "generic"})
+    assert catalog.describe("org/Kokoro-82M")["modality"] == "speech"
+
+
 def test_describe_kv_heads_defaults_to_attention_heads(monkeypatch):
     monkeypatch.setattr(catalog, "_read_config", lambda m: {
         "num_hidden_layers": 12, "hidden_size": 768, "num_attention_heads": 12,
