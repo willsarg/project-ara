@@ -22,6 +22,22 @@ from collections.abc import Callable
 from ara.contracts import ramp, worker
 
 
+def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
+    """The context rungs to probe, ascending, never above the model's window.
+
+    Beyond the standard schedule clamped to *max_context*, this always probes ``max_context``
+    itself — so a model whose window is small (e.g. 2048, below the 2nd schedule rung) still
+    gets the ≥2 distinct points a fit needs, and is measured right at its window. For a window
+    below every standard rung, a lower anchor (half the window) is added so two points exist.
+    """
+    if max_context is None:
+        return list(schedule)
+    rungs = {c for c in schedule if c <= max_context} | {max_context}
+    if len(rungs) < 2:
+        rungs.add(max(1, max_context // 2))
+    return sorted(rungs)
+
+
 def characterize(model: str, *, preflight: Callable[[str], dict],
                  measure: Callable[[str, int], dict], schedule: list[int]) -> dict:
     """Drive the safe ramp for *model* using engine-supplied *preflight*/*measure* callables."""
@@ -40,8 +56,7 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
                                       reason="ARA L2: measured at/over safe budget")
         return m
 
-    rungs = [c for c in schedule
-             if est["max_context"] is None or c <= est["max_context"]]
+    rungs = _rungs(schedule, est["max_context"])
     res = ramp.run(measure_fn, rungs, est["base_gb"], est["slope_gb_per_k"],
                    est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"],
                    max_context=est["max_context"])

@@ -50,6 +50,40 @@ def test_filters_schedule_above_model_window():
     assert max(seen) <= 16000          # 32000/65536 never dispatched
 
 
+def test_tiny_context_window_still_reports_window_ceiling():
+    # A model whose trained window (2048) is below the 2nd schedule rung: only one standard
+    # rung (2000) fits under it. The driver must still probe the window itself so it gets >=2
+    # points and reports the model fits its whole window — not "couldn't fit a ceiling".
+    est = _est(max_context=2048, slope_gb_per_k=0.1)
+    seen: list[int] = []
+
+    def measure(model, ctx):
+        seen.append(ctx)
+        return {"context": ctx, "mem_gb": 1.0 + 0.1 * (ctx / 1000)}
+
+    r = driver.characterize("m", preflight=lambda m: est, measure=measure,
+                            schedule=[2000, 4000, 8000, 16000])
+    assert r["safe_context"] == 2048
+    assert r["binding"] == "context_window"
+    assert 2048 in seen                       # probed the window itself
+    assert all(c <= 2048 for c in seen)       # never probed past it
+
+
+def test_window_below_smallest_rung_gets_a_lower_anchor():
+    # An even tinier window (1024) — below every standard rung. Still needs >=2 distinct probes.
+    est = _est(max_context=1024, slope_gb_per_k=0.1)
+    seen: list[int] = []
+
+    def measure(model, ctx):
+        seen.append(ctx)
+        return {"context": ctx, "mem_gb": 1.0 + 0.1 * (ctx / 1000)}
+
+    r = driver.characterize("m", preflight=lambda m: est, measure=measure,
+                            schedule=[2000, 4000])
+    assert r["safe_context"] == 1024 and r["binding"] == "context_window"
+    assert len(set(seen)) >= 2 and all(c <= 1024 for c in seen)
+
+
 def test_none_when_preflight_errors():
     r = driver.characterize("missing/model",
                             preflight=lambda m: {"error": "not in HF cache"},
