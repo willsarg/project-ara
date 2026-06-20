@@ -83,14 +83,20 @@ hardware-specific engine; it picks a backend for the machine and loads only that
 
 - **Apple Silicon** → the [`wmx-suite`](https://github.com/willsarg/wmx-suite) engine (MLX),
   which finds each model's safe context ceiling *without crashing the machine*.
-- **Other hardware** → recon works everywhere; running support arrives as backends land
-  (NVIDIA / CUDA is next).
+- **NVIDIA / CUDA** → the [`wcx-suite`](https://github.com/willsarg/wcx-suite) engine (torch).
+- **Everything else** → the built-in **CPU engine** (llama.cpp on system RAM) — the universal
+  fallback, so any machine with enough RAM can run models, just not GPU-accelerated.
 
-The engine is **not a dependency**. ARA probes the machine and installs the matched suite
-on demand (`ara install`) — so the core stays universal, `uv sync` is identical on every
-OS, and you never download MLX onto an NVIDIA box or vice-versa. The catalog of engines and
-the install logic live in [`ara/engines.py`](./ara/engines.py). See [AGENTS.md](./AGENTS.md)
-for the design boundary and conventions.
+The engine is **not a dependency**. ARA probes the machine and installs the matched suite into
+its **own isolated environment** on demand (`ara install`) — so the core stays universal,
+`uv sync` is identical on every OS, and you never download MLX onto an NVIDIA box or vice-versa.
+The catalog of engines and the install logic live in [`ara/engines.py`](./ara/engines.py). See
+[AGENTS.md](./AGENTS.md) for the design boundary and conventions.
+
+**Platform support.** Developed and tested on **macOS (Apple Silicon)**. Linux (CPU, and CUDA
+once `wcx-suite` lands) is supported and recon runs there. Windows code is written to be
+portable (interpreter/venv paths, the worker IPC), but is **not yet tested** — no Windows
+claims until it is.
 
 ---
 

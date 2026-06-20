@@ -206,6 +206,15 @@ def test_run_worker_spawns_envs_own_python(engines_root, run_spy, monkeypatch):
     assert cmd[1:] == ["-c", "pass"]
 
 
+def test_run_worker_spawns_windows_interpreter(engines_root, run_spy, monkeypatch):
+    # Portability: the IPC seam must spawn Scripts\python.exe on Windows, not bin/python.
+    monkeypatch.setattr(engine_env, "_is_windows", lambda: True)
+    run_spy.add("python.exe", 0, out='{"ok": true}')
+    engine_env.run_worker("apple", ["-m", "wmx_suite.device", "limits"])
+    cmd = run_spy.calls[0]
+    assert cmd[0] == str(engines_root / "apple" / "Scripts" / "python.exe")
+
+
 def test_run_worker_passes_stdin(engines_root, run_spy):
     run_spy.add("python", 0, out='{"ok": true}')
     engine_env.run_worker("apple", ["-"], input='{"req": 1}')

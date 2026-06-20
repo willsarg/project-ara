@@ -64,3 +64,8 @@ is present. Apple Silicon is the first running backend; recon works everywhere.
   the seam is covered via a fake `wmx_suite`.
 - **Planning/design docs live in the private vault, not the repo.** This repo is code +
   standard community files. Don't add design specs or logs here.
+- **Write portable; claim only what's tested.** Shared layers (the engine env, worker IPC,
+  paths) must be OS-agnostic — use `pathlib`/`os.path`, branch interpreter/venv layout on
+  `os.name` (`Scripts\python.exe` vs `bin/python`), keep OS-specific recon (sysctl, Homebrew
+  paths) behind a platform guard. But ARA is developed and tested on macOS (Apple Silicon),
+  with Linux supported; **make no Windows support claims until it's actually been run there.**
