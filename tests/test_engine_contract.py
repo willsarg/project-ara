@@ -7,9 +7,6 @@ each driven through its own (faked) engine seam. When a new backend lands, addin
 """
 from __future__ import annotations
 
-import sys
-import types
-
 import pytest
 
 from ara.backends import apple, cpu, cuda
@@ -53,30 +50,27 @@ def _seam_cpu(monkeypatch):
 
 
 def _seam_cuda(monkeypatch):
-    limits = types.SimpleNamespace(device="Test Device", total_gb=48.0, wall_gb=40.0,
-                                   used_gb=12.0, safe_threshold_gb=lambda margin: 40.0 - margin)
-    system = types.ModuleType("wcx_suite.system"); system.read_limits = lambda: limits
-    config = types.ModuleType("wcx_suite.config"); config.margin_gb = lambda v=None: 4.0
-    probe = types.ModuleType("wcx_suite.probe")
-    probe.characterize = lambda model, budget_gb: types.SimpleNamespace(
-        safe_context=16000, points=[(512, 1.4)])
-    pkg = types.ModuleType("wcx_suite"); pkg.system, pkg.config, pkg.probe = system, config, probe
-    pkg.__path__ = []
-    for name, mod in {"wcx_suite": pkg, "wcx_suite.system": system,
-                      "wcx_suite.config": config, "wcx_suite.probe": probe}.items():
-        monkeypatch.setitem(sys.modules, name, mod)
+    def worker(name, argv):
+        if "limits" in argv:
+            return dict(_FACTS)
+        if "calibrate" in argv:
+            return {"device": "Test Device", "measured_overhead_gb": 0.9,
+                    "default_overhead_gb": 0.6, "n_points": 1}
+        if "--preflight" in argv:
+            return {"base_gb": 5.0, "ref_baseline_gb": 0.0, "slope_gb_per_k": 1.0,
+                    "budget_gb": 36.0, "max_context": 16000}
+        return {"context": int(argv[3]), "mem_gb": 5.0 + int(argv[3]) / 1000}
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(worker)}))
+    monkeypatch.setattr(cuda, "_budget_params", lambda: (1.0, 0.6))
 
 
 # (label, backend module, seam installer)
 BACKENDS = [("apple", apple, _seam_apple), ("cpu", cpu, _seam_cpu), ("cuda", cuda, _seam_cuda)]
 _IDS = [b[0] for b in BACKENDS]
 
-# The shipping, worker-model backends held to the STRICT result-shape contract. cuda is not
-# here on purpose: it's marked unavailable (in-process import, untested on real NVIDIA) and is
-# known to diverge (tuple points, no `binding`) — see test_cuda_characterize_known_divergence,
-# which pins that divergence so it's documented, not silently permitted by a loose assertion.
-SHIPPING = [b for b in BACKENDS if b[0] in ("apple", "cpu")]
-_SHIP_IDS = [b[0] for b in SHIPPING]
+# Every backend is now a worker-model adapter held to the STRICT result-shape contract.
+SHIPPING = BACKENDS
+_SHIP_IDS = _IDS
 
 
 @pytest.mark.parametrize("label, mod, _seam", BACKENDS, ids=_IDS)
@@ -108,16 +102,6 @@ def test_characterize_returns_the_canonical_shape(label, mod, seam, monkeypatch)
     assert isinstance(r["points"], list)
     for p in r["points"]:
         assert isinstance(p, dict) and {"context", "mem_gb"} <= set(p), f"{label} point shape {p}"
-
-
-def test_cuda_characterize_known_divergence(monkeypatch):
-    # cuda is NOT yet conformant: it returns raw (ctx, mem) tuples and no `binding`. Pinned here
-    # so the divergence is explicit and tracked (cuda-conversion follow-up), not hidden behind a
-    # loose `isinstance(list)` in the shipping conformance test above.
-    _seam_cuda(monkeypatch)
-    r = cuda.characterize("org/model")
-    assert "binding" not in r                      # known gap
-    assert r["points"] and all(isinstance(p, tuple) for p in r["points"])  # tuples, not dicts
 
 
 @pytest.mark.parametrize("label, mod, seam", BACKENDS, ids=_IDS)

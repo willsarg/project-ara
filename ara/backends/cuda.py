@@ -1,48 +1,54 @@
-"""NVIDIA / CUDA backend adapter — the ONLY module that imports wcx-suite.
+"""NVIDIA / CUDA backend adapter — drives wcx-suite's VRAM measurement out-of-process.
 
-Lazy by design: this module isn't imported unless detect picks ``"cuda"``, and the
-``wcx_suite`` import happens inside each function — so even on an NVIDIA box nothing
-torch-shaped loads until ARA actually runs the engine.
+The CUDA twin of backends/apple.py: it reads the GPU's VRAM wall and runs wcx-suite's crash-safe
+probe, but owns **no persistence** — ARA stores and reuses the calibration (see cli.render_profile).
+It never imports wcx in-process: every engine call goes through the isolated ``cuda`` env via
+:mod:`ara.engine_env`, so nothing torch-shaped loads in ARA's interpreter and the core stays
+engine-free at runtime, not just at lock time.
+
+Unlike Apple's hidden cold-start overhead, the VRAM wall is read exactly from nvidia-smi, so the
+*budget* needs no calibration. What calibration measures here is the fixed CUDA-context VRAM cost
+(cuBLAS/cuDNN), which the per-context safety gate adds on top of the model's weights.
 """
 from __future__ import annotations
 
+# Core, engine-free helpers (no wcx) — safe to import at module load and patchable in tests.
+from ara import db, engine_env, profiles
+from ara.contracts import driver
 
-# Tiny model ARA characterizes against — transformers format (torch can't load the
+# The wcx worker modules ARA drives in the isolated cuda env (never imported in-process).
+DEVICE_MODULE = "wcx_suite.device"
+WORKER_MODULE = "wcx_suite.measure_one"
+
+# Tiny model ARA calibrates/characterizes against — transformers format (torch can't load the
 # mlx-community 4-bit build the Apple engine uses).
 CALIBRATION_MODEL = "HuggingFaceTB/SmolLM-135M-Instruct"
 
+# ARA-owned ramp policy (the engine only measures; ARA decides the schedule + safety margin).
+RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
+DEFAULT_MARGIN_GB = 1.0      # VRAM cushion below the wall — tighter than Apple's 2 GB (smaller cards)
+DEFAULT_OVERHEAD_GB = 0.6    # fallback CUDA-context overhead until calibrated
+
 
 def safe_limits() -> dict:
-    """This machine's safe VRAM limits via wcx-suite. Pure read — no model load.
+    """Read this machine's safe VRAM limits via the wcx worker. Pure read — no model.
 
-    The VRAM wall is read exactly from the device (nvidia-smi), so — unlike Apple's hidden
-    cold-start overhead — there's nothing to calibrate for the budget itself (``calibrated``
-    is True, ``overhead_gb`` None). Characterizing a *model*'s context ceiling is a separate,
-    optional step.
+    Stateless: returns the budget with no stored overhead (``calibrated=False``). ARA overlays a
+    previously-measured overhead from its own store — the engine no longer reads a database.
     """
-    from wcx_suite import config, system
-
-    lim = system.read_limits()
-    if lim is None:
-        raise RuntimeError("no NVIDIA GPU visible to nvidia-smi")
-    margin = config.margin_gb(None)
-    safe = lim.safe_threshold_gb(margin)
+    facts = engine_env.run_worker("cuda", ["-m", DEVICE_MODULE, "limits"])
+    if "error" in facts:
+        raise RuntimeError(facts["error"])
     return {
-        "device": lim.device,
-        "total_gb": lim.total_gb,
-        "wall_gb": lim.wall_gb,
-        "safe_budget_gb": safe,
-        "margin_gb": margin,
-        "headroom_gb": safe - lim.used_gb,
-        "swap_free_gb": None,        # VRAM has no swap
-        "overhead_gb": None,         # the wall is exact — nothing to calibrate
-        "calibrated": True,
+        **facts,
+        "overhead_gb": None,        # ARA owns the stored calibration now
+        "calibrated": False,
         "calibrated_at": None,
     }
 
 
 def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
-    """Is the probe model already in the HF cache? (cheap, no load)."""
+    """Is the calibration model already in the HF cache? (cheap, no load)."""
     from huggingface_hub import try_to_load_from_cache
 
     try:
@@ -52,30 +58,65 @@ def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
 
 
 def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
-    """Fetch the probe model into the HF cache. Network + disk only."""
+    """Fetch the calibration model into the HF cache. Network + disk only."""
     from ara import acquire
 
     acquire.download(model)
 
 
-def characterize(model: str) -> dict:
-    """Measure *model*'s safe VRAM context ceiling via wcx-suite's isolated probe (small safe
-    ramp, stops before OOM). Returns ``{model, safe_context, points}``; None ceiling if it
-    couldn't fit/measure."""
-    from wcx_suite import config, probe, system
-
-    lim = system.read_limits()
-    budget = lim.safe_threshold_gb(config.margin_gb(None))
-    result = probe.characterize(model, budget_gb=budget)
-    return {
-        "model": model,
-        "safe_context": result.safe_context if result else None,
-        "points": result.points if result else [],
-    }
-
-
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
-    """Characterize *model* on the GPU and attach it to the limits (for the profile flow)."""
+    """Measure the CUDA-context VRAM overhead via the worker; return fresh limits + what it measured.
+
+    The worker initialises a CUDA context (forcing cuBLAS/cuDNN in) and reads the nvidia-smi delta.
+    ARA only invokes it (out-of-process in the cuda env). Surfaces the **effective** overhead
+    (clamped to the engine's floor: ``max(default, measured)``) as ``overhead_gb`` so ARA can
+    persist it; the raw measurement is in the ``"calibration"`` sub-dict for the caller to show.
+    """
+    result = engine_env.run_worker("cuda", ["-m", DEVICE_MODULE, "calibrate", model])
     limits = safe_limits()
-    limits["characterization"] = characterize(model)
+    overheads = [v for v in (result.get("measured_overhead_gb"),
+                             result.get("default_overhead_gb")) if v is not None]
+    limits["overhead_gb"] = max(overheads) if overheads else None
+    limits["calibrated"] = True
+    limits["calibration"] = result
     return limits
+
+
+def _budget_params() -> tuple[float, float]:
+    """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
+    calibration for the wcx engine, or a safe default if uncalibrated."""
+    overhead = DEFAULT_OVERHEAD_GB
+    stored = profiles.get_calibration(db.connect(), "wcx")
+    if stored and stored.get("fixed_overhead_gb") is not None:
+        overhead = stored["fixed_overhead_gb"]
+    return DEFAULT_MARGIN_GB, overhead
+
+
+def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
+                 preflight: bool = False) -> list[str]:
+    argv = ["-m", WORKER_MODULE, model, str(ctx),
+            "--margin", str(margin), "--overhead", str(overhead)]
+    if preflight:
+        argv.append("--preflight")
+    return argv
+
+
+def characterize(model: str) -> dict:
+    """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
+
+    Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
+    only supplies the CUDA specifics — the isolated ``cuda`` env, wcx's self-vetoing ``measure_one``
+    worker, the budget params, and the schedule. ARA never imports wcx in-process. Crash-safety is
+    layered: the driver gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine
+    refuses-before-load (L4) and a VRAM watchdog aborts mid-probe (L5). Returns
+    ``{model, safe_context, points}``.
+    """
+    margin, overhead = _budget_params()
+    return driver.characterize(
+        model,
+        preflight=lambda m: engine_env.run_worker(
+            "cuda", _worker_argv(m, 0, margin, overhead, preflight=True)),
+        measure=lambda m, ctx: engine_env.run_worker(
+            "cuda", _worker_argv(m, ctx, margin, overhead)),
+        schedule=RAMP_SCHEDULE,
+    )

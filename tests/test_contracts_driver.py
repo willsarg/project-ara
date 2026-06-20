@@ -123,7 +123,9 @@ def test_threads_ref_baseline_into_ceiling():
     assert r["binding"] == "memory"
 
 
-def test_engine_refusal_stops_but_keeps_points():
+def test_engine_refusal_brackets_below_the_abort():
+    # A refusal at 8000 is a hard wall: the driver bisects [4000, 8000) and reports a
+    # confirmed-safe context strictly under it — never extrapolating the fit past the abort.
     est = _est()
 
     def measure(model, ctx):
@@ -133,5 +135,6 @@ def test_engine_refusal_stops_but_keeps_points():
 
     r = driver.characterize("m", preflight=lambda m: est, measure=measure,
                             schedule=[2000, 4000, 8000, 16000])
-    assert [p["context"] for p in r["points"]] == [2000, 4000]
-    assert r["safe_context"] == 30_999
+    assert 4000 <= r["safe_context"] < 8000
+    assert r["binding"] == "memory"
+    assert r["safe_context"] in {p["context"] for p in r["points"]}

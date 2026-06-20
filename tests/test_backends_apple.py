@@ -158,9 +158,11 @@ def test_characterize_stops_on_engine_refusal(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
-    # 2000 + 4000 measured; 8000 refused → escalation stops, ceiling from 2 points
-    assert [p["context"] for p in r["points"]] == [2000, 4000]
-    assert r["safe_context"] == 30_999    # (36-5)/1 = 31k, −1 to stay strictly under budget
+    # 2000 + 4000 measured; 8000 refused → the abort is a hard wall, so ARA bisects [4000, 8000)
+    # and reports a confirmed-safe context strictly under it (never extrapolating past the abort).
+    assert 4000 <= r["safe_context"] < 8000
+    assert r["binding"] == "memory"
+    assert r["safe_context"] in {p["context"] for p in r["points"]}
 
 
 def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypatch):

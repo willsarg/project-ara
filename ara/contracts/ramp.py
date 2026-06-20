@@ -82,6 +82,34 @@ class RampResult:
     binding: str = "memory"
 
 
+# Bisection bounds for refining the ceiling between the highest safe context and a measured
+# abort. Each probe is a full model load, so the step count is capped; the gap tolerance stops
+# once the bracket is tight enough that more precision isn't worth another load.
+BISECT_MIN_GAP = 256       # tokens — stop when the safe/abort bracket is this tight
+BISECT_MAX_STEPS = 6       # hard cap on bisection probes
+
+
+def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]]) -> int:
+    """Refine the highest safe context in ``[lo, hi)``: *lo* is known-safe, *hi* a measured abort.
+
+    Probes midpoints — each guarded by the engine's own L4/L5, since the abort proved the
+    a-priori fit can't be trusted here. A safe midpoint raises the floor (and is recorded);
+    an aborted one lowers the ceiling. Returns the highest confirmed-safe context. Bounded by
+    :data:`BISECT_MIN_GAP` / :data:`BISECT_MAX_STEPS` (each probe is a full model load).
+    """
+    steps = 0
+    while hi - lo > BISECT_MIN_GAP and steps < BISECT_MAX_STEPS:
+        mid = (lo + hi) // 2
+        steps += 1
+        m = measure_fn(mid)
+        if m.refused:
+            hi = mid
+        else:
+            lo = mid
+            points.append((mid, m.mem_gb))
+    return lo
+
+
 def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         budget_gb: float, ref_baseline_gb: float = 0.0,
         max_context: int | None = None) -> RampResult:
@@ -89,13 +117,20 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
 
     *measure_fn(ctx)* returns a Measurement (duck-typed ``.refused`` / ``.mem_gb``) whose
     ``mem_gb`` is the model's DELTA at that context — the adapter wires it to the engine
-    worker. The gate predicts the ABSOLUTE footprint from *base_gb* + *slope_gb_per_k*;
-    the ceiling solve adds *ref_baseline_gb* to the fitted delta. Escalation only visits
-    contexts :func:`plan_next` deems safe; an engine refusal stops it but keeps prior points.
-    A ceiling needs ≥2 points.
+    worker. The gate predicts the ABSOLUTE footprint from *base_gb* + *slope_gb_per_k*; the
+    ceiling solve adds *ref_baseline_gb* to the fitted delta. Escalation only visits contexts
+    :func:`plan_next` deems safe.
+
+    Two regimes produce the ceiling. If no rung ever aborts, the model grows gently and the
+    fitted line extrapolates the ceiling (capped at the model's window). If a rung **aborts**
+    (engine L4/L5 veto, or ARA's L2), that abort is a hard wall — extrapolating past it would
+    claim unsafe contexts are safe — so the ramp bisects ``[highest safe, abort)`` and reports
+    the highest *confirmed-safe* context (always memory-bound). A single safe measurement with
+    no abort is still a real lower bound and is reported as the ceiling, not discarded.
     """
     points: list[tuple[int, float]] = []
     measured: set[int] = set()
+    aborted_at: int | None = None
     while True:
         # Gate inputs: the conservative a-priori estimate until we have ≥2 points, then the
         # REFINED fit (delta intercept + live ref_baseline → absolute). Refining as data
@@ -112,10 +147,31 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         m = measure_fn(ctx)
         measured.add(ctx)
         if m.refused:
+            aborted_at = ctx
             break
         points.append((ctx, m.mem_gb))
+
+    safe_points = [c for c, _ in points]
+
+    # A rung aborted: the ceiling is below it. Bisect to pin the wall — but only with a safe
+    # lower bound to anchor on. If even the smallest rung aborts, the model doesn't fit here;
+    # report None rather than reloading it at ever-smaller contexts (RULE #1 + cost).
+    if aborted_at is not None:
+        if not safe_points:
+            return RampResult(None, None, points, "aborted at smallest context")
+        ceiling = _bisect_ceiling(measure_fn, max(safe_points), aborted_at, points)
+        points.sort()
+        f = fit(points) if len(points) >= 2 else None
+        return RampResult(ceiling, f, points, "bracketed below abort", "memory")
+
+    # No abort. With <2 points a line is undetermined, but a single safe measurement is still a
+    # real lower bound — report it (None only if nothing was ever measured safely).
     if len(points) < 2:
-        return RampResult(None, None, points, "insufficient points")
+        ceiling = max(safe_points) if safe_points else None
+        reason = "single safe point" if safe_points else "insufficient points"
+        return RampResult(ceiling, None, points, reason)
+
+    # Gentle linear regime: fit + extrapolate to the budget, capped at the model's window.
     f = fit(points)
     ceiling = safe_ceiling(f, budget_gb, ref_baseline_gb)
     binding = "memory"

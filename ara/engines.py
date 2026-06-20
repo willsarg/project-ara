@@ -37,11 +37,9 @@ ENGINES: dict[str, dict] = {
     "wcx": {
         "backend": "cuda",
         "package": "wcx-suite",
-        # Not yet wired to the isolated-env model: backends/cuda.py still imports wcx_suite
-        # in-process, but installs now go to the isolated env — so a real install would import
-        # nothing. Marked unavailable (honest "coming soon") until it's converted to the worker
-        # model AND tested on real NVIDIA hardware. See the cuda-conversion follow-up task.
-        "available": False,
+        # Converted to the isolated-env worker model (backends/cuda.py drives wcx-suite's
+        # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
+        "available": True,
         "spec": "git+https://github.com/willsarg/wcx-suite",
         "extras": "cuda",                        # pulls torch + transformers
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default

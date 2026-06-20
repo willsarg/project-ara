@@ -163,13 +163,68 @@ def test_run_returns_none_when_scheduler_refuses_immediately():
     assert res.stopped_reason == "insufficient points"
 
 
-def test_run_stops_on_engine_refusal_but_uses_points_so_far():
+def test_run_bisects_below_abort_instead_of_extrapolating_past_it():
+    # A refusal at 8000 is HARD evidence the ceiling is below it — extrapolating the 2000/4000
+    # fit to 31k would claim unsafe contexts are safe (the bug this guards against). The ramp
+    # must bracket [4000, 8000) and report a confirmed-safe context strictly under the abort.
     def measure(ctx):
         return FakeM(refused=True) if ctx >= 8000 else FakeM(mem_gb=5.0 + ctx / 1000)
     res = ramp.run(measure, schedule=[2000, 4000, 8000, 16000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
-    assert len(res.points) == 2          # 2000 and 4000 measured; 8000 refused → stop
-    assert res.safe_context == 30_999    # still fits from the two safe points
+    assert res.binding == "memory"
+    assert 4000 <= res.safe_context < 8000      # bisected into the bracket, never past it
+    assert res.safe_context != 30_999           # the old extrapolate-past-abort answer is gone
+    assert res.safe_context in {c for c, _ in res.points}   # the ceiling is a measured context
+
+
+def test_run_finds_the_wall_when_growth_is_super_linear():
+    # KV-style linear up to 4000, then a prefill-style wall: anything >= 5000 aborts. Bisection
+    # locates the wall (~5000) far better than the coarse schedule (which jumps 4000 → 8000).
+    def measure(ctx):
+        return FakeM(refused=True) if ctx >= 5000 else FakeM(mem_gb=5.0 + ctx / 1000)
+    res = ramp.run(measure, schedule=[2000, 4000, 8000, 16000],
+                   base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
+    assert 4000 <= res.safe_context < 5000      # pinned just below the real wall
+    assert res.binding == "memory"
+
+
+def test_run_reports_single_safe_point_when_gate_stops_without_abort():
+    # base 33 + slope 1: 2000 → 35 < 36 (probe it), 4000 → 37 ≥ 36 (a-priori gate stops, no abort).
+    # One measured-safe point is a real lower bound — report it, don't discard it as None (#45).
+    res = ramp.run(_linear_measure(33.0, 1.0), schedule=[2000, 4000],
+                   base_gb=33.0, slope_gb_per_k=1.0, budget_gb=36.0)
+    assert res.safe_context == 2000 and res.binding == "memory"
+    assert res.stopped_reason == "single safe point"
+
+
+def test_run_none_when_smallest_context_aborts_with_no_safe_point():
+    # first rung refused and nothing was ever safe → None, and we do NOT keep reloading the model
+    # at smaller contexts (a model that can't do the smallest rung is reported as not fitting).
+    calls = []
+
+    def measure(ctx):
+        calls.append(ctx)
+        return FakeM(refused=True)
+
+    res = ramp.run(measure, schedule=[2000, 4000], base_gb=5.0,
+                   slope_gb_per_k=1.0, budget_gb=36.0)
+    assert res.safe_context is None and res.points == []
+    assert calls == [2000]               # bisection is NOT attempted without a safe lower bound
+
+
+def test_run_bisection_is_bounded():
+    # every midpoint below 8000 is safe → bisection keeps climbing, but the probe count is capped
+    # (each probe is a full model load); assert it doesn't run away.
+    calls = []
+
+    def measure(ctx):
+        calls.append(ctx)
+        return FakeM(refused=True) if ctx >= 8000 else FakeM(mem_gb=5.0 + ctx / 1000)
+
+    ramp.run(measure, schedule=[2000, 4000, 8000], base_gb=5.0,
+             slope_gb_per_k=1.0, budget_gb=36.0)
+    # 3 schedule probes (2000/4000/8000) + at most BISECT_MAX_STEPS bisection probes
+    assert len(calls) <= 3 + ramp.BISECT_MAX_STEPS
 
 
 def test_run_refines_gate_from_measurements_to_escalate_safely():

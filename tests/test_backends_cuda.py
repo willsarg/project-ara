@@ -1,115 +1,223 @@
-"""backends/cuda.py — the wcx-suite seam, exercised against a fake engine."""
+"""backends/cuda.py — a lean wcx-suite seam (stateless; ARA owns persistence).
+
+The CUDA twin of test_backends_apple.py: cuda drives wcx-suite's device + measure_one workers
+out-of-process through engine_env, never importing wcx in ARA's interpreter.
+"""
 from __future__ import annotations
 
-import sys
-import types
-
-import pytest
-
+from ara import acquire
 from ara.backends import cuda
 
 
-class _FakeGPULimits:
-    device = "NVIDIA GeForce RTX 2070"
-    total_gb = 8.0
-    wall_gb = 8.0
-    free_gb = 6.9
-    used_gb = 0.9
-
-    def safe_threshold_gb(self, margin):
-        return self.wall_gb - margin
+def _fake_worker(monkeypatch, fn):
+    monkeypatch.setattr(cuda, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fn)}))
 
 
-@pytest.fixture
-def fake_wcx(monkeypatch):
-    """Inject a fake ``wcx_suite`` package; return knobs (.limits / .characterize_result)."""
-    state = types.SimpleNamespace(
-        limits=_FakeGPULimits(),
-        margin=1.0,
-        characterize_result=types.SimpleNamespace(
-            safe_context=16000, points=[(512, 1.4), (2048, 2.0)]),
-    )
-    system = types.ModuleType("wcx_suite.system")
-    system.read_limits = lambda: state.limits
-    config = types.ModuleType("wcx_suite.config")
-    config.margin_gb = lambda v=None: state.margin
-    probe = types.ModuleType("wcx_suite.probe")
-    probe.characterize = lambda model, budget_gb: state.characterize_result
-    pkg = types.ModuleType("wcx_suite")
-    pkg.system, pkg.config, pkg.probe = system, config, probe
-    pkg.__path__ = []
-    for name, mod in {"wcx_suite": pkg, "wcx_suite.system": system,
-                      "wcx_suite.config": config, "wcx_suite.probe": probe}.items():
-        monkeypatch.setitem(sys.modules, name, mod)
-    return state
+# Engine facts the wcx `device limits` worker returns (ARA overlays its own calibration fields).
+_LIMITS_FACTS = {
+    "device": "NVIDIA GeForce RTX 2070", "total_gb": 8.0, "wall_gb": 8.0,
+    "safe_budget_gb": 7.0, "margin_gb": 1.0, "headroom_gb": 5.0, "swap_free_gb": None,
+}
 
 
-def test_safe_limits(fake_wcx):
+def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
+    calls = []
+
+    def worker(name, argv):
+        calls.append((name, argv))
+        return dict(_LIMITS_FACTS)
+
+    _fake_worker(monkeypatch, worker)
     m = cuda.safe_limits()
+    assert calls == [("cuda", ["-m", "wcx_suite.device", "limits"])]
     assert m["device"] == "NVIDIA GeForce RTX 2070"
     assert m["total_gb"] == 8.0 and m["wall_gb"] == 8.0
-    assert m["safe_budget_gb"] == 7.0     # wall − 1 GB margin
-    assert m["margin_gb"] == 1.0
-    assert m["headroom_gb"] == 6.1        # safe 7 − used 0.9
-    assert m["swap_free_gb"] is None
+    assert m["safe_budget_gb"] == 7.0 and m["margin_gb"] == 1.0
+    assert m["headroom_gb"] == 5.0 and m["swap_free_gb"] is None
+    # no stored calibration in the engine — ARA overlays it from its own store
+    assert m["calibrated"] is False
     assert m["overhead_gb"] is None
-    assert m["calibrated"] is True and m["calibrated_at"] is None
+    assert m["calibrated_at"] is None
 
 
-def test_safe_limits_raises_without_gpu(fake_wcx):
-    fake_wcx.limits = None
-    with pytest.raises(RuntimeError):
+def test_safe_limits_raises_when_no_gpu(monkeypatch):
+    _fake_worker(monkeypatch, lambda name, argv: {"error": "no NVIDIA GPU visible to nvidia-smi"})
+    try:
         cuda.safe_limits()
-
-
-def test_calibrate_attaches_characterization(fake_wcx):
-    m = cuda.calibrate("smol")
-    assert m["calibrated"] is True
-    assert m["characterization"]["model"] == "smol"
-    assert m["characterization"]["safe_context"] == 16000
-    assert m["characterization"]["points"] == [(512, 1.4), (2048, 2.0)]
-
-
-def test_calibrate_handles_failed_characterize(fake_wcx):
-    fake_wcx.characterize_result = None
-    m = cuda.calibrate("smol")
-    assert m["characterization"]["safe_context"] is None
-    assert m["characterization"]["points"] == []
-
-
-def test_characterize_returns_ceiling(fake_wcx):
-    r = cuda.characterize("smol")
-    assert r["model"] == "smol"
-    assert r["safe_context"] == 16000
-    assert r["points"] == [(512, 1.4), (2048, 2.0)]
-
-
-def test_characterize_none_when_failed(fake_wcx):
-    fake_wcx.characterize_result = None
-    r = cuda.characterize("smol")
-    assert r["safe_context"] is None and r["points"] == []
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "no NVIDIA GPU" in str(e)
 
 
 def test_calibration_model_cached_true(monkeypatch):
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache",
-                        lambda model, fn: "/path/to/config.json")
-    assert cuda.calibration_model_cached("smol") is True
+                        lambda m, fn: "/path/to/config.json")
+    assert cuda.calibration_model_cached("any/model") is True
 
 
-def test_calibration_model_cached_false(monkeypatch):
-    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda model, fn: None)
-    assert cuda.calibration_model_cached("smol") is False
+def test_calibration_model_cached_false_when_absent(monkeypatch):
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda m, fn: None)
+    assert cuda.calibration_model_cached("any/model") is False
 
 
-def test_calibration_model_cached_handles_error(monkeypatch):
-    def boom(model, fn):
+def test_calibration_model_cached_false_on_error(monkeypatch):
+    def boom(m, fn):
         raise RuntimeError("hf down")
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", boom)
-    assert cuda.calibration_model_cached("smol") is False
+    assert cuda.calibration_model_cached("any/model") is False
 
 
-def test_download_delegates_to_acquire(monkeypatch):
-    called = {}
-    monkeypatch.setattr("ara.acquire.download", lambda m: called.setdefault("model", m))
-    cuda.download_calibration_model("smol")
-    assert called["model"] == "smol"
+def test_download_calibration_model_delegates_to_acquire(monkeypatch):
+    calls = []
+    monkeypatch.setattr(acquire, "download", lambda repo_id: calls.append(repo_id))
+    cuda.download_calibration_model("org/calib-model")
+    assert calls == ["org/calib-model"]
+
+
+def _calibrate_worker(monkeypatch, calibration, calls=None):
+    def worker(name, argv):
+        if calls is not None:
+            calls.append(argv)
+        return dict(calibration) if argv[2] == "calibrate" else dict(_LIMITS_FACTS)
+    _fake_worker(monkeypatch, worker)
+
+
+def test_calibrate_surfaces_effective_overhead(monkeypatch):
+    calls = []
+    _calibrate_worker(monkeypatch, {
+        "device": "RTX 2070", "measured_overhead_gb": 0.9,
+        "default_overhead_gb": 0.6, "n_points": 1,
+    }, calls)
+    m = cuda.calibrate("org/calib-model")
+    assert m["device"] == "NVIDIA GeForce RTX 2070"     # carries fresh limits …
+    assert m["overhead_gb"] == 0.9                       # effective = max(default 0.6, measured 0.9)
+    assert m["calibrated"] is True
+    assert m["calibration"]["n_points"] == 1             # … plus what it measured
+    assert ["-m", "wcx_suite.device", "calibrate", "org/calib-model"] in calls
+
+
+def test_calibrate_overhead_falls_back_to_default(monkeypatch):
+    _calibrate_worker(monkeypatch, {"default_overhead_gb": 0.6})   # no measurement key
+    assert cuda.calibrate("org/calib-model")["overhead_gb"] == 0.6
+
+
+def test_calibrate_overhead_none_when_nothing_measured(monkeypatch):
+    _calibrate_worker(monkeypatch, {"n_points": 0})               # no overhead keys at all
+    assert cuda.calibrate("org/calib-model")["overhead_gb"] is None
+
+
+class _FakeEngine:
+    """Stand-in for engine_env.run_worker: answers preflight + per-ctx measurements, driven by a
+    canned estimate and a linear memory model. Records every spawn."""
+    def __init__(self, est, intercept=1.0, slope_per_k=0.2, refuse_at=None):
+        self.est, self.intercept, self.slope = est, intercept, slope_per_k
+        self.refuse_at = refuse_at
+        self.measured: list[int] = []
+
+    def __call__(self, name, argv):
+        assert name == "cuda"
+        ctx = int(argv[3])
+        if "--preflight" in argv:
+            return dict(self.est)
+        self.measured.append(ctx)
+        if self.refuse_at is not None and ctx >= self.refuse_at:
+            return {"context": ctx, "refused": True, "reason": "engine veto"}
+        return {"context": ctx, "mem_gb": self.intercept + self.slope * (ctx / 1000)}
+
+
+def _patch_budget(monkeypatch, margin=1.0, overhead=0.6):
+    monkeypatch.setattr(cuda, "_budget_params", lambda: (margin, overhead))
+
+
+def test_characterize_drives_ramp_over_engine_env(monkeypatch):
+    _patch_budget(monkeypatch)
+    est = {"base_gb": 1.6, "slope_gb_per_k": 0.2, "budget_gb": 7.0,
+           "max_context": 16000, "ref_baseline_gb": 0.0}
+    fake = _FakeEngine(est, intercept=1.0, slope_per_k=0.2)
+    _fake_worker(monkeypatch, fake)
+    r = cuda.characterize("org/model")
+    assert r["model"] == "org/model"
+    # fitted ceiling ~30k exceeds the 16k window → capped, window-bound
+    assert r["safe_context"] == 16_000
+    assert r["binding"] == "context_window"
+    assert all(c <= 16000 for c in fake.measured)
+    assert r["points"][0] == {"context": 2000, "mem_gb": 1.4}
+
+
+def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
+    _patch_budget(monkeypatch)
+    # delta fit: model base 1, slope 0.2; live VRAM baseline 2 GB → ceiling (7-2-1)/0.2 = 20k
+    est = {"base_gb": 3.0, "slope_gb_per_k": 0.2, "budget_gb": 7.0,
+           "max_context": None, "ref_baseline_gb": 2.0}
+    fake = _FakeEngine(est, intercept=1.0, slope_per_k=0.2)
+    _fake_worker(monkeypatch, fake)
+    r = cuda.characterize("org/model")
+    assert r["safe_context"] == 19_999    # (7-2-1)/0.2 = 20k, −1 to stay strictly under budget
+
+
+def test_characterize_none_when_preflight_errors(monkeypatch):
+    _patch_budget(monkeypatch)
+    fake = _FakeEngine({"error": "model not found in HF cache"})
+    _fake_worker(monkeypatch, fake)
+    out = cuda.characterize("missing/model")
+    assert out == {"model": "missing/model", "safe_context": None, "points": []}
+
+
+def test_characterize_stops_on_engine_refusal(monkeypatch):
+    _patch_budget(monkeypatch)
+    est = {"base_gb": 1.0, "slope_gb_per_k": 0.2, "budget_gb": 7.0,
+           "max_context": None, "ref_baseline_gb": 0.0}
+    fake = _FakeEngine(est, refuse_at=8000)
+    _fake_worker(monkeypatch, fake)
+    r = cuda.characterize("org/model")
+    # 8000 refused → hard wall: bisect [4000, 8000), report a confirmed-safe context under it
+    assert 4000 <= r["safe_context"] < 8000
+    assert r["binding"] == "memory"
+    assert r["safe_context"] in {p["context"] for p in r["points"]}
+
+
+def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypatch):
+    _patch_budget(monkeypatch)
+    # base already at budget → L1 refuses the first rung; nothing is dispatched
+    est = {"base_gb": 6.95, "slope_gb_per_k": 0.2, "budget_gb": 7.0,
+           "max_context": None, "ref_baseline_gb": 0.0}
+    fake = _FakeEngine(est)
+    _fake_worker(monkeypatch, fake)
+    r = cuda.characterize("org/model")
+    assert fake.measured == []
+    assert r["safe_context"] is None
+
+
+def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatch):
+    _patch_budget(monkeypatch)
+    # L1 predicts safe (tiny slope), but the ACTUAL measured VRAM is high → L2 catches it
+    est = {"base_gb": 1.0, "slope_gb_per_k": 0.0001, "budget_gb": 7.0,
+           "max_context": None, "ref_baseline_gb": 0.0}
+    fake = _FakeEngine(est, intercept=8.0, slope_per_k=0.0)   # every measurement reports 8 GB
+    _fake_worker(monkeypatch, fake)
+    r = cuda.characterize("org/model")
+    assert fake.measured == [2000] and r["safe_context"] is None
+
+
+def test_budget_params_uses_stored_calibration(monkeypatch):
+    monkeypatch.setattr(cuda, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(cuda, "profiles",
+                        type("P", (), {"get_calibration": staticmethod(
+                            lambda con, eng: {"fixed_overhead_gb": 1.2})}), raising=False)
+    margin, overhead = cuda._budget_params()
+    assert (margin, overhead) == (cuda.DEFAULT_MARGIN_GB, 1.2)
+
+
+def test_budget_params_falls_back_to_default_overhead(monkeypatch):
+    monkeypatch.setattr(cuda, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(cuda, "profiles",
+                        type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
+                        raising=False)
+    margin, overhead = cuda._budget_params()
+    assert (margin, overhead) == (cuda.DEFAULT_MARGIN_GB, cuda.DEFAULT_OVERHEAD_GB)
+
+
+def test_calibration_model_constant_is_transformers_format():
+    # transformers-format (torch loads this), NOT the mlx-community 4-bit build apple uses
+    assert cuda.CALIBRATION_MODEL == "HuggingFaceTB/SmolLM-135M-Instruct"

@@ -121,12 +121,23 @@ def test_install_targets_wcx_local_is_editable_with_extra(monkeypatch):
 # --------------------------------------------------------------------------- #
 # install() — create the isolated env (engine_env injected)
 # --------------------------------------------------------------------------- #
-def test_wcx_is_unavailable_until_tested_on_real_hardware(monkeypatch):
-    # cuda isn't wired to the isolated-env model yet and there's no NVIDIA to verify it, so wcx
-    # is honestly "coming soon" rather than producing a broken install.
-    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
-    assert engines.ENGINES["wcx"]["available"] is False
-    assert engines.install("wcx").status == "coming_soon"
+def test_wcx_is_available_and_installs_into_its_cuda_env(monkeypatch):
+    # wcx is converted to the isolated-env worker model, so it installs like any other engine —
+    # into the `cuda` env, folding the [cuda] extra + the auto torch-backend selector.
+    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    seen = {}
+
+    def fake_create(name, packages, *, python=None, **kw):
+        seen.update(name=name, packages=packages, python=python)
+
+    monkeypatch.setattr(engines.engine_env, "create", fake_create)
+    assert engines.ENGINES["wcx"]["available"] is True
+    assert engines.install("wcx").status == "installed"
+    assert seen["name"] == "cuda" and seen["python"] == "3.12"
+    assert seen["packages"] == [
+        "--torch-backend=auto",
+        "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
 
 
 def test_install_unknown_engine_reports_unknown():
