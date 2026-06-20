@@ -20,8 +20,10 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-# A tiny instruct GGUF (worker auto-picks the smallest quant, ~100 MB) with a 2048 window —
-# the exact small-window shape that exposed the driver bug.
+# A tiny instruct GGUF (worker auto-picks the smallest quant, ~100 MB; 8192-token window). This
+# tier checks the real end-to-end path — worker preflight reads the GGUF's real max_context, real
+# RSS measurements flow through the real driver. The tiny-window edge case itself (window below
+# the 2nd schedule rung) is covered exhaustively at unit level in test_methodology_matrix.py.
 SMOKE_MODEL = "bartowski/SmolLM2-135M-Instruct-GGUF"
 
 
@@ -48,14 +50,20 @@ def test_safe_limits_reads_a_real_ram_wall(cpu_engine):
 
 
 def test_characterize_finds_a_sane_ceiling(cpu_engine):
+    # Pre-fetch the GGUF so we can tell "offline" apart from "bug". The worker folds fetch
+    # failures into a None ceiling (no exception), so skipping on None would HIDE the exact
+    # bug this tier targets (a fitting model reported as None). Fetch first: a failure here is
+    # a legitimate skip; once the model is cached, a None ceiling is a real failure.
+    from ara.workers import cpu_llama
     try:
-        r = cpu_engine.characterize(SMOKE_MODEL)
-    except Exception as e:                       # offline / model unfetchable
-        pytest.skip(f"could not fetch/run {SMOKE_MODEL}: {e}")
-    if r["safe_context"] is None:
-        pytest.skip("model could not be fetched (no cached GGUF, likely offline)")
-    # A 135M model fits its whole trained window on any real machine — so the live path must
-    # report a positive, window-bound ceiling (memory never binds first here).
+        cpu_llama._resolve_gguf(SMOKE_MODEL)     # downloads the smallest quant; raises offline
+    except Exception as e:
+        pytest.skip(f"{SMOKE_MODEL} unavailable (offline?): {e}")
+
+    r = cpu_engine.characterize(SMOKE_MODEL)
+    # A 135M model fits its whole trained window on any real machine → a positive, window-bound
+    # ceiling. With the model cached, None would mean the methodology regressed — fail, don't skip.
+    assert r["safe_context"] is not None, "cached model must yield a ceiling, got None"
     assert isinstance(r["safe_context"], int) and r["safe_context"] >= 2048
     assert r["binding"] == "context_window"
     assert r["points"] and all(p["mem_gb"] > 0 for p in r["points"])
