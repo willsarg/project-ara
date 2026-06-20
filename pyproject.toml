@@ -42,6 +42,11 @@ addopts = "-q --cov=ara --cov-report=term-missing"
 [tool.coverage.run]
 source = ["ara"]
 branch = true
+# Built-in engine workers run in their own isolated uv env (with llama-cpp-python etc.),
+# not in ARA's test venv — so they can't be exercised here, exactly like the external
+# wmx-suite. Their pure logic still has unit tests (tests/test_workers_*), they're just
+# out of the 100% core gate.
+omit = ["ara/workers/*"]
 
 [tool.coverage.report]
 show_missing = true
