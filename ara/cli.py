@@ -21,8 +21,10 @@ _CMD_W = 16
 
 
 def _cmd(c: Console, name: str, why: str) -> str:
-    """One command row: accent name padded, dim gloss."""
-    return "  " + c.style("accent", name.ljust(_CMD_W)) + c.style("gloss", why)
+    """One command row: accent name padded, dim gloss. Names wider than the column
+    (e.g. ``characterize <model>``) still keep a gap so they don't collide with the gloss."""
+    width = _CMD_W if len(name) < _CMD_W else len(name) + 2
+    return "  " + c.style("accent", name.ljust(width)) + c.style("gloss", why)
 
 
 def _fmt_gb(v: float | None, decimals: int = 0) -> str:
@@ -656,7 +658,8 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
           if engine_key else None)
     ceiling = ch["safe_context"] if ch else None
     if as_json:
-        print(json.dumps({"model_id": model_id, **meta, "safe_context": ceiling}, indent=2))
+        print(json.dumps({"model_id": model_id, **meta, "safe_context": ceiling,
+                          "characterized": ch is not None}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
     c.emit()
@@ -666,8 +669,13 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("kv cache", f"{kvh} heads × {hd} dim" if (kvh and hd) else "?"))
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
-    c.emit(c.field("ceiling",
-                   f"~{ceiling} tokens" if ceiling else "not characterized"))
+    if ceiling:
+        ceiling_text = f"~{ceiling} tokens"
+    elif ch is not None:                  # measured here, but nothing fit (mirrors '—')
+        ceiling_text = "no safe ceiling"
+    else:
+        ceiling_text = "not characterized"
+    c.emit(c.field("ceiling", ceiling_text))
     c.emit()
     return 0
 
@@ -744,22 +752,28 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
                     for r in db.list_characterizations(con, profiles.machine_key(), engine_key)}
 
     if as_json:
-        print(json.dumps([{**m, "safe_context": ceilings.get(m["model_id"])} for m in models],
+        print(json.dumps([{**m, "safe_context": ceilings.get(m["model_id"]),
+                           "characterized": m["model_id"] in ceilings} for m in models],
                          indent=2))
         return
 
     c.emit()
     c.emit(c.section("  MODEL CATALOG"))
     for m in models:
-        ceiling = ceilings.get(m["model_id"])
-        tail = f"~{ceiling} tokens" if ceiling else "not characterized"
-        c.emit("  " + c.style("metric", m["model_id"])
+        mid = m["model_id"]
+        if mid in ceilings:                       # ARA has measured this model here
+            ceiling = ceilings[mid]
+            tail = f"~{ceiling} tokens" if ceiling else "no safe ceiling"
+            role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
+        else:
+            tail, role = "not characterized", "dim"
+        c.emit("  " + c.style("metric", mid)
                + c.style("dim", f"  {m['modality'] or '?'}  →  ")
-               + c.style("good" if ceiling else "dim", tail))
+               + c.style(role, tail))
     if not models:
         c.emit(c.style("dim", "  empty — download a model and it'll be cataloged here"))
     c.emit()
-    n_char = sum(1 for m in models if ceilings.get(m["model_id"]))
+    n_char = sum(1 for m in models if m["model_id"] in ceilings)
     c.emit(c.style("dim", f"  {len(models)} cataloged · {n_char} characterized on this machine"))
     c.emit()
 

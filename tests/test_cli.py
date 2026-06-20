@@ -191,6 +191,21 @@ def test_render_landing_unsupported_warns(make_console, monkeypatch):
     assert "no supported backend" in buf.getvalue()
 
 
+def test_cmd_long_name_keeps_gap_before_gloss(make_console):
+    """A command label longer than the alignment column must not collide with its gloss."""
+    c, _ = make_console()  # color off → plain text
+    row = cli._cmd(c, "characterize <model>", "measure a model's safe context ceiling here")
+    assert "<model>measure" not in row     # the bug: label runs straight into the gloss
+    assert "<model>  measure" in row       # at least a two-space gap
+
+
+def test_cmd_short_name_stays_column_aligned(make_console):
+    """Short labels still align to the fixed command column (no regression)."""
+    c, _ = make_console()
+    row = cli._cmd(c, "detect", "inspect this machine")
+    assert "detect" + " " * 10 + "inspect" in row   # 6-char name padded to the 16-col gutter
+
+
 # --------------------------------------------------------------------------- #
 # render_detect
 # --------------------------------------------------------------------------- #
@@ -1349,6 +1364,30 @@ def test_render_models_lists_catalog(make_console, store, monkeypatch):
     assert "2 cataloged" in out
 
 
+def test_render_models_distinguishes_measured_no_ceiling(make_console, store, monkeypatch):
+    """A model ARA measured but couldn't fit (row with safe_context=None) reads as
+    characterized-with-no-ceiling — not lumped with never-measured models. Keeps
+    `ara models` consistent with `ara profile`'s CHARACTERIZED list (which shows '—')."""
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/Fits", "modality": "text"},
+                                     {"model_id": "org/NoCeiling", "modality": "text"},
+                                     {"model_id": "org/Never", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000},
+                                            {"model_id": "org/NoCeiling", "safe_context": None}])
+    c, buf = make_console()
+    cli.render_models(c)
+    lines = {ln.split()[0]: ln for ln in buf.getvalue().splitlines() if "org/" in ln}
+    assert "16000" in lines["org/Fits"]
+    assert "no safe ceiling" in lines["org/NoCeiling"]
+    assert "not characterized" not in lines["org/NoCeiling"]
+    assert "not characterized" in lines["org/Never"]      # the only never-measured one
+    assert "2 characterized on this machine" in buf.getvalue()
+
+
 def test_render_models_empty_and_no_engine(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
@@ -1370,6 +1409,28 @@ def test_render_models_json(monkeypatch, capsys, store):
     cli.render_models(c, as_json=True)
     data = json.loads(capsys.readouterr().out)
     assert data[0]["safe_context"] == 9000
+
+
+def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
+    """Models JSON carries a `characterized` flag so a null ceiling that was *measured*
+    (no fit) is distinguishable from one that was *never measured*."""
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/Fits", "modality": "text"},
+                                     {"model_id": "org/NoCeiling", "modality": "text"},
+                                     {"model_id": "org/Never", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000},
+                                            {"model_id": "org/NoCeiling", "safe_context": None}])
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    data = {d["model_id"]: d for d in json.loads(capsys.readouterr().out)}
+    assert data["org/Fits"].get("characterized") is True
+    assert data["org/NoCeiling"].get("characterized") is True
+    assert data["org/NoCeiling"]["safe_context"] is None
+    assert data["org/Never"].get("characterized") is False
 
 
 def test_main_models_dispatch(monkeypatch):
@@ -1475,6 +1536,46 @@ def test_model_detail_json(monkeypatch, capsys):
     assert cli.render_model_detail(c, "org/A", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["model_id"] == "org/A" and data["safe_context"] == 9000
+
+
+def test_model_detail_measured_no_ceiling(make_console, monkeypatch):
+    """`ara models <id>` for a measured-but-unfit model reads 'no safe ceiling',
+    not 'not characterized' — consistent with `ara models` and `ara profile`."""
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": None})
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/Unfit") == 0
+    out = buf.getvalue()
+    assert "no safe ceiling" in out
+    assert "not characterized" not in out
+
+
+def test_model_detail_json_characterized_flag(monkeypatch, capsys):
+    """Detail JSON flags a measured-but-unfit model as characterized with a null ceiling."""
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": None})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/Unfit", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["safe_context"] is None
+    assert data.get("characterized") is True
+
+
+def test_model_detail_json_uncharacterized_flag(monkeypatch, capsys):
+    """Detail JSON flags a never-measured model as not characterized."""
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")  # engine_key None → ch None
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "x", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["safe_context"] is None
+    assert data.get("characterized") is False
 
 
 def test_main_models_id_dispatch(monkeypatch):
