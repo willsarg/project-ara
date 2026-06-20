@@ -10,10 +10,13 @@ emits).
 Pure orchestration: no ML library is imported here. The one external boundary is
 :func:`_run` (uv / the engine's python), which tests stub.
 
-The link-mode *fallback ladder* (clone→hardlink→copy on filesystems without CoW)
-is deliberately **not** built yet: uv's behavior on a non-CoW filesystem is
-unverified, and retrying a multi-GB install three times would be exactly the disk
-waste this design avoids. ``create`` takes a single resolved ``link_mode`` for now.
+ARA does **not** implement a link-mode fallback ladder, because uv already owns one.
+Verified empirically (uv 0.11.20, ``--link-mode clone`` into a venv on a non-CoW exFAT
+volume): uv degrades per-file in a *single* install pass — clone → hardlink → full copy —
+succeeds (rc 0), and only prints a stderr warning. So ``clone`` is the right universal
+default: optimal (~7 MB/extra env) on a CoW filesystem (APFS/btrfs/XFS), and a correct
+full copy elsewhere, with no errors and no multi-GB retry waste. ``create`` passes a single
+``link_mode`` and lets uv resolve the rest.
 """
 from __future__ import annotations
 
@@ -25,8 +28,9 @@ from pathlib import Path
 
 import platformdirs
 
-# Best link mode on a CoW filesystem (APFS/btrfs/XFS): ~7 MB/extra env vs a full
-# copy. Caller/config may override per filesystem until the ladder is built.
+# Optimal on a CoW filesystem (APFS/btrfs/XFS): ~7 MB/extra env vs a full copy. On a
+# non-CoW filesystem uv auto-degrades clone → hardlink → copy in one pass (verified), so
+# this stays the universal default; a caller/config may still override it.
 DEFAULT_LINK_MODE = "clone"
 
 
