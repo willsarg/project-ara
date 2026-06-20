@@ -78,13 +78,15 @@ class RampResult:
 
 
 def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
-        budget_gb: float) -> RampResult:
+        budget_gb: float, ref_baseline_gb: float = 0.0) -> RampResult:
     """Drive the safe ramp: schedule a rung (L1 gate), measure it, repeat, then fit + solve.
 
-    *measure_fn(ctx)* returns a Measurement (duck-typed ``.refused`` / ``.mem_gb``) — the
-    adapter wires it to the engine worker. Escalation only ever visits contexts
-    :func:`plan_next` deems safe; an engine refusal (defense in depth) stops escalation but
-    keeps the points already gathered. A ceiling needs ≥2 points.
+    *measure_fn(ctx)* returns a Measurement (duck-typed ``.refused`` / ``.mem_gb``) whose
+    ``mem_gb`` is the model's DELTA at that context — the adapter wires it to the engine
+    worker. The gate predicts the ABSOLUTE footprint from *base_gb* + *slope_gb_per_k*;
+    the ceiling solve adds *ref_baseline_gb* to the fitted delta. Escalation only visits
+    contexts :func:`plan_next` deems safe; an engine refusal stops it but keeps prior points.
+    A ceiling needs ≥2 points.
     """
     points: list[tuple[int, float]] = []
     measured: set[int] = set()
@@ -100,7 +102,7 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     if len(points) < 2:
         return RampResult(None, None, points, "insufficient points")
     f = fit(points)
-    return RampResult(safe_ceiling(f, budget_gb), f, points, "ok")
+    return RampResult(safe_ceiling(f, budget_gb, ref_baseline_gb), f, points, "ok")
 
 
 def plan_next(schedule: list[int], measured, base_gb: float,
@@ -120,14 +122,16 @@ def plan_next(schedule: list[int], measured, base_gb: float,
     return None
 
 
-def safe_ceiling(f: Fit, budget_gb: float) -> int | None:
+def safe_ceiling(f: Fit, budget_gb: float, ref_baseline_gb: float = 0.0) -> int | None:
     """Largest context (tokens) whose predicted memory stays within *budget_gb*.
 
-    Returns ``None`` when the curve shows no measurable growth (slope ≤ 0) — we can't
-    honestly project a ceiling. Returns ``0`` when the base footprint already exceeds the
-    budget (won't fit even at minimal context). Otherwise the floored token count.
+    The fit is on the model's DELTA over its own launch baseline (so ``intercept_gb`` is the
+    model's footprint at context→0, free of ambient noise); *ref_baseline_gb* is the live OS
+    baseline added back at solve time — mirroring wmx's ``ref_baseline + model_base + slope·c``.
+    Returns ``None`` when there's no measurable growth (slope ≤ 0), ``0`` when the base already
+    exceeds budget, else the floored token count.
     """
     if f.slope_gb_per_k <= 0:
         return None
-    headroom = budget_gb - f.intercept_gb
+    headroom = budget_gb - ref_baseline_gb - f.intercept_gb
     return int(max(0.0, headroom / f.slope_gb_per_k) * 1000)

@@ -62,6 +62,20 @@ def test_safe_ceiling_zero_when_model_base_exceeds_budget():
     assert ramp.safe_ceiling(f, budget_gb=15.0) == 0
 
 
+def test_safe_ceiling_subtracts_live_ref_baseline():
+    # fit is the model DELTA (intercept 5 = model base); live OS baseline 8 GB eats headroom
+    f = ramp.Fit(intercept_gb=5.0, slope_gb_per_k=1.0, r2=1.0, n_points=3)
+    # headroom = 36 - 8 (ref) - 5 (model) = 23 → 23k tokens
+    assert ramp.safe_ceiling(f, budget_gb=36.0, ref_baseline_gb=8.0) == 23_000
+
+
+def test_run_threads_ref_baseline_into_ceiling():
+    # delta points: model base 5, slope 1; ref baseline 8 → ceiling (36-8-5)/1 = 23k
+    res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
+                   base_gb=13.0, slope_gb_per_k=1.0, budget_gb=36.0, ref_baseline_gb=8.0)
+    assert res.safe_context == 23_000
+
+
 def test_safe_ceiling_none_when_no_measurable_growth():
     flat = ramp.Fit(intercept_gb=5.0, slope_gb_per_k=0.0, r2=1.0, n_points=3)
     assert ramp.safe_ceiling(flat, budget_gb=15.0) is None

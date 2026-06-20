@@ -87,7 +87,7 @@ def _patch_budget(monkeypatch, margin=2.0, overhead=1.0):
 
 def test_characterize_drives_ramp_over_engine_env(monkeypatch):
     _patch_budget(monkeypatch)
-    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": 16000}
+    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": 16000, "ref_baseline_gb": 0.0}
     fake = _FakeEngine(est, intercept=5.0, slope_per_k=1.0)
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
@@ -97,6 +97,18 @@ def test_characterize_drives_ramp_over_engine_env(monkeypatch):
     assert r["safe_context"] == 31_000
     assert all(c <= 16000 for c in fake.measured)
     assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
+
+
+def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
+    _patch_budget(monkeypatch)
+    # delta fit: model base 5, slope 1; live OS baseline 8 GB → ceiling (36-8-5)/1 = 23k
+    est = {"base_gb": 13.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
+           "max_context": None, "ref_baseline_gb": 8.0}
+    fake = _FakeEngine(est, intercept=5.0, slope_per_k=1.0)
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    r = apple.characterize("org/model")
+    assert r["safe_context"] == 23_000
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):
@@ -110,7 +122,7 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
 
 def test_characterize_stops_on_engine_refusal(monkeypatch):
     _patch_budget(monkeypatch)
-    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None}
+    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None, "ref_baseline_gb": 0.0}
     fake = _FakeEngine(est, refuse_at=8000)
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
@@ -123,7 +135,7 @@ def test_characterize_stops_on_engine_refusal(monkeypatch):
 def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypatch):
     _patch_budget(monkeypatch)
     # base already at budget → L1 plan_next refuses the first rung; nothing is dispatched
-    est = {"base_gb": 35.9, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None}
+    est = {"base_gb": 35.9, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None, "ref_baseline_gb": 0.0}
     fake = _FakeEngine(est)
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
@@ -135,7 +147,7 @@ def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypa
 def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatch):
     _patch_budget(monkeypatch)
     # L1 predicts safe (low slope), but the ACTUAL measured memory is high → L2 catches it
-    est = {"base_gb": 5.0, "slope_gb_per_k": 0.001, "budget_gb": 36.0, "max_context": None}
+    est = {"base_gb": 5.0, "slope_gb_per_k": 0.001, "budget_gb": 36.0, "max_context": None, "ref_baseline_gb": 0.0}
     fake = _FakeEngine(est, intercept=40.0, slope_per_k=0.0)  # every measurement reports 40 GB
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))

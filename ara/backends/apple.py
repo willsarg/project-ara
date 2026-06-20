@@ -128,16 +128,18 @@ def characterize(model: str) -> dict:
     def measure_fn(ctx: int):
         raw = engine_env.run_worker("apple", _worker_argv(model, ctx, margin, overhead))
         m = worker.parse(raw)
-        # L2 (independent of L1's prediction): if the ACTUAL measurement reached the budget,
-        # stop escalating and don't trust higher contexts — even though L1 predicted it safe.
-        if not m.refused and m.mem_gb is not None and m.mem_gb >= est["budget_gb"]:
+        # L2 (independent of L1's prediction): mem_gb is the model DELTA, so the ACTUAL
+        # absolute footprint is ref_baseline + delta. If that reached the budget, stop
+        # escalating and don't trust higher contexts — even though L1 predicted it safe.
+        if not m.refused and m.mem_gb is not None \
+                and est["ref_baseline_gb"] + m.mem_gb >= est["budget_gb"]:
             return worker.Measurement(context=ctx, mem_gb=None, refused=True,
                                       reason="ARA L2: measured at/over safe budget")
         return m
 
     schedule = [c for c in RAMP_SCHEDULE
                 if est["max_context"] is None or c <= est["max_context"]]
-    res = ramp.run(measure_fn, schedule, est["base_gb"],
-                   est["slope_gb_per_k"], est["budget_gb"])
+    res = ramp.run(measure_fn, schedule, est["base_gb"], est["slope_gb_per_k"],
+                   est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"])
     return {"model": model, "safe_context": res.safe_context,
             "points": [{"context": c, "mem_gb": m} for c, m in res.points]}
