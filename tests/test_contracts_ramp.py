@@ -186,6 +186,20 @@ def test_run_refines_gate_from_measurements_to_escalate_safely():
     assert 32000 in seen          # refined fit let escalation pass the steep a-priori gate
 
 
+def test_run_caps_ceiling_at_model_context_window():
+    # memory would allow ~31k, but the model's window is 20k → report 20k, window-bound
+    res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
+                   base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0, max_context=20000)
+    assert res.safe_context == 20000
+    assert res.binding == "context_window"
+
+
+def test_run_memory_bound_when_ceiling_below_window():
+    res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
+                   base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0, max_context=100000)
+    assert res.safe_context == 31000 and res.binding == "memory"
+
+
 def test_run_none_when_fewer_than_two_points():
     res = ramp.run(lambda c: FakeM(refused=True), schedule=[2000, 4000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)

@@ -140,6 +140,7 @@ def characterize(model: str) -> dict:
     schedule = [c for c in RAMP_SCHEDULE
                 if est["max_context"] is None or c <= est["max_context"]]
     res = ramp.run(measure_fn, schedule, est["base_gb"], est["slope_gb_per_k"],
-                   est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"])
-    return {"model": model, "safe_context": res.safe_context,
+                   est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"],
+                   max_context=est["max_context"])
+    return {"model": model, "safe_context": res.safe_context, "binding": res.binding,
             "points": [{"context": c, "mem_gb": m} for c, m in res.points]}

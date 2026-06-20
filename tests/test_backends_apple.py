@@ -93,8 +93,9 @@ def test_characterize_drives_ramp_over_engine_env(monkeypatch):
                         type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
     assert r["model"] == "org/model"
-    # fitted intercept 5, slope 1 → ceiling (36-5)/1 = 31k; schedule capped at max_context 16000
-    assert r["safe_context"] == 31_000
+    # fitted memory ceiling ~31k exceeds the model's 16k window → capped, window-bound
+    assert r["safe_context"] == 16_000
+    assert r["binding"] == "context_window"
     assert all(c <= 16000 for c in fake.measured)
     assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
 

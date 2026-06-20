@@ -70,15 +70,21 @@ def would_breach(base_gb: float, slope_gb_per_k: float, ctx_tokens: int,
 
 @dataclass(frozen=True)
 class RampResult:
-    """Outcome of a safe ramp: the ceiling (or None), the fit, and the points gathered."""
+    """Outcome of a safe ramp: the ceiling (or None), the fit, and the points gathered.
+
+    ``binding`` says what limits the ceiling — ``"memory"`` (the safe budget) or
+    ``"context_window"`` (the model's own ``max_context``, which memory would otherwise exceed).
+    """
     safe_context: int | None
     fit: Fit | None
     points: list[tuple[int, float]]
     stopped_reason: str
+    binding: str = "memory"
 
 
 def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
-        budget_gb: float, ref_baseline_gb: float = 0.0) -> RampResult:
+        budget_gb: float, ref_baseline_gb: float = 0.0,
+        max_context: int | None = None) -> RampResult:
     """Drive the safe ramp: schedule a rung (L1 gate), measure it, repeat, then fit + solve.
 
     *measure_fn(ctx)* returns a Measurement (duck-typed ``.refused`` / ``.mem_gb``) whose
@@ -111,7 +117,13 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     if len(points) < 2:
         return RampResult(None, None, points, "insufficient points")
     f = fit(points)
-    return RampResult(safe_ceiling(f, budget_gb, ref_baseline_gb), f, points, "ok")
+    ceiling = safe_ceiling(f, budget_gb, ref_baseline_gb)
+    binding = "memory"
+    # Honesty: a memory ceiling past the model's own context window is unusable — cap it,
+    # and say the limit is the window, not memory.
+    if ceiling is not None and max_context is not None and ceiling > max_context:
+        ceiling, binding = max_context, "context_window"
+    return RampResult(ceiling, f, points, "ok", binding)
 
 
 def plan_next(schedule: list[int], measured, base_gb: float,
