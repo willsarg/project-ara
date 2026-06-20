@@ -515,6 +515,18 @@ def test_profile_cpu_fallback(set_platform, run_stub, fake_home, monkeypatch):
     assert m.backend == "cpu"             # universal fallback — every machine has a backend
     assert m.accelerated is False         # but no GPU-class acceleration
     assert m.engine == "llama.cpp"
+    assert m.engine_ready is False        # cpu env not installed here
+
+
+def test_profile_cpu_fallback_engine_ready_when_env_present(set_platform, run_stub, fake_home,
+                                                            monkeypatch):
+    # The "fits but reported as can't" failure mode guard: when the cpu env IS installed,
+    # engine_ready must be True (for_backend("cpu") resolves and is_installed sees the env).
+    set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: name == "cpu")
+    m = detect.profile()
+    assert m.backend == "cpu" and m.engine_ready is True
 
 
 # --------------------------------------------------------------------------- #

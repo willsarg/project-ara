@@ -84,6 +84,20 @@ def test_window_below_smallest_rung_gets_a_lower_anchor():
     assert len(set(seen)) >= 2 and all(c <= 1024 for c in seen)
 
 
+def test_degenerate_window_never_probes_above_it():
+    # Pathological window of 0 must never produce a probe above the window (the anchor that
+    # guarantees ≥2 points is suppressed when it would exceed max_context).
+    seen: list[int] = []
+    est = _est(max_context=0)
+
+    def measure(model, ctx):
+        seen.append(ctx)
+        return {"context": ctx, "mem_gb": 1.0}
+
+    driver.characterize("m", preflight=lambda m: est, measure=measure, schedule=[2000, 4000])
+    assert all(c <= 0 for c in seen)          # never probed above the model's window
+
+
 def test_none_when_preflight_errors():
     r = driver.characterize("missing/model",
                             preflight=lambda m: {"error": "not in HF cache"},
@@ -105,7 +119,7 @@ def test_threads_ref_baseline_into_ceiling():
     est = _est(base_gb=13.0, ref_baseline_gb=8.0)
     r = driver.characterize("m", preflight=lambda m: est, measure=_linear(5.0, 1.0),
                             schedule=[2000, 4000, 8000])
-    assert r["safe_context"] == 23_000
+    assert r["safe_context"] == 22_999
     assert r["binding"] == "memory"
 
 
@@ -120,4 +134,4 @@ def test_engine_refusal_stops_but_keeps_points():
     r = driver.characterize("m", preflight=lambda m: est, measure=measure,
                             schedule=[2000, 4000, 8000, 16000])
     assert [p["context"] for p in r["points"]] == [2000, 4000]
-    assert r["safe_context"] == 31_000
+    assert r["safe_context"] == 30_999

@@ -121,6 +121,14 @@ def test_install_targets_wcx_local_is_editable_with_extra(monkeypatch):
 # --------------------------------------------------------------------------- #
 # install() — create the isolated env (engine_env injected)
 # --------------------------------------------------------------------------- #
+def test_wcx_is_unavailable_until_tested_on_real_hardware(monkeypatch):
+    # cuda isn't wired to the isolated-env model yet and there's no NVIDIA to verify it, so wcx
+    # is honestly "coming soon" rather than producing a broken install.
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
+    assert engines.ENGINES["wcx"]["available"] is False
+    assert engines.install("wcx").status == "coming_soon"
+
+
 def test_install_unknown_engine_reports_unknown():
     assert engines.install("nonsense").status == "unknown"
 

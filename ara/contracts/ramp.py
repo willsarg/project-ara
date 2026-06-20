@@ -155,4 +155,10 @@ def safe_ceiling(f: Fit, budget_gb: float, ref_baseline_gb: float = 0.0) -> int 
     if f.slope_gb_per_k <= 0:
         return None
     headroom = budget_gb - ref_baseline_gb - f.intercept_gb
-    return int(max(0.0, headroom / f.slope_gb_per_k) * 1000)
+    tokens = int(max(0.0, headroom / f.slope_gb_per_k) * 1000)
+    # The budget is the line predicted peak must never reach: ``>=`` is unsafe everywhere else
+    # (would_breach, plan_next, the L2/L4 gates). When headroom divides evenly, the floored token
+    # count predicts *exactly* the budget — so step one token below to stay strictly under it.
+    if tokens > 0 and predict_gb(ref_baseline_gb + f.intercept_gb, f.slope_gb_per_k, tokens) >= budget_gb:
+        tokens -= 1
+    return tokens

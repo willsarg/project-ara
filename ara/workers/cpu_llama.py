@@ -67,9 +67,20 @@ def max_context_from(meta: dict) -> int:
     return int(meta[f"{arch}.context_length"])
 
 
+def effective_margin_gb(total_gb: float, cap_gb: float) -> float:
+    """The CPU safety margin to actually use, given the RAM and a policy cap.
+
+    A flat cap (2 GB) is right for a workstation but absurd on the small machines CPU is now the
+    fallback for — it would zero out a 2 GB box. So scale the margin to ~10% of RAM, capped at
+    *cap_gb* and floored at 0.5 GB: ~0.5 GB on a Pi, the full cap on anything large.
+    """
+    return min(cap_gb, max(0.5, total_gb * 0.1))
+
+
 def safe_threshold_gb(total_gb: float, margin_gb: float) -> float:
-    """The safe RAM budget: physical RAM minus the policy margin (the cushion below the wall)."""
-    return total_gb - margin_gb
+    """The safe RAM budget: physical RAM minus the margin, never negative (clamped at 0 so a
+    machine with no safe headroom reports 0, not a nonsensical negative budget)."""
+    return max(0.0, total_gb - margin_gb)
 
 
 def limits_from(total_gb: float, used_gb: float, swap_free_gb: float, device: str,
@@ -77,15 +88,16 @@ def limits_from(total_gb: float, used_gb: float, swap_free_gb: float, device: st
     """The CPU memory wall + safe budget as a plain dict — pure arithmetic over the readings.
 
     For CPU the wall *is* physical RAM (no separate device memory), so it's read exactly: there
-    is no hidden cold-start overhead to calibrate the way Apple's MLX path needs."""
+    is no hidden cold-start overhead to calibrate the way Apple's MLX path needs. *margin_gb* is
+    the already-resolved effective margin. Budget and headroom are clamped at 0."""
     safe = safe_threshold_gb(total_gb, margin_gb)
     return {
         "device": device,
         "total_gb": round(total_gb, 3),
         "wall_gb": round(total_gb, 3),
         "safe_budget_gb": round(safe, 3),
-        "margin_gb": margin_gb,
-        "headroom_gb": round(safe - used_gb, 3),
+        "margin_gb": round(margin_gb, 3),
+        "headroom_gb": round(max(0.0, safe - used_gb), 3),
         "swap_free_gb": round(swap_free_gb, 3),
     }
 
@@ -155,7 +167,13 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float) -> dict:
     A watchdog thread (L5) aborts the process if live system RAM reaches *abort_gb* mid-load,
     so an under-estimate can never run the machine out of memory. Returns the process RSS
     high-water minus its pre-load baseline — the model's marginal footprint at this context.
+
+    Refuses outright if *abort_gb* is None: loading without an L5 wall would be the safety layer
+    failing open (the watchdog comparison would also crash), so we never load in that case.
     """
+    if abort_gb is None:
+        return {"status": "error", "note": "refusing to probe without an L5 abort limit"}
+
     import threading
 
     import psutil
@@ -216,11 +234,12 @@ def preflight(model: str, *, margin_gb: float, overhead_gb: float) -> dict:
         return {"error": str(e)}
     live_base = _used_gb()
     model_base = _model_base_gb(gguf, overhead_gb)
+    total = _total_gb()
     return {
         "base_gb": round(live_base + model_base, 4),    # absolute, for ARA's a-priori gate
         "ref_baseline_gb": round(live_base, 4),         # live RAM, added back at solve time
         "slope_gb_per_k": kv_slope_gb_per_k(meta),
-        "budget_gb": safe_threshold_gb(_total_gb(), margin_gb),
+        "budget_gb": safe_threshold_gb(total, effective_margin_gb(total, margin_gb)),
         "max_context": max_context_from(meta),
     }
 
@@ -231,12 +250,13 @@ def limits(*, margin_gb: float) -> dict:
 
     import psutil
 
+    total = _total_gb()
     return limits_from(
-        total_gb=_total_gb(),
+        total_gb=total,
         used_gb=_used_gb(),
         swap_free_gb=psutil.swap_memory().free / GIB,
         device=platform.processor() or platform.machine() or "CPU",
-        margin_gb=margin_gb,
+        margin_gb=effective_margin_gb(total, margin_gb),
     )
 
 
@@ -252,7 +272,8 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
         meta = _read_meta(gguf)
     except Exception as e:
         return _refused(ctx, str(e))
-    budget = safe_threshold_gb(_total_gb(), margin_gb)
+    total = _total_gb()
+    budget = safe_threshold_gb(total, effective_margin_gb(total, margin_gb))
     base_gb = _used_gb() + _model_base_gb(gguf, overhead_gb)
     reason = safety_gate(base_gb=base_gb, slope_gb_per_k=kv_slope_gb_per_k(meta),
                          ctx=ctx, budget_gb=budget)

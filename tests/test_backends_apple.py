@@ -139,7 +139,7 @@ def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
-    assert r["safe_context"] == 23_000
+    assert r["safe_context"] == 22_999    # (36-8-5)/1 = 23k, −1 to stay strictly under budget
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):
@@ -160,7 +160,7 @@ def test_characterize_stops_on_engine_refusal(monkeypatch):
     r = apple.characterize("org/model")
     # 2000 + 4000 measured; 8000 refused → escalation stops, ceiling from 2 points
     assert [p["context"] for p in r["points"]] == [2000, 4000]
-    assert r["safe_context"] == 31_000
+    assert r["safe_context"] == 30_999    # (36-5)/1 = 31k, −1 to stay strictly under budget
 
 
 def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypatch):

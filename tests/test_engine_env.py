@@ -173,6 +173,21 @@ def test_create_raises_when_install_fails(engines_root, run_spy):
         engine_env.create("cpu", ["x"])
 
 
+def test_create_tears_down_half_built_env_on_install_failure(engines_root, run_spy):
+    # uv venv made the python (env "exists"), but the pip install then fails. Without cleanup,
+    # exists()/is_installed() would report the broken env as ready forever and `ara install`
+    # would say "already". create() must remove it so a retry can actually repair the install.
+    run_spy.add("pip install", 1, err="boom")
+    py = engine_env.python_path("cpu")
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("#!/bin/sh\n")          # simulate the venv's python from the (mocked) uv venv
+    assert engine_env.exists("cpu") is True
+    with pytest.raises(engine_env.EngineEnvError):
+        engine_env.create("cpu", ["x"])
+    assert engine_env.exists("cpu") is False          # torn down, not left half-built
+    assert not engine_env.env_path("cpu").exists()
+
+
 # --------------------------------------------------------------------------- #
 # remove
 # --------------------------------------------------------------------------- #

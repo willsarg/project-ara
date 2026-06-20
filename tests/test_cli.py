@@ -537,6 +537,17 @@ def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):
     assert "couldn't read limits" in buf.getvalue()
 
 
+def test_profile_safe_limits_error_json(make_console, monkeypatch, set_platform, capsys):
+    # --json must emit a JSON error, not human text, when limits can't be read
+    import json as _json
+    bk = FakeBackend(_limits())
+    bk.safe_limits_exc = RuntimeError("sysctl exploded")
+    _wire_profile(monkeypatch, set_platform, bk)
+    c, _ = make_console()
+    assert cli.render_profile(c, as_json=True) == 1
+    assert "error" in _json.loads(capsys.readouterr().out.strip())
+
+
 def test_profile_json(monkeypatch, set_platform, capsys):
     bk = FakeBackend(_limits(calibrated=True))
     _wire_profile(monkeypatch, set_platform, bk)

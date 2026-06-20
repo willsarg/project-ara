@@ -35,7 +35,7 @@ class _FakeBackend:
 
     def characterize(self, model):
         return {"model": model, "safe_context": 8192, "binding": "context_window",
-                "points": [[512, 1.2]]}
+                "points": [{"context": 512, "mem_gb": 1.2}]}   # real dict-point shape
 
     def safe_limits(self):
         return {"device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
@@ -96,7 +96,7 @@ CONTRACT = [
     (["models", "--json"], list, None),
     (["models", "org/m", "--json"], dict, "model_id"),
     (["search", "smol", "--json"], list, None),
-    (["characterize", "org/m", "--json"], dict, "model"),
+    (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
     (["install", "--engine", "wmx", "--json"], dict, "status"),
     (["uninstall", "--engine", "wmx", "--json"], dict, "status"),
@@ -127,3 +127,29 @@ def test_unknown_command_is_nonzero_and_not_json(mocked_world, monkeypatch, caps
     assert cli.main() == 1
     with pytest.raises(json.JSONDecodeError):
         json.loads(capsys.readouterr().out.strip())
+
+
+def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):
+    # asdict() skips the @property; the CPU-fallback distinction must still reach --json consumers
+    monkeypatch.setattr("sys.argv", ["ara", "detect", "--json"])
+    cli.main()
+    payload = _extract_json(capsys.readouterr().out)
+    assert isinstance(payload.get("accelerated"), bool)
+
+
+# --json error paths must emit a JSON {"error": ...}, never human text (a script piping
+# `ara <cmd> --json` should always get parseable output, even on failure).
+@pytest.mark.parametrize("argv, setup", [
+    (["characterize", "org/m", "--json"], "engine_off"),
+    (["profile", "--json"], "engine_off"),
+    (["models", "bad/x", "--json"], "undescribable"),
+])
+def test_json_error_paths_emit_json(mocked_world, monkeypatch, capsys, argv, setup):
+    if setup == "engine_off":
+        monkeypatch.setattr(cli, "engine_status", lambda: (False, "wmx-suite"))
+    else:
+        monkeypatch.setattr(cli.catalog, "describe", lambda model_id: None)
+    monkeypatch.setattr("sys.argv", ["ara", *argv])
+    assert cli.main() == 1
+    payload = _extract_json(capsys.readouterr().out)
+    assert "error" in payload

@@ -34,7 +34,9 @@ def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
         return list(schedule)
     rungs = {c for c in schedule if c <= max_context} | {max_context}
     if len(rungs) < 2:
-        rungs.add(max(1, max_context // 2))
+        anchor = max(1, max_context // 2)
+        if anchor <= max_context:          # never add a rung above the model's own window
+            rungs.add(anchor)
     return sorted(rungs)
 
 

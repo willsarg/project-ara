@@ -46,8 +46,9 @@ def test_fit_needs_distinct_contexts():
 # --------------------------------------------------------------------------- #
 def test_safe_ceiling_solves_for_budget():
     f = ramp.Fit(intercept_gb=5.0, slope_gb_per_k=1.0, r2=1.0, n_points=3)
-    # headroom = 15 - 5 = 10 GB; 10 GB / (1 GB/1k) = 10k tokens
-    assert ramp.safe_ceiling(f, budget_gb=15.0) == 10_000
+    # headroom 15-5 = 10 GB; 10/(1 GB/1k) = 10k, minus 1 token to stay STRICTLY under budget
+    # (predicted memory at 10000 would equal 15.0 == the budget, which every gate treats as unsafe)
+    assert ramp.safe_ceiling(f, budget_gb=15.0) == 9_999
 
 
 def test_safe_ceiling_truncates_to_int_tokens():
@@ -65,15 +66,15 @@ def test_safe_ceiling_zero_when_model_base_exceeds_budget():
 def test_safe_ceiling_subtracts_live_ref_baseline():
     # fit is the model DELTA (intercept 5 = model base); live OS baseline 8 GB eats headroom
     f = ramp.Fit(intercept_gb=5.0, slope_gb_per_k=1.0, r2=1.0, n_points=3)
-    # headroom = 36 - 8 (ref) - 5 (model) = 23 → 23k tokens
-    assert ramp.safe_ceiling(f, budget_gb=36.0, ref_baseline_gb=8.0) == 23_000
+    # headroom = 36 - 8 (ref) - 5 (model) = 23 → 23k, minus 1 token to stay strictly under budget
+    assert ramp.safe_ceiling(f, budget_gb=36.0, ref_baseline_gb=8.0) == 22_999
 
 
 def test_run_threads_ref_baseline_into_ceiling():
-    # delta points: model base 5, slope 1; ref baseline 8 → ceiling (36-8-5)/1 = 23k
+    # delta points: model base 5, slope 1; ref baseline 8 → (36-8-5)/1 = 23k, −1 strictly under
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=13.0, slope_gb_per_k=1.0, budget_gb=36.0, ref_baseline_gb=8.0)
-    assert res.safe_context == 23_000
+    assert res.safe_context == 22_999
 
 
 def test_safe_ceiling_none_when_no_measurable_growth():
@@ -149,7 +150,7 @@ def test_run_collects_points_fits_and_solves():
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
     assert len(res.points) == 3
     # fitted intercept 5, slope 1 → ceiling (36-5)/1 = 31k
-    assert res.safe_context == 31_000
+    assert res.safe_context == 30_999
     assert res.stopped_reason == "ok"
 
 
@@ -168,7 +169,7 @@ def test_run_stops_on_engine_refusal_but_uses_points_so_far():
     res = ramp.run(measure, schedule=[2000, 4000, 8000, 16000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
     assert len(res.points) == 2          # 2000 and 4000 measured; 8000 refused → stop
-    assert res.safe_context == 31_000    # still fits from the two safe points
+    assert res.safe_context == 30_999    # still fits from the two safe points
 
 
 def test_run_refines_gate_from_measurements_to_escalate_safely():
@@ -197,7 +198,7 @@ def test_run_caps_ceiling_at_model_context_window():
 def test_run_memory_bound_when_ceiling_below_window():
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0, max_context=100000)
-    assert res.safe_context == 31000 and res.binding == "memory"
+    assert res.safe_context == 30999 and res.binding == "memory"
 
 
 def test_run_none_when_fewer_than_two_points():

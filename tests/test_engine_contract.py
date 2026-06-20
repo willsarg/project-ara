@@ -71,6 +71,13 @@ def _seam_cuda(monkeypatch):
 BACKENDS = [("apple", apple, _seam_apple), ("cpu", cpu, _seam_cpu), ("cuda", cuda, _seam_cuda)]
 _IDS = [b[0] for b in BACKENDS]
 
+# The shipping, worker-model backends held to the STRICT result-shape contract. cuda is not
+# here on purpose: it's marked unavailable (in-process import, untested on real NVIDIA) and is
+# known to diverge (tuple points, no `binding`) — see test_cuda_characterize_known_divergence,
+# which pins that divergence so it's documented, not silently permitted by a loose assertion.
+SHIPPING = [b for b in BACKENDS if b[0] in ("apple", "cpu")]
+_SHIP_IDS = [b[0] for b in SHIPPING]
+
 
 @pytest.mark.parametrize("label, mod, _seam", BACKENDS, ids=_IDS)
 def test_backend_exposes_the_interface(label, mod, _seam):
@@ -88,14 +95,29 @@ def test_safe_limits_returns_the_canonical_shape(label, mod, seam, monkeypatch):
     assert isinstance(m["safe_budget_gb"], (int, float))
 
 
-@pytest.mark.parametrize("label, mod, seam", BACKENDS, ids=_IDS)
+@pytest.mark.parametrize("label, mod, seam", SHIPPING, ids=_SHIP_IDS)
 def test_characterize_returns_the_canonical_shape(label, mod, seam, monkeypatch):
     seam(monkeypatch)
     r = mod.characterize("org/model")
-    assert {"model", "safe_context", "points"} <= set(r), f"{label} characterize shape"
+    assert {"model", "safe_context", "binding", "points"} <= set(r), f"{label} characterize shape"
     assert r["model"] == "org/model"
     assert r["safe_context"] is None or isinstance(r["safe_context"], int)
+    assert r["binding"] in ("memory", "context_window")
+    # points must be the canonical dict shape — NOT just "a list" (the loose check let cuda's
+    # raw (ctx, mem) tuples pass and diverge silently; this is what the conformance test exists for)
     assert isinstance(r["points"], list)
+    for p in r["points"]:
+        assert isinstance(p, dict) and {"context", "mem_gb"} <= set(p), f"{label} point shape {p}"
+
+
+def test_cuda_characterize_known_divergence(monkeypatch):
+    # cuda is NOT yet conformant: it returns raw (ctx, mem) tuples and no `binding`. Pinned here
+    # so the divergence is explicit and tracked (cuda-conversion follow-up), not hidden behind a
+    # loose `isinstance(list)` in the shipping conformance test above.
+    _seam_cuda(monkeypatch)
+    r = cuda.characterize("org/model")
+    assert "binding" not in r                      # known gap
+    assert r["points"] and all(isinstance(p, tuple) for p in r["points"])  # tuples, not dicts
 
 
 @pytest.mark.parametrize("label, mod, seam", BACKENDS, ids=_IDS)

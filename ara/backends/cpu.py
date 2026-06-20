@@ -1,10 +1,11 @@
 """CPU backend — system-RAM inference via llama.cpp (GGUF) — the second real engine.
 
-Contract class: **ramp** (safe context ceiling). Wall source: system RAM + swap. One adapter
-for *all* CPU-only inference regardless of ISA — x86 (Intel/AMD), arm64, Raspberry Pi,
-riscv-when-it-matters. The ISA is metadata reported by ``detect``, not a separate backend,
-because it doesn't change the wall. This is the universal fallback: nearly every machine
-matches it.
+Contract class: **ramp** (safe context ceiling). Wall source: **physical RAM** (swap is
+reported but never counted toward the budget — swapping during inference is catastrophically
+slow, so it's not usable headroom). One adapter for *all* CPU-only inference regardless of ISA
+— x86 (Intel/AMD), arm64, Raspberry Pi, riscv-when-it-matters. The ISA is metadata reported by
+``detect``, not a separate backend, because it doesn't change the wall. This is the universal
+fallback: nearly every machine matches it.
 
 It exists to keep the abstraction honest. Unlike Apple (whose engine is the external
 ``wmx-suite``), llama.cpp is **built into ARA** (see the engine repo-split rule: only the huge
@@ -28,7 +29,7 @@ WORKER = Path(__file__).resolve().parent.parent / "workers" / "cpu_llama.py"
 ENV_NAME = "cpu"
 CALIBRATION_ENGINE = "cpu"   # profiles key for this machine's stored overhead
 RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
-DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
+DEFAULT_MARGIN_GB = 2.0      # margin CAP (GB); the worker scales it to ~10% of RAM, floor 0.5GB
 DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
 
 # A small GGUF ARA characterizes against in the profile flow (the worker auto-picks its

@@ -344,7 +344,9 @@ _DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
 def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     m = detect.profile()
     if as_json:
-        print(json.dumps(asdict(m), indent=2))
+        # asdict() omits @property fields, so add `accelerated` explicitly — otherwise the very
+        # distinction the CPU-fallback design introduced is invisible to machine consumers.
+        print(json.dumps({**asdict(m), "accelerated": m.accelerated}, indent=2))
         return
     want = want or (lambda _key: True)
     c.emit()
@@ -671,7 +673,10 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
     meta = catalog.describe(model_id)
     if meta is None:
-        c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
+        if as_json:
+            print(json.dumps({"error": f"couldn't describe {model_id}"}))
+        else:
+            c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
         return 1
     engine_key = engines.for_backend(detect.backend_name())
     ch = (db.get_characterization(db.connect(), profiles.machine_key(), engine_key, model_id)
@@ -707,8 +712,11 @@ def render_characterize(c: Console, model: str, *, as_json: bool = False) -> int
     result, so it then shows up in `ara models` regardless of engine."""
     engine_ok, engine_pkg = engine_status()
     if not engine_ok:
-        c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
-               + c.style("accent", "ara install"))
+        if as_json:
+            print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
+        else:
+            c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
+                   + c.style("accent", "ara install"))
         return 1
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
@@ -899,6 +907,9 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
                    engine: str | None = None) -> int:
     engine_ok, engine_pkg = engine_status()
     if not engine_ok:
+        if as_json:
+            print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
+            return 1
         # --engine is consent to install. We can't import a just-installed package
         # in this process, so install then ask for a re-run rather than fake it.
         if engine is not None:
@@ -913,7 +924,10 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
     try:
         m = bk.safe_limits()
     except Exception as exc:
-        c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
+        if as_json:
+            print(json.dumps({"error": f"couldn't read limits: {exc}"}))
+        else:
+            c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
 
     engine_key = engines.for_backend(detect.backend_name())

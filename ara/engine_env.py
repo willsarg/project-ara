@@ -97,6 +97,10 @@ def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE
          "--link-mode", link_mode, *packages]
     )
     if rc != 0:
+        # The venv (with a working python) already exists, so a half-built env would make
+        # exists()/is_installed() report it as ready forever. Make create atomic: tear the
+        # env down on install failure so `ara install` can be retried to actually repair it.
+        shutil.rmtree(path, ignore_errors=True)
         raise EngineEnvError(f"installing into {name!r} failed: {err.strip()}")
     return path
 
