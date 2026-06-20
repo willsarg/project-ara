@@ -785,19 +785,31 @@ def test_render_status_gpu_and_no_port(make_console, monkeypatch):
     assert ":" not in out.split("Ollama")[-1].split("\n")[0].replace("pid", "")
 
 
-def test_profile_through_real_apple_backend(make_console, monkeypatch, set_platform, fake_wmx):
+def test_profile_through_real_apple_backend(make_console, monkeypatch, set_platform):
+    from ara.backends import apple
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli, "engine_status", lambda: (True, "wmx-suite"))
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-    fake_wmx.profile = None                 # uncalibrated → proceeds to calibrate
-    fake_wmx.describe_return = {"id": "m"}   # model already cached → no download
+    monkeypatch.setattr(apple, "calibration_model_cached", lambda *a: True)  # no download
+    facts = {"device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
+             "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0,
+             "swap_free_gb": 2.0}
+    calls = []
+
+    def worker(name, argv):
+        calls.append(argv[2])
+        return {"measured_overhead_gb": 5.0, "default_overhead_gb": 6.0,
+                "n_points": 4} if argv[2] == "calibrate" else dict(facts)
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
     c, buf = make_console()
     rc = cli.render_profile(c, assume_yes=True)
     out = buf.getvalue()
     assert rc == 0
     assert "SAFE LIMITS" in out
     assert "calibrated." in out
-    assert fake_wmx.calibrate_calls  # real apple.calibrate hit the fake probe
+    assert "calibrate" in calls   # real apple.calibrate drove the device worker
 
 
 # --------------------------------------------------------------------------- #

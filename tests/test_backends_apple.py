@@ -5,13 +5,33 @@ from ara import acquire
 from ara.backends import apple
 
 
-def test_safe_limits_is_stateless(fake_wmx):
+def _fake_worker(monkeypatch, fn):
+    """Patch engine_env.run_worker on the apple module (the only engine seam)."""
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fn)}))
+
+
+# The engine facts the wmx `device limits` worker returns (ARA overlays its own fields).
+_LIMITS_FACTS = {
+    "device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
+    "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0,
+}
+
+
+def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
+    calls = []
+
+    def worker(name, argv):
+        calls.append((name, argv))
+        return dict(_LIMITS_FACTS)
+
+    _fake_worker(monkeypatch, worker)
     m = apple.safe_limits()
+    assert calls == [("apple", ["-m", "wmx_suite.device", "limits"])]
     assert m["device"] == "Apple M4 Pro"
     assert m["total_gb"] == 48.0 and m["wall_gb"] == 40.0
     assert m["safe_budget_gb"] == 36.0 and m["margin_gb"] == 4.0
-    assert m["headroom_gb"] == 28.0       # safe 36 − wired 8
-    assert m["swap_free_gb"] == 2.0
+    assert m["headroom_gb"] == 28.0 and m["swap_free_gb"] == 2.0
     # no stored calibration in the engine — ARA overlays it from its own store
     assert m["calibrated"] is False
     assert m["overhead_gb"] is None
@@ -43,20 +63,30 @@ def test_download_calibration_model_delegates_to_acquire(monkeypatch):
     assert calls == ["org/calib-model"]
 
 
-def test_calibrate_surfaces_effective_overhead(fake_wmx):
-    fake_wmx.calibrate_return = {
+def _calibrate_worker(monkeypatch, calibration, calls=None):
+    """Worker that answers the device 'calibrate' call with *calibration*, 'limits' with facts."""
+    def worker(name, argv):
+        if calls is not None:
+            calls.append(argv)
+        return dict(calibration) if argv[2] == "calibrate" else dict(_LIMITS_FACTS)
+    _fake_worker(monkeypatch, worker)
+
+
+def test_calibrate_surfaces_effective_overhead(monkeypatch):
+    calls = []
+    _calibrate_worker(monkeypatch, {
         "measured_overhead_gb": 5.0, "default_overhead_gb": 6.0, "n_points": 4,
-    }
+    }, calls)
     m = apple.calibrate("org/calib-model")
     assert m["device"] == "Apple M4 Pro"               # carries fresh limits …
     assert m["overhead_gb"] == 6.0                      # effective = max(default 6, measured 5)
     assert m["calibrated"] is True
-    assert m["calibration"] == fake_wmx.calibrate_return  # … plus what it measured
-    assert fake_wmx.calibrate_calls == ["org/calib-model"]
+    assert m["calibration"]["n_points"] == 4           # … plus what it measured
+    assert ["-m", "wmx_suite.device", "calibrate", "org/calib-model"] in calls
 
 
-def test_calibrate_overhead_none_when_no_measurement(fake_wmx):
-    fake_wmx.calibrate_return = {"n_points": 0}        # no overhead keys at all
+def test_calibrate_overhead_none_when_no_measurement(monkeypatch):
+    _calibrate_worker(monkeypatch, {"n_points": 0})    # no overhead keys at all
     m = apple.calibrate("org/calib-model")
     assert m["overhead_gb"] is None
 
