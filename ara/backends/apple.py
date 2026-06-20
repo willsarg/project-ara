@@ -9,6 +9,10 @@ probe / ui) — not its db, profiles, or model catalog.
 """
 from __future__ import annotations
 
+# Core, engine-free helpers (no wmx) — safe to import at module load and patchable in tests.
+from ara import db, engine_env, profiles
+from ara.contracts import ramp, worker
+
 
 # Model ARA calibrates against — smallest SmolLM (MLX 4-bit). Calibration only measures
 # fixed memory overhead, so a tiny instruct model is plenty.
@@ -79,14 +83,61 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     return limits
 
 
+# ARA-owned ramp policy (the engine only measures; ARA decides the schedule + safety margin).
+WORKER_MODULE = "wmx_suite.measure_one"
+RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
+DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
+DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
+
+
+def _budget_params() -> tuple[float, float]:
+    """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
+    calibration for the wmx engine, or a safe default if uncalibrated."""
+    overhead = DEFAULT_OVERHEAD_GB
+    stored = profiles.get_calibration(db.connect(), "wmx")
+    if stored and stored.get("fixed_overhead_gb") is not None:
+        overhead = stored["fixed_overhead_gb"]
+    return DEFAULT_MARGIN_GB, overhead
+
+
+def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
+                 preflight: bool = False) -> list[str]:
+    argv = ["-m", WORKER_MODULE, model, str(ctx),
+            "--margin", str(margin), "--overhead", str(overhead)]
+    if preflight:
+        argv.append("--preflight")
+    return argv
+
+
 def characterize(model: str) -> dict:
-    """Measure *model*'s safe context ceiling on this Mac via wmx-suite — measurement only.
+    """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
-    Runs wmx's crash-safe ramp with a null recorder (ARA persists the result, not wmx),
-    returning ``{model, safe_context, points}``; ``safe_context`` is None if it won't fit.
+    ARA owns the methodology: it asks the engine for a no-load estimate (base/slope/budget),
+    then drives the ramp (schedule → fit → ceiling, ``ara.contracts.ramp``) by spawning the
+    engine's self-vetoing ``measure_one`` worker in the isolated apple env via ``engine_env``.
+    ARA never imports wmx in-process. Crash-safety is checked at every layer: ARA gates each
+    rung (L1 ``plan_next`` + L2 re-assert), the engine refuses-before-load (L4) and a watchdog
+    aborts mid-probe (L5). Returns ``{model, safe_context, points}``.
     """
-    from wmx_suite import probe
+    margin, overhead = _budget_params()
+    est = engine_env.run_worker(
+        "apple", _worker_argv(model, 0, margin, overhead, preflight=True))
+    if "error" in est:
+        return {"model": model, "safe_context": None, "points": []}
 
-    result = probe.characterize(model, allow_min_probe=True, verbose=False)
-    fit = result.get("fit") or {}
-    return {"model": model, "safe_context": fit.get("safe_ceiling_ctx"), "points": []}
+    def measure_fn(ctx: int):
+        raw = engine_env.run_worker("apple", _worker_argv(model, ctx, margin, overhead))
+        m = worker.parse(raw)
+        # L2 (independent of L1's prediction): if the ACTUAL measurement reached the budget,
+        # stop escalating and don't trust higher contexts — even though L1 predicted it safe.
+        if not m.refused and m.mem_gb is not None and m.mem_gb >= est["budget_gb"]:
+            return worker.Measurement(context=ctx, mem_gb=None, refused=True,
+                                      reason="ARA L2: measured at/over safe budget")
+        return m
+
+    schedule = [c for c in RAMP_SCHEDULE
+                if est["max_context"] is None or c <= est["max_context"]]
+    res = ramp.run(measure_fn, schedule, est["base_gb"],
+                   est["slope_gb_per_k"], est["budget_gb"])
+    return {"model": model, "safe_context": res.safe_context,
+            "points": [{"context": c, "mem_gb": m} for c, m in res.points]}

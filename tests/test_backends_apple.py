@@ -61,17 +61,105 @@ def test_calibrate_overhead_none_when_no_measurement(fake_wmx):
     assert m["overhead_gb"] is None
 
 
-def test_characterize_returns_safe_context(fake_wmx):
-    fake_wmx.characterize_return = {"fit": {"safe_ceiling_ctx": 20000}, "refused": False}
+class _FakeEngine:
+    """Stand-in for engine_env.run_worker: answers preflight + per-ctx measurements,
+    driven by a canned estimate and a linear memory model. Records every spawn."""
+    def __init__(self, est, intercept=5.0, slope_per_k=1.0, refuse_at=None):
+        self.est, self.intercept, self.slope = est, intercept, slope_per_k
+        self.refuse_at = refuse_at
+        self.measured: list[int] = []
+
+    def __call__(self, name, argv):
+        assert name == "apple"
+        model = argv[2]
+        ctx = int(argv[3])
+        if "--preflight" in argv:
+            return dict(self.est)
+        self.measured.append(ctx)
+        if self.refuse_at is not None and ctx >= self.refuse_at:
+            return {"context": ctx, "refused": True, "reason": "engine veto"}
+        return {"context": ctx, "mem_gb": self.intercept + self.slope * (ctx / 1000)}
+
+
+def _patch_budget(monkeypatch, margin=2.0, overhead=1.0):
+    monkeypatch.setattr(apple, "_budget_params", lambda: (margin, overhead))
+
+
+def test_characterize_drives_ramp_over_engine_env(monkeypatch):
+    _patch_budget(monkeypatch)
+    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": 16000}
+    fake = _FakeEngine(est, intercept=5.0, slope_per_k=1.0)
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
     assert r["model"] == "org/model"
-    assert r["safe_context"] == 20000
-    assert fake_wmx.characterize_calls == ["org/model"]
+    # fitted intercept 5, slope 1 → ceiling (36-5)/1 = 31k; schedule capped at max_context 16000
+    assert r["safe_context"] == 31_000
+    assert all(c <= 16000 for c in fake.measured)
+    assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
 
 
-def test_characterize_none_when_no_fit(fake_wmx):
-    fake_wmx.characterize_return = {"refused": True}   # too big — no fit
-    assert apple.characterize("org/model")["safe_context"] is None
+def test_characterize_none_when_preflight_errors(monkeypatch):
+    _patch_budget(monkeypatch)
+    fake = _FakeEngine({"error": "model not found in HF cache"})
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    out = apple.characterize("missing/model")
+    assert out == {"model": "missing/model", "safe_context": None, "points": []}
+
+
+def test_characterize_stops_on_engine_refusal(monkeypatch):
+    _patch_budget(monkeypatch)
+    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None}
+    fake = _FakeEngine(est, refuse_at=8000)
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    r = apple.characterize("org/model")
+    # 2000 + 4000 measured; 8000 refused → escalation stops, ceiling from 2 points
+    assert [p["context"] for p in r["points"]] == [2000, 4000]
+    assert r["safe_context"] == 31_000
+
+
+def test_characterize_l1_scheduler_skips_dispatch_when_predicted_breach(monkeypatch):
+    _patch_budget(monkeypatch)
+    # base already at budget → L1 plan_next refuses the first rung; nothing is dispatched
+    est = {"base_gb": 35.9, "slope_gb_per_k": 1.0, "budget_gb": 36.0, "max_context": None}
+    fake = _FakeEngine(est)
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    r = apple.characterize("org/model")
+    assert fake.measured == []          # L1 prevented any measurement dispatch
+    assert r["safe_context"] is None
+
+
+def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatch):
+    _patch_budget(monkeypatch)
+    # L1 predicts safe (low slope), but the ACTUAL measured memory is high → L2 catches it
+    est = {"base_gb": 5.0, "slope_gb_per_k": 0.001, "budget_gb": 36.0, "max_context": None}
+    fake = _FakeEngine(est, intercept=40.0, slope_per_k=0.0)  # every measurement reports 40 GB
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    r = apple.characterize("org/model")
+    # first rung dispatched, measured 40 >= 36 → L2 refuses → stop with no usable points
+    assert fake.measured == [2000] and r["safe_context"] is None
+
+
+def test_budget_params_uses_stored_calibration(monkeypatch):
+    monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(apple, "profiles",
+                        type("P", (), {"get_calibration": staticmethod(
+                            lambda con, eng: {"fixed_overhead_gb": 5.5})}), raising=False)
+    margin, overhead = apple._budget_params()
+    assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, 5.5)
+
+
+def test_budget_params_falls_back_to_default_overhead(monkeypatch):
+    monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(apple, "profiles",
+                        type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
+                        raising=False)
+    margin, overhead = apple._budget_params()
+    assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, apple.DEFAULT_OVERHEAD_GB)
 
 
 def test_calibration_model_constant_is_small_instruct():
