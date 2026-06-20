@@ -11,7 +11,7 @@ from __future__ import annotations
 
 # Core, engine-free helpers (no wmx) — safe to import at module load and patchable in tests.
 from ara import db, engine_env, profiles
-from ara.contracts import ramp, worker
+from ara.contracts import driver
 
 
 # Model ARA calibrates against — smallest SmolLM (MLX 4-bit). Calibration only measures
@@ -112,35 +112,19 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
 def characterize(model: str) -> dict:
     """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
-    ARA owns the methodology: it asks the engine for a no-load estimate (base/slope/budget),
-    then drives the ramp (schedule → fit → ceiling, ``ara.contracts.ramp``) by spawning the
-    engine's self-vetoing ``measure_one`` worker in the isolated apple env via ``engine_env``.
-    ARA never imports wmx in-process. Crash-safety is checked at every layer: ARA gates each
-    rung (L1 ``plan_next`` + L2 re-assert), the engine refuses-before-load (L4) and a watchdog
-    aborts mid-probe (L5). Returns ``{model, safe_context, points}``.
+    Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver`` (the
+    antidote to an Apple-shaped abstraction); this adapter only supplies the Apple specifics —
+    the isolated ``apple`` env, wmx's self-vetoing ``measure_one`` worker, the budget params,
+    and the schedule. ARA never imports wmx in-process. Crash-safety is layered: the driver
+    gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine refuses-before-
+    load (L4) and a watchdog aborts mid-probe (L5). Returns ``{model, safe_context, points}``.
     """
     margin, overhead = _budget_params()
-    est = engine_env.run_worker(
-        "apple", _worker_argv(model, 0, margin, overhead, preflight=True))
-    if "error" in est:
-        return {"model": model, "safe_context": None, "points": []}
-
-    def measure_fn(ctx: int):
-        raw = engine_env.run_worker("apple", _worker_argv(model, ctx, margin, overhead))
-        m = worker.parse(raw)
-        # L2 (independent of L1's prediction): mem_gb is the model DELTA, so the ACTUAL
-        # absolute footprint is ref_baseline + delta. If that reached the budget, stop
-        # escalating and don't trust higher contexts — even though L1 predicted it safe.
-        if not m.refused and m.mem_gb is not None \
-                and est["ref_baseline_gb"] + m.mem_gb >= est["budget_gb"]:
-            return worker.Measurement(context=ctx, mem_gb=None, refused=True,
-                                      reason="ARA L2: measured at/over safe budget")
-        return m
-
-    schedule = [c for c in RAMP_SCHEDULE
-                if est["max_context"] is None or c <= est["max_context"]]
-    res = ramp.run(measure_fn, schedule, est["base_gb"], est["slope_gb_per_k"],
-                   est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"],
-                   max_context=est["max_context"])
-    return {"model": model, "safe_context": res.safe_context, "binding": res.binding,
-            "points": [{"context": c, "mem_gb": m} for c, m in res.points]}
+    return driver.characterize(
+        model,
+        preflight=lambda m: engine_env.run_worker(
+            "apple", _worker_argv(m, 0, margin, overhead, preflight=True)),
+        measure=lambda m, ctx: engine_env.run_worker(
+            "apple", _worker_argv(m, ctx, margin, overhead)),
+        schedule=RAMP_SCHEDULE,
+    )

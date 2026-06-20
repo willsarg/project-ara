@@ -16,7 +16,6 @@ import pytest
 _STUBS = [
     ("ara.backends.rocm", "ramp"),        # AMD GPU (Radeon + APU/Strix)
     ("ara.backends.oneapi", "ramp"),      # Intel Arc / iGPU
-    ("ara.backends.cpu", "ramp"),         # x86 / arm64 / pi / riscv
     ("ara.backends.ane", "graph-fit"),    # Apple Neural Engine
     ("ara.backends.xdna", "graph-fit"),   # AMD Ryzen AI NPU
     ("ara.backends.intel_npu", "graph-fit"),  # Intel NPU
