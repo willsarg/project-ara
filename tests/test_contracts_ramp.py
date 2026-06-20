@@ -171,6 +171,21 @@ def test_run_stops_on_engine_refusal_but_uses_points_so_far():
     assert res.safe_context == 31_000    # still fits from the two safe points
 
 
+def test_run_refines_gate_from_measurements_to_escalate_safely():
+    # a-priori slope is STEEP (2.0) → a static gate would stop escalating after ~8000.
+    # The real measured slope is shallow, so once ≥2 points exist the gate uses the refined
+    # fit and safely climbs higher — mirroring wmx (more data → more accurate gate).
+    seen = []
+
+    def measure(ctx):
+        seen.append(ctx)
+        return FakeM(mem_gb=1.0 + 0.1 * (ctx / 1000))   # shallow real growth
+
+    ramp.run(measure, schedule=[2000, 4000, 8000, 16000, 32000],
+             base_gb=10.0, slope_gb_per_k=2.0, budget_gb=36.0)
+    assert 32000 in seen          # refined fit let escalation pass the steep a-priori gate
+
+
 def test_run_none_when_fewer_than_two_points():
     res = ramp.run(lambda c: FakeM(refused=True), schedule=[2000, 4000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)

@@ -91,7 +91,16 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     points: list[tuple[int, float]] = []
     measured: set[int] = set()
     while True:
-        ctx = plan_next(schedule, measured, base_gb, slope_gb_per_k, budget_gb)
+        # Gate inputs: the conservative a-priori estimate until we have ≥2 points, then the
+        # REFINED fit (delta intercept + live ref_baseline → absolute). Refining as data
+        # arrives lets escalation safely climb higher when growth is gentler than estimated —
+        # and stop earlier when it's steeper. (The engine's L4 veto backstops either way.)
+        if len(points) >= 2:
+            f = fit(points)
+            gate_base, gate_slope = ref_baseline_gb + f.intercept_gb, f.slope_gb_per_k
+        else:
+            gate_base, gate_slope = base_gb, slope_gb_per_k
+        ctx = plan_next(schedule, measured, gate_base, gate_slope, budget_gb)
         if ctx is None:
             break
         m = measure_fn(ctx)
