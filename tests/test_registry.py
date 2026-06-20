@@ -19,16 +19,12 @@ def test_get_backend_returns_cuda_module(set_platform, monkeypatch):
     assert mod.__name__ == "ara.backends.cuda"
 
 
-def test_get_backend_unsupported_raises_import(set_platform, monkeypatch):
-    # Non-Apple, non-CUDA → backend_name() == "unsupported", which has no module.
+def test_get_backend_falls_back_to_cpu(set_platform, monkeypatch):
+    # Non-Apple, non-CUDA → backend_name() == "cpu", the universal fallback adapter.
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n: None)   # no nvidia-smi
-    try:
-        registry.get_backend()
-    except ModuleNotFoundError as exc:
-        assert "unsupported" in str(exc)
-    else:
-        raise AssertionError("expected ModuleNotFoundError for unsupported backend")
+    mod = registry.get_backend()
+    assert mod.__name__ == "ara.backends.cpu"
 
 
 def test_engine_status_apple_reports_wmx(set_platform, monkeypatch):
@@ -45,10 +41,11 @@ def test_engine_status_apple_missing_engine(set_platform, monkeypatch):
     assert installed is False and name == "wmx-suite"
 
 
-def test_engine_status_non_apple(set_platform):
+def test_engine_status_cpu_fallback(set_platform, monkeypatch):
     set_platform("Linux", "x86_64")
+    monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: False)
     installed, name = registry.engine_status()
-    assert installed is False and name == "unsupported"
+    assert installed is False and name == "llama.cpp"   # the cpu engine's display name
 
 
 def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):

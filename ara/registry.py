@@ -21,12 +21,10 @@ def get_backend():
 def engine_status() -> tuple[bool, str]:
     """Is the active backend's engine installed? Cheap — no import of it.
 
-    Returns ``(installed, engine_name)``, both sourced from the engine table so
-    there's one place that maps hardware → engine. Uses ``find_spec`` under the
-    hood, so it never imports the engine (and never pulls MLX).
+    Returns ``(installed, engine_name)``, both sourced from the engine table so there's one
+    place that maps hardware → engine. Presence is an isolated-env existence check, so it never
+    imports the engine. Every backend (apple/cuda/cpu) has an engine entry, so the lookup always
+    resolves.
     """
-    name = backend_name()
-    key = engines.for_backend(name)
-    if key is None:
-        return False, name
+    key = engines.for_backend(backend_name())
     return engines.is_installed(key), engines.ENGINES[key]["package"]

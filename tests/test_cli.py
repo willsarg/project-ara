@@ -179,16 +179,19 @@ def test_render_landing_supported(make_console, monkeypatch):
     assert "ara" in out and "Apple M4 Pro" in out
     assert "GETTING STARTED" in out
     assert "detect" in out and "status" in out and "profile" in out
-    assert "no supported backend" not in out
+    assert "mlx" in out                       # MLX view shown on Apple
+    assert "CPU fallback" not in out
 
 
-def test_render_landing_unsupported_warns(make_console, monkeypatch):
+def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Intel i7")
-    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
-    monkeypatch.setattr(cli, "engine_status", lambda: (False, "unsupported"))
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda: (False, "llama.cpp"))
     c, buf = make_console()
     cli.render_landing(c)
-    assert "no supported backend" in buf.getvalue()
+    out = buf.getvalue()
+    assert "no GPU backend detected" in out and "ara install --engine cpu" in out
+    assert "mlx" not in out                    # MLX view is Apple-only
 
 
 def test_cmd_long_name_keeps_gap_before_gloss(make_console):
@@ -414,13 +417,6 @@ def _wire_profile(monkeypatch, set_platform, bk, *, engine_ok=True, isatty=False
     monkeypatch.setattr(cli, "engine_status", lambda: (engine_ok, "wmx-suite"))
     monkeypatch.setattr(cli, "get_backend", lambda: bk)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
-
-
-def test_profile_unsupported_backend(make_console, monkeypatch, set_platform):
-    set_platform("Linux", "x86_64")
-    c, buf = make_console()
-    assert cli.render_profile(c) == 1
-    assert "profiling needs an ARA backend" in buf.getvalue()
 
 
 def test_profile_engine_not_installed(make_console, monkeypatch, set_platform):
@@ -701,13 +697,13 @@ def test_emit_calibration_silent_without_measurements(make_console):
 
 
 # --------------------------------------------------------------------------- #
-# render_detect verbose + unsupported branches
+# render_detect verbose + CPU-fallback branches
 # --------------------------------------------------------------------------- #
-def test_render_detect_verbose_and_unsupported(monkeypatch, make_console, stub_pythons):
-    # `supported` is a property, not a ctor arg — drive it via backend="unsupported".
+def test_render_detect_verbose_and_cpu_fallback(monkeypatch, make_console, stub_pythons):
+    # `accelerated` is a property — drive it via backend="cpu" (no GPU-class adapter).
     stub_pythons(count=1, discover=[])
     m = _machine(
-        backend="unsupported", engine="unsupported", engine_ready=False,
+        backend="cpu", engine="llama.cpp", engine_ready=False,
         cpu_logical=24, hf_token=False,
         accel=Accelerator("none", "none detected", None, None),
         runtimes=[Runtime("Ollama", False, None, kind="engine"),
@@ -719,10 +715,10 @@ def test_render_detect_verbose_and_unsupported(monkeypatch, make_console, stub_p
     cli.render_detect(c)
     out = buf.getvalue()
     assert "physical" in out and "logical" in out      # verbose cpu line
-    assert "no GPU detected" in out                     # accel none branch
+    assert "CPU fallback — no GPU backend detected" in out   # _det_ara backend hint
+    assert "install: ara install" in out               # engine install hint (not gated)
     # verbose lists absent engine and absent store as "not found"
     assert out.count("not found") >= 2
-    assert "no ARA backend for this hardware yet" in out  # unsupported footer
 
 
 def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pythons):
@@ -1670,13 +1666,6 @@ def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     assert cli.render_characterize(c, "org/Big") == 0
     assert "couldn't fit" in buf.getvalue()
     assert cli.db.get_characterization(store, "mkey", "wmx", "org/Big")["safe_context"] is None
-
-
-def test_render_characterize_unsupported(make_console, monkeypatch):
-    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
-    c, buf = make_console()
-    assert cli.render_characterize(c, "x") == 1
-    assert "no ARA backend" in buf.getvalue()
 
 
 def test_render_characterize_engine_not_installed(make_console, monkeypatch):

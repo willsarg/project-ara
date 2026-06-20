@@ -102,8 +102,8 @@ def render_landing(c: Console) -> None:
     backend = detect.backend_name()
     engine_ok, engine = engine_status()
 
-    supported = backend != "unsupported"
-    backend_role = "good" if supported else "warn"
+    accelerated = backend in ("apple", "cuda")
+    backend_role = "good" if accelerated else "metric"   # cpu is a real backend, just not GPU
     engine_role = "good" if engine_ok else "warn"
     engine_str = f"{engine} ready" if engine_ok else f"{engine} not installed"
 
@@ -126,7 +126,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
     c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
     c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
-    if supported:  # MLX ecosystem view is Apple-Silicon only
+    if backend == "apple":  # MLX ecosystem view is Apple-Silicon only
         c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
     c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
@@ -136,8 +136,9 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit()
-    if not supported:
-        c.emit(c.style("warn", "  no supported backend for this machine yet — Apple Silicon only for now"))
+    if not accelerated:
+        c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
+                              "install with ") + c.style("accent", "ara install --engine cpu"))
     c.emit(
         c.style("dim", "  try ") + c.style("accent", "ara detect")
         + c.style("dim", "  ·  recommend / run are next")
@@ -306,12 +307,13 @@ def _det_ara(c: Console, m) -> None:
     c.emit(c.section("  ARA"))
     c.emit(c.field(
         "backend", m.backend,
-        "auto-picked for this hardware" if m.supported else "no adapter for this hardware yet",
-        value_role="good" if m.supported else "warn",
+        "auto-picked for this hardware" if m.accelerated
+        else "CPU fallback — no GPU backend detected",
+        value_role="good",
     ))
     c.emit(c.field(
         "engine", f"{m.engine} {'ready' if m.engine_ready else 'not installed'}",
-        None if m.engine_ready else ("install: ara install" if m.supported else None),
+        None if m.engine_ready else "install: ara install",
         value_role="good" if m.engine_ready else "warn",
     ))
     c.emit(c.field("hf cli",
@@ -324,9 +326,6 @@ def _det_ara(c: Console, m) -> None:
                    value_role="good" if m.hf_token else "dim"))
     c.emit(c.field("power", m.power))
     c.emit()
-    if not m.supported:
-        c.emit(c.style("warn", "  no ARA backend for this hardware yet — recon works, running comes later"))
-        c.emit()
 
 
 _DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
@@ -704,12 +703,8 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
 def render_characterize(c: Console, model: str, *, as_json: bool = False) -> int:
     """Measure a model's safe context ceiling on this machine's engine, and store it.
 
-    Works for whichever engine is active (Apple/MLX or CUDA) — ARA owns the result, so it
-    then shows up in `ara models` regardless of engine."""
-    backend = detect.backend_name()
-    if backend == "unsupported":
-        c.emit(c.style("warn", "  no ARA backend for this hardware yet"))
-        return 1
+    Works for whichever engine is active (Apple/MLX, CUDA, or the CPU fallback) — ARA owns the
+    result, so it then shows up in `ara models` regardless of engine."""
     engine_ok, engine_pkg = engine_status()
     if not engine_ok:
         c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
@@ -724,7 +719,8 @@ def render_characterize(c: Console, model: str, *, as_json: bool = False) -> int
 
     ceiling = result["safe_context"]
     con = db.connect()
-    db.save_characterization(con, profiles.machine_key(), engines.for_backend(backend),
+    engine_key = engines.for_backend(detect.backend_name())
+    db.save_characterization(con, profiles.machine_key(), engine_key,
                              model, safe_context=ceiling, points=result["points"])
     catalog.remember(con, model)
 
@@ -901,10 +897,6 @@ def _persist_calibration(m: dict, engine_key: str | None) -> None:
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
                    assume_yes: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
-    backend = detect.backend_name()
-    if backend == "unsupported":
-        c.emit(c.style("warn", "  profiling needs an ARA backend — none for this hardware yet."))
-        return 1
     engine_ok, engine_pkg = engine_status()
     if not engine_ok:
         # --engine is consent to install. We can't import a just-installed package
@@ -924,7 +916,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
         c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
 
-    engine_key = engines.for_backend(backend)
+    engine_key = engines.for_backend(detect.backend_name())
     _overlay_stored_calibration(m, engine_key)   # reuse a stored measurement if we have one
 
     if as_json:

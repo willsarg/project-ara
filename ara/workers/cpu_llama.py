@@ -72,6 +72,24 @@ def safe_threshold_gb(total_gb: float, margin_gb: float) -> float:
     return total_gb - margin_gb
 
 
+def limits_from(total_gb: float, used_gb: float, swap_free_gb: float, device: str,
+                margin_gb: float) -> dict:
+    """The CPU memory wall + safe budget as a plain dict — pure arithmetic over the readings.
+
+    For CPU the wall *is* physical RAM (no separate device memory), so it's read exactly: there
+    is no hidden cold-start overhead to calibrate the way Apple's MLX path needs."""
+    safe = safe_threshold_gb(total_gb, margin_gb)
+    return {
+        "device": device,
+        "total_gb": round(total_gb, 3),
+        "wall_gb": round(total_gb, 3),
+        "safe_budget_gb": round(safe, 3),
+        "margin_gb": margin_gb,
+        "headroom_gb": round(safe - used_gb, 3),
+        "swap_free_gb": round(swap_free_gb, 3),
+    }
+
+
 def safety_gate(*, base_gb: float, slope_gb_per_k: float, ctx: int,
                 budget_gb: float) -> str | None:
     """Refuse-before-load (L4). ``base_gb`` is the absolute footprint at ctx→0 (live RAM +
@@ -207,6 +225,21 @@ def preflight(model: str, *, margin_gb: float, overhead_gb: float) -> dict:
     }
 
 
+def limits(*, margin_gb: float) -> dict:
+    """The CPU memory wall + safe budget, read live from the host (RAM, swap, CPU name)."""
+    import platform
+
+    import psutil
+
+    return limits_from(
+        total_gb=_total_gb(),
+        used_gb=_used_gb(),
+        swap_free_gb=psutil.swap_memory().free / GIB,
+        device=platform.processor() or platform.machine() or "CPU",
+        margin_gb=margin_gb,
+    )
+
+
 def _refused(ctx: int, reason: str) -> dict:
     return {"context": ctx, "refused": True, "reason": reason}
 
@@ -236,10 +269,12 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Safe single-context CPU memory measurement.")
-    ap.add_argument("model", help="local .gguf, HF repo id, or repo:filename.gguf")
-    ap.add_argument("ctx", type=int)
+    ap.add_argument("model", nargs="?", help="local .gguf, HF repo id, or repo:filename.gguf")
+    ap.add_argument("ctx", nargs="?", type=int)
     ap.add_argument("--margin", type=float, default=2.0)
     ap.add_argument("--overhead", type=float, default=1.0)
+    ap.add_argument("--limits", action="store_true",
+                    help="print the memory wall + safe budget and exit (no model)")
     ap.add_argument("--preflight", action="store_true",
                     help="print the no-load estimate and exit")
     ap.add_argument("--probe", action="store_true",
@@ -249,7 +284,9 @@ def main(argv=None) -> None:
     ap.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     args = ap.parse_args(argv)
 
-    if args.probe:
+    if args.limits:
+        result = limits(margin_gb=args.margin)
+    elif args.probe:
         result = _probe(args.model, args.ctx, args.abort_gb)
     elif args.preflight:
         result = preflight(args.model, margin_gb=args.margin, overhead_gb=args.overhead)

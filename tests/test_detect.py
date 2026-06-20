@@ -35,16 +35,16 @@ def test_backend_name_cuda_on_nvidia(set_platform, monkeypatch):
     assert backend_name() == "cuda"
 
 
-def test_backend_name_unsupported_on_linux(set_platform, monkeypatch):
+def test_backend_name_cpu_fallback_on_linux(set_platform, monkeypatch):
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n: None)   # no nvidia-smi
-    assert backend_name() == "unsupported"
+    assert backend_name() == "cpu"                        # universal fallback
 
 
-def test_backend_name_unsupported_on_intel_mac(set_platform, monkeypatch):
+def test_backend_name_cpu_fallback_on_intel_mac(set_platform, monkeypatch):
     set_platform("Darwin", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n: None)
-    assert backend_name() == "unsupported"
+    assert backend_name() == "cpu"
 
 
 # --------------------------------------------------------------------------- #
@@ -407,7 +407,7 @@ def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     assert m.backend == "apple"
     assert m.engine == "wmx-suite"
     assert m.engine_ready is False
-    assert m.supported is True
+    assert m.accelerated is True
     assert m.arch == "arm64"
     assert len(m.model_stores) == 5
     assert m.runtimes  # non-empty
@@ -507,13 +507,14 @@ def test_ara_pkg_version_reads_own_env():
     assert detect._ara_pkg_version("definitely-not-installed-xyz") is None
 
 
-def test_profile_unsupported(set_platform, run_stub, fake_home, monkeypatch):
+def test_profile_cpu_fallback(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: False)
     m = detect.profile()
-    assert m.backend == "unsupported"
-    assert m.supported is False
-    assert m.engine == "unsupported"
+    assert m.backend == "cpu"             # universal fallback — every machine has a backend
+    assert m.accelerated is False         # but no GPU-class acceleration
+    assert m.engine == "llama.cpp"
 
 
 # --------------------------------------------------------------------------- #

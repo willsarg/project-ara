@@ -31,6 +31,45 @@ RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
 DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
 DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
 
+# A small GGUF ARA characterizes against in the profile flow (the worker auto-picks its
+# smallest quant and downloads it on demand).
+CALIBRATION_MODEL = "bartowski/SmolLM2-135M-Instruct-GGUF"
+
+
+def safe_limits() -> dict:
+    """This machine's safe RAM limits via the cpu worker. Pure read — no model load.
+
+    Like CUDA's VRAM (and unlike Apple's hidden MLX cold-start overhead), the wall is read
+    exactly — physical RAM — so there's nothing to calibrate for the budget itself
+    (``calibrated`` True, ``overhead_gb`` None). Characterizing a *model*'s context ceiling is a
+    separate, optional step.
+    """
+    facts = engine_env.run_worker(
+        ENV_NAME, [str(WORKER), "--limits", "--margin", str(DEFAULT_MARGIN_GB)])
+    return {
+        **facts,
+        "overhead_gb": None,         # the wall is exact — nothing to calibrate
+        "calibrated": True,
+        "calibrated_at": None,
+    }
+
+
+def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
+    """Always True: the worker downloads the smallest GGUF on demand during characterization,
+    so the profile flow never blocks on a separate fetch step."""
+    return True
+
+
+def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
+    """No-op: GGUF acquisition is lazy inside the worker (it pulls only the smallest quant)."""
+
+
+def calibrate(model: str = CALIBRATION_MODEL) -> dict:
+    """Characterize *model* on CPU and attach it to the limits (for the profile flow)."""
+    out = safe_limits()
+    out["characterization"] = characterize(model)
+    return out
+
 
 def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored

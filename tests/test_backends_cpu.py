@@ -78,3 +78,41 @@ def test_budget_params_falls_back_to_default_overhead(monkeypatch):
                         type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
                         raising=False)
     assert cpu._budget_params() == (cpu.DEFAULT_MARGIN_GB, cpu.DEFAULT_OVERHEAD_GB)
+
+
+# --------------------------------------------------------------------------- #
+# safe_limits / calibrate — the profile flow (exact RAM wall, like CUDA's VRAM)
+# --------------------------------------------------------------------------- #
+def test_safe_limits_exact_wall_needs_no_calibration(monkeypatch):
+    facts = {"device": "x86_64", "total_gb": 24.0, "wall_gb": 24.0, "safe_budget_gb": 22.0,
+             "margin_gb": 2.0, "headroom_gb": 12.0, "swap_free_gb": 1.0}
+    seen = {}
+
+    def worker(name, argv):
+        seen["name"], seen["argv"] = name, argv
+        return dict(facts)
+
+    monkeypatch.setattr(cpu, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    m = cpu.safe_limits()
+    assert seen["name"] == "cpu" and "--limits" in seen["argv"]
+    assert m["wall_gb"] == 24.0 and m["safe_budget_gb"] == 22.0
+    assert m["calibrated"] is True          # the wall is read exactly
+    assert m["overhead_gb"] is None and m["calibrated_at"] is None
+
+
+def test_calibration_model_cached_is_always_true():
+    assert cpu.calibration_model_cached() is True   # worker downloads lazily
+
+
+def test_download_calibration_model_is_noop():
+    assert cpu.download_calibration_model() is None
+
+
+def test_calibrate_attaches_characterization(monkeypatch):
+    monkeypatch.setattr(cpu, "safe_limits", lambda: {"wall_gb": 24.0, "calibrated": True})
+    monkeypatch.setattr(cpu, "characterize",
+                        lambda model: {"model": model, "safe_context": 8192, "points": []})
+    out = cpu.calibrate("org/m")
+    assert out["calibrated"] is True
+    assert out["characterization"]["safe_context"] == 8192

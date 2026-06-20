@@ -31,14 +31,16 @@ GB = 1024 ** 3
 def backend_name() -> str:
     """Return the backend module name for this machine.
 
-    ``"unsupported"`` means we have no adapter for this hardware yet (detect
-    still reports everything else).
+    Every machine gets a backend: Apple Silicon and NVIDIA get their accelerated adapters,
+    and everything else falls back to ``"cpu"`` (llama.cpp on system RAM, which runs nearly
+    anywhere with a Python runtime). There is no "unsupported" hardware for running models —
+    only "not accelerated" (see :attr:`Machine.accelerated`).
     """
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "apple"
     if shutil.which("nvidia-smi"):       # any NVIDIA GPU with the driver installed
         return "cuda"
-    return "unsupported"
+    return "cpu"                         # universal fallback — CPU inference runs anywhere
 
 
 # --------------------------------------------------------------------------- #
@@ -519,13 +521,15 @@ class Machine:
     hf_cli: bool = False
     hf_cli_version: str | None = None
     power: str = "unknown"
-    backend: str = "unsupported"
-    engine: str = "unsupported"
+    backend: str = "cpu"
+    engine: str = "cpu"
     engine_ready: bool = False
 
     @property
-    def supported(self) -> bool:
-        return self.backend != "unsupported"
+    def accelerated(self) -> bool:
+        """A GPU-class backend was matched (Apple/CUDA), as opposed to the CPU fallback.
+        Every machine has *a* backend now, so this is the meaningful distinction."""
+        return self.backend in ("apple", "cuda")
 
 
 def profile() -> Machine:

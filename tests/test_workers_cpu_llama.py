@@ -43,6 +43,15 @@ def test_safe_threshold_is_total_minus_margin():
     assert w.safe_threshold_gb(48.0, 2.0) == 46.0
 
 
+def test_limits_from_computes_wall_budget_and_headroom():
+    out = w.limits_from(total_gb=24.0, used_gb=10.0, swap_free_gb=1.0,
+                        device="x86_64", margin_gb=2.0)
+    assert out == {
+        "device": "x86_64", "total_gb": 24.0, "wall_gb": 24.0, "safe_budget_gb": 22.0,
+        "margin_gb": 2.0, "headroom_gb": 12.0, "swap_free_gb": 1.0,
+    }
+
+
 def test_safety_gate_passes_with_headroom():
     assert w.safety_gate(base_gb=5.0, slope_gb_per_k=0.02, ctx=4000, budget_gb=46.0) is None
 
