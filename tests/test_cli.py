@@ -309,8 +309,16 @@ def _proc(**over):
     return Proc(**base)
 
 
+def _app(**over):
+    from ara.status import AppProc
+    base = dict(label="Claude", n_procs=8, rss_gb=1.2, uptime_s=300.0)
+    base.update(over)
+    return AppProc(**base)
+
+
 def test_render_status_with_processes(make_console, monkeypatch):
     monkeypatch.setattr(cli.status, "scan", lambda: [_proc(), _proc(pid=5, label="vLLM", rss_gb=4.0)])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
     c, buf = make_console()
     cli.render_status(c)
     out = buf.getvalue()
@@ -322,17 +330,40 @@ def test_render_status_with_processes(make_console, monkeypatch):
 
 def test_render_status_empty(make_console, monkeypatch):
     monkeypatch.setattr(cli.status, "scan", lambda: [])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
     c, buf = make_console()
     cli.render_status(c)
     assert "nothing running right now" in buf.getvalue()
 
 
+def test_render_status_shows_ai_apps(make_console, monkeypatch):
+    monkeypatch.setattr(cli.status, "scan", lambda: [])
+    monkeypatch.setattr(cli.status, "scan_apps",
+                        lambda: [_app(), _app(label="Claude Code", n_procs=1, rss_gb=0.2)])
+    c, buf = make_console()
+    cli.render_status(c)
+    out = buf.getvalue()
+    assert "AI APPS" in out
+    assert "Claude" in out and "Claude Code" in out
+    assert "8 procs" in out and "1 proc" in out
+
+
+def test_render_status_ai_apps_empty(make_console, monkeypatch):
+    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    c, buf = make_console()
+    cli.render_status(c)
+    assert "no AI apps running" in buf.getvalue()
+
+
 def test_render_status_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [_app()])
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_status(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["label"] == "Ollama" and payload[0]["port"] == 11434
+    assert payload["workloads"][0]["label"] == "Ollama" and payload["workloads"][0]["port"] == 11434
+    assert payload["apps"][0]["label"] == "Claude" and payload["apps"][0]["n_procs"] == 8
 
 
 # --------------------------------------------------------------------------- #
@@ -1152,10 +1183,21 @@ def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pyt
 
 
 def test_render_status_want_excludes_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [])
+    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
     c, buf = make_console()
-    cli.render_status(c, want=lambda k: k != "processes")   # filtered out → early return
-    assert buf.getvalue() == ""
+    cli.render_status(c, want=lambda k: k != "processes")   # workloads section filtered out
+    out = buf.getvalue()
+    assert "RUNNING AI/ML" not in out and "AI APPS" in out  # apps section still shows
+
+
+def test_render_status_want_excludes_apps(make_console, monkeypatch):
+    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
+    monkeypatch.setattr(cli.status, "scan_apps", lambda: [_app()])
+    c, buf = make_console()
+    cli.render_status(c, want=lambda k: k != "apps")        # apps section filtered out
+    out = buf.getvalue()
+    assert "RUNNING AI/ML" in out and "AI APPS" not in out
 
 
 def test_render_python_want_excludes_interpreters(make_console, monkeypatch):

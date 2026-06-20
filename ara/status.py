@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import psutil
 
+from ara import apps as _apps
+
 GB = 1024 ** 3  # binary GiB, matching `detect`
 
 
@@ -56,6 +58,46 @@ def _classify(name: str, cmd: str) -> str | None:
             return label
     if ("python" in nl or "python" in cl) and any(tok in cl for tok in _ML_PYTHON_TOKENS):
         return "Python ML"
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# AI client apps (a different lane from workloads)
+# --------------------------------------------------------------------------- #
+# These talk to a remote API — they aren't local ML workloads, so `status` reports them
+# in their own section. The set of "client" apps is the apps catalog's assistant + coding
+# categories (local runners stay in the workload lane above).
+_APP_CATEGORIES = ("assistant", "coding")
+
+# GUI clients matched by their .app bundle path (reused from the shared apps catalog, so
+# there's one source of truth for "known AI apps"). Each helper process of an Electron app
+# also has the parent bundle in its path, so grouping by label collapses them to one entry.
+_APP_BUNDLES: list[tuple[str, str]] = [
+    (f"/{bundle.lower()}.app/", label)
+    for label, category, bundles, _tokens in _apps.CATALOG if category in _APP_CATEGORIES
+    for bundle in bundles
+]
+
+# Terminal clients matched by exact process basename — a CLI's process name differs from
+# its package token (e.g. `claude` vs the `claude-code` cask), so it's listed explicitly.
+_CLI_CLIENTS: dict[str, str] = {
+    "claude": "Claude Code",
+    "codex": "Codex CLI",
+}
+
+
+def _classify_app(name: str, cmd: str) -> str | None:
+    """Return a client-app label if this process belongs to a known AI client app, else None.
+
+    GUI bundles are checked first so a `.app` whose exec basename collides with a CLI name
+    (Claude.app's "Claude" vs the `claude` CLI) is attributed to the app, not the CLI.
+    """
+    cl = cmd.lower()
+    for marker, label in _APP_BUNDLES:
+        if marker in cl:
+            return label
+    if ".app/" not in cl and name.lower() in _CLI_CLIENTS:
+        return _CLI_CLIENTS[name.lower()]
     return None
 
 
@@ -162,3 +204,47 @@ def scan() -> list[Proc]:
             continue
     found.sort(key=lambda x: x.rss_gb, reverse=True)
     return found
+
+
+@dataclass(frozen=True)
+class AppProc:
+    label: str
+    n_procs: int
+    rss_gb: float
+    uptime_s: float
+
+
+def scan_apps() -> list[AppProc]:
+    """Running AI *client* apps (assistant/coding), one entry per app, largest memory first.
+
+    A counterpart to ``scan``: those are local ML workloads, these are remote-API clients
+    (Claude Desktop, ChatGPT, Cursor, Claude Code …). Multi-process apps (Electron helpers)
+    collapse into a single entry. RSS is ordinary RAM — these consume no local ML resources.
+    Read-only.
+    """
+    now = time.time()
+    skip = {os.getpid(), os.getppid()}  # don't report ARA itself
+
+    agg: dict[str, dict] = {}
+    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time", "memory_info"]):
+        try:
+            info = p.info
+            pid = info.get("pid")
+            if pid in skip:
+                continue
+            label = _classify_app(info.get("name") or "", " ".join(info.get("cmdline") or []))
+            if not label:
+                continue
+            mem = info.get("memory_info")
+            rss_gb = (mem.rss / GB) if mem else 0.0
+            created = info.get("create_time") or now
+            a = agg.setdefault(label, {"n": 0, "rss": 0.0, "oldest": created})
+            a["n"] += 1
+            a["rss"] += rss_gb
+            a["oldest"] = min(a["oldest"], created)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    out = [AppProc(label=k, n_procs=v["n"], rss_gb=round(v["rss"], 2),
+                   uptime_s=round(now - v["oldest"], 1)) for k, v in agg.items()]
+    out.sort(key=lambda x: x.rss_gb, reverse=True)
+    return out

@@ -48,7 +48,7 @@ _RECON_SECTIONS: dict[str, tuple[str, ...]] = {
                "engines", "frameworks", "models", "apps", "ara"),
     "apps": ("runner", "image", "speech", "toolkit", "assistant", "coding"),
     "mlx": ("readiness", "libraries"),
-    "status": ("processes",),
+    "status": ("processes", "apps"),
     "python": ("interpreters",),
 }
 _SECTION_ALIASES = {
@@ -429,22 +429,14 @@ def _fmt_mem(gb: float) -> str:
     return f"{gb * 1024:.0f} MB" if gb < 1 else f"{gb:.1f} GB"
 
 
-def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
-    procs = status.scan()
-
-    if as_json:
-        print(json.dumps([asdict(p) for p in procs], indent=2))
-        return
-
-    if not (want or (lambda _key: True))("processes"):
-        return
+def _emit_workloads(c: Console, procs) -> None:
+    """RUNNING AI/ML — local inference workloads consuming memory/GPU right now."""
     c.emit()
     c.emit(c.section("  RUNNING AI/ML"))
     if not procs:
         c.emit(c.style("dim", "  nothing running right now"))
         c.emit()
         return
-
     for p in procs:
         bits = [f"pid {p.pid}", f"up {_fmt_uptime(p.uptime_s)}"]
         if p.port:
@@ -454,13 +446,42 @@ def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
         if p.detail:
             bits.append(p.detail)
         c.emit(c.field(p.label, _fmt_mem(p.rss_gb), " · ".join(bits), value_role="metric"))
-
     total = sum(p.rss_gb for p in procs)
     plural = "process" if len(procs) == 1 else "processes"
     c.emit()
     c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
                    value_role="good"))
     c.emit()
+
+
+def _emit_apps(c: Console, apps_) -> None:
+    """AI APPS — running client apps (remote-API GUIs/CLIs). RSS is ordinary RAM, not ML."""
+    c.emit(c.section("  AI APPS"))
+    if not apps_:
+        c.emit(c.style("dim", "  no AI apps running right now"))
+        c.emit()
+        return
+    for a in apps_:
+        plural = "proc" if a.n_procs == 1 else "procs"
+        bits = [f"{a.n_procs} {plural}", f"up {_fmt_uptime(a.uptime_s)}"]
+        c.emit(c.field(a.label, _fmt_mem(a.rss_gb), " · ".join(bits), value_role="metric"))
+    c.emit()
+
+
+def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
+    procs = status.scan()
+    apps_ = status.scan_apps()
+
+    if as_json:
+        print(json.dumps({"workloads": [asdict(p) for p in procs],
+                          "apps": [asdict(a) for a in apps_]}, indent=2))
+        return
+
+    show = want or (lambda _key: True)
+    if show("processes"):
+        _emit_workloads(c, procs)
+    if show("apps"):
+        _emit_apps(c, apps_)
 
 
 # --------------------------------------------------------------------------- #

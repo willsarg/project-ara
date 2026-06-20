@@ -219,3 +219,117 @@ def test_scan_attaches_gpu_memory(monkeypatch):
     monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
     found = status.scan()
     assert found[0].gpu_mb == 8192.0
+
+
+# --------------------------------------------------------------------------- #
+# _classify_app — AI *client* apps (assistant + coding), distinct from workloads
+# --------------------------------------------------------------------------- #
+def test_classify_app_gui_bundle_match():
+    # GUI clients match their .app bundle path (reused from the apps catalog).
+    assert status._classify_app(
+        "ChatGPT", "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT") == "ChatGPT"
+    assert status._classify_app(
+        "Cursor", "/Applications/Cursor.app/Contents/MacOS/Cursor") == "Cursor"
+
+
+def test_classify_app_cli_basename_match():
+    # terminal client: matched by exact process basename, no .app in the cmdline.
+    assert status._classify_app("claude", "claude --resume abc123") == "Claude Code"
+
+
+def test_classify_app_gui_wins_over_cli_collision():
+    # Claude.app's main exec basename is "Claude" → collides with the `claude` CLI.
+    # The .app path must win so Claude Desktop isn't mislabeled "Claude Code".
+    assert status._classify_app(
+        "Claude", "/Applications/Claude.app/Contents/MacOS/Claude") == "Claude"
+
+
+def test_classify_app_cli_ignored_inside_app_bundle():
+    # a `claude`-named process living inside some unrelated .app must NOT be taken as the
+    # CLI client (the .app guard), and it isn't a known client bundle → None.
+    assert status._classify_app("claude", "/Applications/SomeEditor.app/bin/claude") is None
+
+
+def test_classify_app_excludes_runners_and_unrelated():
+    # Ollama is a 'runner' (a local workload), not a client app → not in this section.
+    assert status._classify_app(
+        "Ollama", "/Applications/Ollama.app/Contents/MacOS/Ollama") is None
+    assert status._classify_app("bash", "bash -c ls") is None
+
+
+# --------------------------------------------------------------------------- #
+# scan_apps — running AI client apps, one entry per app
+# --------------------------------------------------------------------------- #
+def _app_info(pid, name, cmdline, rss_gb=0.5, create_time=None):
+    return {
+        "pid": pid, "name": name, "cmdline": cmdline,
+        "memory_info": types.SimpleNamespace(rss=int(rss_gb * GB)),
+        "create_time": create_time,
+    }
+
+
+def test_scan_apps_collapses_multiprocess_app(monkeypatch):
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    base = "/Applications/Claude.app/Contents"
+    helper = f"{base}/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
+    procs = [
+        FakeProc(_app_info(1, "Claude", [f"{base}/MacOS/Claude"], rss_gb=0.4, create_time=100.0)),
+        FakeProc(_app_info(2, "Claude Helper", [helper, "--type=renderer"], rss_gb=0.3, create_time=200.0)),
+        FakeProc(_app_info(3, "Claude Helper", [helper, "--type=gpu-process"], rss_gb=0.2, create_time=150.0)),
+    ]
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
+    found = status.scan_apps()
+    assert len(found) == 1                       # 8-helper Electron app -> one line
+    assert found[0].label == "Claude" and found[0].n_procs == 3
+    assert found[0].rss_gb == 0.9                # summed RSS
+    assert found[0].uptime_s == 900.0            # 1000 - oldest create_time (100)
+
+
+def test_scan_apps_sorts_by_memory_and_includes_cli(monkeypatch):
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    procs = [
+        FakeProc(_app_info(10, "claude", ["claude", "--resume", "x"], rss_gb=0.2, create_time=500.0)),
+        FakeProc(_app_info(11, "ChatGPT", ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"], rss_gb=1.5, create_time=500.0)),
+        FakeProc(_app_info(12, "bash", ["bash"], rss_gb=9.0)),  # unrelated -> excluded
+    ]
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
+    found = status.scan_apps()
+    assert [a.label for a in found] == ["ChatGPT", "Claude Code"]   # 1.5 GB before 0.2 GB
+    assert all(isinstance(a, status.AppProc) for a in found)
+
+
+def test_scan_apps_skips_self_and_parent(monkeypatch):
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    me, parent = os.getpid(), os.getppid()
+    cc = ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"]
+    procs = [
+        FakeProc(_app_info(me, "ChatGPT", cc)),
+        FakeProc(_app_info(parent, "ChatGPT", cc)),
+        FakeProc(_app_info(7777, "ChatGPT", cc, create_time=500.0)),
+    ]
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
+    found = status.scan_apps()
+    assert len(found) == 1 and found[0].n_procs == 1     # only pid 7777
+
+
+def test_scan_apps_survives_dead_process(monkeypatch):
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    procs = [
+        FakeProc(_app_info(8001, "ChatGPT", ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"], create_time=500.0)),
+        FakeProc(_app_info(8002, "x", []), raise_on_info=True),
+    ]
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
+    found = status.scan_apps()
+    assert [a.label for a in found] == ["ChatGPT"]
+
+
+def test_scan_apps_handles_missing_mem_and_time(monkeypatch):
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    info = {"pid": 9001, "name": "Cursor",
+            "cmdline": ["/Applications/Cursor.app/Contents/MacOS/Cursor"],
+            "memory_info": None, "create_time": None}
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter([FakeProc(info)]))
+    found = status.scan_apps()
+    assert found[0].label == "Cursor"
+    assert found[0].rss_gb == 0.0          # no memory_info -> 0
+    assert found[0].uptime_s == 0.0        # no create_time -> now -> 0
