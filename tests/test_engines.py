@@ -1,4 +1,4 @@
-"""engines.py — the engine catalog + hardware-matched resolution (`--engine auto`)."""
+"""engines.py — the engine catalog + isolated-env install lifecycle (`ara install`)."""
 from __future__ import annotations
 
 import ara.engines as engines
@@ -29,11 +29,12 @@ def test_for_hardware_none_when_no_known_accelerator(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# resolve() — map an --engine value (wmx | wcx | auto) to a concrete engine key
+# resolve() — map an --engine value (wmx | wcx | cpu | auto) to a concrete key
 # --------------------------------------------------------------------------- #
 def test_resolve_passes_through_explicit_engine():
     assert engines.resolve("wmx") == "wmx"
     assert engines.resolve("wcx") == "wcx"
+    assert engines.resolve("cpu") == "cpu"
 
 
 def test_resolve_auto_uses_hardware_pick(monkeypatch):
@@ -53,20 +54,20 @@ def test_resolve_unknown_is_none():
 def test_for_backend_maps_backend_to_engine():
     assert engines.for_backend("apple") == "wmx"
     assert engines.for_backend("cuda") == "wcx"
+    assert engines.for_backend("cpu") == "cpu"
     assert engines.for_backend("unsupported") is None
 
 
 # --------------------------------------------------------------------------- #
-# is_installed() — is the engine's module importable? (cheap, no import)
+# is_installed() — is the engine's isolated env present? (no import of the engine)
 # --------------------------------------------------------------------------- #
-def test_is_installed_true_when_module_present(monkeypatch):
-    monkeypatch.setattr(engines, "find_spec",
-                        lambda m: object() if m == "wmx_suite" else None)
+def test_is_installed_true_when_env_exists(monkeypatch):
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: name == "apple")
     assert engines.is_installed("wmx") is True
 
 
-def test_is_installed_false_when_module_absent(monkeypatch):
-    monkeypatch.setattr(engines, "find_spec", lambda m: None)
+def test_is_installed_false_when_env_absent(monkeypatch):
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     assert engines.is_installed("wmx") is False
 
 
@@ -75,7 +76,7 @@ def test_is_installed_false_for_unknown_engine():
 
 
 # --------------------------------------------------------------------------- #
-# source_for() — the install source, with a dev env-var override
+# source_for() — the install source, with a dev env-var override (external suites)
 # --------------------------------------------------------------------------- #
 def test_source_for_defaults_to_git_spec(monkeypatch):
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
@@ -88,100 +89,102 @@ def test_source_for_uses_env_override(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# install() — orchestration around `uv pip install` (subprocess injected)
+# _install_targets() — the uv-pip args per engine kind
+# --------------------------------------------------------------------------- #
+def test_install_targets_builtin_is_the_package_list():
+    assert engines._install_targets("cpu") == engines.ENGINES["cpu"]["packages"]
+
+
+def test_install_targets_external_git_spec(monkeypatch):
+    monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
+    assert engines._install_targets("wmx") == ["git+https://github.com/willsarg/wmx-suite"]
+
+
+def test_install_targets_external_local_is_editable(monkeypatch):
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../wmx-suite")
+    assert engines._install_targets("wmx") == ["-e", "../wmx-suite"]
+
+
+def test_install_targets_wcx_folds_extra_and_torch_backend(monkeypatch):
+    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    assert engines._install_targets("wcx") == [
+        "--torch-backend=auto",
+        "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
+
+
+def test_install_targets_wcx_local_is_editable_with_extra(monkeypatch):
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../wcx-suite")
+    assert engines._install_targets("wcx") == [
+        "--torch-backend=auto", "-e", "../wcx-suite[cuda]"]
+
+
+# --------------------------------------------------------------------------- #
+# install() — create the isolated env (engine_env injected)
 # --------------------------------------------------------------------------- #
 def test_install_unknown_engine_reports_unknown():
-    r = engines.install("nonsense")
-    assert r.status == "unknown"
+    assert engines.install("nonsense").status == "unknown"
 
 
 def test_install_unavailable_engine_is_coming_soon(monkeypatch):
     monkeypatch.setitem(engines.ENGINES["wcx"], "available", False)   # force coming-soon
-    called = []
-    monkeypatch.setattr(engines, "_run_pip", lambda args: called.append(args) or (0, ""))
+    created = []
+    monkeypatch.setattr(engines.engine_env, "create",
+                        lambda *a, **k: created.append(a))
     r = engines.install("wcx")
     assert r.status == "coming_soon"
-    assert called == []   # never shelled out for a not-yet-available engine
-
-
-def test_install_wcx_uses_cuda_extra_and_torch_backend(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
-    seen = {}
-
-    def fake_pip(args):
-        seen["args"] = args
-        return 0, "ok"
-
-    monkeypatch.setattr(engines, "_run_pip", fake_pip)
-    engines.install("wcx")
-    assert seen["args"] == ["install", "--torch-backend=auto",
-                            "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
-
-
-def test_install_wcx_local_source_is_editable_with_extra(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.setenv("ARA_WCX_SOURCE", "../wcx-suite")
-    seen = {}
-
-    def fake_pip(args):
-        seen["args"] = args
-        return 0, ""
-
-    monkeypatch.setattr(engines, "_run_pip", fake_pip)
-    engines.install("wcx")
-    assert seen["args"] == ["install", "--torch-backend=auto", "-e", "../wcx-suite[cuda]"]
+    assert created == []   # never built an env for a not-yet-available engine
 
 
 def test_install_already_present_is_noop(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: True)
-    called = []
-    monkeypatch.setattr(engines, "_run_pip", lambda args: called.append(args) or (0, ""))
+    created = []
+    monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
     r = engines.install("wmx")
     assert r.status == "already"
-    assert called == []   # already there → don't reinstall
+    assert created == []   # already there → don't rebuild
 
 
-def test_install_runs_uv_pip_install_and_succeeds(monkeypatch):
+def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: False)
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
     seen = {}
 
-    def fake_pip(args):
-        seen["args"] = args
-        return 0, "ok"
+    def fake_create(name, packages, *, python=None, **kw):
+        seen.update(name=name, packages=packages, python=python)
 
-    monkeypatch.setattr(engines, "_run_pip", fake_pip)
+    monkeypatch.setattr(engines.engine_env, "create", fake_create)
     r = engines.install("wmx")
     assert r.status == "installed"
-    assert seen["args"] == ["install", "git+https://github.com/willsarg/wmx-suite"]
+    assert seen == {"name": "apple",
+                    "packages": ["git+https://github.com/willsarg/wmx-suite"],
+                    "python": "3.12"}
 
 
-def test_install_local_source_is_editable(monkeypatch):
+def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.setenv("ARA_WMX_SOURCE", "../wmx-suite")
     seen = {}
-
-    def fake_pip(args):
-        seen["args"] = args
-        return 0, ""
-
-    monkeypatch.setattr(engines, "_run_pip", fake_pip)
-    engines.install("wmx")
-    assert seen["args"] == ["install", "-e", "../wmx-suite"]   # local path → editable
+    monkeypatch.setattr(engines.engine_env, "create",
+                        lambda name, packages, **kw: seen.update(name=name, packages=packages))
+    assert engines.install("cpu").status == "installed"
+    assert seen["name"] == "cpu"
+    assert "llama-cpp-python>=0.3" in seen["packages"]
 
 
-def test_install_reports_failed_on_nonzero(monkeypatch):
+def test_install_reports_failed_on_engine_env_error(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: False)
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    monkeypatch.setattr(engines, "_run_pip", lambda args: (1, "boom: clone failed"))
+
+    def boom(*a, **k):
+        raise engines.engine_env.EngineEnvError("resolution impossible")
+
+    monkeypatch.setattr(engines.engine_env, "create", boom)
     r = engines.install("wmx")
     assert r.status == "failed"
-    assert "boom" in r.detail
+    assert "resolution impossible" in r.detail
 
 
 # --------------------------------------------------------------------------- #
-# uninstall() — symmetric: remove the engine's package
+# uninstall() — symmetric: remove the engine's env
 # --------------------------------------------------------------------------- #
 def test_uninstall_unknown_engine_reports_unknown():
     assert engines.uninstall("nonsense").status == "unknown"
@@ -189,55 +192,16 @@ def test_uninstall_unknown_engine_reports_unknown():
 
 def test_uninstall_absent_engine_is_noop(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    called = []
-    monkeypatch.setattr(engines, "_run_pip", lambda args: called.append(args) or (0, ""))
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
     assert engines.uninstall("wmx").status == "absent"
-    assert called == []   # nothing installed → nothing to remove
+    assert removed == []   # nothing installed → nothing to remove
 
 
-def test_uninstall_removes_installed_package(monkeypatch):
+def test_uninstall_removes_the_env(monkeypatch):
     monkeypatch.setattr(engines, "is_installed", lambda k: True)
-    seen = {}
-
-    def fake_pip(args):
-        seen["args"] = args
-        return 0, "removed"
-
-    monkeypatch.setattr(engines, "_run_pip", fake_pip)
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
     r = engines.uninstall("wmx")
     assert r.status == "removed"
-    assert seen["args"] == ["uninstall", "wmx-suite"]   # the dist name, not the module
-
-
-def test_uninstall_reports_failed_on_nonzero(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
-    monkeypatch.setattr(engines, "_run_pip", lambda args: (1, "pip blew up"))
-    r = engines.uninstall("wmx")
-    assert r.status == "failed"
-    assert "blew up" in r.detail
-
-
-# --------------------------------------------------------------------------- #
-# _run_pip() — the real subprocess boundary (uv pip ...)
-# --------------------------------------------------------------------------- #
-def test_run_pip_prefixes_uv_pip_and_combines_output(monkeypatch):
-    import types as _t
-    seen = {}
-
-    def fake_run(cmd, capture_output, text):
-        seen["cmd"] = cmd
-        return _t.SimpleNamespace(returncode=0, stdout="out\n", stderr="warn\n")
-
-    monkeypatch.setattr(engines.subprocess, "run", fake_run)
-    rc, out = engines._run_pip(["install", "x"])
-    assert seen["cmd"] == ["uv", "pip", "install", "x"]
-    assert rc == 0 and "out" in out and "warn" in out
-
-
-def test_run_pip_swallows_errors_as_nonzero(monkeypatch):
-    def boom(*a, **k):
-        raise FileNotFoundError("uv not found")
-
-    monkeypatch.setattr(engines.subprocess, "run", boom)
-    rc, out = engines._run_pip(["install", "x"])
-    assert rc == 1 and "uv not found" in out
+    assert removed == ["apple"]   # the backend/env name, not the dist

@@ -72,14 +72,20 @@ def exists(name: str) -> bool:
     return python_path(name).exists()
 
 
-def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE) -> Path:
+def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE,
+           python: str | None = None) -> Path:
     """Create engine *name*'s isolated uv env and install *packages* into it.
 
-    Raises :class:`EngineEnvError` if the venv or the install fails.
+    *python* pins the interpreter version (e.g. ``"3.12"``) — some engines require a floor
+    (wmx-suite needs ``>=3.12``); omit to take uv's default. Raises :class:`EngineEnvError`
+    if the venv or the install fails.
     """
     path = env_path(name)
     engines_root().mkdir(parents=True, exist_ok=True)
-    rc, _out, err = _run(["uv", "venv", str(path)])
+    venv_cmd = ["uv", "venv", str(path)]
+    if python:
+        venv_cmd += ["--python", python]
+    rc, _out, err = _run(venv_cmd)
     if rc != 0:
         raise EngineEnvError(f"creating env {name!r} failed: {err.strip()}")
     rc, _out, err = _run(

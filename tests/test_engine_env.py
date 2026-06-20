@@ -150,6 +150,17 @@ def test_create_honors_explicit_link_mode(engines_root, run_spy):
     assert install[install.index("--link-mode") + 1] == "hardlink"
 
 
+def test_create_pins_python_when_requested(engines_root, run_spy):
+    engine_env.create("apple", ["wmx-suite"], python="3.12")
+    venv = run_spy.calls[0]
+    assert venv[venv.index("--python") + 1] == "3.12"
+
+
+def test_create_omits_python_pin_by_default(engines_root, run_spy):
+    engine_env.create("cpu", ["x"])
+    assert "--python" not in run_spy.calls[0]
+
+
 def test_create_raises_when_venv_fails(engines_root, run_spy):
     run_spy.add("uv venv", 1, err="no python found")
     with pytest.raises(engine_env.EngineEnvError, match="no python found"):

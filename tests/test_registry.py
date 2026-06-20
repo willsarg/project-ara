@@ -53,6 +53,7 @@ def test_engine_status_non_apple(set_platform):
 
 def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(registry.engines, "find_spec", lambda name: object())
+    # presence is an env-existence check (no find_spec, no import of the engine)
+    monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: True)
     registry.engine_status()
     assert "wmx_suite" not in sys.modules
