@@ -1572,9 +1572,51 @@ def test_gpu_info_unknown_os_returns_empty(monkeypatch):
     assert hw.gpu_info() == []
 
 
-def test_gpus_linux_stub_returns_empty():
-    """Direct call to the stub so its body line is covered."""
+def test_drm_gpu_amd_apu_parsed():
     from ara import hardware as hw
+    g = hw._drm_gpu("0x1002", "0x15bf", 4294967296, "Phoenix1", cpu_vendor="AuthenticAMD")
+    assert g.vendor == "amd"
+    assert g.name == "Phoenix1"            # lspci name when available
+    assert g.vram_gb == 4.3               # 4294967296 / 1e9 rounded (decimal GB)
+    assert g.integrated is True           # AMD GPU + AMD CPU ⇒ APU
+    assert g.compute_runtime is None      # runtime filled in Task 3, not here
+
+
+def test_drm_gpu_no_lspci_name_falls_back_generic():
+    from ara import hardware as hw
+    g = hw._drm_gpu("0x1002", "0x15bf", None, None, cpu_vendor="AuthenticAMD")
+    assert g.name == "AMD Radeon Graphics"   # generic fallback
+    assert g.vram_gb is None
+
+
+def test_drm_gpu_nvidia_discrete_not_integrated():
+    from ara import hardware as hw
+    g = hw._drm_gpu("0x10de", "0x2484", 8589934592, "GA104 [GeForce RTX 3070]",
+                    cpu_vendor="AuthenticAMD")
+    assert g.vendor == "nvidia" and g.integrated is False
+
+
+def test_gpus_linux_reads_sysfs(tmp_path, monkeypatch):
+    from ara import hardware as hw
+    # fake /sys/class/drm/card1/device
+    dev = tmp_path / "card1" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    (dev / "mem_info_vram_total").write_text("4294967296\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
+    monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1 and gpus[0].name == "Phoenix1" and gpus[0].vendor == "amd"
+
+
+def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
+    from ara import hardware as hw
+    (tmp_path / "card0" / "device").mkdir(parents=True)   # no vendor file
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo())
     assert hw._gpus_linux() == []
 
 
@@ -1621,3 +1663,53 @@ def test_gpu_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
     monkeypatch.setattr(hw, "_gpus_linux", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     assert hw.gpu_info() == []
+
+
+# ---------------------------------------------------------------------------
+# Task 7: _lspci_names, _drm_gpu intel/unknown branches, _read_text exception
+# ---------------------------------------------------------------------------
+
+def test_drm_gpu_intel_always_integrated():
+    from ara import hardware as hw
+    g = hw._drm_gpu("0x8086", "0x9bc4", 0, "Intel UHD Graphics", cpu_vendor="GenuineIntel")
+    assert g.vendor == "intel" and g.integrated is True
+
+
+def test_drm_gpu_unknown_vendor_integrated_none():
+    from ara import hardware as hw
+    g = hw._drm_gpu("0xffff", "0x0001", None, None, cpu_vendor=None)
+    assert g.vendor == "unknown" and g.integrated is None and g.vram_gb is None
+
+
+def test_lspci_names_returns_empty_when_lspci_absent(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: None)
+    assert hw._lspci_names() == {}
+
+
+def test_lspci_names_parses_amd_device(monkeypatch):
+    from ara import hardware as hw
+    # Simulate `lspci -mm -nn` output with an AMD GPU line
+    lspci_out = (
+        '"0300" "VGA compatible controller [0300]" '
+        '"Advanced Micro Devices, Inc. [AMD/ATI] [1002:15bf]" '
+        '"Phoenix1" "" ""\n'
+    )
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
+    names = hw._lspci_names()
+    assert names.get("0x15bf") == "Phoenix1"
+
+
+def test_lspci_names_skips_lines_without_match(monkeypatch):
+    from ara import hardware as hw
+    # A line that has no PCI vendor bracket we recognise → skipped cleanly
+    lspci_out = '"0300" "Some other device" "Vendor [dead:beef]" "TheName" "" ""\n'
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
+    names = hw._lspci_names()
+    assert names == {}
+
+
+def test_read_text_returns_none_on_missing_file():
+    from ara import hardware as hw
+    result = hw._read_text("/nonexistent/path/that/cannot/exist")
+    assert result is None

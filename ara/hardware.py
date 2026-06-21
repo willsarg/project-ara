@@ -866,7 +866,70 @@ def _gpu_vendor(raw: str | None) -> str:
     return "unknown"
 
 
-def _gpus_linux() -> list["GpuInfo"]: return []
+import glob as _glob_mod
+
+_DRM_GLOB = "/sys/class/drm/card*"   # module-level so tests can monkeypatch
+
+_GENERIC_GPU_NAME = {"amd": "AMD Radeon Graphics", "nvidia": "NVIDIA GPU",
+                     "intel": "Intel Graphics"}
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _lspci_names() -> dict[str, str]:
+    """Map PCI device-id (lowercased '0x....') → human name via `lspci -mm -nn`. {} if absent."""
+    out = _run(["lspci", "-mm", "-nn"])
+    names: dict[str, str] = {}
+    if not out:
+        return names
+    for line in out.splitlines():
+        m = re.search(
+            r"\[(?:1002|10de|8086):([0-9a-fA-F]{4})\]",
+            line,
+        )
+        nm = re.findall(r'"([^"]*)"', line)
+        if m and nm:
+            dev = m.group(1)
+            names[f"0x{dev.lower()}"] = nm[-1] or (nm[-3] if len(nm) >= 3 else nm[-1])
+    return names
+
+
+def _drm_gpu(vendor_raw, device_raw, vram_bytes, lspci_name, cpu_vendor):
+    vendor = _gpu_vendor(vendor_raw)
+    name = lspci_name or _GENERIC_GPU_NAME.get(vendor)
+    if vendor == "intel":
+        integrated: bool | None = True
+    elif vendor == "amd":
+        integrated = bool(cpu_vendor and "amd" in cpu_vendor.lower()) or None
+    elif vendor == "nvidia":
+        integrated = False
+    else:
+        integrated = None
+    return GpuInfo(vendor=vendor, name=name, vram_gb=_gb_dec(vram_bytes), integrated=integrated)
+
+
+def _gpus_linux() -> list["GpuInfo"]:
+    names = _lspci_names()
+    cpu_vendor = cpu_info().vendor
+    gpus: list[GpuInfo] = []
+    for card in sorted(_glob_mod.glob(_DRM_GLOB)):
+        vendor_raw = _read_text(f"{card}/device/vendor")
+        if not vendor_raw:
+            continue
+        device_raw = _read_text(f"{card}/device/device")
+        vram = _read_text(f"{card}/device/mem_info_vram_total")
+        vram_bytes = int(vram) if vram and vram.isdigit() else None
+        gpus.append(_drm_gpu(vendor_raw, device_raw,
+                             vram_bytes, names.get((device_raw or "").lower()), cpu_vendor))
+    return gpus
+
+
 def _gpus_windows() -> list["GpuInfo"]: return []
 def _gpus_macos() -> list["GpuInfo"]: return []
 def _with_runtime(g: "GpuInfo") -> "GpuInfo": return g
