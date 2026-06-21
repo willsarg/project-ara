@@ -519,6 +519,7 @@ class Machine:
     memory: _hardware.MemoryInfo = field(default_factory=_hardware.MemoryInfo)
     storage: _hardware.StorageInfo = field(default_factory=_hardware.StorageInfo)
     board: _hardware.BoardInfo = field(default_factory=_hardware.BoardInfo)
+    gpus: list[_hardware.GpuInfo] = field(default_factory=list)
     runtimes: list[Runtime] = field(default_factory=list)
     framework_python: str | None = None  # interpreter the FRAMEWORKS group was probed in
     model_stores: list[ModelStore] = field(default_factory=list)
@@ -574,6 +575,7 @@ def profile() -> Machine:
         memory=hw.memory,
         storage=hw.storage,
         board=hw.board,
+        gpus=hw.gpus,
         runtimes=runtimes(accel.kind, user_py),
         framework_python=user_py,
         model_stores=model_stores(),

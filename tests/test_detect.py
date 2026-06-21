@@ -852,3 +852,19 @@ def test_import_no_circular():
     import importlib
     importlib.import_module("ara.detect")
     importlib.import_module("ara.hardware")
+
+
+# --------------------------------------------------------------------------- #
+# Task 6 (cont.): Machine.gpus — GPU inventory flows through detect
+# --------------------------------------------------------------------------- #
+
+def test_machine_carries_gpus(monkeypatch):
+    from ara import detect, hardware
+    fake = hardware.Hardware(
+        cpu=hardware.CpuInfo(), memory=hardware.MemoryInfo(),
+        storage=hardware.StorageInfo(), board=hardware.BoardInfo(),
+        gpus=[hardware.GpuInfo(vendor="amd", name="Phoenix1", usable_backend="vulkan")])
+    monkeypatch.setattr(detect._hardware, "probe", lambda: fake)
+    m = detect.profile()
+    assert m.gpus and m.gpus[0].vendor == "amd"
+    assert m.gpus[0].usable_backend == "vulkan"
