@@ -34,7 +34,8 @@ class _FakeBackend:
     CALIBRATION_MODEL = "org/calib"
 
     def characterize(self, model):
-        return {"model": model, "safe_context": 8192, "binding": "context_window",
+        return {"model": model, "safe_context": 8192, "decode_context": None,
+                "binding": "context_window",
                 "points": [{"context": 512, "mem_gb": 1.2}]}   # real dict-point shape
 
     def safe_limits(self):

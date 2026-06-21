@@ -514,8 +514,10 @@ def test_persist_none_engine_key_is_noop(store):
 
 def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
-    cli.db.save_characterization(store, "mkey", "wcx", "org/SmolLM", safe_context=16000, points=[])
-    cli.db.save_characterization(store, "mkey", "wcx", "org/Unbound", safe_context=None, points=[])
+    cli.db.save_characterization(store, "mkey", "wcx", "org/SmolLM", safe_context=16000, points=[],
+                                 decode_context=None)
+    cli.db.save_characterization(store, "mkey", "wcx", "org/Unbound", safe_context=None, points=[],
+                                 decode_context=None)
     c, buf = make_console()
     cli._emit_characterized(c, "wcx")
     out = buf.getvalue()
@@ -1423,7 +1425,8 @@ def test_render_models_lists_catalog(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
-                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000}])
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
+                                             "decode_context": None}])
     c, buf = make_console()
     cli.render_models(c)
     out = buf.getvalue()
@@ -1445,8 +1448,10 @@ def test_render_models_distinguishes_measured_no_ceiling(make_console, store, mo
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
-                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000},
-                                            {"model_id": "org/NoCeiling", "safe_context": None}])
+                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000,
+                                             "decode_context": None},
+                                            {"model_id": "org/NoCeiling", "safe_context": None,
+                                             "decode_context": None}])
     c, buf = make_console()
     cli.render_models(c)
     lines = {ln.split()[0]: ln for ln in buf.getvalue().splitlines() if "org/" in ln}
@@ -1473,7 +1478,8 @@ def test_render_models_json(monkeypatch, capsys, store):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
-                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 9000}])
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 9000,
+                                             "decode_context": None}])
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_models(c, as_json=True)
     data = json.loads(capsys.readouterr().out)
@@ -1491,8 +1497,10 @@ def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
-                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000},
-                                            {"model_id": "org/NoCeiling", "safe_context": None}])
+                        lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000,
+                                             "decode_context": None},
+                                            {"model_id": "org/NoCeiling", "safe_context": None,
+                                             "decode_context": None}])
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_models(c, as_json=True)
     data = {d["model_id"]: d for d in json.loads(capsys.readouterr().out)}
@@ -1510,8 +1518,8 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
                         lambda con: [{"model_id": "org/L", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = wcx
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
-    per_engine = {"wcx": [{"model_id": "org/L", "safe_context": 3500}],
-                  "cpu": [{"model_id": "org/L", "safe_context": 8192}]}
+    per_engine = {"wcx": [{"model_id": "org/L", "safe_context": 3500, "decode_context": None}],
+                  "cpu": [{"model_id": "org/L", "safe_context": 8192, "decode_context": None}]}
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: per_engine.get(e, []))
     c, buf = make_console()
@@ -1587,7 +1595,7 @@ def test_model_detail_full(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": 16000})
+                        lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": None})
     c, buf = make_console()
     assert cli.render_model_detail(c, "org/Smol") == 0
     out = buf.getvalue()
@@ -1618,11 +1626,12 @@ def test_model_detail_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": 9000})
+                        lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": None})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_model_detail(c, "org/A", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["model_id"] == "org/A" and data["safe_context"] == 9000
+    assert data["decode_context"] is None
 
 
 def test_model_detail_measured_no_ceiling(make_console, monkeypatch):
@@ -1632,7 +1641,7 @@ def test_model_detail_measured_no_ceiling(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": None})
+                        lambda con, mk, e, mid: {"safe_context": None, "decode_context": None})
     c, buf = make_console()
     assert cli.render_model_detail(c, "org/Unfit") == 0
     out = buf.getvalue()
@@ -1646,12 +1655,13 @@ def test_model_detail_json_characterized_flag(monkeypatch, capsys):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": None})
+                        lambda con, mk, e, mid: {"safe_context": None, "decode_context": None})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_model_detail(c, "org/Unfit", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["safe_context"] is None
     assert data.get("characterized") is True
+    assert data.get("decode_context") is None
 
 
 def test_model_detail_json_uncharacterized_flag(monkeypatch, capsys):
@@ -1663,6 +1673,7 @@ def test_model_detail_json_uncharacterized_flag(monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["safe_context"] is None
     assert data.get("characterized") is False
+    assert data.get("decode_context") is None
 
 
 def test_main_models_id_dispatch(monkeypatch):
@@ -1692,7 +1703,8 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
 
 def test_render_characterize_persists_and_shows(make_console, store, monkeypatch):
     _wire_characterize(monkeypatch,
-                       characterize=lambda m: {"model": m, "safe_context": 20000, "points": [[512, 1.4]]})
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": None, "points": [[512, 1.4]]})
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Model") == 0
     assert "20000" in buf.getvalue()
@@ -1702,7 +1714,8 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
 
 def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     _wire_characterize(monkeypatch,
-                       characterize=lambda m: {"model": m, "safe_context": None, "points": []})
+                       characterize=lambda m: {"model": m, "safe_context": None,
+                                               "decode_context": None, "points": []})
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Big") == 0
     assert "couldn't fit" in buf.getvalue()
@@ -1727,10 +1740,13 @@ def test_render_characterize_engine_error(make_console, monkeypatch):
 
 def test_render_characterize_json(monkeypatch, capsys, store):
     _wire_characterize(monkeypatch,
-                       characterize=lambda m: {"model": m, "safe_context": 9000, "points": []})
+                       characterize=lambda m: {"model": m, "safe_context": 9000,
+                                               "decode_context": None, "points": []})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_characterize(c, "org/M", as_json=True) == 0
-    assert json.loads(capsys.readouterr().out)["safe_context"] == 9000
+    data = json.loads(capsys.readouterr().out)
+    assert data["safe_context"] == 9000
+    assert "decode_context" in data
 
 
 def test_render_characterize_engine_flag_overrides_detected_backend(make_console, store, monkeypatch):
@@ -1834,7 +1850,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
 
 
 def _fake_bk_characterize(model):
-    return {"model": model, "safe_context": 16000, "points": [[1024, 1.2]]}
+    return {"model": model, "safe_context": 16000, "decode_context": None, "points": [[1024, 1.2]]}
 
 
 def test_render_characterize_prefetch_uncached_transformers(make_console, store, monkeypatch):
@@ -1897,3 +1913,163 @@ def test_render_characterize_prefetch_insufficient_disk_json(monkeypatch, capsys
     assert cli.render_characterize(c, "org/Big", as_json=True) == 1
     out = json.loads(capsys.readouterr().out)
     assert "error" in out and "disk" in out["error"]
+
+
+# --------------------------------------------------------------------------- #
+# decode-safe ceiling display (task #48b)
+# --------------------------------------------------------------------------- #
+def test_render_characterize_decode_shown_when_greater(make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": 25000, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    out = buf.getvalue()
+    assert "25000" in out and "decode" in out and "est." in out
+
+
+def test_render_characterize_decode_hidden_when_none(make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": None, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert "decode" not in buf.getvalue()
+
+
+def test_render_characterize_decode_hidden_when_not_greater(make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": 15000, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert "decode" not in buf.getvalue()
+
+
+def test_render_characterize_decode_persisted(store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": 25000, "points": []})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/Model") == 0
+    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    assert row["decode_context"] == 25000
+
+
+def test_render_characterize_json_includes_decode_context(monkeypatch, capsys, store):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 9000,
+                                               "decode_context": 12000, "points": []})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/M", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "decode_context" in data and data["decode_context"] == 12000
+
+
+def test_render_characterize_json_decode_context_none(monkeypatch, capsys, store):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 9000,
+                                               "decode_context": None, "points": []})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/M", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "decode_context" in data and data["decode_context"] is None
+
+
+def test_render_models_decode_gloss_when_greater(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
+                                             "decode_context": 20000}])
+    c, buf = make_console()
+    cli.render_models(c)
+    out = buf.getvalue()
+    assert "20000" in out and "decode" in out
+
+
+def test_render_models_decode_hidden_when_not_greater(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
+                                             "decode_context": 8000}])
+    c, buf = make_console()
+    cli.render_models(c)
+    assert "decode" not in buf.getvalue()
+
+
+def test_render_models_json_includes_decode_context(monkeypatch, capsys, store):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
+                                             "decode_context": 20000}])
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert data[0].get("decode_context") == 20000
+
+
+def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": 20000})
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    out = buf.getvalue()
+    assert "20000" in out and "decode" in out
+
+
+def test_model_detail_per_engine_decode_hidden_when_not_greater(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": 8000})
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    assert "decode" not in buf.getvalue()
+
+
+def test_model_detail_json_has_decode_context(monkeypatch, capsys):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": 12000})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/A", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data.get("decode_context") == 12000
+    assert all(isinstance(v, int) for v in data["engines"].values())
+
+
+def test_emit_characterized_decode_gloss_when_greater(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
+                                 safe_context=16000, points=[], decode_context=20000)
+    c, buf = make_console()
+    cli._emit_characterized(c, "wcx")
+    out = buf.getvalue()
+    assert "20000" in out and "decode" in out
+
+
+def test_emit_characterized_decode_hidden_when_not_greater(make_console, store, monkeypatch):
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
+                                 safe_context=16000, points=[], decode_context=8000)
+    c, buf = make_console()
+    cli._emit_characterized(c, "wcx")
+    assert "decode" not in buf.getvalue()

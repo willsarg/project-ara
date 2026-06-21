@@ -681,15 +681,18 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     con = db.connect()
     mk = profiles.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
-    per_engine = {}                       # engine_key -> safe_context (only engines that measured it)
+    per_engine = {}                       # engine_key -> (safe_context, decode_context)
     for key in engines.ENGINES:
         row = db.get_characterization(con, mk, key, model_id)
         if row is not None:
-            per_engine[key] = row["safe_context"]
-    best = max((sc for sc in per_engine.values() if sc is not None), default=None)
+            per_engine[key] = (row["safe_context"], row.get("decode_context"))
+    best = max((sc for (sc, _) in per_engine.values() if sc is not None), default=None)
+    best_decode = max((dc for (_, dc) in per_engine.values() if dc is not None), default=None)
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
-                          "engines": per_engine, "characterized": bool(per_engine)}, indent=2))
+                          "decode_context": best_decode,
+                          "engines": {k: sc for k, (sc, _) in per_engine.items()},
+                          "characterized": bool(per_engine)}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
     c.emit()
@@ -700,8 +703,11 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
     if per_engine:                        # one ceiling line per engine that measured it
-        for key, sc in per_engine.items():
-            c.emit(c.field(f"{key} ceiling", f"~{sc} tokens" if sc else "no safe ceiling"))
+        for key, (sc, dc) in per_engine.items():
+            ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
+            if sc and dc and dc > sc:
+                ceiling_str += f"  · ~{dc} decode (est.)"
+            c.emit(c.field(f"{key} ceiling", ceiling_str))
     else:
         c.emit(c.field("ceiling", "not characterized"))
     c.emit()
@@ -771,15 +777,21 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     ceiling = result["safe_context"]
     con = db.connect()
     db.save_characterization(con, profiles.machine_key(), sel.engine_key,
-                             model, safe_context=ceiling, points=result["points"])
+                             model, safe_context=ceiling, points=result["points"],
+                             decode_context=result.get("decode_context"))
     catalog.remember(con, model)
 
     if as_json:
-        print(json.dumps({"model": model, "safe_context": ceiling}, indent=2))
+        print(json.dumps({"model": model, "safe_context": ceiling,
+                          "decode_context": result.get("decode_context")}, indent=2))
         return 0
     if ceiling:
         c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
                + c.style("dim", "  · stored (see ara models)"))
+        dc = result.get("decode_context")
+        if dc and dc > ceiling:
+            c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
+                   + c.style("dim", "  · grow-by-streaming, not a prompt size"))
     else:
         c.emit(c.style("warn", "  couldn't fit a ceiling — the model may be too big or borderline"))
     c.emit()
@@ -807,15 +819,15 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     return 0
 
 
-def _best_ceilings(con) -> dict[str, tuple[int | None, str]]:
-    """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key)}``.
+def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
+    """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key, decode_context)}``.
 
     A model can be characterized under several engines on one machine (GPU + CPU); ``ara models``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
     mk = profiles.machine_key()
     default = engines.for_backend(detect.backend_name())
-    best: dict[str, tuple[int | None, str]] = {}
+    best: dict[str, tuple[int | None, str, int | None]] = {}
     for key in dict.fromkeys([default, *engines.ENGINES]):
         if key is None:
             continue
@@ -823,7 +835,7 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str]]:
             mid, sc = r["model_id"], r["safe_context"]
             cur = best.get(mid)
             if cur is None or (sc is not None and (cur[0] is None or sc > cur[0])):
-                best[mid] = (sc, key)
+                best[mid] = (sc, key, r.get("decode_context"))
     return best
 
 
@@ -839,6 +851,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
             [{**m,
               "safe_context": best[m["model_id"]][0] if m["model_id"] in best else None,
               "engine": best[m["model_id"]][1] if m["model_id"] in best else None,
+              "decode_context": best[m["model_id"]][2] if m["model_id"] in best else None,
               "characterized": m["model_id"] in best} for m in models], indent=2))
         return
 
@@ -847,8 +860,10 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     for m in models:
         mid = m["model_id"]
         if mid in best:                           # measured under at least one engine
-            ceiling, ekey = best[mid]
+            ceiling, ekey, decode = best[mid]
             tail = f"~{ceiling} tokens ({ekey})" if ceiling else "no safe ceiling"
+            if ceiling and decode and decode > ceiling:
+                tail = f"~{ceiling} tokens ({ekey}) · ~{decode} decode (est.)"
             role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
         else:
             tail, role = "not characterized", "dim"
@@ -942,7 +957,13 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     c.emit(c.section("  CHARACTERIZED MODELS"))
     for r in rows:
         name = r["model_id"].split("/")[-1]
-        ceiling = f"~{r['safe_context']} tokens" if r["safe_context"] else "—"
+        if r["safe_context"]:
+            dc = r.get("decode_context")
+            ceiling = f"~{r['safe_context']} tokens"
+            if dc and dc > r["safe_context"]:
+                ceiling += f"  · ~{dc} decode (est.)"
+        else:
+            ceiling = "—"
         c.emit("  " + c.style("metric", name) + c.style("dim", "  →  ")
                + c.style("good", ceiling) + c.style("dim", "  safe context ceiling"))
     c.emit()
