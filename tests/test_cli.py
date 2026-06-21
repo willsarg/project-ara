@@ -2631,3 +2631,174 @@ def test_verbose_memory_no_modules_but_slots_known_no_not_reported(
     assert "2 / 4 used" in out
     assert "not reported on this system" not in out
     assert "module" not in out
+
+
+# --------------------------------------------------------------------------- #
+# Task 7: _det_accelerator — present-vs-usable GPU rendering
+# --------------------------------------------------------------------------- #
+from ara.hardware import GpuInfo  # noqa: E402 — grouped with hardware imports above
+
+
+def _fake_machine(**over):
+    """Thin wrapper over _machine() for accelerator tests that need gpus=."""
+    return _machine(**over)
+
+
+def test_accelerator_amd_vulkan_present_not_usable(make_console):
+    # accel.kind none, but a Vulkan-usable AMD iGPU present → reported, engine-coming hint
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="amd", name="AMD Radeon 780M",
+                            vram_gb=4.0, integrated=True,
+                            compute_runtime="Vulkan 1.4.318 · radv · coopmat",
+                            usable_backend="vulkan")])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "AMD Radeon 780M" in s
+    assert "Vulkan 1.4.318 · radv · coopmat" in s
+    assert "engine coming" in s
+    assert "no GPU detected" not in s
+
+
+def test_accelerator_empty_still_says_none(make_console):
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None), gpus=[])
+    cli._det_accelerator(c, m)
+    assert "no GPU detected" in out.getvalue()
+
+
+def test_accelerator_nvidia_rich_block_preserved(make_console):
+    # existing NVIDIA rich rendering must be unchanged
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("nvidia", "RTX 2070", 8.0, "CUDA",
+                      compute="7.5", cuda_version="13.1", driver_version="591"), gpus=[])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "RTX 2070" in s and "CUDA 13.1" in s
+
+
+def test_accelerator_rocm_noted_not_usable(make_console):
+    # usable_backend=None, but compute_runtime set (ROCm noted) → "not ARA's path" hint
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="amd", name="RX 6700 XT",
+                            vram_gb=12.0, integrated=False,
+                            compute_runtime="ROCm 6.1",
+                            usable_backend=None)])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "RX 6700 XT" in s
+    assert "not ARA's path" in s
+    assert "engine coming" not in s
+
+
+def test_accelerator_no_runtime_detected(make_console):
+    # usable_backend=None, compute_runtime=None → "no usable GPU runtime detected"
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="intel", name="Intel UHD 770",
+                            vram_gb=None, integrated=True,
+                            compute_runtime=None,
+                            usable_backend=None)])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "Intel UHD 770" in s
+    assert "no usable GPU runtime detected" in s
+
+
+def test_accelerator_cuda_usable_backend_has_engine(make_console):
+    # usable_backend="cuda" is in _ARA_ENGINE_BACKENDS → hint says "usable" without "coming"
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="nvidia", name="RTX 3080",
+                            vram_gb=10.0, integrated=False,
+                            compute_runtime="CUDA 12.4",
+                            usable_backend="cuda")])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "RTX 3080" in s
+    assert "usable" in s
+    assert "engine coming" not in s
+
+
+def test_accelerator_nvidia_with_other_gpu_not_double_printed(make_console):
+    # accel.kind=nvidia + gpus has the same nvidia GPU + an amd GPU
+    # nvidia GPU should NOT be double-printed; the amd GPU SHOULD be shown
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(
+        accel=detect.Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1,
+                                  compute="8.9", cuda_version="12.4", driver_version="550"),
+        gpus=[
+            GpuInfo(vendor="nvidia", name="RTX 4090", vram_gb=24.0),   # same vendor → skip
+            GpuInfo(vendor="amd", name="Radeon Pro 580", vram_gb=8.0,
+                    compute_runtime=None, usable_backend=None),          # other → show
+        ],
+    )
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "RTX 4090" in s            # shown once via the rich block
+    assert "Radeon Pro 580" in s      # other GPU shown
+    # The RTX 4090 must not appear twice (rich block + gpu_line)
+    assert s.count("RTX 4090") == 1
+
+
+def test_accelerator_apple_rich_block_preserved(make_console):
+    # Apple GPU: Metal line unchanged
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("apple", "Apple M4 Pro GPU", None, "Metal",
+                                               cores=16), gpus=[])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "Apple M4 Pro GPU" in s and "Metal" in s
+
+
+def test_accelerator_gpu_vram_none_omitted(make_console):
+    # GpuInfo with vram_gb=None → VRAM token absent from the line
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="intel", name="Intel Arc A770",
+                            vram_gb=None, integrated=False,
+                            compute_runtime=None, usable_backend=None)])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "Intel Arc A770" in s
+    assert "GB" not in s
+
+
+def test_accelerator_apple_with_other_gpu_shows_it(make_console):
+    # accel.kind=apple + gpus has the apple GPU + a non-apple GPU → non-apple shown
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(
+        accel=detect.Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
+        gpus=[
+            GpuInfo(vendor="apple", name="Apple M4 Pro GPU"),   # same vendor → skip
+            GpuInfo(vendor="intel", name="Thunderbolt eGPU", vram_gb=8.0,
+                    compute_runtime=None, usable_backend=None),  # other → show
+        ],
+    )
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "Apple M4 Pro GPU" in s and "Metal" in s
+    assert "Thunderbolt eGPU" in s
+
+
+def test_render_detect_json_has_gpus_key(monkeypatch, capsys):
+    # --json must emit a 'gpus' key (Task 6 plumbing, confirmed via asdict)
+    monkeypatch.setattr(cli.detect, "profile",
+                        lambda: _machine(gpus=[GpuInfo(vendor="amd", name="Radeon 780M",
+                                                        vram_gb=4.0, integrated=True)]))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert "gpus" in payload
+    assert payload["gpus"][0]["vendor"] == "amd"

@@ -243,6 +243,39 @@ def _det_memory_detail(c: Console, m) -> None:
         c.emit(c.field("  modules", "(not reported on this system)"))
 
 
+_ARA_ENGINE_BACKENDS = {"cuda", "mlx"}   # backends ARA can actually run today
+_RUNTIME_LABEL = {"vulkan": "Vulkan", "cuda": "CUDA", "mlx": "MLX", "rocm": "ROCm"}
+
+
+def _gpu_line(c: Console, g) -> None:
+    """Render one GpuInfo entry: a name·VRAM line, then a hint sub-line."""
+    parts = [g.name or g.vendor.upper()]
+    if g.vram_gb is not None:
+        parts.append(f"{g.vram_gb:.0f} GB" + (" (shared)" if g.integrated else ""))
+    if g.integrated:
+        parts.append("integrated")
+    c.emit(c.field("gpu", parts[0], " · ".join(parts[1:]) or None))
+    # hint line
+    if g.usable_backend:
+        label = _RUNTIME_LABEL.get(g.usable_backend, g.usable_backend)
+        rt = g.compute_runtime or label
+        if g.usable_backend in _ARA_ENGINE_BACKENDS:
+            hint = f"{rt} — usable"
+        else:
+            hint = f"{rt} — usable via {label}, ARA engine coming (not yet runnable)"
+    elif g.compute_runtime:
+        hint = f"{g.compute_runtime} present — not ARA's path"
+    else:
+        hint = "no usable GPU runtime detected"
+    c.emit(c.field("", "", hint))
+
+
+def _is_usable_accel(a, g) -> bool:
+    """True when g is the same GPU already shown in the rich accelerator block."""
+    return (a.kind == "nvidia" and g.vendor == "nvidia") or \
+           (a.kind == "apple" and g.vendor == "apple")
+
+
 def _det_accelerator(c: Console, m) -> None:
     a = m.accel
     c.emit(c.section("  ACCELERATOR"))
@@ -259,11 +292,21 @@ def _det_accelerator(c: Console, m) -> None:
         gloss = " · ".join(bits)
         name = f"{a.name}  (x{a.count})" if a.count > 1 else a.name
         c.emit(c.field("gpu", name, gloss))
+        for g in getattr(m, "gpus", []):
+            if not _is_usable_accel(a, g):
+                _gpu_line(c, g)
     elif a.kind == "apple":
         cores = f"{a.cores}-core " if a.cores else ""
         c.emit(c.field("gpu", a.name, f"{cores}Metal · unified memory (shared with system)"))
+        for g in getattr(m, "gpus", []):
+            if not _is_usable_accel(a, g):
+                _gpu_line(c, g)
     else:
-        c.emit(c.field("gpu", a.name, "no GPU detected", value_role="warn"))
+        if getattr(m, "gpus", None):
+            for g in m.gpus:
+                _gpu_line(c, g)
+        else:
+            c.emit(c.field("gpu", a.name, "no GPU detected", value_role="warn"))
     c.emit()
 
 
