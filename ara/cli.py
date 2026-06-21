@@ -304,18 +304,21 @@ def _det_board(c: Console, m) -> None:
     if not any_board:
         return
     c.emit(c.section("  BOARD"))
+    # Labels here are up to 13 chars ("system vendor") — widen the pad past the 12 default so the
+    # value never butts against the label.
+    w = 14
     if board.board_vendor is not None:
-        c.emit(c.field("board vendor", board.board_vendor))
+        c.emit(c.field("board vendor", board.board_vendor, label_width=w))
     if board.board_model is not None:
-        c.emit(c.field("board model", board.board_model))
+        c.emit(c.field("board model", board.board_model, label_width=w))
     if board.bios_version is not None:
-        c.emit(c.field("bios", board.bios_version))
+        c.emit(c.field("bios", board.bios_version, label_width=w))
     if board.bios_date is not None:
-        c.emit(c.field("bios date", board.bios_date))
+        c.emit(c.field("bios date", board.bios_date, label_width=w))
     if board.system_vendor is not None:
-        c.emit(c.field("system vendor", board.system_vendor))
+        c.emit(c.field("system vendor", board.system_vendor, label_width=w))
     if board.system_model is not None:
-        c.emit(c.field("system model", board.system_model))
+        c.emit(c.field("system model", board.system_model, label_width=w))
     c.emit()
 
 

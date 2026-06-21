@@ -2420,6 +2420,7 @@ def test_verbose_board_windows(make_console, monkeypatch, stub_pythons):
     assert "BOARD" in out
     assert "ASUSTeK COMPUTER INC." in out
     assert "ROG STRIX X470-F GAMING" in out
+    assert "board vendorASUSTeK" not in out  # label must not butt against value (pad width)
     assert "6042" in out               # bios version
     assert "2022-04-28" in out         # bios date
     assert "system vendor" not in out  # None → skipped
@@ -2437,7 +2438,7 @@ def test_verbose_board_apple(make_console, monkeypatch, stub_pythons):
     out = buf.getvalue()
     assert "BOARD" in out
     assert "13822.81.10" in out        # bios version (firmware)
-    assert "Apple" in out              # system vendor
+    assert "system vendor Apple" in out  # padded label + value (no run-together)
     assert "MacBook Pro" in out        # system model
     assert "board vendor" not in out   # None → skipped
     assert "board model" not in out    # None → skipped
