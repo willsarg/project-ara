@@ -1165,3 +1165,273 @@ def test_disk_free_gb_returns_none_on_exception(monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage", lambda p: (_ for _ in ()).throw(OSError("no disk")))
     result = hw._disk_free_gb()
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Board / firmware (board_info)
+# ---------------------------------------------------------------------------
+
+# --- Fixtures from the plan (REAL captured output) ---
+
+# macOS SPHardwareDataType text fixture (real Apple M4 Pro / MacBook Pro)
+_MACOS_SPHARDWARE = """\
+Hardware Overview:
+
+      Model Name:          MacBook Pro
+      Model Identifier:    Mac16,8
+      Model Number:        Z1CM000KVLL/A
+      Chip:                Apple M4 Pro
+      Total Number of Cores:  12 (8 performance and 4 efficiency)
+      Memory:              24 GB
+      System Firmware Version: 13822.81.10
+      OS Loader Version:   13822.81.10
+      Serial Number (system):  XXXXXXXXXX
+      Hardware UUID:       XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+      Provisioning UDID:   XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+      Activation Lock Status: Disabled
+"""
+
+# Windows WMI fixture objects (real willw11)
+_WIN_BASEBOARD = {"Manufacturer": "ASUSTeK COMPUTER INC.", "Product": "ROG STRIX X470-F GAMING"}
+_WIN_BIOS = {"SMBIOSBIOSVersion": "6042", "ReleaseDate": "\\/Date(1651104000000)\\/"}
+_WIN_SYSTEM = {"Manufacturer": "System manufacturer", "Model": "System Product Name"}
+
+# Linux /sys/class/dmi/id file content map (real values on a typical bare-metal Linux)
+_LINUX_DMI_FILES = {
+    "board_vendor": "ASUSTeK COMPUTER INC.",
+    "board_name": "ROG STRIX X470-F GAMING",
+    "bios_version": "6042",
+    "bios_date": "04/28/2022",
+    "sys_vendor": "System manufacturer",   # placeholder → None
+    "product_name": "System Product Name", # placeholder → None
+}
+
+
+# --- _board_macos parser ---
+
+def test_board_macos_apple_mbp():
+    """Real macOS SPHardwareDataType: system_vendor=Apple, system_model=MacBook Pro,
+    bios_version from System Firmware Version, board_* = None."""
+    b = hw._board_macos(_MACOS_SPHARDWARE)
+    assert b.system_vendor == "Apple"
+    assert b.system_model == "MacBook Pro"
+    assert b.bios_version == "13822.81.10"
+    assert b.bios_date is None          # macOS has no BIOS date
+    assert b.board_vendor is None       # Macs have no separate motherboard
+    assert b.board_model is None
+
+
+def test_board_macos_missing_fields():
+    """Empty SPHardwareDataType text → all None (no crash)."""
+    b = hw._board_macos("")
+    assert b.system_vendor is None
+    assert b.system_model is None
+    assert b.bios_version is None
+
+
+def test_board_macos_sets_vendor_apple_always():
+    """Any text that lacks 'Model Name:' → system_vendor is still None (not forced to Apple
+    unless we actually found hardware info — honest gap)."""
+    b = hw._board_macos("Some hardware text without expected keys\n")
+    assert b.system_vendor is None
+
+
+# --- _board_windows parser ---
+
+def test_board_windows_asus_rog_willw11():
+    """Real willw11 fixture: board=ASUS ROG STRIX X470-F, bios=6042@2022-04-28,
+    system=None/None (placeholders stripped by _clean)."""
+    b = hw._board_windows(_WIN_BASEBOARD, _WIN_BIOS, _WIN_SYSTEM)
+    assert b.board_vendor == "ASUSTeK COMPUTER INC."
+    assert b.board_model == "ROG STRIX X470-F GAMING"
+    assert b.bios_version == "6042"
+    assert b.bios_date == "2022-04-28"
+    assert b.system_vendor is None   # "System manufacturer" is a placeholder
+    assert b.system_model is None    # "System Product Name" is a placeholder
+
+
+def test_board_windows_real_system_fields():
+    """Non-placeholder system fields are kept as-is."""
+    system = {"Manufacturer": "Dell Inc.", "Model": "XPS 15 9520"}
+    b = hw._board_windows(_WIN_BASEBOARD, _WIN_BIOS, system)
+    assert b.system_vendor == "Dell Inc."
+    assert b.system_model == "XPS 15 9520"
+
+
+def test_board_windows_missing_bios_date():
+    """BIOS with no ReleaseDate → bios_date=None (honest gap)."""
+    bios = {"SMBIOSBIOSVersion": "6042"}
+    b = hw._board_windows(_WIN_BASEBOARD, bios, _WIN_SYSTEM)
+    assert b.bios_version == "6042"
+    assert b.bios_date is None
+
+
+def test_board_windows_empty_dicts():
+    """All-empty WMI dicts → all None (no crash)."""
+    b = hw._board_windows({}, {}, {})
+    assert b.board_vendor is None
+    assert b.board_model is None
+    assert b.bios_version is None
+    assert b.bios_date is None
+    assert b.system_vendor is None
+    assert b.system_model is None
+
+
+# --- _board_linux parser ---
+
+def test_board_linux_reads_dmi_files():
+    """Real Linux DMI dict: board and bios populated; sys_vendor/product_name are
+    placeholders so system_* = None."""
+    b = hw._board_linux(_LINUX_DMI_FILES)
+    assert b.board_vendor == "ASUSTeK COMPUTER INC."
+    assert b.board_model == "ROG STRIX X470-F GAMING"
+    assert b.bios_version == "6042"
+    assert b.bios_date == "04/28/2022"
+    assert b.system_vendor is None   # placeholder → _clean → None
+    assert b.system_model is None    # placeholder → _clean → None
+
+
+def test_board_linux_missing_files():
+    """Missing DMI files (empty dict) → all None."""
+    b = hw._board_linux({})
+    assert b.board_vendor is None
+    assert b.board_model is None
+    assert b.bios_version is None
+
+
+def test_board_linux_real_system_fields():
+    """Non-placeholder sys_vendor/product_name → kept."""
+    dmi = {
+        "board_vendor": "ASUSTeK COMPUTER INC.",
+        "board_name": "ROG STRIX X470-F GAMING",
+        "bios_version": "6042",
+        "bios_date": "04/28/2022",
+        "sys_vendor": "ASUS",
+        "product_name": "Custom Build",
+    }
+    b = hw._board_linux(dmi)
+    assert b.system_vendor == "ASUS"
+    assert b.system_model == "Custom Build"
+
+
+# --- board_info() dispatcher ---
+
+def test_board_info_dispatches_macos(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: _MACOS_SPHARDWARE)
+    b = hw.board_info()
+    assert b.system_vendor == "Apple"
+    assert b.system_model == "MacBook Pro"
+    assert b.bios_version == "13822.81.10"
+    assert b.board_vendor is None
+
+
+def test_board_info_dispatches_windows(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Windows")
+
+    def fake_pwsh_json(args):
+        cmd = args[0] if args else ""
+        if "Win32_BaseBoard" in cmd:
+            return [_WIN_BASEBOARD]
+        if "Win32_BIOS" in cmd:
+            return [_WIN_BIOS]
+        if "Win32_ComputerSystem" in cmd:
+            return [_WIN_SYSTEM]
+        return []
+
+    monkeypatch.setattr(hw, "_pwsh_json", fake_pwsh_json)
+    b = hw.board_info()
+    assert b.board_vendor == "ASUSTeK COMPUTER INC."
+    assert b.board_model == "ROG STRIX X470-F GAMING"
+    assert b.bios_version == "6042"
+    assert b.bios_date == "2022-04-28"
+    assert b.system_vendor is None
+    assert b.system_model is None
+
+
+def test_board_info_dispatches_linux(monkeypatch, tmp_path):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Linux")
+
+    # Create a fake /sys/class/dmi/id directory
+    dmi_dir = tmp_path / "dmi_id"
+    dmi_dir.mkdir()
+    (dmi_dir / "board_vendor").write_text("ASUSTeK COMPUTER INC.\n")
+    (dmi_dir / "board_name").write_text("ROG STRIX X470-F GAMING\n")
+    (dmi_dir / "bios_version").write_text("6042\n")
+    (dmi_dir / "bios_date").write_text("04/28/2022\n")
+    (dmi_dir / "sys_vendor").write_text("System manufacturer\n")
+    (dmi_dir / "product_name").write_text("System Product Name\n")
+
+    monkeypatch.setattr(hw, "_DMI_ID_PATH", str(dmi_dir))
+    b = hw.board_info()
+    assert b.board_vendor == "ASUSTeK COMPUTER INC."
+    assert b.board_model == "ROG STRIX X470-F GAMING"
+    assert b.system_vendor is None
+    assert b.system_model is None
+
+
+def test_board_info_dispatches_linux_missing_files(monkeypatch, tmp_path):
+    """Linux with some DMI files missing → those fields are None (no crash)."""
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Linux")
+
+    # Only board_vendor exists; rest missing
+    dmi_dir = tmp_path / "dmi_id"
+    dmi_dir.mkdir()
+    (dmi_dir / "board_vendor").write_text("ASUS\n")
+
+    monkeypatch.setattr(hw, "_DMI_ID_PATH", str(dmi_dir))
+    b = hw.board_info()
+    assert b.board_vendor == "ASUS"
+    assert b.board_model is None
+    assert b.bios_version is None
+
+
+def test_board_info_unknown_platform_returns_empty(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "FreeBSD")
+    b = hw.board_info()
+    assert isinstance(b, hw.BoardInfo)
+    assert b.board_vendor is None
+
+
+def test_board_info_exception_returns_empty(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    b = hw.board_info()
+    assert isinstance(b, hw.BoardInfo)
+
+
+# ---------------------------------------------------------------------------
+# probe() — bundles all four
+# ---------------------------------------------------------------------------
+
+def test_probe_returns_hardware_bundle(monkeypatch):
+    """probe() must return a Hardware with all four substructures populated."""
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+
+    # Patch the four dispatchers to return known values
+    fake_cpu = hw.CpuInfo(brand="Apple M4 Pro", vendor="Apple")
+    fake_mem = hw.MemoryInfo(total_gb=24.0, kind="LPDDR5")
+    fake_storage = hw.StorageInfo(free_gb=200.0)
+    fake_board = hw.BoardInfo(system_vendor="Apple", system_model="MacBook Pro",
+                               bios_version="13822.81.10")
+
+    monkeypatch.setattr(hw, "cpu_info", lambda: fake_cpu)
+    monkeypatch.setattr(hw, "memory_info", lambda: fake_mem)
+    monkeypatch.setattr(hw, "storage_info", lambda: fake_storage)
+    monkeypatch.setattr(hw, "board_info", lambda: fake_board)
+
+    result = hw.probe()
+    assert isinstance(result, hw.Hardware)
+    assert result.cpu is fake_cpu
+    assert result.memory is fake_mem
+    assert result.storage is fake_storage
+    assert result.board is fake_board
+    assert result.cpu.brand == "Apple M4 Pro"
+    assert result.board.system_vendor == "Apple"

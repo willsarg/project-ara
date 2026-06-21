@@ -674,6 +674,146 @@ _SYSCTL_CPU_KEYS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Task 5: Board / firmware detail
+# ---------------------------------------------------------------------------
+
+# Path to Linux DMI id sysfs directory — module-level so tests can monkeypatch it.
+_DMI_ID_PATH = "/sys/class/dmi/id"
+
+# DMI file names → BoardInfo field mapping
+_LINUX_DMI_FIELDS = [
+    ("board_vendor", "board_vendor"),
+    ("board_name",   "board_model"),
+    ("bios_version", "bios_version"),
+    ("bios_date",    "bios_date"),
+    ("sys_vendor",   "system_vendor"),
+    ("product_name", "system_model"),
+]
+
+
+def _read_dmi_file(filename: str) -> str | None:
+    """Read a single /sys/class/dmi/id/<filename> file; return None on missing/error."""
+    try:
+        with open(f"{_DMI_ID_PATH}/{filename}") as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _board_linux(dmi: dict[str, str | None]) -> "BoardInfo":
+    """Pure parser: turn a dict of DMI file values → BoardInfo.
+
+    The dict keys are the DMI filenames (board_vendor, board_name, bios_version,
+    bios_date, sys_vendor, product_name). Each value has already been read from
+    /sys/class/dmi/id; missing files map to None. _clean() handles placeholders.
+    """
+    return BoardInfo(
+        board_vendor=_clean(dmi.get("board_vendor")),
+        board_model=_clean(dmi.get("board_name")),
+        bios_version=_clean(dmi.get("bios_version")),
+        bios_date=_clean(dmi.get("bios_date")),
+        system_vendor=_clean(dmi.get("sys_vendor")),
+        system_model=_clean(dmi.get("product_name")),
+    )
+
+
+def _board_windows(baseboard: dict, bios: dict, system: dict) -> "BoardInfo":
+    """Parse Win32_BaseBoard + Win32_BIOS + Win32_ComputerSystem WMI dicts → BoardInfo.
+
+    system_vendor/model run through _clean so custom-build placeholders ("System manufacturer",
+    "System Product Name") → None — exactly what willw11 returns.
+    """
+    return BoardInfo(
+        board_vendor=_clean(baseboard.get("Manufacturer")),
+        board_model=_clean(baseboard.get("Product")),
+        bios_version=_clean(bios.get("SMBIOSBIOSVersion")),
+        bios_date=_wmi_date(bios.get("ReleaseDate")),
+        system_vendor=_clean(system.get("Manufacturer")),
+        system_model=_clean(system.get("Model")),
+    )
+
+
+def _board_macos(sphardware_text: str) -> "BoardInfo":
+    """Parse `system_profiler SPHardwareDataType` text → BoardInfo.
+
+    Macs have no separate motherboard concept — board_vendor/board_model = None.
+    system_vendor is always "Apple" when we successfully parse hardware info.
+    system_model = Model Name line value.
+    bios_version = System Firmware Version line value.
+    """
+    model_name: str | None = None
+    firmware_version: str | None = None
+
+    for line in sphardware_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Model Name:"):
+            model_name = _clean(stripped.removeprefix("Model Name:").strip())
+        elif stripped.startswith("System Firmware Version:"):
+            firmware_version = _clean(stripped.removeprefix("System Firmware Version:").strip())
+
+    # Only set system_vendor=Apple if we actually found hardware info
+    system_vendor = "Apple" if model_name is not None else None
+
+    return BoardInfo(
+        board_vendor=None,
+        board_model=None,
+        bios_version=firmware_version,
+        bios_date=None,   # macOS exposes no BIOS date in SPHardwareDataType
+        system_vendor=system_vendor,
+        system_model=model_name,
+    )
+
+
+def board_info() -> "BoardInfo":
+    """Dispatch to the per-OS board/firmware parser and return a BoardInfo.  Never raises."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            raw = _run(["system_profiler", "SPHardwareDataType"]) or ""
+            return _board_macos(raw)
+        if system == "Windows":
+            baseboard_rows = _pwsh_json([
+                "Get-CimInstance Win32_BaseBoard | ConvertTo-Json -Compress"
+            ])
+            bios_rows = _pwsh_json([
+                "Get-CimInstance Win32_BIOS | ConvertTo-Json -Compress"
+            ])
+            system_rows = _pwsh_json([
+                "Get-CimInstance Win32_ComputerSystem | ConvertTo-Json -Compress"
+            ])
+            baseboard = baseboard_rows[0] if baseboard_rows else {}
+            bios = bios_rows[0] if bios_rows else {}
+            sys_dict = system_rows[0] if system_rows else {}
+            return _board_windows(baseboard, bios, sys_dict)
+        if system == "Linux":
+            dmi: dict[str, str | None] = {}
+            for filename, _ in _LINUX_DMI_FIELDS:
+                dmi[filename] = _read_dmi_file(filename)
+            return _board_linux(dmi)
+    except Exception:
+        pass
+    return BoardInfo()
+
+
+# ---------------------------------------------------------------------------
+# probe() — bundle all four into a Hardware
+# ---------------------------------------------------------------------------
+
+def probe() -> "Hardware":
+    """Probe all hardware subsystems and return a bundled Hardware dataclass.
+
+    Each subsystem dispatcher is fail-soft and never raises; worst case you get empty
+    dataclasses with all-None fields. Task 6 will embed this into detect.Machine.
+    """
+    return Hardware(
+        cpu=cpu_info(),
+        memory=memory_info(),
+        storage=storage_info(),
+        board=board_info(),
+    )
+
+
 def cpu_info() -> CpuInfo:
     """Dispatch to the per-OS CPU parser and return a CpuInfo.  Never raises."""
     system = platform.system()
