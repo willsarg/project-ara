@@ -527,7 +527,8 @@ SwapTotal:       2097152 kB
 SwapFree:        2097152 kB
 """
 
-# Linux dmidecode -t memory fixture (minimal, 1 DIMM)
+# Linux dmidecode -t memory fixture — 1 populated DIMM + 1 empty slot (real dmidecode format:
+# empty slots emit "Size: No Module Installed" and must NOT be counted or appended).
 _LINUX_DMIDECODE = """\
 # dmidecode 3.3
 Getting SMBIOS data from sysfs.
@@ -557,6 +558,25 @@ Memory Device
 \tMaximum Voltage: 1.2 V
 \tConfigured Voltage: 1.1 V
 \tMemory Technology: DRAM
+
+Handle 0x1101, DMI type 17, 84 bytes
+Memory Device
+\tArray Handle: 0x1000
+\tError Information Handle: 0x1102
+\tTotal Width: Unknown
+\tData Width: Unknown
+\tSize: No Module Installed
+\tForm Factor: Unknown
+\tSet: None
+\tLocator: Controller0-ChannelB-DIMM0
+\tBank Locator: BANK 1
+\tType: Unknown
+\tType Detail: None
+\tSpeed: Unknown
+\tManufacturer: Unknown
+\tSerial Number: --
+\tAsset Tag: --
+\tPart Number: Unknown
 """
 
 
@@ -646,15 +666,22 @@ def test_mem_linux_non_root_no_modules():
 
 
 def test_mem_linux_root_parses_dmidecode():
-    """Root Linux with dmidecode output → 1 module parsed."""
+    """Root Linux: 1 populated DIMM + 1 empty slot (No Module Installed).
+    - Only the populated DIMM appears in modules (empty slot excluded).
+    - capacity_gb is parsed from 'Size: 8 GB'.
+    - slots_used == 1 (populated only), slots_total == 2 (all Memory Device blocks).
+    """
     mi = hw._mem_linux(_LINUX_MEMINFO, _LINUX_DMIDECODE, (31.2, 15.2, 2.0))
-    assert len(mi.modules) == 1
+    assert len(mi.modules) == 1                         # empty slot excluded
     m = mi.modules[0]
     assert m.slot == "Controller0-ChannelA-DIMM0"
     assert m.manufacturer == "Samsung"
     assert m.part_number == "K4EBE304EB-EGCG"
     assert m.speed_mts == 3200
+    assert m.capacity_gb == 8.0                         # parsed from "Size: 8 GB"
     assert mi.kind == "LPDDR4"
+    assert mi.slots_used == 1                           # only populated slots
+    assert mi.slots_total == 2                          # all Memory Device blocks
 
 
 def test_mem_linux_empty_meminfo():
@@ -663,7 +690,17 @@ def test_mem_linux_empty_meminfo():
     assert mi.modules == []
 
 
+def test_mem_linux_dmidecode_no_memory_device_blocks():
+    """dmidecode text with no Memory Device blocks → slots_total=None (zero-block edge case)."""
+    # Only header, no Memory Device entries at all
+    text = "# dmidecode 3.3\nGetting SMBIOS data from sysfs.\n"
+    mi = hw._mem_linux("", text, (0.0, 0.0, 0.0))
+    assert mi.modules == []
+    assert mi.slots_total is None
+
+
 # Two-module dmidecode fixture — covers the "flush current when new block starts" path.
+# Both blocks have "Size: 8 GB" so they are treated as populated and included.
 _LINUX_DMIDECODE_TWO = """\
 # dmidecode 3.3
 
@@ -671,6 +708,7 @@ Handle 0x1100, DMI type 17, 84 bytes
 Memory Device
 \tLocator: ChannelA-DIMM0
 \tType: DDR4
+\tSize: 8 GB
 \tSpeed: 3200 MT/s
 \tManufacturer: Samsung
 \tPart Number: M471A1G44AB0
@@ -679,6 +717,7 @@ Handle 0x1101, DMI type 17, 84 bytes
 Memory Device
 \tLocator: ChannelB-DIMM0
 \tType: DDR4
+\tSize: 8 GB
 \tManufacturer: Samsung
 \tPart Number: M471A1G44AB0
 """
@@ -711,6 +750,7 @@ _LINUX_DMIDECODE_TWO_TYPED = """\
 Memory Device
 \tLocator: ChannelA-DIMM0
 \tType: DDR4
+\tSize: 8 GB
 \tSpeed: 3200 MT/s
 \tManufacturer: Micron
 \tPart Number: PART-A
@@ -718,6 +758,7 @@ Memory Device
 Memory Device
 \tLocator: ChannelB-DIMM0
 \tType: DDR4
+\tSize: 8 GB
 \tSpeed: 3200 MT/s
 \tManufacturer: Micron
 \tPart Number: PART-B
@@ -732,18 +773,21 @@ def test_mem_linux_two_typed_modules_kind_not_overwritten():
 Memory Device
 \tLocator: DIMM0
 \tType: DDR4
+\tSize: 16 GB
 \tManufacturer: Micron
 \tPart Number: PART-A
 
 Memory Device
 \tLocator: DIMM1
 \tType: DDR4
+\tSize: 16 GB
 \tManufacturer: Micron
 \tPart Number: PART-B
 
 Memory Device
 \tLocator: DIMM2
 \tType: DDR4
+\tSize: 16 GB
 \tManufacturer: Micron
 \tPart Number: PART-C
 """
@@ -752,11 +796,14 @@ Memory Device
     assert mi.kind == "DDR4"
 
 
-# A dmidecode text that ends with a 'Memory Device' header but no fields (empty current at EOF).
+# A dmidecode text ending with a 'Memory Device' header followed by no fields (empty block at EOF).
+# The first block has a "Size:" line so it is populated; the trailing block has no fields (no Size)
+# so it is treated as empty and skipped.
 _LINUX_DMIDECODE_TRAILING_HEADER = """\
 Memory Device
 \tLocator: ChannelA-DIMM0
 \tType: DDR4
+\tSize: 8 GB
 \tManufacturer: Micron
 \tPart Number: PART-A
 
@@ -765,9 +812,10 @@ Memory Device
 
 
 def test_mem_linux_dmidecode_trailing_empty_block():
-    """A trailing 'Memory Device' header with no fields → last empty current not appended."""
+    """A trailing 'Memory Device' header with no fields → empty trailing block is skipped.
+    The first populated block (Size: 8 GB) is included; trailing empty block is not."""
     mi = hw._mem_linux("", _LINUX_DMIDECODE_TRAILING_HEADER, (0.0, 0.0, 0.0))
-    # Only the first module (with fields) is parsed; empty trailing block is skipped.
+    # Only the first module (with fields and Size) is parsed; empty trailing block is skipped.
     assert len(mi.modules) == 1
     assert mi.modules[0].slot == "ChannelA-DIMM0"
 
@@ -917,14 +965,25 @@ NVMExpress:
           S.M.A.R.T. status:    Verified
 """
 
-# Linux lsblk JSON fixture
+# Linux lsblk JSON fixture — mixed string and boolean rota values (real lsblk behaviour:
+# util-linux < 2.33 emits strings "0"/"1"; >= 2.33 emits JSON booleans true/false).
 _LINUX_LSBLK_JSON = """\
 {
    "blockdevices": [
       {"name": "sda", "model": "Samsung SSD 870", "size": "500107862016", "rota": "0", "tran": "sata"},
-      {"name": "sdb", "model": "WDC WD20EZRZ", "size": "2000398934016", "rota": "1", "tran": "sata"},
-      {"name": "sdc", "model": "SanDisk Cruzer", "size": "32016969728", "rota": "0", "tran": "usb"},
-      {"name": "nvme0n1", "model": "Samsung SSD 980 PRO", "size": "1000204886016", "rota": "0", "tran": "nvme"}
+      {"name": "sdb", "model": "WDC WD20EZRZ", "size": "2000398934016", "rota": true, "tran": "sata"},
+      {"name": "sdc", "model": "SanDisk Cruzer", "size": "32016969728", "rota": false, "tran": "usb"},
+      {"name": "nvme0n1", "model": "Samsung SSD 980 PRO", "size": "1000204886016", "rota": false, "tran": "nvme"}
+   ]
+}
+"""
+
+# String-form lsblk fixture ("1"/"0") — covers the legacy util-linux < 2.33 code path.
+_LINUX_LSBLK_JSON_STR_ROTA = """\
+{
+   "blockdevices": [
+      {"name": "sda", "model": "Old HDD", "size": "2000398934016", "rota": "1", "tran": "sata"},
+      {"name": "sdb", "model": "Old SATA SSD", "size": "500107862016", "rota": "0", "tran": "sata"}
    ]
 }
 """
@@ -1039,14 +1098,24 @@ def test_drives_macos_missing_bytes_in_capacity():
 # --- _drives_linux parser ---
 
 def test_drives_linux_mixed_types():
-    """lsblk JSON fixture: sata-ssd, hdd, usb, nvme → correct media classification."""
+    """lsblk JSON fixture: sata-ssd (rota "0"), hdd (rota true boolean), usb (rota false),
+    nvme-ssd (rota false) — covers both string and boolean rota shapes."""
     drives = hw._drives_linux(_LINUX_LSBLK_JSON)
     assert len(drives) == 4
     by_name = {d.model: d for d in drives}
-    assert by_name["Samsung SSD 870"].media == "sata-ssd"
-    assert by_name["WDC WD20EZRZ"].media == "hdd"
-    assert by_name["SanDisk Cruzer"].media == "usb"
-    assert by_name["Samsung SSD 980 PRO"].media == "nvme-ssd"
+    assert by_name["Samsung SSD 870"].media == "sata-ssd"   # rota "0" (string)
+    assert by_name["WDC WD20EZRZ"].media == "hdd"           # rota true (boolean)
+    assert by_name["SanDisk Cruzer"].media == "usb"         # rota false (boolean)
+    assert by_name["Samsung SSD 980 PRO"].media == "nvme-ssd"  # rota false (boolean)
+
+
+def test_drives_linux_string_rota_legacy():
+    """String-form rota ("1"/"0") from util-linux < 2.33 must still classify correctly."""
+    drives = hw._drives_linux(_LINUX_LSBLK_JSON_STR_ROTA)
+    assert len(drives) == 2
+    by_name = {d.model: d for d in drives}
+    assert by_name["Old HDD"].media == "hdd"          # rota "1"
+    assert by_name["Old SATA SSD"].media == "sata-ssd"  # rota "0"
 
 
 def test_drives_linux_unknown_tran():
@@ -1166,6 +1235,17 @@ def test_disk_free_gb_returns_none_on_exception(monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage", lambda p: (_ for _ in ()).throw(OSError("no disk")))
     result = hw._disk_free_gb()
     assert result is None
+
+
+def test_disk_free_gb_uses_gib_not_decimal_gb(monkeypatch):
+    """_disk_free_gb must divide by 1024**3 (GiB), not 1e9 (decimal GB).
+    Pin: 107374182400 bytes (100 GiB exactly) must return 100.0, not 107.4."""
+    import shutil
+    _100_GiB = 100 * hw.GB   # 107374182400 bytes
+    DiskUsage = type("DiskUsage", (), {"free": _100_GiB, "total": _100_GiB, "used": 0})
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: DiskUsage())
+    result = hw._disk_free_gb()
+    assert result == 100.0   # GiB: 107374182400 / 1024**3 == 100.0
 
 
 # ---------------------------------------------------------------------------

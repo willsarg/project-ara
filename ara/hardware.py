@@ -11,7 +11,7 @@ import platform
 import re
 import subprocess
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 GB = 1024 ** 3  # GiB — defined locally (NOT imported from detect) to avoid a circular import,
                 # since detect imports hardware. Matches detect.GB exactly.
@@ -415,29 +415,44 @@ def _mem_linux(
     # Parse per-module from dmidecode if we have it.
     modules: list[MemoryModule] = []
     kind: str | None = None
+    slots_total: int | None = None
+    slots_used: int | None = None
     if dmidecode_text:
         current: dict[str, str] = {}
+        all_blocks: list[dict[str, str]] = []
         for line in dmidecode_text.splitlines():
             stripped = line.strip()
             if stripped.startswith("Memory Device") and not stripped.startswith("Memory Device Array"):
                 if current:
-                    modules.append(_parse_dmidecode_module(current))
-                    if kind is None:
-                        kind = current.get("Type")
+                    all_blocks.append(current)
                 current = {}
             elif ":" in stripped and current is not None:
                 k, _, v = stripped.partition(":")
                 current[k.strip()] = v.strip()
         if current:
-            modules.append(_parse_dmidecode_module(current))
-            if kind is None and current.get("Type"):
-                kind = current.get("Type")
+            all_blocks.append(current)
+
+        slots_total = len(all_blocks)
+        for block in all_blocks:
+            size_str = block.get("Size", "").strip()
+            # Skip empty slots: no Size field, "No Module Installed", or "Unknown".
+            if not size_str or size_str.lower() in ("no module installed", "unknown"):
+                continue
+            mod = _parse_dmidecode_module(block)
+            modules.append(mod)
+            if kind is None:
+                kind = block.get("Type")
+        slots_used = len(modules) if modules else None
+        if slots_total == 0:
+            slots_total = None
 
     return MemoryInfo(
         total_gb=total_gb,
         available_gb=available_gb,
         swap_gb=swap_gb,
         kind=kind,
+        slots_used=slots_used,
+        slots_total=slots_total,
         modules=modules,
     )
 
@@ -456,8 +471,18 @@ def _parse_dmidecode_module(fields: dict[str, str]) -> "MemoryModule":
     if m:
         speed_mts = int(m.group(1))
 
+    # Capacity: "Size: 8 GB" → 8.0; "Size: 4096 MB" → 4.0; absent/unknown → None.
+    capacity_gb: float | None = None
+    size_str = fields.get("Size", "").strip()
+    size_m = re.match(r"(\d+)\s*(GB|MB)", size_str, re.IGNORECASE)
+    if size_m:
+        size_val = float(size_m.group(1))
+        unit = size_m.group(2).upper()
+        capacity_gb = round(size_val / 1024 if unit == "MB" else size_val, 1)
+
     return MemoryModule(
         slot=slot,
+        capacity_gb=capacity_gb,
         speed_mts=speed_mts,
         manufacturer=manufacturer,
         part_number=part_number,
@@ -571,9 +596,12 @@ def _drives_linux(lsblk_json: str) -> list["Drive"]:
         return []
     drives: list[Drive] = []
     for dev in data.get("blockdevices", []):
-        rota = str(dev.get("rota", "")).strip()
+        # util-linux >= 2.33 emits rota as a JSON boolean (true/false); older versions emit
+        # the string "1"/"0". Normalise to lowercase string so both shapes work.
+        rota = str(dev.get("rota", "")).strip().lower()
+        is_hdd = rota in ("1", "true")
         tran = (dev.get("tran") or "").strip().lower()
-        if rota == "1":
+        if is_hdd:
             media = "hdd"
         elif tran == "nvme":
             media = "nvme-ssd"
@@ -593,11 +621,12 @@ def _drives_linux(lsblk_json: str) -> list["Drive"]:
 
 
 def _disk_free_gb() -> float | None:
-    """Return free GB of the home partition (reuses detect logic without importing detect)."""
+    """Return free GiB of the home partition, using GiB (1024**3) to match the pre-existing
+    detect._disk_free_gb() convention and keep the disk_free_gb field stable."""
     try:
         import shutil
         from pathlib import Path
-        return shutil.disk_usage(Path.home()).free / 1e9
+        return shutil.disk_usage(Path.home()).free / GB
     except Exception:
         return None
 
@@ -608,7 +637,7 @@ def storage_info() -> "StorageInfo":
     free_gb = _disk_free_gb()
     try:
         if system == "Darwin":
-            raw = _run(["system_profiler", "SPNVMeDataType"]) or ""
+            raw = _run(["system_profiler", "SPNVMeDataType"], timeout=15) or ""
             return StorageInfo(free_gb=free_gb, drives=_drives_macos(raw))
         if system == "Windows":
             disks = _pwsh_json(["Get-PhysicalDisk | ConvertTo-Json -Compress"])
@@ -638,7 +667,7 @@ def memory_info() -> "MemoryInfo":
     try:
         totals = _psutil_totals()
         if system == "Darwin":
-            raw = _run(["system_profiler", "SPMemoryDataType"]) or ""
+            raw = _run(["system_profiler", "SPMemoryDataType"], timeout=15) or ""
             return _mem_macos(raw, totals)
         if system == "Windows":
             modules = _pwsh_json([
@@ -770,7 +799,7 @@ def board_info() -> "BoardInfo":
     system = platform.system()
     try:
         if system == "Darwin":
-            raw = _run(["system_profiler", "SPHardwareDataType"]) or ""
+            raw = _run(["system_profiler", "SPHardwareDataType"], timeout=15) or ""
             return _board_macos(raw)
         if system == "Windows":
             baseboard_rows = _pwsh_json([
