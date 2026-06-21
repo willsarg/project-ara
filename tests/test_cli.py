@@ -9,6 +9,7 @@ import pytest
 
 import ara.cli as cli
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
+from ara.hardware import (BoardInfo, CpuInfo, Drive, MemoryInfo, MemoryModule, StorageInfo)
 
 
 def _raise_input(exc):
@@ -2091,3 +2092,541 @@ def test_emit_characterized_decode_hidden_when_not_greater(make_console, store, 
     c, buf = make_console()
     cli._emit_characterized(c, "wcx")
     assert "decode" not in buf.getvalue()
+
+
+# =========================================================================== #
+# Task 7: hardware verbose detail blocks + JSON nesting
+# =========================================================================== #
+
+def _apple_cpu() -> CpuInfo:
+    """Apple M4 Pro–shaped CpuInfo: no clock/L3; L1+L2 only; no vendor features."""
+    return CpuInfo(
+        brand="Apple M4 Pro", vendor="Apple", arch_id="arm64",
+        physical=12, logical=12,
+        base_mhz=None, max_mhz=None,
+        l1_kb=192, l2_kb=4096, l3_kb=None,
+        features=[],
+    )
+
+
+def _windows_cpu() -> CpuInfo:
+    """Ryzen 9 5900X–shaped CpuInfo: full clocks + L2/L3; no features (WMI gap)."""
+    return CpuInfo(
+        brand="AMD Ryzen 9 5900X 12-Core Processor", vendor="AuthenticAMD", arch_id="AMD64",
+        physical=12, logical=24,
+        base_mhz=None, max_mhz=3701,
+        l1_kb=None, l2_kb=6144, l3_kb=65536,
+        features=[],
+    )
+
+
+def _windows_memory() -> MemoryInfo:
+    """willw11-shaped MemoryInfo: 4×DDR4 8 GB DIMMs, 4/4 slots used."""
+    modules = [
+        MemoryModule(slot=f"DIMM_A{i}", capacity_gb=8.0, speed_mts=3400,
+                     manufacturer="G-Skill", part_number="F4-3200C14-8GFX")
+        for i in range(1, 5)
+    ]
+    return MemoryInfo(
+        total_gb=32.0, available_gb=20.0, swap_gb=0.0,
+        kind="DDR4", speed_mts=3400,
+        slots_used=4, slots_total=4,
+        modules=modules,
+    )
+
+
+def _apple_memory() -> MemoryInfo:
+    """Apple-shaped MemoryInfo: kind/speed present but no slots/modules (soldered)."""
+    return MemoryInfo(
+        total_gb=24.0, available_gb=18.0, swap_gb=0.0,
+        kind="LPDDR5", speed_mts=None,
+        slots_used=None, slots_total=None,
+        modules=[],
+    )
+
+
+def _windows_storage() -> StorageInfo:
+    """willw11-shaped StorageInfo: NVMe SSD + HDD."""
+    return StorageInfo(
+        free_gb=500.0,
+        drives=[
+            Drive(model="Samsung SSD 990 EVO 1TB", media="nvme-ssd", size_gb=1000.2),
+            Drive(model="ST2000DM008-2FR102", media="hdd", size_gb=2000.4),
+        ],
+    )
+
+
+def _apple_storage() -> StorageInfo:
+    """Apple-shaped StorageInfo: one NVMe drive."""
+    return StorageInfo(
+        free_gb=200.0,
+        drives=[Drive(model="APPLE SSD AP0512Z", media="nvme-ssd", size_gb=500.3)],
+    )
+
+
+def _windows_board() -> BoardInfo:
+    """willw11-shaped BoardInfo: ASUS ROG STRIX; system_* → None (custom PC)."""
+    return BoardInfo(
+        board_vendor="ASUSTeK COMPUTER INC.", board_model="ROG STRIX X470-F GAMING",
+        bios_version="6042", bios_date="2022-04-28",
+        system_vendor=None, system_model=None,
+    )
+
+
+def _apple_board() -> BoardInfo:
+    """Mac-shaped BoardInfo: system_vendor/model from SPHardwareDataType; board_* → None."""
+    return BoardInfo(
+        board_vendor=None, board_model=None,
+        bios_version="13822.81.10", bios_date=None,
+        system_vendor="Apple", system_model="MacBook Pro",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# verbose CPU block
+# --------------------------------------------------------------------------- #
+
+def test_verbose_cpu_detail_apple_silicon(make_console, monkeypatch, stub_pythons):
+    """Apple Silicon: vendor shown, no clock/L3; L1+L2 shown; features empty → skipped."""
+    stub_pythons(count=1)
+    m = _machine(cpu=_apple_cpu(), memory=_apple_memory(), storage=_apple_storage(),
+                 board=_apple_board())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "vendor" in out and "Apple" in out
+    assert "threads" in out and "12" in out
+    assert "L1" in out and "L2" in out
+    assert "L3" not in out             # Apple Silicon has no L3
+    assert "clocks" not in out         # no clock data on Apple Silicon
+    assert "features" not in out       # empty features list → line skipped
+
+
+def test_verbose_cpu_detail_windows_ryzen(make_console, monkeypatch, stub_pythons):
+    """Ryzen: max clock shown; L2+L3 shown; no features (WMI gap) → skipped."""
+    stub_pythons(count=1)
+    m = _machine(cpu=_windows_cpu(), memory=_windows_memory(), storage=_windows_storage(),
+                 board=_windows_board(), chip="AMD Ryzen 9 5900X 12-Core Processor",
+                 cpu_physical=12, cpu_logical=24,
+                 accel=Accelerator("none", "none detected", None, None),
+                 backend="cpu", engine="llama.cpp", engine_ready=False)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "AuthenticAMD" in out        # vendor
+    assert "24" in out                  # logical threads
+    assert "max 3701 MHz" in out        # max clock
+    assert "L2 6144 KB" in out
+    assert "L3 65536 KB" in out
+    assert "features" not in out        # empty features → skipped
+
+
+def test_verbose_cpu_detail_with_features(make_console, monkeypatch, stub_pythons):
+    """CPU with features list → features line rendered."""
+    stub_pythons(count=1)
+    cpu = CpuInfo(brand="Intel Core i9", vendor="GenuineIntel", logical=16,
+                  features=["AVX-512", "AVX2"])
+    m = _machine(cpu=cpu)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "features" in out and "AVX-512" in out and "AVX2" in out
+
+
+def test_verbose_cpu_detail_base_clock_only(make_console, monkeypatch, stub_pythons):
+    """Base clock with no max → shows 'base N MHz' only."""
+    stub_pythons(count=1)
+    cpu = CpuInfo(brand="FakeCPU", base_mhz=2400)
+    m = _machine(cpu=cpu)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "base 2400 MHz" in out
+    assert "max" not in out.split("clocks")[-1].split("\n")[0]
+
+
+def test_verbose_cpu_all_none_no_detail_lines(make_console, monkeypatch, stub_pythons):
+    """All CpuInfo fields None → no vendor/threads/clocks/L1/L2/L3/features lines."""
+    stub_pythons(count=1)
+    m = _machine(cpu=CpuInfo())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    # None of the optional sub-fields should appear (use specific indented labels)
+    assert "  vendor" not in out
+    assert "  threads" not in out
+    assert "  clocks" not in out
+    assert "  cache" not in out
+    assert "  features" not in out
+
+
+def test_non_verbose_no_cpu_detail(make_console, monkeypatch, stub_pythons):
+    """Non-verbose: CPU detail block not shown."""
+    stub_pythons(count=1)
+    m = _machine(cpu=_windows_cpu())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "AuthenticAMD" not in out
+    assert "max 3701 MHz" not in out
+
+
+# --------------------------------------------------------------------------- #
+# verbose MEMORY detail block
+# --------------------------------------------------------------------------- #
+
+def test_verbose_memory_detail_windows_4modules(make_console, monkeypatch, stub_pythons):
+    """Windows 4-DIMM system: kind, speed, slots 4/4, 4 module rows."""
+    stub_pythons(count=1)
+    m = _machine(memory=_windows_memory(), cpu=_windows_cpu(), storage=_windows_storage(),
+                 board=_windows_board())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "DDR4" in out
+    assert "3400 MT/s" in out
+    assert "4 / 4 used" in out
+    assert out.count("module") == 4      # one row per DIMM
+    assert "G-Skill" in out
+    assert "F4-3200C14-8GFX" in out
+
+
+def test_verbose_memory_detail_apple_no_modules(make_console, monkeypatch, stub_pythons):
+    """Apple Silicon: kind shown, no slots, no modules → '(not reported)' line."""
+    stub_pythons(count=1)
+    m = _machine(memory=_apple_memory(), cpu=_apple_cpu(), storage=_apple_storage(),
+                 board=_apple_board())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "LPDDR5" in out
+    assert "not reported on this system" in out
+    assert "slots" not in out            # no slot count (soldered; slots_used/total both None)
+
+
+def test_verbose_memory_kind_none_skipped(make_console, monkeypatch, stub_pythons):
+    """kind=None → kind line not rendered."""
+    stub_pythons(count=1)
+    mem = MemoryInfo(total_gb=16.0, kind=None, modules=[])
+    m = _machine(memory=mem)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    assert "kind" not in buf.getvalue()
+
+
+def test_verbose_memory_partial_slots(make_console, monkeypatch, stub_pythons):
+    """slots_used=2 but slots_total=None → renders '2 / ? used'."""
+    stub_pythons(count=1)
+    mem = MemoryInfo(total_gb=16.0, slots_used=2, slots_total=None, modules=[
+        MemoryModule(slot="A1", capacity_gb=8.0, speed_mts=3200),
+        MemoryModule(slot="A2", capacity_gb=8.0, speed_mts=3200),
+    ])
+    m = _machine(memory=mem)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "2 / ? used" in out
+
+
+def test_non_verbose_no_memory_detail(make_console, monkeypatch, stub_pythons):
+    """Non-verbose: memory detail block not shown."""
+    stub_pythons(count=1)
+    m = _machine(memory=_windows_memory())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "DDR4" not in out
+    assert "DIMM" not in out
+
+
+# --------------------------------------------------------------------------- #
+# verbose STORAGE detail block
+# --------------------------------------------------------------------------- #
+
+def test_verbose_storage_detail_drives(make_console, monkeypatch, stub_pythons):
+    """Storage drives listed in verbose mode."""
+    stub_pythons(count=1)
+    m = _machine(storage=_windows_storage(), cpu=_windows_cpu(), memory=_windows_memory(),
+                 board=_windows_board())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "Samsung SSD 990 EVO 1TB" in out
+    assert "nvme-ssd" in out
+    assert "1000 GB" in out
+    assert "ST2000DM008-2FR102" in out
+    assert "hdd" in out
+
+
+def test_verbose_storage_drive_none_fields_skipped(make_console, monkeypatch, stub_pythons):
+    """Drive with model=None, media=None: only size shown."""
+    stub_pythons(count=1)
+    storage = StorageInfo(free_gb=100.0, drives=[Drive(model=None, media=None, size_gb=500.0)])
+    m = _machine(storage=storage)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "drive" in out
+    assert "500 GB" in out
+
+
+def test_verbose_storage_no_drives(make_console, monkeypatch, stub_pythons):
+    """No drives in StorageInfo → storage verbose block is silent (no drive rows)."""
+    stub_pythons(count=1)
+    storage = StorageInfo(free_gb=200.0, drives=[])
+    m = _machine(storage=storage)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    assert "  drive" not in buf.getvalue()
+
+
+def test_non_verbose_no_storage_detail(make_console, monkeypatch, stub_pythons):
+    """Non-verbose: drives not listed."""
+    stub_pythons(count=1)
+    m = _machine(storage=_windows_storage())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    assert "Samsung SSD" not in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# verbose BOARD section
+# --------------------------------------------------------------------------- #
+
+def test_verbose_board_windows(make_console, monkeypatch, stub_pythons):
+    """Windows board: vendor, model, BIOS; system_* None → those lines skipped."""
+    stub_pythons(count=1)
+    m = _machine(board=_windows_board(), cpu=_windows_cpu(), memory=_windows_memory(),
+                 storage=_windows_storage())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "BOARD" in out
+    assert "ASUSTeK COMPUTER INC." in out
+    assert "ROG STRIX X470-F GAMING" in out
+    assert "6042" in out               # bios version
+    assert "2022-04-28" in out         # bios date
+    assert "system vendor" not in out  # None → skipped
+    assert "system model" not in out   # None → skipped
+
+
+def test_verbose_board_apple(make_console, monkeypatch, stub_pythons):
+    """Mac board: system_vendor/model shown; board_* None → those lines skipped."""
+    stub_pythons(count=1)
+    m = _machine(board=_apple_board(), cpu=_apple_cpu(), memory=_apple_memory(),
+                 storage=_apple_storage())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "BOARD" in out
+    assert "13822.81.10" in out        # bios version (firmware)
+    assert "Apple" in out              # system vendor
+    assert "MacBook Pro" in out        # system model
+    assert "board vendor" not in out   # None → skipped
+    assert "board model" not in out    # None → skipped
+
+
+def test_board_all_none_no_section(make_console, monkeypatch, stub_pythons):
+    """BoardInfo with all fields None → BOARD section not rendered at all."""
+    stub_pythons(count=1)
+    m = _machine(board=BoardInfo())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    assert "BOARD" not in buf.getvalue()
+
+
+def test_non_verbose_no_board_section(make_console, monkeypatch, stub_pythons):
+    """Non-verbose: BOARD section never shown even with board data."""
+    stub_pythons(count=1)
+    m = _machine(board=_windows_board())
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=False)
+    cli.render_detect(c)
+    assert "BOARD" not in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# JSON: nested hardware structures present + all existing keys intact
+# --------------------------------------------------------------------------- #
+
+def test_render_detect_json_has_cpu_nested(monkeypatch, capsys):
+    """--json includes cpu as a nested dict with all CpuInfo fields."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(cpu=_apple_cpu()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert "cpu" in payload
+    assert payload["cpu"]["brand"] == "Apple M4 Pro"
+    assert payload["cpu"]["vendor"] == "Apple"
+    assert payload["cpu"]["l3_kb"] is None
+    assert payload["cpu"]["features"] == []
+
+
+def test_render_detect_json_has_memory_nested(monkeypatch, capsys):
+    """--json includes memory as a nested dict with modules list."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(memory=_windows_memory()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert "memory" in payload
+    assert payload["memory"]["kind"] == "DDR4"
+    assert payload["memory"]["slots_used"] == 4
+    mods = payload["memory"]["modules"]
+    assert len(mods) == 4
+    assert mods[0]["manufacturer"] == "G-Skill"
+
+
+def test_render_detect_json_has_storage_nested(monkeypatch, capsys):
+    """--json includes storage as a nested dict with drives list."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(storage=_windows_storage()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert "storage" in payload
+    drives = payload["storage"]["drives"]
+    assert len(drives) == 2
+    assert drives[0]["model"] == "Samsung SSD 990 EVO 1TB"
+    assert drives[0]["media"] == "nvme-ssd"
+
+
+def test_render_detect_json_has_board_nested(monkeypatch, capsys):
+    """--json includes board as a nested dict."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(board=_windows_board()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert "board" in payload
+    assert payload["board"]["board_vendor"] == "ASUSTeK COMPUTER INC."
+    assert payload["board"]["bios_version"] == "6042"
+    assert payload["board"]["system_vendor"] is None
+
+
+def test_render_detect_json_existing_keys_intact(monkeypatch, capsys):
+    """--json still has the existing flat keys (chip, backend, accel, etc.)."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(cpu=_apple_cpu()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    # All pre-existing keys must survive
+    for key in ("chip", "backend", "accelerated", "accel", "ram_total_gb",
+                "disk_free_gb", "os_version", "arch"):
+        assert key in payload, f"missing key: {key}"
+    assert payload["chip"] == "Apple M4 Pro"
+    assert payload["accelerated"] is True
+
+
+def test_render_detect_json_apple_memory_no_modules(monkeypatch, capsys):
+    """Apple-shaped memory: modules=[] in JSON, no slots info."""
+    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(memory=_apple_memory()))
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_detect(c, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["memory"]["modules"] == []
+    assert payload["memory"]["slots_used"] is None
+    assert payload["memory"]["kind"] == "LPDDR5"
+
+
+# --------------------------------------------------------------------------- #
+# branch corners: None-field skipping inside loops
+# --------------------------------------------------------------------------- #
+
+def test_verbose_memory_module_with_some_none_fields(make_console, monkeypatch, stub_pythons):
+    """MemoryModule with mixed None/non-None fields covers all field-skip branches."""
+    stub_pythons(count=1)
+    # mod1: slot+manufacturer+part_number=None, capacity+speed present
+    mod1 = MemoryModule(slot=None, capacity_gb=16.0, speed_mts=4800,
+                        manufacturer=None, part_number=None)
+    # mod2: capacity_gb=None and speed_mts=None → those append branches skipped
+    mod2 = MemoryModule(slot="B1", capacity_gb=None, speed_mts=None,
+                        manufacturer="Kingston", part_number="KVR32N22D8/16")
+    mem = MemoryInfo(total_gb=32.0, slots_used=2, slots_total=4, modules=[mod1, mod2])
+    m = _machine(memory=mem)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert out.count("module") == 2    # both modules rendered
+    assert "16 GB" in out and "4800 MT/s" in out
+    assert "Kingston" in out and "B1" in out
+    # None fields must be absent
+    assert "DIMM" not in out
+    assert "G-Skill" not in out
+
+
+def test_verbose_storage_drive_all_none_fields_no_row(make_console, monkeypatch, stub_pythons):
+    """Drive with all fields None → parts is empty → no row emitted."""
+    stub_pythons(count=1)
+    storage = StorageInfo(free_gb=100.0, drives=[Drive(model=None, media=None, size_gb=None)])
+    m = _machine(storage=storage)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    # The drive exists but all fields None → no "drive" row
+    assert "  drive" not in buf.getvalue()
+
+
+def test_verbose_board_bios_version_none_bios_date_present(make_console, monkeypatch, stub_pythons):
+    """Board with bios_version=None but bios_date present → date shown, version line skipped."""
+    stub_pythons(count=1)
+    board = BoardInfo(board_vendor="ACME", bios_version=None, bios_date="2023-01-01")
+    m = _machine(board=board)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "BOARD" in out
+    assert "bios date" in out and "2023-01-01" in out
+    assert "bios  " not in out   # bios version line skipped (only "bios date" present)
+
+
+def test_verbose_memory_module_all_none_then_real(make_console, monkeypatch, stub_pythons):
+    """First module all-None (parts empty → skipped), second module has data → row shown.
+    Covers the 'if parts' False-branch with more iterations remaining in the loop."""
+    stub_pythons(count=1)
+    empty_mod = MemoryModule(slot=None, capacity_gb=None, speed_mts=None,
+                             manufacturer=None, part_number=None)
+    real_mod = MemoryModule(slot="A2", capacity_gb=8.0, speed_mts=3200, manufacturer=None,
+                            part_number=None)
+    mem = MemoryInfo(total_gb=8.0, slots_used=1, slots_total=2, modules=[empty_mod, real_mod])
+    m = _machine(memory=mem)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    # Only one module row (the real one)
+    assert out.count("  module") == 1
+    assert "A2" in out and "8 GB" in out
+
+
+def test_verbose_memory_no_modules_but_slots_known_no_not_reported(
+        make_console, monkeypatch, stub_pythons):
+    """modules=[] but slots_used is not None → elif is False, 'not reported' NOT printed."""
+    stub_pythons(count=1)
+    # Rare case: slot count known but no per-module data (e.g. Linux non-root dmidecode)
+    mem = MemoryInfo(total_gb=32.0, slots_used=2, slots_total=4, modules=[])
+    m = _machine(memory=mem)
+    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    c, buf = make_console(verbose=True)
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "2 / 4 used" in out
+    assert "not reported on this system" not in out
+    assert "module" not in out

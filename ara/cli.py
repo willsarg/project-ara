@@ -44,7 +44,7 @@ def _fmt_size(gb: float | None) -> str:
 # The sections each recon command can show, in display order. Single-section
 # commands list one key so the flags behave consistently everywhere.
 _RECON_SECTIONS: dict[str, tuple[str, ...]] = {
-    "detect": ("system", "memory", "accelerator", "storage",
+    "detect": ("system", "memory", "accelerator", "storage", "board",
                "engines", "frameworks", "models", "apps", "ara"),
     "apps": ("runner", "image", "speech", "toolkit", "assistant", "coding"),
     "mlx": ("readiness", "libraries"),
@@ -160,6 +160,8 @@ def _det_system(c: Console, m) -> None:
         if m.cpu_features:
             cores += "   " + " · ".join(m.cpu_features)
         c.emit(c.field("cpu", cores))
+    if c.verbose:
+        _det_cpu_detail(c, m)
     if m.python_version:
         gloss = "your default python3" if m.framework_python else "ARA's python (no user env found)"
         c.emit(c.field("python", m.python_version, gloss))
@@ -169,6 +171,33 @@ def _det_system(c: Console, m) -> None:
     c.emit()
 
 
+def _det_cpu_detail(c: Console, m) -> None:
+    """Verbose-only CPU detail block: vendor, clocks, caches, features."""
+    cpu = m.cpu
+    if cpu.vendor is not None:
+        c.emit(c.field("  vendor", cpu.vendor))
+    if cpu.logical is not None:
+        c.emit(c.field("  threads", str(cpu.logical)))
+    clocks = []
+    if cpu.base_mhz is not None:
+        clocks.append(f"base {cpu.base_mhz} MHz")
+    if cpu.max_mhz is not None:
+        clocks.append(f"max {cpu.max_mhz} MHz")
+    if clocks:
+        c.emit(c.field("  clocks", " · ".join(clocks)))
+    caches = []
+    if cpu.l1_kb is not None:
+        caches.append(f"L1 {cpu.l1_kb} KB")
+    if cpu.l2_kb is not None:
+        caches.append(f"L2 {cpu.l2_kb} KB")
+    if cpu.l3_kb is not None:
+        caches.append(f"L3 {cpu.l3_kb} KB")
+    if caches:
+        c.emit(c.field("  cache", " · ".join(caches)))
+    if cpu.features:
+        c.emit(c.field("  features", " · ".join(cpu.features)))
+
+
 def _det_memory(c: Console, m) -> None:
     c.emit(c.section("  MEMORY"))
     c.emit(c.field("total", _fmt_gb(m.ram_total_gb)))
@@ -176,7 +205,42 @@ def _det_memory(c: Console, m) -> None:
         c.emit(c.field("available", _fmt_gb(m.ram_available_gb, 1), "free right now"))
     if m.swap_gb:
         c.emit(c.field("swap", _fmt_gb(m.swap_gb, 1)))
+    if c.verbose:
+        _det_memory_detail(c, m)
     c.emit()
+
+
+def _det_memory_detail(c: Console, m) -> None:
+    """Verbose-only memory detail: kind, speed, slot summary, per-module list."""
+    mem = m.memory
+    if mem.kind is not None:
+        c.emit(c.field("  kind", mem.kind))
+    if mem.speed_mts is not None:
+        c.emit(c.field("  speed", f"{mem.speed_mts} MT/s"))
+    # Slot summary
+    if mem.slots_used is not None or mem.slots_total is not None:
+        used = str(mem.slots_used) if mem.slots_used is not None else "?"
+        total = str(mem.slots_total) if mem.slots_total is not None else "?"
+        c.emit(c.field("  slots", f"{used} / {total} used"))
+    # Per-module list
+    if mem.modules:
+        for mod in mem.modules:
+            parts = []
+            if mod.slot is not None:
+                parts.append(mod.slot)
+            if mod.capacity_gb is not None:
+                parts.append(f"{mod.capacity_gb:.0f} GB")
+            if mod.speed_mts is not None:
+                parts.append(f"{mod.speed_mts} MT/s")
+            if mod.manufacturer is not None:
+                parts.append(mod.manufacturer)
+            if mod.part_number is not None:
+                parts.append(mod.part_number)
+            if parts:
+                c.emit(c.field("  module", " · ".join(parts)))
+    elif mem.slots_used is None and mem.slots_total is None:
+        # No slot info at all and no modules → platform doesn't expose them
+        c.emit(c.field("  modules", "(not reported on this system)"))
 
 
 def _det_accelerator(c: Console, m) -> None:
@@ -206,6 +270,52 @@ def _det_accelerator(c: Console, m) -> None:
 def _det_storage(c: Console, m) -> None:
     c.emit(c.section("  STORAGE"))
     c.emit(c.field("disk free", _fmt_gb(m.disk_free_gb), "on the home volume"))
+    if c.verbose:
+        _det_storage_detail(c, m)
+    c.emit()
+
+
+def _det_storage_detail(c: Console, m) -> None:
+    """Verbose-only storage detail: per-drive list."""
+    drives = m.storage.drives
+    if drives:
+        for drive in drives:
+            parts = []
+            if drive.model is not None:
+                parts.append(drive.model)
+            if drive.media is not None:
+                parts.append(drive.media)
+            if drive.size_gb is not None:
+                parts.append(f"{drive.size_gb:.0f} GB")
+            if parts:
+                c.emit(c.field("  drive", " · ".join(parts)))
+
+
+def _det_board(c: Console, m) -> None:
+    """Verbose-only BOARD section: board vendor/model, BIOS version/date, system vendor/model."""
+    if not c.verbose:
+        return
+    board = m.board
+    # Check if there's anything to show at all
+    any_board = any(v is not None for v in (
+        board.board_vendor, board.board_model, board.bios_version,
+        board.bios_date, board.system_vendor, board.system_model,
+    ))
+    if not any_board:
+        return
+    c.emit(c.section("  BOARD"))
+    if board.board_vendor is not None:
+        c.emit(c.field("board vendor", board.board_vendor))
+    if board.board_model is not None:
+        c.emit(c.field("board model", board.board_model))
+    if board.bios_version is not None:
+        c.emit(c.field("bios", board.bios_version))
+    if board.bios_date is not None:
+        c.emit(c.field("bios date", board.bios_date))
+    if board.system_vendor is not None:
+        c.emit(c.field("system vendor", board.system_vendor))
+    if board.system_model is not None:
+        c.emit(c.field("system model", board.system_model))
     c.emit()
 
 
@@ -333,6 +443,7 @@ _DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
     ("memory", _det_memory),
     ("accelerator", _det_accelerator),
     ("storage", _det_storage),
+    ("board", _det_board),
     ("engines", _det_engines),
     ("frameworks", _det_frameworks),
     ("models", _det_models),
@@ -346,6 +457,8 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     if as_json:
         # asdict() omits @property fields, so add `accelerated` explicitly — otherwise the very
         # distinction the CPU-fallback design introduced is invisible to machine consumers.
+        # cpu/memory/storage/board are already dataclass fields on Machine, so asdict(m)
+        # already includes them as nested dicts — no extra work needed.
         print(json.dumps({**asdict(m), "accelerated": m.accelerated}, indent=2))
         return
     want = want or (lambda _key: True)
