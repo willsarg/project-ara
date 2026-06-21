@@ -45,7 +45,7 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     """Drive the safe ramp for *model* using engine-supplied *preflight*/*measure* callables."""
     est = preflight(model)
     if "error" in est:
-        return {"model": model, "safe_context": None, "points": []}
+        return {"model": model, "safe_context": None, "points": [], "error": est["error"]}
 
     def measure_fn(ctx: int):
         m = worker.parse(measure(model, ctx))

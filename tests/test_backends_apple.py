@@ -148,7 +148,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     out = apple.characterize("missing/model")
-    assert out == {"model": "missing/model", "safe_context": None, "points": []}
+    assert out == {"model": "missing/model", "safe_context": None, "points": [],
+                   "error": "model not found in HF cache"}
 
 
 def test_characterize_stops_on_engine_refusal(monkeypatch):

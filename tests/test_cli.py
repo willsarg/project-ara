@@ -174,7 +174,7 @@ def test_main_verbose_flag_sets_console(monkeypatch):
 def test_render_landing_supported(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
     c, buf = make_console()
     cli.render_landing(c)
     out = buf.getvalue()
@@ -188,7 +188,7 @@ def test_render_landing_supported(make_console, monkeypatch):
 def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Intel i7")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
-    monkeypatch.setattr(cli, "engine_status", lambda: (False, "llama.cpp"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "llama.cpp"))
     c, buf = make_console()
     cli.render_landing(c)
     out = buf.getvalue()
@@ -416,8 +416,8 @@ class FakeBackend:
 
 def _wire_profile(monkeypatch, set_platform, bk, *, engine_ok=True, isatty=False):
     set_platform("Darwin", "arm64")  # backend_name() -> "apple"
-    monkeypatch.setattr(cli, "engine_status", lambda: (engine_ok, "wmx-suite"))
-    monkeypatch.setattr(cli, "get_backend", lambda: bk)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
 
 
@@ -458,6 +458,12 @@ def test_main_profile_passes_engine(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["profile", "--engine", "wmx"])
     assert rec["profile"]["engine"] == "wmx"
+
+
+def test_profile_unknown_engine_errors(make_console, monkeypatch):
+    c, buf = make_console()
+    assert cli.render_profile(c, engine="bogus") == 1
+    assert "unknown engine" in buf.getvalue().lower()
 
 
 # --- persistence wiring: overlay a stored calibration / persist a fresh one ---
@@ -797,7 +803,7 @@ def test_render_status_gpu_and_no_port(make_console, monkeypatch):
 def test_profile_through_real_apple_backend(make_console, monkeypatch, set_platform):
     from ara.backends import apple
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(cli, "engine_status", lambda: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr(apple, "calibration_model_cached", lambda *a: True)  # no download
     facts = {"device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
@@ -1400,7 +1406,7 @@ def test_render_uninstall_no_match_json(monkeypatch, capsys):
 def test_render_landing_lists_install_command(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda: (False, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "wmx-suite"))
     c, buf = make_console()
     cli.render_landing(c)
     assert "install the engine" in buf.getvalue()
@@ -1494,6 +1500,24 @@ def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
     assert data["org/NoCeiling"].get("characterized") is True
     assert data["org/NoCeiling"]["safe_context"] is None
     assert data["org/Never"].get("characterized") is False
+
+
+def test_render_models_best_fit_across_engines(make_console, store, monkeypatch):
+    """A model characterized under two engines shows the LARGER ceiling + which engine reached
+    it — the willw11 case (GPU 3500 vs CPU 8192 for one model → 8192, cpu)."""
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/L", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = wcx
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    per_engine = {"wcx": [{"model_id": "org/L", "safe_context": 3500}],
+                  "cpu": [{"model_id": "org/L", "safe_context": 8192}]}
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: per_engine.get(e, []))
+    c, buf = make_console()
+    cli.render_models(c)
+    line = next(ln for ln in buf.getvalue().splitlines() if "org/L" in ln)
+    assert "8192" in line and "(cpu)" in line and "3500" not in line
 
 
 def test_main_models_dispatch(monkeypatch):
@@ -1733,6 +1757,39 @@ def test_render_characterize_unknown_engine_errors(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "x", engine="bogus") == 1
     assert "unknown engine" in buf.getvalue().lower()
+
+
+def _error_characterize(model):
+    # the driver shape when an engine couldn't even LOAD the model (preflight error)
+    return {"model": model, "safe_context": None, "points": [], "error": "no transformers config"}
+
+
+def test_render_characterize_skips_persist_on_engine_error(make_console, store, monkeypatch):
+    # An engine that can't load the model returns `error` (not a measurement): don't persist a
+    # misleading null row, and suggest a compatible engine when we can tell (a .gguf → cpu).
+    _wire_characterize(monkeypatch, characterize=_error_characterize)   # default backend apple→wmx
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model.gguf") == 1
+    out = buf.getvalue()
+    assert "couldn't load" in out
+    assert "--engine cpu" in out                       # suggested the GGUF-capable engine
+    assert cli.db.get_characterization(store, "mkey", "wmx", "org/Model.gguf") is None   # not stored
+
+
+def test_render_characterize_engine_error_json(monkeypatch, capsys, store):
+    _wire_characterize(monkeypatch, characterize=_error_characterize)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/Model.gguf", as_json=True) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "no transformers config"
+
+
+def test_render_characterize_engine_error_no_suggestion(make_console, store, monkeypatch):
+    # A non-GGUF ref on the wrong engine: we can't cheaply tell which engine fits → no hint.
+    _wire_characterize(monkeypatch, characterize=_error_characterize)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/PlainModel") == 1
+    out = buf.getvalue()
+    assert "couldn't load" in out and "--engine" not in out
 
 
 def test_main_characterize_dispatch(monkeypatch):

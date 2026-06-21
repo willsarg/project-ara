@@ -242,3 +242,31 @@ def test_uninstall_removes_the_env(monkeypatch):
     r = engines.uninstall("wmx")
     assert r.status == "removed"
     assert removed == ["apple"]   # the backend/env name, not the dist
+
+
+# --------------------------------------------------------------------------- #
+# model_kinds — every shipping engine declares which model formats it accepts
+# --------------------------------------------------------------------------- #
+def test_every_shipping_engine_has_model_kinds():
+    for key in ("wmx", "wcx", "cpu"):
+        assert "model_kinds" in engines.ENGINES[key], f"{key!r} missing model_kinds"
+
+
+# --------------------------------------------------------------------------- #
+# engine_for_model() — cheap classifier: confident GGUF signal only
+# --------------------------------------------------------------------------- #
+def test_engine_for_model_gguf_file_path():
+    assert engines.engine_for_model("x.gguf") == "cpu"
+
+
+def test_engine_for_model_repo_colon_gguf_file():
+    assert engines.engine_for_model("org/repo:Model-Q4_K_M.gguf") == "cpu"
+
+
+def test_engine_for_model_bare_repo_is_none():
+    assert engines.engine_for_model("org/Model") is None
+
+
+def test_engine_for_model_repo_name_contains_gguf_but_no_suffix_is_none():
+    # Repo *name* has GGUF in it but there's no .gguf file reference — not a confident signal.
+    assert engines.engine_for_model("bartowski/SmolLM2-135M-Instruct-GGUF") is None

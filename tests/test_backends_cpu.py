@@ -61,7 +61,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     fake = _FakeEngine({"error": "no GGUF for model"})
     _patch(monkeypatch, fake)
     assert cpu.characterize("org/model") == {
-        "model": "org/model", "safe_context": None, "points": []}
+        "model": "org/model", "safe_context": None, "points": [],
+        "error": "no GGUF for model"}
 
 
 def test_budget_params_uses_stored_calibration(monkeypatch):

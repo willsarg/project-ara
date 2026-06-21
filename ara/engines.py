@@ -34,6 +34,7 @@ ENGINES: dict[str, dict] = {
         "available": True,
         "spec": "git+https://github.com/willsarg/wmx-suite",
         "python": "3.12",          # wmx-suite requires >=3.12
+        "model_kinds": ("transformers",),
     },
     "wcx": {
         "backend": "cuda",
@@ -47,6 +48,7 @@ ENGINES: dict[str, dict] = {
         # PyPI torch on Windows/Linux is CPU-only).
         "pip_args": ["--torch-backend=auto"],
         "python": "3.12",
+        "model_kinds": ("transformers",),
     },
     "cpu": {
         "backend": "cpu",
@@ -54,6 +56,7 @@ ENGINES: dict[str, dict] = {
         "available": True,
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
+        "model_kinds": ("gguf",),
         # llama-cpp-python ships NO PyPI wheels, so a stock Windows box (no MSVC) can't build
         # it from source. On Windows pull a prebuilt CPU wheel from the project's own index;
         # `--only-binary` (added in _install_targets) makes that deterministic. Scoped to
@@ -204,3 +207,19 @@ def uninstall(key: str) -> InstallResult:
         return InstallResult(key, "absent")
     engine_env.remove(ENGINES[key]["backend"])
     return InstallResult(key, "removed")
+
+
+def _is_gguf(ref: str) -> bool:
+    """Confident GGUF signal: a .gguf file path, or a repo:file.gguf reference."""
+    tail = ref.split(":", 1)[1] if ":" in ref else ref
+    return tail.endswith(".gguf")
+
+
+def engine_for_model(ref: str) -> str | None:
+    """The engine key best suited to *ref*, or None when it can't be told cheaply.
+
+    Only a confident GGUF signal classifies; a bare repo id (even one named '...-GGUF')
+    returns None so the caller falls back to the engine's own preflight error."""
+    if _is_gguf(ref):
+        return next((k for k, e in ENGINES.items() if "gguf" in e.get("model_kinds", ())), None)
+    return None

@@ -161,7 +161,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     fake = _FakeEngine({"error": "model not found in HF cache"})
     _fake_worker(monkeypatch, fake)
     out = cuda.characterize("missing/model")
-    assert out == {"model": "missing/model", "safe_context": None, "points": []}
+    assert out == {"model": "missing/model", "safe_context": None, "points": [],
+                   "error": "model not found in HF cache"}
 
 
 def test_characterize_stops_on_engine_refusal(monkeypatch):

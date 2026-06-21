@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ara import (acquire, apps, catalog, db, detect, engines, hub, mlx, profiles,
                  pythons, status, versions)
-from ara.registry import engine_status, get_backend
+from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
 _CMD_W = 16
@@ -678,13 +678,18 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         else:
             c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
         return 1
-    engine_key = engines.for_backend(detect.backend_name())
-    ch = (db.get_characterization(db.connect(), profiles.machine_key(), engine_key, model_id)
-          if engine_key else None)
-    ceiling = ch["safe_context"] if ch else None
+    con = db.connect()
+    mk = profiles.machine_key()
+    # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
+    per_engine = {}                       # engine_key -> safe_context (only engines that measured it)
+    for key in engines.ENGINES:
+        row = db.get_characterization(con, mk, key, model_id)
+        if row is not None:
+            per_engine[key] = row["safe_context"]
+    best = max((sc for sc in per_engine.values() if sc is not None), default=None)
     if as_json:
-        print(json.dumps({"model_id": model_id, **meta, "safe_context": ceiling,
-                          "characterized": ch is not None}, indent=2))
+        print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
+                          "engines": per_engine, "characterized": bool(per_engine)}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
     c.emit()
@@ -694,62 +699,59 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("kv cache", f"{kvh} heads × {hd} dim" if (kvh and hd) else "?"))
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
-    if ceiling:
-        ceiling_text = f"~{ceiling} tokens"
-    elif ch is not None:                  # measured here, but nothing fit (mirrors '—')
-        ceiling_text = "no safe ceiling"
+    if per_engine:                        # one ceiling line per engine that measured it
+        for key, sc in per_engine.items():
+            c.emit(c.field(f"ceiling ({key})", f"~{sc} tokens" if sc else "no safe ceiling"))
     else:
-        ceiling_text = "not characterized"
-    c.emit(c.field("ceiling", ceiling_text))
+        c.emit(c.field("ceiling", "not characterized"))
     c.emit()
     return 0
-
-
-def _selected_backend(engine: str | None) -> tuple[str | None, str | None]:
-    """Resolve an explicit ``--engine`` value to ``(backend_module, engine_key)``, or the
-    detected backend when *engine* is None/``auto``. ``(None, None)`` if it names no engine.
-
-    This is what lets ``--engine cpu`` run on the CPU fallback on a machine whose detected
-    backend is a GPU — the value selects the backend, not just install consent."""
-    if not engine or engine == "auto":
-        backend = detect.backend_name()
-        return backend, engines.for_backend(backend)
-    key = engines.resolve(engine)
-    if key is None or key not in engines.ENGINES:
-        return None, None
-    return engines.ENGINES[key]["backend"], key
 
 
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False) -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
-    Defaults to whichever engine is active (Apple/MLX, CUDA, or the CPU fallback); ``--engine``
-    overrides that so you can target a non-detected backend (e.g. the CPU fallback on a GPU
-    box). ARA owns the result, so it shows up in `ara models` regardless of engine."""
-    backend, engine_key = _selected_backend(engine)
-    if backend is None:
+    Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
+    backend (e.g. the CPU fallback on a GPU box). ARA owns the result, so it shows up in
+    `ara models` regardless of which engine measured it."""
+    try:
+        sel = resolve_engine(engine)
+    except UnknownEngine:
         msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    engine_ok, engine_pkg = engine_status(backend)
+    engine_ok, engine_pkg = engine_status(sel.backend)
     if not engine_ok:
         if as_json:
             print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
         else:
             c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
-                   + c.style("accent", f"ara install --engine {engine_key}"))
+                   + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
-        result = get_backend(backend).characterize(model)
+        result = get_backend(sel.backend).characterize(model)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
         c.emit(c.style("bad", f"  characterization failed: {exc}"))
         return 1
 
+    # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
+    # persist a misleading null row. Suggest a compatible engine when we can tell cheaply (e.g. a
+    # GGUF handed to the torch-based wcx → suggest the CPU/llama.cpp engine).
+    if result.get("error"):
+        suggest = engines.engine_for_model(model)
+        hint = ("  — try " + c.style("accent", f"ara characterize {model} --engine {suggest}")
+                if suggest and suggest != sel.engine_key else "")
+        if as_json:
+            print(json.dumps({"error": result["error"]}))
+        else:
+            c.emit(c.style("warn", f"  {engine_pkg} couldn't load {model}: {result['error']}") + hint)
+        return 1
+
     ceiling = result["safe_context"]
     con = db.connect()
-    db.save_characterization(con, profiles.machine_key(), engine_key,
+    db.save_characterization(con, profiles.machine_key(), sel.engine_key,
                              model, safe_context=ceiling, points=result["points"])
     catalog.remember(con, model)
 
@@ -786,30 +788,48 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     return 0
 
 
+def _best_ceilings(con) -> dict[str, tuple[int | None, str]]:
+    """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key)}``.
+
+    A model can be characterized under several engines on one machine (GPU + CPU); ``ara models``
+    shows the largest ceiling and which engine reached it. A real ceiling beats a null
+    (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
+    mk = profiles.machine_key()
+    default = engines.for_backend(detect.backend_name())
+    best: dict[str, tuple[int | None, str]] = {}
+    for key in dict.fromkeys([default, *engines.ENGINES]):
+        if key is None:
+            continue
+        for r in db.list_characterizations(con, mk, key):
+            mid, sc = r["model_id"], r["safe_context"]
+            cur = best.get(mid)
+            if cur is None or (sc is not None and (cur[0] is None or sc > cur[0])):
+                best[mid] = (sc, key)
+    return best
+
+
 def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
-    """The model catalog: scan the HF cache, then list each model + its safe ceiling here."""
+    """The model catalog: scan the HF cache, then list each model + its best safe ceiling here."""
     con = db.connect()
     catalog.scan(con)
     models = catalog.all_models(con)
-    engine_key = engines.for_backend(detect.backend_name())
-    ceilings = {}
-    if engine_key:
-        ceilings = {r["model_id"]: r["safe_context"]
-                    for r in db.list_characterizations(con, profiles.machine_key(), engine_key)}
+    best = _best_ceilings(con)
 
     if as_json:
-        print(json.dumps([{**m, "safe_context": ceilings.get(m["model_id"]),
-                           "characterized": m["model_id"] in ceilings} for m in models],
-                         indent=2))
+        print(json.dumps(
+            [{**m,
+              "safe_context": best[m["model_id"]][0] if m["model_id"] in best else None,
+              "engine": best[m["model_id"]][1] if m["model_id"] in best else None,
+              "characterized": m["model_id"] in best} for m in models], indent=2))
         return
 
     c.emit()
     c.emit(c.section("  MODEL CATALOG"))
     for m in models:
         mid = m["model_id"]
-        if mid in ceilings:                       # ARA has measured this model here
-            ceiling = ceilings[mid]
-            tail = f"~{ceiling} tokens" if ceiling else "no safe ceiling"
+        if mid in best:                           # measured under at least one engine
+            ceiling, ekey = best[mid]
+            tail = f"~{ceiling} tokens ({ekey})" if ceiling else "no safe ceiling"
             role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
         else:
             tail, role = "not characterized", "dim"
@@ -819,7 +839,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     if not models:
         c.emit(c.style("dim", "  empty — download a model and it'll be cataloged here"))
     c.emit()
-    n_char = sum(1 for m in models if m["model_id"] in ceilings)
+    n_char = sum(1 for m in models if m["model_id"] in best)
     c.emit(c.style("dim", f"  {len(models)} cataloged · {n_char} characterized on this machine"))
     c.emit()
 
@@ -926,7 +946,13 @@ def _persist_calibration(m: dict, engine_key: str | None) -> None:
 def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
                    assume_yes: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
-    engine_ok, engine_pkg = engine_status()
+    try:
+        sel = resolve_engine(engine)
+    except UnknownEngine:
+        msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    engine_ok, engine_pkg = engine_status(sel.backend)
     if not engine_ok:
         if as_json:
             print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
@@ -941,7 +967,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
                + c.style("accent", "ara install"))
         return 1
 
-    bk = get_backend()
+    bk = get_backend(sel.backend)
     try:
         m = bk.safe_limits()
     except Exception as exc:
@@ -951,7 +977,7 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
             c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
 
-    engine_key = engines.for_backend(detect.backend_name())
+    engine_key = sel.engine_key
     _overlay_stored_calibration(m, engine_key)   # reuse a stored measurement if we have one
 
     if as_json:

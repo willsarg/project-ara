@@ -102,7 +102,8 @@ def test_none_when_preflight_errors():
     r = driver.characterize("missing/model",
                             preflight=lambda m: {"error": "not in HF cache"},
                             measure=lambda m, c: {}, schedule=[2000])
-    assert r == {"model": "missing/model", "safe_context": None, "points": []}
+    assert r == {"model": "missing/model", "safe_context": None, "points": [],
+                 "error": "not in HF cache"}
 
 
 def test_l2_stops_when_measured_reaches_budget():
