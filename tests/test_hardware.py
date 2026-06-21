@@ -58,13 +58,14 @@ def test_run_returns_none_on_failure():
 
 
 def test_run_returns_none_on_nonzero_exit():
-    # `false` exits 1; expect None.
-    result = hw._run(["false"], timeout=3)
+    # Exit 1 with no ignore_rc → None. Use the interpreter (cross-platform; `false` isn't on Windows).
+    result = hw._run([sys.executable, "-c", "import sys; sys.exit(1)"], timeout=10)
     assert result is None
 
 
 def test_run_returns_stdout_on_success():
-    result = hw._run(["echo", "hello"], timeout=3)
+    # Use the interpreter, not `echo` (a cmd builtin on Windows, not an executable).
+    result = hw._run([sys.executable, "-c", "import sys; sys.stdout.write('hello')"], timeout=10)
     assert result is not None and "hello" in result
 
 
@@ -824,7 +825,7 @@ def test_memory_info_dispatches_linux_non_root(monkeypatch):
     import psutil
     monkeypatch.setattr(_platform, "system", lambda: "Linux")
     monkeypatch.setattr(hw, "_run", lambda *a, **k: _LINUX_MEMINFO)
-    monkeypatch.setattr(os, "geteuid", lambda: 1000)  # non-root
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)  # non-root (os.geteuid is POSIX-only)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 31 * hw.GB, "available": 15 * hw.GB})())
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 2 * hw.GB})())
     mi = hw.memory_info()
@@ -843,7 +844,7 @@ def test_memory_info_dispatches_linux_root(monkeypatch):
         return _LINUX_MEMINFO
 
     monkeypatch.setattr(hw, "_run", fake_run)
-    monkeypatch.setattr(os, "geteuid", lambda: 0)  # root
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)  # root (os.geteuid is POSIX-only)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 31 * hw.GB, "available": 15 * hw.GB})())
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 2 * hw.GB})())
     mi = hw.memory_info()
