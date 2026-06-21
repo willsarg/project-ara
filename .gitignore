@@ -217,7 +217,14 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Mutation testing (mutmut) — generated workspace + cache, never commit
+# Local agent/session artifacts — archive useful summaries in the private vault, not the repo
+.superpowers/
+superpowers/
+.playwright-mcp/
+
+# macOS local metadata
+.DS_Store
+**/.DS_Store
 mutants/
 .mutmut-cache
 
