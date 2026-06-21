@@ -701,7 +701,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("quant", meta["quant"] or "none"))
     if per_engine:                        # one ceiling line per engine that measured it
         for key, sc in per_engine.items():
-            c.emit(c.field(f"ceiling ({key})", f"~{sc} tokens" if sc else "no safe ceiling"))
+            c.emit(c.field(f"{key} ceiling", f"~{sc} tokens" if sc else "no safe ceiling"))
     else:
         c.emit(c.field("ceiling", "not characterized"))
     c.emit()
