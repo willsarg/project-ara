@@ -1655,10 +1655,109 @@ def test_gpus_windows_dispatch(monkeypatch):
     assert len(gpus) == 1 and gpus[0].vendor == "amd"
 
 
-def test_gpus_macos_stub_returns_empty():
-    """Direct call to the stub so its body line is covered."""
+def test_gpus_macos_stub_returns_empty(monkeypatch):
+    """_gpus_macos() on empty SPDisplaysDataType text returns []."""
     from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: "")
     assert hw._gpus_macos() == []
+
+
+# ---------------------------------------------------------------------------
+# Task 5: macOS GPU enumeration (_spdisplays_gpus / _gpus_macos)
+# ---------------------------------------------------------------------------
+
+_SPDISPLAYS_APPLE = """\
+Graphics/Displays:
+    Apple M4 Pro:
+      Chipset Model: Apple M4 Pro
+      Type: GPU
+      Bus: Built-In
+      Total Number of Cores: 16
+      Vendor: Apple (0x106b)
+"""
+
+
+def test_spdisplays_apple_unified():
+    from ara import hardware as hw
+    gpus = hw._spdisplays_gpus(_SPDISPLAYS_APPLE)
+    assert len(gpus) == 1
+    g = gpus[0]
+    assert g.vendor == "apple" and g.name == "Apple M4 Pro"
+    assert g.vram_gb is None and g.integrated is True
+
+
+def test_spdisplays_empty_returns_empty():
+    from ara import hardware as hw
+    assert hw._spdisplays_gpus("") == []
+
+
+_SPDISPLAYS_INTEL_DISCRETE = """\
+Graphics/Displays:
+    Intel Iris Pro:
+      Chipset Model: Intel Iris Pro
+      Type: GPU
+      Bus: Built-In
+      Vendor: Intel (0x8086)
+      VRAM (Total): 1536 MB
+"""
+
+_SPDISPLAYS_INTEL_WITH_GB_VRAM = """\
+Graphics/Displays:
+    AMD Radeon Pro 5500M:
+      Chipset Model: AMD Radeon Pro 5500M
+      Type: GPU
+      Bus: PCIe
+      Vendor: AMD (0x1002)
+      VRAM (Total): 8 GB
+"""
+
+
+def test_spdisplays_intel_no_gb_vram_line():
+    """VRAM line present but no GB → vram_gb=None; Intel vendor; integrated=None (not apple)."""
+    from ara import hardware as hw
+    gpus = hw._spdisplays_gpus(_SPDISPLAYS_INTEL_DISCRETE)
+    assert len(gpus) == 1
+    g = gpus[0]
+    assert g.vendor == "intel"
+    assert g.vram_gb is None   # "1536 MB" — no GB match → None
+    assert g.integrated is None  # not apple → None
+
+
+def test_spdisplays_amd_vram_gb():
+    """VRAM line with 'N GB' → vram_gb=float; AMD vendor; integrated=None."""
+    from ara import hardware as hw
+    gpus = hw._spdisplays_gpus(_SPDISPLAYS_INTEL_WITH_GB_VRAM)
+    assert len(gpus) == 1
+    g = gpus[0]
+    assert g.vendor == "amd"
+    assert g.vram_gb == 8.0
+    assert g.integrated is None  # AMD on non-AMD CPU → None
+
+
+def test_gpus_macos_calls_run_with_spdisplays(monkeypatch):
+    """_gpus_macos() calls _run with SPDisplaysDataType and parses the result."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _SPDISPLAYS_APPLE)
+    gpus = hw._gpus_macos()
+    assert len(gpus) == 1
+    assert gpus[0].vendor == "apple" and gpus[0].name == "Apple M4 Pro"
+
+
+def test_gpus_macos_returns_empty_when_run_fails(monkeypatch):
+    """When _run returns None (e.g. system_profiler absent), _gpus_macos returns []."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: None)
+    assert hw._gpus_macos() == []
+
+
+def test_gpu_info_dispatches_macos(monkeypatch):
+    """gpu_info() on Darwin hits the macOS branch."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_gpus_macos", lambda: [hw.GpuInfo(vendor="apple", name="Apple M4 Pro",
+                                                                 integrated=True)])
+    result = hw.gpu_info()
+    assert len(result) == 1 and result[0].vendor == "apple"
 
 
 def test_with_runtime_unknown_vendor_passthrough(monkeypatch):

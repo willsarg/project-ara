@@ -957,7 +957,32 @@ def _gpus_windows() -> list["GpuInfo"]:
     return [_video_controller_gpu(r) for r in rows]
 
 
-def _gpus_macos() -> list["GpuInfo"]: return []
+def _spdisplays_gpus(text: str) -> list["GpuInfo"]:
+    gpus: list[GpuInfo] = []
+    chipset = vendor_raw = vram = None
+    def flush():
+        nonlocal chipset, vendor_raw, vram
+        if chipset:
+            vendor = _gpu_vendor(vendor_raw or chipset)
+            gpus.append(GpuInfo(vendor=vendor, name=_clean(chipset),
+                                vram_gb=vram, integrated=(vendor == "apple") or None))
+        chipset = vendor_raw = vram = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("Chipset Model:"):
+            flush()
+            chipset = s.split(":", 1)[1].strip()
+        elif s.startswith("Vendor:"):
+            vendor_raw = s.split(":", 1)[1].strip()
+        elif s.startswith("VRAM"):
+            m = re.search(r"(\d+)\s*GB", s)
+            vram = float(m.group(1)) if m else None
+    flush()
+    return gpus
+
+
+def _gpus_macos() -> list["GpuInfo"]:
+    return _spdisplays_gpus(_run(["system_profiler", "SPDisplaysDataType"], timeout=15) or "")
 
 
 def _vulkan_devices() -> list[dict]:
