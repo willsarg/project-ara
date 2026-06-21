@@ -932,7 +932,68 @@ def _gpus_linux() -> list["GpuInfo"]:
 
 def _gpus_windows() -> list["GpuInfo"]: return []
 def _gpus_macos() -> list["GpuInfo"]: return []
-def _with_runtime(g: "GpuInfo") -> "GpuInfo": return g
+
+
+def _vulkan_devices() -> list[dict]:
+    out = _run(["vulkaninfo", "--summary"])
+    if not out:
+        return []
+    coop_out = _run(["vulkaninfo"]) or ""
+    coopmat = "cooperativeMatrix = true" in coop_out
+    devices: list[dict] = []
+    cur: dict = {}
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("deviceName"):
+            cur["name"] = s.split("=", 1)[1].strip()
+        elif s.startswith("driverName"):
+            cur["driver"] = s.split("=", 1)[1].strip()
+        elif s.startswith("apiVersion"):
+            cur["api"] = s.split("=", 1)[1].strip()
+            # apiVersion is the last field per GPU block in --summary → flush
+            name = cur.get("name", "")
+            if name and cur.get("driver") != "llvmpipe" and "llvmpipe" not in name.lower():
+                devices.append({"vendor": _gpu_vendor(name), "api": cur.get("api"),
+                                "driver": cur.get("driver"), "coopmat": coopmat})
+            cur = {}
+    return devices
+
+
+def _rocm_version() -> str | None:
+    """Return the ROCm version string (e.g. '6.0.2'), or None if ROCm is not present."""
+    import shutil as _sh
+    if not (_sh.which("rocminfo") or _sh.which("rocm-smi") or os.path.isdir("/opt/rocm")):
+        return None
+    v = _read_text("/opt/rocm/.info/version")
+    return v.split("-")[0] if v else "unknown"
+
+
+def _cuda_version_smi() -> str | None:
+    out = _run(["nvidia-smi"]) or ""
+    m = re.search(r"CUDA Version:\s*([0-9.]+)", out)
+    return m.group(1) if m else None
+
+
+def _with_runtime(g: "GpuInfo") -> "GpuInfo":
+    from dataclasses import replace
+    runtime: str | None = None
+    backend: str | None = None
+    if g.vendor == "apple":
+        runtime, backend = "Metal", "mlx"
+    elif g.vendor == "nvidia":
+        cu = _cuda_version_smi()
+        runtime, backend = (f"CUDA {cu}", "cuda") if cu else (None, None)
+    elif g.vendor in ("amd", "intel"):
+        vk = next((d for d in _vulkan_devices() if d["vendor"] == g.vendor), None)
+        if vk:
+            bits = f"Vulkan {vk['api']} · {vk['driver']}"
+            if vk["coopmat"]:
+                bits += " · coopmat"
+            runtime, backend = bits, "vulkan"
+        else:
+            rv = _rocm_version()           # noted only; not a usable_backend on RDNA3/APU
+            runtime = f"ROCm {rv}" if rv is not None else None
+    return replace(g, compute_runtime=runtime, usable_backend=backend)
 
 
 def gpu_info() -> list["GpuInfo"]:

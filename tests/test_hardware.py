@@ -1632,11 +1632,12 @@ def test_gpus_macos_stub_returns_empty():
     assert hw._gpus_macos() == []
 
 
-def test_with_runtime_stub_identity():
-    """Direct call to the stub so its body line is covered."""
+def test_with_runtime_unknown_vendor_passthrough(monkeypatch):
+    """Unknown vendor returns None runtime and None backend (else branch)."""
     from ara import hardware as hw
-    g = hw.GpuInfo(vendor="nvidia")
-    assert hw._with_runtime(g) is g
+    g = hw.GpuInfo(vendor="unknown")
+    result = hw._with_runtime(g)
+    assert result.compute_runtime is None and result.usable_backend is None
 
 
 def test_gpu_info_dispatches_linux(monkeypatch):
@@ -1713,3 +1714,147 @@ def test_read_text_returns_none_on_missing_file():
     from ara import hardware as hw
     result = hw._read_text("/nonexistent/path/that/cannot/exist")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Compute-runtime detection (_vulkan_devices, _rocm_version, _with_runtime)
+# ---------------------------------------------------------------------------
+
+_VULKANINFO_SUMMARY = """\
+Devices:
+========
+GPU0:
+\tapiVersion         = 1.4.318
+\tdeviceName         = AMD Ryzen Z1 Extreme (RADV PHOENIX)
+\tdriverName         = radv
+GPU1:
+\tapiVersion         = 1.4.318
+\tdeviceName         = llvmpipe (LLVM 20.1.2, 256 bits)
+\tdriverName         = llvmpipe
+"""
+
+
+def test_vulkan_devices_parsed_filters_llvmpipe(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
+                        if "--summary" in cmd else "cooperativeMatrix = true\n")
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1                       # llvmpipe filtered out
+    assert devs[0]["vendor"] == "amd"
+    assert devs[0]["api"] == "1.4.318" and devs[0]["driver"] == "radv"
+    assert devs[0]["coopmat"] is True
+
+
+def test_with_runtime_amd_vulkan_usable(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_vulkan_devices",
+        lambda: [{"vendor": "amd", "api": "1.4.318", "driver": "radv", "coopmat": True}])
+    monkeypatch.setattr(hw, "_rocm_version", lambda: None)
+    g = hw._with_runtime(hw.GpuInfo(vendor="amd", name="Phoenix1"))
+    assert g.usable_backend == "vulkan"
+    assert g.compute_runtime == "Vulkan 1.4.318 · radv · coopmat"
+
+
+def test_with_runtime_amd_no_runtime_none(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    monkeypatch.setattr(hw, "_rocm_version", lambda: None)
+    g = hw._with_runtime(hw.GpuInfo(vendor="amd"))
+    assert g.usable_backend is None and g.compute_runtime is None
+
+
+def test_with_runtime_amd_rocm_noted_not_usable(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    monkeypatch.setattr(hw, "_rocm_version", lambda: "6.0.2")
+    g = hw._with_runtime(hw.GpuInfo(vendor="amd"))
+    assert g.usable_backend is None and g.compute_runtime == "ROCm 6.0.2"
+
+
+def test_with_runtime_apple_metal(monkeypatch):
+    from ara import hardware as hw
+    g = hw._with_runtime(hw.GpuInfo(vendor="apple", name="Apple M4 Pro GPU"))
+    assert g.usable_backend == "mlx" and g.compute_runtime == "Metal"
+
+
+def test_with_runtime_nvidia_cuda(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_cuda_version_smi", lambda: "12.4")
+    g = hw._with_runtime(hw.GpuInfo(vendor="nvidia", name="RTX 4090"))
+    assert g.usable_backend == "cuda" and g.compute_runtime == "CUDA 12.4"
+
+
+def test_with_runtime_nvidia_no_cuda(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_cuda_version_smi", lambda: None)
+    g = hw._with_runtime(hw.GpuInfo(vendor="nvidia", name="RTX 4090"))
+    assert g.usable_backend is None and g.compute_runtime is None
+
+
+def test_with_runtime_intel_vulkan_usable(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_vulkan_devices",
+        lambda: [{"vendor": "intel", "api": "1.3.290", "driver": "anv", "coopmat": False}])
+    monkeypatch.setattr(hw, "_rocm_version", lambda: None)
+    g = hw._with_runtime(hw.GpuInfo(vendor="intel", name="Intel Arc A770"))
+    assert g.usable_backend == "vulkan"
+    assert g.compute_runtime == "Vulkan 1.3.290 · anv"
+
+
+def test_with_runtime_unknown_vendor_none(monkeypatch):
+    from ara import hardware as hw
+    g = hw._with_runtime(hw.GpuInfo(vendor="unknown", name="Some GPU"))
+    assert g.usable_backend is None and g.compute_runtime is None
+
+
+def test_vulkan_devices_empty_when_vulkaninfo_absent(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: None)
+    assert hw._vulkan_devices() == []
+
+
+def test_rocm_version_returns_none_when_no_rocm(monkeypatch):
+    from ara import hardware as hw
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    monkeypatch.setattr(hw.os.path, "isdir", lambda _: False)
+    assert hw._rocm_version() is None
+
+
+def test_rocm_version_parses_version_file(monkeypatch):
+    from ara import hardware as hw
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rocminfo" if name == "rocminfo" else None)
+    monkeypatch.setattr(hw, "_read_text", lambda path: "6.0.2-1234" if "version" in path else None)
+    result = hw._rocm_version()
+    assert result == "6.0.2"
+
+
+def test_rocm_version_returns_unknown_when_no_version_file(monkeypatch):
+    from ara import hardware as hw
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rocminfo" if name == "rocminfo" else None)
+    monkeypatch.setattr(hw, "_read_text", lambda path: None)
+    result = hw._rocm_version()
+    assert result == "unknown"
+
+
+def test_cuda_version_smi_parses_version(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: "CUDA Version: 12.4\n")
+    assert hw._cuda_version_smi() == "12.4"
+
+
+def test_cuda_version_smi_returns_none_when_absent(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: None)
+    assert hw._cuda_version_smi() is None
+
+
+def test_vulkan_devices_no_coopmat(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
+                        if "--summary" in cmd else "")
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1
+    assert devs[0]["coopmat"] is False
