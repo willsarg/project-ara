@@ -870,3 +870,298 @@ def test_memory_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
     mi = hw.memory_info()
     assert isinstance(mi, hw.MemoryInfo)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Storage detail
+# ---------------------------------------------------------------------------
+
+# --- Windows fixture (real willw11 Get-PhysicalDisk output) ---
+_WIN_PHYSICAL_DISKS = [
+    {"FriendlyName": "Samsung SSD 990 EVO 1TB", "MediaType": "SSD", "BusType": "NVMe",
+     "Size": 1000204886016},
+    {"FriendlyName": "ST2000DM008-2FR102", "MediaType": "HDD", "BusType": "SATA",
+     "Size": 2000398934016},
+    {"FriendlyName": "QNAP TR-004 DISK00", "MediaType": "Unspecified", "BusType": "USB",
+     "Size": 8001456963584},
+]
+
+# Extended fixture to cover every branch in the media-type mapping
+_WIN_PHYSICAL_DISKS_FULL = [
+    {"FriendlyName": "NVMe Drive", "MediaType": "SSD", "BusType": "NVMe", "Size": 1000000000000},
+    {"FriendlyName": "SATA SSD", "MediaType": "SSD", "BusType": "SATA", "Size": 500000000000},
+    {"FriendlyName": "SATA HDD", "MediaType": "HDD", "BusType": "SATA", "Size": 2000000000000},
+    {"FriendlyName": "USB Drive", "MediaType": "Unspecified", "BusType": "USB", "Size": 8000000000000},
+    {"FriendlyName": "Unknown Device", "MediaType": "Unspecified", "BusType": "Unknown",
+     "Size": 100000000000},
+]
+
+# macOS SPNVMeDataType fixture (real Apple M4 Pro / MacBook Pro output shape)
+_MACOS_SPNVME = """\
+NVMExpress:
+
+    Apple SSD Controller:
+
+      APPLE SSD AP0512Z:
+
+          Capacity:          500.28 GB (500,277,792,768 bytes)
+          TRIM Support:          Yes
+          Model:                 APPLE SSD AP0512Z
+          Revision:              0000000000000001
+          Link Speed:            Unknown
+          Link Width:            Unknown
+          Detachable Drive:      No
+          BSD Name:              disk0
+          Partition Map Type:    GPT (GUID Partition Table)
+          S.M.A.R.T. status:    Verified
+"""
+
+# Linux lsblk JSON fixture
+_LINUX_LSBLK_JSON = """\
+{
+   "blockdevices": [
+      {"name": "sda", "model": "Samsung SSD 870", "size": "500107862016", "rota": "0", "tran": "sata"},
+      {"name": "sdb", "model": "WDC WD20EZRZ", "size": "2000398934016", "rota": "1", "tran": "sata"},
+      {"name": "sdc", "model": "SanDisk Cruzer", "size": "32016969728", "rota": "0", "tran": "usb"},
+      {"name": "nvme0n1", "model": "Samsung SSD 980 PRO", "size": "1000204886016", "rota": "0", "tran": "nvme"}
+   ]
+}
+"""
+
+# lsblk fixture where tran is null/missing (unknown fallback)
+_LINUX_LSBLK_JSON_UNKNOWN = """\
+{
+   "blockdevices": [
+      {"name": "sda", "model": "Mystery Drive", "size": "1000000000000", "rota": "0", "tran": null}
+   ]
+}
+"""
+
+
+# --- _drives_windows parser ---
+
+def test_drives_windows_nvme_classification():
+    """BusType=NVMe → 'nvme-ssd' regardless of MediaType."""
+    drives = hw._drives_windows([{"FriendlyName": "Samsung SSD 990 EVO 1TB",
+                                   "MediaType": "SSD", "BusType": "NVMe",
+                                   "Size": 1000204886016}])
+    assert len(drives) == 1
+    d = drives[0]
+    assert d.model == "Samsung SSD 990 EVO 1TB"
+    assert d.media == "nvme-ssd"
+    assert d.size_gb == round(1000204886016 / 1e9, 1)
+
+
+def test_drives_windows_sata_ssd_classification():
+    """MediaType=SSD + BusType=SATA → 'sata-ssd'."""
+    drives = hw._drives_windows([{"FriendlyName": "SATA SSD",
+                                   "MediaType": "SSD", "BusType": "SATA",
+                                   "Size": 500000000000}])
+    assert drives[0].media == "sata-ssd"
+
+
+def test_drives_windows_hdd_classification():
+    """MediaType=HDD → 'hdd'."""
+    drives = hw._drives_windows([{"FriendlyName": "ST2000DM008-2FR102",
+                                   "MediaType": "HDD", "BusType": "SATA",
+                                   "Size": 2000398934016}])
+    assert drives[0].media == "hdd"
+
+
+def test_drives_windows_usb_classification():
+    """BusType=USB → 'usb'."""
+    drives = hw._drives_windows([{"FriendlyName": "QNAP TR-004 DISK00",
+                                   "MediaType": "Unspecified", "BusType": "USB",
+                                   "Size": 8001456963584}])
+    assert drives[0].media == "usb"
+
+
+def test_drives_windows_unknown_classification():
+    """Unrecognised MediaType+BusType → 'unknown'."""
+    drives = hw._drives_windows([{"FriendlyName": "Unknown Device",
+                                   "MediaType": "Unspecified", "BusType": "Unknown",
+                                   "Size": 100000000000}])
+    assert drives[0].media == "unknown"
+
+
+def test_drives_windows_full_willw11_fixture():
+    """Full willw11 Get-PhysicalDisk fixture: NVMe SSD + HDD + USB → 3 drives, correct media."""
+    drives = hw._drives_windows(_WIN_PHYSICAL_DISKS)
+    assert len(drives) == 3
+    assert drives[0].media == "nvme-ssd"
+    assert drives[1].media == "hdd"
+    assert drives[2].media == "usb"
+    assert drives[0].model == "Samsung SSD 990 EVO 1TB"
+    assert drives[1].model == "ST2000DM008-2FR102"
+    assert drives[2].model == "QNAP TR-004 DISK00"
+
+
+def test_drives_windows_empty_list():
+    """Empty input → empty list (no crash)."""
+    assert hw._drives_windows([]) == []
+
+
+# --- _drives_macos parser ---
+
+def test_drives_macos_apple_m4_pro_nvme():
+    """Real macOS SPNVMeDataType output → 1 NVMe drive, correct model/size."""
+    drives = hw._drives_macos(_MACOS_SPNVME)
+    assert len(drives) == 1
+    d = drives[0]
+    assert d.model == "APPLE SSD AP0512Z"
+    assert d.media == "nvme-ssd"
+    assert d.size_gb == round(500277792768 / 1e9, 1)
+
+
+def test_drives_macos_empty_text():
+    """No NVMe output → empty list."""
+    drives = hw._drives_macos("")
+    assert drives == []
+
+
+def test_drives_macos_missing_model_line():
+    """Capacity without Model → drive skipped (model is None → not appended)."""
+    text = "      Capacity:          500.28 GB (500000000000 bytes)\n"
+    drives = hw._drives_macos(text)
+    # No model found → nothing appended
+    assert drives == []
+
+
+def test_drives_macos_missing_bytes_in_capacity():
+    """Capacity line with no '(N bytes)' → size_gb=None but drive still appended with model."""
+    text = "      Model:                 APPLE SSD AP0512Z\n      Capacity:          500.28 GB\n"
+    drives = hw._drives_macos(text)
+    assert len(drives) == 1
+    assert drives[0].size_gb is None
+
+
+# --- _drives_linux parser ---
+
+def test_drives_linux_mixed_types():
+    """lsblk JSON fixture: sata-ssd, hdd, usb, nvme → correct media classification."""
+    drives = hw._drives_linux(_LINUX_LSBLK_JSON)
+    assert len(drives) == 4
+    by_name = {d.model: d for d in drives}
+    assert by_name["Samsung SSD 870"].media == "sata-ssd"
+    assert by_name["WDC WD20EZRZ"].media == "hdd"
+    assert by_name["SanDisk Cruzer"].media == "usb"
+    assert by_name["Samsung SSD 980 PRO"].media == "nvme-ssd"
+
+
+def test_drives_linux_unknown_tran():
+    """ROTA=0 but tran=null → 'unknown'."""
+    drives = hw._drives_linux(_LINUX_LSBLK_JSON_UNKNOWN)
+    assert len(drives) == 1
+    assert drives[0].media == "unknown"
+
+
+def test_drives_linux_empty_json():
+    """Empty blockdevices → empty list."""
+    drives = hw._drives_linux('{"blockdevices": []}')
+    assert drives == []
+
+
+def test_drives_linux_bad_json():
+    """Invalid JSON → empty list (no crash)."""
+    drives = hw._drives_linux("not-json")
+    assert drives == []
+
+
+# --- storage_info() dispatcher ---
+
+def test_storage_info_dispatches_macos(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: _MACOS_SPNVME)
+    monkeypatch.setattr(hw, "_disk_free_gb", lambda: 200.5)
+    si = hw.storage_info()
+    assert si.free_gb == 200.5
+    assert len(si.drives) == 1
+    assert si.drives[0].media == "nvme-ssd"
+
+
+def test_storage_info_dispatches_windows(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: _WIN_PHYSICAL_DISKS)
+    monkeypatch.setattr(hw, "_disk_free_gb", lambda: 400.0)
+    si = hw.storage_info()
+    assert si.free_gb == 400.0
+    assert len(si.drives) == 3
+    assert si.drives[0].media == "nvme-ssd"
+
+
+def test_storage_info_dispatches_linux(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: _LINUX_LSBLK_JSON)
+    monkeypatch.setattr(hw, "_disk_free_gb", lambda: 150.0)
+    si = hw.storage_info()
+    assert si.free_gb == 150.0
+    assert len(si.drives) == 4
+
+
+def test_storage_info_unknown_platform_returns_empty(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "FreeBSD")
+    monkeypatch.setattr(hw, "_disk_free_gb", lambda: None)
+    si = hw.storage_info()
+    assert isinstance(si, hw.StorageInfo)
+    assert si.drives == []
+    assert si.free_gb is None
+
+
+def test_storage_info_exception_returns_empty(monkeypatch):
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(hw, "_disk_free_gb", lambda: None)
+    si = hw.storage_info()
+    assert isinstance(si, hw.StorageInfo)
+
+
+# --- _drives_macos branch coverage ---
+
+def test_drives_macos_empty_model_value_skipped():
+    """'Model:   ' (blank after stripping) must be silently skipped (if val: False branch)."""
+    text = "      Model:   \n      Capacity:   100 GB (100000000000 bytes)\n"
+    drives = hw._drives_macos(text)
+    # Empty model → if val: is False → nothing appended
+    assert drives == []
+
+
+def test_drives_macos_model_with_no_capacity():
+    """A Model line with no Capacity line → size_gb=None (best_idx is None branch)."""
+    text = "      Model:   APPLE SSD TEST\n"
+    drives = hw._drives_macos(text)
+    assert len(drives) == 1
+    assert drives[0].size_gb is None
+    assert drives[0].model == "APPLE SSD TEST"
+
+
+def test_drives_macos_two_drives_nearest_capacity_pairing():
+    """Two drives: each Model is paired with nearest Capacity.
+    This covers the 'ci in used_cap_indices' skip + 'dist < best_dist' False path."""
+    text = (
+        "      Capacity:   100 GB (100000000000 bytes)\n"
+        "      Model:   DRIVE A\n"
+        "      Capacity:   200 GB (200000000000 bytes)\n"
+        "      Model:   DRIVE B\n"
+    )
+    drives = hw._drives_macos(text)
+    assert len(drives) == 2
+    # DRIVE A is on line 1, capacity at line 0 → nearest cap is 100 GB
+    # DRIVE B is on line 3, capacity at line 2 → nearest cap is 200 GB
+    models = {d.model: d for d in drives}
+    assert models["DRIVE A"].size_gb == round(100000000000 / 1e9, 1)
+    assert models["DRIVE B"].size_gb == round(200000000000 / 1e9, 1)
+
+
+# --- _disk_free_gb exception path ---
+
+def test_disk_free_gb_returns_none_on_exception(monkeypatch):
+    """_disk_free_gb must return None when disk_usage raises (exception branch)."""
+    import shutil
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: (_ for _ in ()).throw(OSError("no disk")))
+    result = hw._disk_free_gb()
+    assert result is None

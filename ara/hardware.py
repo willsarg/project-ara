@@ -464,6 +464,163 @@ def _parse_dmidecode_module(fields: dict[str, str]) -> "MemoryModule":
     )
 
 
+# ---------------------------------------------------------------------------
+# Task 4: Storage detail
+# ---------------------------------------------------------------------------
+
+def _drives_windows(physicaldisks: list[dict]) -> list["Drive"]:
+    """Parse Get-PhysicalDisk rows → list[Drive].
+
+    Media classification (plan spec, verbatim priority order):
+      BusType "NVMe"                       → "nvme-ssd"
+      MediaType "SSD" + BusType "SATA"     → "sata-ssd"
+      MediaType "HDD"                      → "hdd"
+      BusType "USB"                        → "usb"
+      else                                 → "unknown"
+    """
+    drives: list[Drive] = []
+    for disk in physicaldisks:
+        bus = disk.get("BusType", "")
+        media_type = disk.get("MediaType", "")
+        if bus == "NVMe":
+            media = "nvme-ssd"
+        elif media_type == "SSD" and bus == "SATA":
+            media = "sata-ssd"
+        elif media_type == "HDD":
+            media = "hdd"
+        elif bus == "USB":
+            media = "usb"
+        else:
+            media = "unknown"
+        drives.append(Drive(
+            model=disk.get("FriendlyName") or None,
+            media=media,
+            size_gb=_gb_dec(disk.get("Size")),
+        ))
+    return drives
+
+
+def _drives_macos(spnvme_text: str) -> list["Drive"]:
+    """Parse `system_profiler SPNVMeDataType` text → list[Drive].
+
+    system_profiler emits NVMe drive blocks where each drive is identified by a group of
+    indented key-value lines. The fixture (real Apple M4 Pro) shows Capacity before Model:
+
+      Capacity:          500.28 GB (500,277,792,768 bytes)
+      Model:                 APPLE SSD AP0512Z
+
+    We scan each block independently: a blank line or deeper-nested heading signals a block
+    boundary. Simpler approach: collect all Model + Capacity lines globally then zip them.
+    Since system_profiler lists drives sequentially (one Model per drive, one Capacity per
+    drive), we pair them positionally after sorting by line number.
+    """
+    models: list[tuple[int, str]] = []      # (lineno, value)
+    capacities: list[tuple[int, float | None]] = []  # (lineno, size_gb)
+
+    for i, line in enumerate(spnvme_text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("Model:"):
+            val = stripped.removeprefix("Model:").strip() or None
+            if val:
+                models.append((i, val))
+        elif stripped.startswith("Capacity:"):
+            m = re.search(r"\(([0-9,]+)\s+bytes\)", stripped)
+            if m:
+                raw_bytes = int(m.group(1).replace(",", ""))
+                size_gb = _gb_dec(raw_bytes)
+            else:
+                size_gb = None
+            capacities.append((i, size_gb))
+
+    # Pair each Model line with the nearest Capacity line in the same block.
+    # Strategy: for each model, find the capacity line closest to it (min abs distance).
+    drives: list[Drive] = []
+    used_cap_indices: set[int] = set()
+    for _lineno, model_val in models:
+        best_idx: int | None = None
+        best_dist = float("inf")
+        for ci, (cap_lineno, _size) in enumerate(capacities):
+            if ci in used_cap_indices:
+                continue
+            dist = abs(cap_lineno - _lineno)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = ci
+        size_gb: float | None = None
+        if best_idx is not None:
+            size_gb = capacities[best_idx][1]
+            used_cap_indices.add(best_idx)
+        drives.append(Drive(model=model_val, media="nvme-ssd", size_gb=size_gb))
+
+    return drives
+
+
+def _drives_linux(lsblk_json: str) -> list["Drive"]:
+    """Parse `lsblk -d -b -o NAME,MODEL,SIZE,ROTA,TRAN -J` JSON → list[Drive].
+
+    Media classification:
+      ROTA == "1"  → "hdd"
+      ROTA == "0", TRAN == "nvme"  → "nvme-ssd"
+      ROTA == "0", TRAN == "sata"  → "sata-ssd"
+      ROTA == "0", TRAN == "usb"   → "usb"
+      else                          → "unknown"
+    """
+    try:
+        data = json.loads(lsblk_json)
+    except Exception:
+        return []
+    drives: list[Drive] = []
+    for dev in data.get("blockdevices", []):
+        rota = str(dev.get("rota", "")).strip()
+        tran = (dev.get("tran") or "").strip().lower()
+        if rota == "1":
+            media = "hdd"
+        elif tran == "nvme":
+            media = "nvme-ssd"
+        elif tran == "sata":
+            media = "sata-ssd"
+        elif tran == "usb":
+            media = "usb"
+        else:
+            media = "unknown"
+        size_raw = dev.get("size")
+        drives.append(Drive(
+            model=dev.get("model") or None,
+            media=media,
+            size_gb=_gb_dec(size_raw),
+        ))
+    return drives
+
+
+def _disk_free_gb() -> float | None:
+    """Return free GB of the home partition (reuses detect logic without importing detect)."""
+    try:
+        import shutil
+        from pathlib import Path
+        return shutil.disk_usage(Path.home()).free / 1e9
+    except Exception:
+        return None
+
+
+def storage_info() -> "StorageInfo":
+    """Dispatch to the per-OS storage parser and return a StorageInfo.  Never raises."""
+    system = platform.system()
+    free_gb = _disk_free_gb()
+    try:
+        if system == "Darwin":
+            raw = _run(["system_profiler", "SPNVMeDataType"]) or ""
+            return StorageInfo(free_gb=free_gb, drives=_drives_macos(raw))
+        if system == "Windows":
+            disks = _pwsh_json(["Get-PhysicalDisk | ConvertTo-Json -Compress"])
+            return StorageInfo(free_gb=free_gb, drives=_drives_windows(disks))
+        if system == "Linux":
+            raw = _run(["lsblk", "-d", "-b", "-o", "NAME,MODEL,SIZE,ROTA,TRAN", "-J"]) or ""
+            return StorageInfo(free_gb=free_gb, drives=_drives_linux(raw))
+    except Exception:
+        pass
+    return StorageInfo(free_gb=free_gb)
+
+
 def _psutil_totals() -> tuple[float, float, float]:
     """Return (total_gb, available_gb, swap_gb) from psutil."""
     import psutil
