@@ -684,6 +684,14 @@ def test_mem_linux_root_parses_dmidecode():
     assert mi.slots_total == 2                          # all Memory Device blocks
 
 
+def test_mem_linux_top_level_speed_from_modules():
+    """Top-level MemoryInfo.speed_mts is aggregated (max) from the populated modules, the
+    same as the Windows path — so `ara detect` shows a memory speed on Linux when dmidecode
+    exposes it. (Linux previously left this None despite per-module speeds being known.)"""
+    mi = hw._mem_linux(_LINUX_MEMINFO, _LINUX_DMIDECODE, (31.2, 15.2, 2.0))
+    assert mi.speed_mts == 3200
+
+
 def test_mem_linux_empty_meminfo():
     """Blank /proc/meminfo → totals from passed-in tuple, no crash."""
     mi = hw._mem_linux("", None, (0.0, 0.0, 0.0))
@@ -1116,6 +1124,18 @@ def test_drives_linux_string_rota_legacy():
     by_name = {d.model: d for d in drives}
     assert by_name["Old HDD"].media == "hdd"          # rota "1"
     assert by_name["Old SATA SSD"].media == "sata-ssd"  # rota "0"
+
+
+def test_drives_linux_usb_rota_true_is_usb():
+    """A USB-attached SSD whose bridge falsely reports rota=true must classify as 'usb',
+    not 'hdd'. USB bridges routinely lie about rotation; transport is the reliable signal.
+    (Real case: Crucial X6 external SSD on a ROG Ally, validated live 2026-06-21.)"""
+    drives = hw._drives_linux(
+        '{"blockdevices": [{"name": "sda", "model": "CT2000X6SSD9", '
+        '"size": 2000398934016, "rota": true, "tran": "usb"}]}'
+    )
+    assert len(drives) == 1
+    assert drives[0].media == "usb"
 
 
 def test_drives_linux_unknown_tran():

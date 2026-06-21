@@ -446,11 +446,17 @@ def _mem_linux(
         if slots_total == 0:
             slots_total = None
 
+    # Aggregate top-level speed from the populated modules (matches the Windows path) so the
+    # renderer surfaces a memory speed on Linux when dmidecode exposes per-module speeds.
+    speeds = [m.speed_mts for m in modules if m.speed_mts]
+    speed_mts = max(speeds) if speeds else None
+
     return MemoryInfo(
         total_gb=total_gb,
         available_gb=available_gb,
         swap_gb=swap_gb,
         kind=kind,
+        speed_mts=speed_mts,
         slots_used=slots_used,
         slots_total=slots_total,
         modules=modules,
@@ -583,11 +589,11 @@ def _drives_macos(spnvme_text: str) -> list["Drive"]:
 def _drives_linux(lsblk_json: str) -> list["Drive"]:
     """Parse `lsblk -d -b -o NAME,MODEL,SIZE,ROTA,TRAN -J` JSON → list[Drive].
 
-    Media classification:
-      ROTA == "1"  → "hdd"
-      ROTA == "0", TRAN == "nvme"  → "nvme-ssd"
-      ROTA == "0", TRAN == "sata"  → "sata-ssd"
-      ROTA == "0", TRAN == "usb"   → "usb"
+    Media classification (transport before rotation — USB bridges lie about ROTA):
+      TRAN == "nvme"               → "nvme-ssd"
+      TRAN == "usb"                → "usb"      (ROTA unreliable over USB; trust transport)
+      ROTA truthy                  → "hdd"
+      TRAN == "sata"               → "sata-ssd"
       else                          → "unknown"
     """
     try:
@@ -601,14 +607,15 @@ def _drives_linux(lsblk_json: str) -> list["Drive"]:
         rota = str(dev.get("rota", "")).strip().lower()
         is_hdd = rota in ("1", "true")
         tran = (dev.get("tran") or "").strip().lower()
-        if is_hdd:
-            media = "hdd"
-        elif tran == "nvme":
+        if tran == "nvme":
             media = "nvme-ssd"
+        elif tran == "usb":
+            # USB bridges routinely misreport ROTA; the transport is the reliable signal.
+            media = "usb"
+        elif is_hdd:
+            media = "hdd"
         elif tran == "sata":
             media = "sata-ssd"
-        elif tran == "usb":
-            media = "usb"
         else:
             media = "unknown"
         size_raw = dev.get("size")
