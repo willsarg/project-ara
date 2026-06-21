@@ -5,8 +5,16 @@ out-of-process through engine_env, never importing wcx in ARA's interpreter.
 """
 from __future__ import annotations
 
-from ara import acquire
+import pytest
+
+from ara import acquire, catalog
 from ara.backends import cuda
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Keep the suite offline: characterize now calls catalog.describe; stub it out."""
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
 
 
 def _fake_worker(monkeypatch, fn):

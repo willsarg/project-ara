@@ -10,7 +10,16 @@ methodology is independent of any one engine.
 """
 from __future__ import annotations
 
+import pytest
+
+from ara import catalog
 from ara.contracts import driver
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Keep the suite offline: characterize now calls catalog.describe; stub it out."""
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
 
 
 def _est(**kw) -> dict:
@@ -139,3 +148,60 @@ def test_engine_refusal_brackets_below_the_abort():
     assert 4000 <= r["safe_context"] < 8000
     assert r["binding"] == "memory"
     assert r["safe_context"] in {p["context"] for p in r["points"]}
+
+
+# --------------------------------------------------------------------------- #
+# decode_context — analytic decode ceiling returned from characterize
+# --------------------------------------------------------------------------- #
+_META_DICT = {"n_layers": 32, "kv_heads": 8, "head_dim": 128}
+
+
+def test_decode_context_larger_than_safe_context_when_meta_available(monkeypatch):
+    # Shallow linear ramp → prefill fit exists; meta provides kv dims; kv slope < prefill slope
+    # so decode ceiling > prefill ceiling.
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))
+    est = _est(slope_gb_per_k=2.0)   # steep prefill slope to ensure kv slope is smaller
+    r = drv.characterize("m", preflight=lambda m: est, measure=_linear(5.0, 2.0),
+                         schedule=[2000, 4000, 8000])
+    assert "decode_context" in r
+    assert r["decode_context"] is not None
+    assert isinstance(r["decode_context"], int)
+    assert r["decode_context"] > r["safe_context"]
+
+
+def test_decode_context_none_when_describe_returns_none(monkeypatch):
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    est = _est()
+    r = drv.characterize("m", preflight=lambda m: est, measure=_linear(5.0, 1.0),
+                         schedule=[2000, 4000, 8000])
+    assert r["decode_context"] is None
+
+
+def test_decode_context_none_when_fit_is_none(monkeypatch):
+    # Single safe point → res.fit is None → decode_context must be None
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))
+    # base 33+slope 1: 2k→35 < 36 (safe), 4k→37≥36 (L1 gates out), so only 1 point — no fit
+    est = _est(base_gb=33.0, slope_gb_per_k=1.0)
+    r = drv.characterize("m", preflight=lambda m: est, measure=_linear(33.0, 1.0),
+                         schedule=[2000, 4000])
+    assert r["safe_context"] == 2000
+    assert r["decode_context"] is None
+
+
+def test_decode_context_does_not_change_prefill_ceiling_or_binding(monkeypatch):
+    # Confirm the L2 gate still keys off the measured peak; decode_context is additive only
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))
+    est = _est(max_context=16000)
+    r = drv.characterize("m", preflight=lambda m: est, measure=_linear(5.0, 1.0),
+                         schedule=[2000, 4000, 8000, 16000, 32000])
+    assert r["safe_context"] == 16000
+    assert r["binding"] == "context_window"
+    assert "decode_context" in r

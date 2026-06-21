@@ -199,6 +199,34 @@ def plan_next(schedule: list[int], measured, base_gb: float,
     return None
 
 
+def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2):
+    """Analytic fp16 KV-cache growth, GB per 1000 tokens, from model metadata.
+
+    2 (K and V) · n_layers · kv_heads · head_dim · kv_dtype_bytes bytes per token. Returns None
+    if any dimension is missing or zero (can't estimate). Uses TOTAL n_layers (over-counts KV for
+    sliding-window models → conservative) and fp16 KV by default (engines that quantize KV get
+    more headroom → conservative). This is an estimate, not a measurement.
+    """
+    if not (n_layers and kv_heads and head_dim):
+        return None
+    return 2 * n_layers * kv_heads * head_dim * kv_dtype_bytes / 1e9 * 1000
+
+
+def decode_ceiling(intercept_gb, kv_slope_gb_per_k, budget_gb, ref_baseline_gb=0.0,
+                   max_context=None):
+    """Decode-safe ceiling (tokens) + binding, from the MEASURED base and the analytic KV slope.
+
+    Reuses safe_ceiling with the prefill fit's intercept (the model's measured footprint at
+    context→0) and the analytic KV slope. Caps at the model's window like the prefill solve.
+    Returns (int | None, binding) where binding is "memory" or "context_window".
+    """
+    ceiling = safe_ceiling(Fit(intercept_gb, kv_slope_gb_per_k, 1.0, 2), budget_gb, ref_baseline_gb)
+    binding = "memory"
+    if ceiling is not None and max_context is not None and ceiling > max_context:
+        ceiling, binding = max_context, "context_window"
+    return ceiling, binding
+
+
 def safe_ceiling(f: Fit, budget_gb: float, ref_baseline_gb: float = 0.0) -> int | None:
     """Largest context (tokens) whose predicted memory stays within *budget_gb*.
 

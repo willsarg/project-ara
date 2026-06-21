@@ -85,3 +85,66 @@ def test_list_characterizations_for_machine_and_engine(store):
     rows = db.list_characterizations(store, "m", "wcx")
     assert {r["model_id"] for r in rows} == {"a", "b"}
     assert rows[0]["points"] == [[1, 2.0]]   # JSON parsed back
+
+
+# --- decode_context persistence ---
+def test_save_characterization_with_decode_context_round_trips(store):
+    db.save_characterization(store, "m", "wcx", "org/model", safe_context=16000,
+                             points=[], decode_context=62000)
+    row = db.get_characterization(store, "m", "wcx", "org/model")
+    assert row["decode_context"] == 62000
+
+
+def test_save_characterization_default_decode_context_is_none(store):
+    db.save_characterization(store, "m", "wcx", "org/model", safe_context=16000, points=[])
+    row = db.get_characterization(store, "m", "wcx", "org/model")
+    assert row["decode_context"] is None
+
+
+def test_list_characterizations_includes_decode_context(store):
+    db.save_characterization(store, "m", "wcx", "a", safe_context=8000, points=[], decode_context=50000)
+    db.save_characterization(store, "m", "wcx", "b", safe_context=4000, points=[])
+    rows = db.list_characterizations(store, "m", "wcx")
+    by_id = {r["model_id"]: r for r in rows}
+    assert by_id["a"]["decode_context"] == 50000
+    assert by_id["b"]["decode_context"] is None
+
+
+def test_migration_adds_decode_context_column_to_old_schema(tmp_path, monkeypatch):
+    """An existing DB without decode_context gets the column after connect()."""
+    import sqlite3 as _sqlite3
+    db_path = tmp_path / "old.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(db_path))
+
+    # Build an old-schema DB (no decode_context column) and seed one row.
+    OLD_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS characterizations (
+        machine_key  TEXT NOT NULL,
+        engine       TEXT NOT NULL,
+        model_id     TEXT NOT NULL,
+        safe_context INTEGER,
+        points_json  TEXT,
+        measured_at  TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    """
+    old_con = _sqlite3.connect(str(db_path))
+    old_con.row_factory = _sqlite3.Row
+    old_con.executescript(OLD_SCHEMA)
+    old_con.execute(
+        "INSERT INTO characterizations (machine_key, engine, model_id, safe_context, points_json, measured_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("m", "wcx", "org/model", 8000, "[]", "2026-01-01T00:00:00+00:00"))
+    old_con.commit()
+    old_con.close()
+
+    # Now call connect() — it must run the migration
+    con = db.connect()
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(characterizations)")}
+    assert "decode_context" in cols
+
+    # Old row must still be readable and decode_context should be None
+    row = db.get_characterization(con, "m", "wcx", "org/model")
+    assert row is not None
+    assert row["safe_context"] == 8000
+    assert row["decode_context"] is None

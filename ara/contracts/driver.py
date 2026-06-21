@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from ara import catalog
 from ara.contracts import ramp, worker
 
 
@@ -62,5 +63,15 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     res = ramp.run(measure_fn, rungs, est["base_gb"], est["slope_gb_per_k"],
                    est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"],
                    max_context=est["max_context"])
+    decode_context = None
+    if res.fit is not None:
+        meta = catalog.describe(model) or {}
+        kv_slope = ramp.analytic_kv_slope_gb_per_k(
+            meta.get("n_layers"), meta.get("kv_heads"), meta.get("head_dim"))
+        if kv_slope:
+            decode_context, _ = ramp.decode_ceiling(
+                res.fit.intercept_gb, kv_slope, est["budget_gb"],
+                est["ref_baseline_gb"], est["max_context"])
     return {"model": model, "safe_context": res.safe_context, "binding": res.binding,
+            "decode_context": decode_context,
             "points": [{"context": c, "mem_gb": m} for c, m in res.points]}

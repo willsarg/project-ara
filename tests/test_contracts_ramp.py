@@ -260,3 +260,75 @@ def test_run_none_when_fewer_than_two_points():
     res = ramp.run(lambda c: FakeM(refused=True), schedule=[2000, 4000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
     assert res.points == [] and res.safe_context is None and res.fit is None
+
+
+# --------------------------------------------------------------------------- #
+# analytic_kv_slope_gb_per_k — decode slope from model metadata
+# --------------------------------------------------------------------------- #
+def test_analytic_kv_slope_known_numbers():
+    # 2 * 32 layers * 8 kv_heads * 128 head_dim * 2 bytes / 1e9 * 1000 = ~0.13107 GB/1k
+    slope = ramp.analytic_kv_slope_gb_per_k(32, 8, 128)
+    expected = 2 * 32 * 8 * 128 * 2 / 1e9 * 1000
+    assert slope == pytest.approx(expected)
+
+
+def test_analytic_kv_slope_none_when_n_layers_is_none():
+    assert ramp.analytic_kv_slope_gb_per_k(None, 8, 128) is None
+
+
+def test_analytic_kv_slope_none_when_kv_heads_is_none():
+    assert ramp.analytic_kv_slope_gb_per_k(32, None, 128) is None
+
+
+def test_analytic_kv_slope_none_when_head_dim_is_none():
+    assert ramp.analytic_kv_slope_gb_per_k(32, 8, None) is None
+
+
+def test_analytic_kv_slope_none_when_n_layers_is_zero():
+    assert ramp.analytic_kv_slope_gb_per_k(0, 8, 128) is None
+
+
+def test_analytic_kv_slope_none_when_kv_heads_is_zero():
+    assert ramp.analytic_kv_slope_gb_per_k(32, 0, 128) is None
+
+
+def test_analytic_kv_slope_none_when_head_dim_is_zero():
+    assert ramp.analytic_kv_slope_gb_per_k(32, 8, 0) is None
+
+
+# --------------------------------------------------------------------------- #
+# decode_ceiling — analytic decode-safe context ceiling
+# --------------------------------------------------------------------------- #
+def test_decode_ceiling_larger_than_prefill_for_shallower_kv_slope():
+    # Prefill: intercept=5, slope=2.0 → safe_ceiling budget=36 → (36-5)/2 = 15.5k
+    # Decode: intercept=5, kv_slope=0.5 → (36-5)/0.5 = 62k, much bigger
+    prefill_f = ramp.Fit(intercept_gb=5.0, slope_gb_per_k=2.0, r2=1.0, n_points=3)
+    prefill_c = ramp.safe_ceiling(prefill_f, budget_gb=36.0)
+    kv_slope = 0.5
+    decode_c, binding = ramp.decode_ceiling(5.0, kv_slope, 36.0)
+    assert decode_c is not None and prefill_c is not None
+    assert decode_c > prefill_c
+    assert binding == "memory"
+
+
+def test_decode_ceiling_none_when_kv_slope_zero():
+    c, binding = ramp.decode_ceiling(5.0, 0.0, 36.0)
+    assert c is None and binding == "memory"
+
+
+def test_decode_ceiling_none_when_kv_slope_negative():
+    c, binding = ramp.decode_ceiling(5.0, -0.5, 36.0)
+    assert c is None and binding == "memory"
+
+
+def test_decode_ceiling_capped_at_max_context():
+    # kv_slope so small the analytic ceiling would far exceed 20k
+    c, binding = ramp.decode_ceiling(5.0, 0.01, 36.0, max_context=20000)
+    assert c == 20000 and binding == "context_window"
+
+
+def test_decode_ceiling_memory_bound_when_below_max_context():
+    # kv_slope steep enough that decode ceiling is below max_context
+    c, binding = ramp.decode_ceiling(5.0, 5.0, 36.0, max_context=100000)
+    assert c is not None and c < 100000
+    assert binding == "memory"

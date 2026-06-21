@@ -14,7 +14,14 @@ from __future__ import annotations
 
 import pytest
 
+from ara import catalog
 from ara.contracts import driver
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Keep the suite offline: characterize now calls catalog.describe; stub it out."""
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
 
 BUDGET = 15.0          # safe budget (GB)
 REF = 2.0              # live OS baseline (GB), added back at solve time

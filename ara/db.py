@@ -41,12 +41,13 @@ CREATE TABLE IF NOT EXISTS models (
 );
 
 CREATE TABLE IF NOT EXISTS characterizations (
-    machine_key  TEXT NOT NULL,
-    engine       TEXT NOT NULL,
-    model_id     TEXT NOT NULL,
-    safe_context INTEGER,
-    points_json  TEXT,
-    measured_at  TEXT,
+    machine_key   TEXT NOT NULL,
+    engine        TEXT NOT NULL,
+    model_id      TEXT NOT NULL,
+    safe_context  INTEGER,
+    decode_context INTEGER,
+    points_json   TEXT,
+    measured_at   TEXT,
     PRIMARY KEY (machine_key, engine, model_id)
 );
 """
@@ -68,6 +69,9 @@ def connect() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.executescript(SCHEMA)
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(characterizations)")}
+    if "decode_context" not in cols:
+        con.execute("ALTER TABLE characterizations ADD COLUMN decode_context INTEGER")
     return con
 
 
@@ -119,14 +123,16 @@ def list_models(con: sqlite3.Connection) -> list[dict]:
 # --- characterizations (fitted ceilings, per machine + engine + model) ---
 def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
                           model_id: str, *, safe_context: int | None,
-                          points: list, measured_at: str | None = None) -> None:
+                          points: list, measured_at: str | None = None,
+                          decode_context: int | None = None) -> None:
     con.execute(
         "INSERT INTO characterizations "
-        "(machine_key, engine, model_id, safe_context, points_json, measured_at) "
-        "VALUES (?,?,?,?,?,?) ON CONFLICT(machine_key, engine, model_id) DO UPDATE SET "
-        "safe_context=excluded.safe_context, points_json=excluded.points_json, "
-        "measured_at=excluded.measured_at",
-        (machine_key, engine, model_id, safe_context, json.dumps(points), measured_at or _now()))
+        "(machine_key, engine, model_id, safe_context, decode_context, points_json, measured_at) "
+        "VALUES (?,?,?,?,?,?,?) ON CONFLICT(machine_key, engine, model_id) DO UPDATE SET "
+        "safe_context=excluded.safe_context, decode_context=excluded.decode_context, "
+        "points_json=excluded.points_json, measured_at=excluded.measured_at",
+        (machine_key, engine, model_id, safe_context, decode_context,
+         json.dumps(points), measured_at or _now()))
     con.commit()
 
 

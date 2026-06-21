@@ -9,7 +9,14 @@ from __future__ import annotations
 
 import pytest
 
+from ara import catalog
 from ara.backends import apple, cpu, cuda
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Keep the suite offline: characterize now calls catalog.describe; stub it out."""
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
 
 # The interface every ramp-class backend must expose.
 REQUIRED = ["characterize", "safe_limits", "calibrate", "calibration_model_cached",

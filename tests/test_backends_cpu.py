@@ -7,7 +7,16 @@ mocked engine env — no llama.cpp, no model download — exactly as the apple t
 """
 from __future__ import annotations
 
+import pytest
+
+from ara import catalog
 from ara.backends import cpu
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Keep the suite offline: characterize now calls catalog.describe; stub it out."""
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
 
 
 def test_worker_is_a_builtin_script_under_ara(tmp_path=None):
