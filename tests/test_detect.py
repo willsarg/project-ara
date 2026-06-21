@@ -6,6 +6,7 @@ import sys
 import types
 
 import ara.detect as detect
+import ara.hardware as hardware
 from ara.detect import (
     Accelerator,
     Machine,
@@ -13,6 +14,44 @@ from ara.detect import (
     accelerator,
     backend_name,
 )
+from ara.hardware import (
+    BoardInfo,
+    CpuInfo,
+    Drive,
+    Hardware,
+    MemoryInfo,
+    MemoryModule,
+    StorageInfo,
+)
+
+
+def _make_hw(
+    cpu: CpuInfo | None = None,
+    memory: MemoryInfo | None = None,
+    storage: StorageInfo | None = None,
+    board: BoardInfo | None = None,
+) -> Hardware:
+    """Build a Hardware fixture with sensible defaults for unit tests."""
+    return Hardware(
+        cpu=cpu or CpuInfo(
+            brand="Test CPU Brand",
+            physical=6,
+            logical=12,
+        ),
+        memory=memory or MemoryInfo(
+            total_gb=16.0,
+            available_gb=8.0,
+            swap_gb=2.0,
+        ),
+        storage=storage or StorageInfo(
+            free_gb=100.0,
+            drives=[Drive(model="Test SSD", media="nvme-ssd", size_gb=512.0)],
+        ),
+        board=board or BoardInfo(
+            board_vendor="TestVendor",
+            board_model="TestBoard",
+        ),
+    )
 
 
 def _raise(exc=RuntimeError("boom")):
@@ -87,6 +126,14 @@ def test_chip_name_falls_back_to_machine(set_platform, monkeypatch):
     set_platform("Linux", "x86_64")
     monkeypatch.setattr(detect.platform, "processor", lambda: "")
     assert detect.chip_name() == "x86_64"
+
+
+def test_chip_name_darwin_no_brand_falls_back(set_platform, monkeypatch):
+    # Darwin but sysctl returns nothing (e.g. very old kernel) → fall through to processor().
+    set_platform("Darwin", "x86_64")
+    monkeypatch.setattr(detect, "_sysctl", lambda k: None)
+    monkeypatch.setattr(detect.platform, "processor", lambda: "i386")
+    assert detect.chip_name() == "i386"
 
 
 def test_os_version_darwin(set_platform):
@@ -544,6 +591,13 @@ def test_profile_cpu_fallback_engine_ready_when_env_present(set_platform, run_st
 # --------------------------------------------------------------------------- #
 # defensive fallbacks — system reads that return None/empty when the OS throws
 # --------------------------------------------------------------------------- #
+def test_memory_gb_returns_totals(monkeypatch):
+    monkeypatch.setattr(detect.psutil, "virtual_memory",
+                        lambda: types.SimpleNamespace(total=detect.GB * 16, available=detect.GB * 8))
+    total, avail = detect._memory_gb()
+    assert total == 16.0 and avail == 8.0
+
+
 def test_memory_gb_none_on_error(monkeypatch):
     monkeypatch.setattr(detect.psutil, "virtual_memory", _raise())
     assert detect._memory_gb() == (None, None)
@@ -693,3 +747,108 @@ def test_hf_cli_present_without_parseable_version(monkeypatch, run_stub):
 def test_hf_cli_absent(monkeypatch):
     monkeypatch.setattr(detect, "_user_which", lambda cmd: None)
     assert detect._hf_cli() == (False, None)
+
+
+# --------------------------------------------------------------------------- #
+# Task 6: Machine gains cpu/memory/storage/board; profile() embeds hardware.probe()
+# --------------------------------------------------------------------------- #
+
+def test_profile_embeds_hardware_structures(set_platform, run_stub, fake_home, monkeypatch):
+    """profile() must call hardware.probe() and embed all four sub-structures."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
+
+    hw = _make_hw()
+    monkeypatch.setattr(hardware, "probe", lambda: hw)
+
+    m = detect.profile()
+    assert isinstance(m, Machine)
+    assert m.cpu is hw.cpu
+    assert m.memory is hw.memory
+    assert m.storage is hw.storage
+    assert m.board is hw.board
+
+
+def test_profile_chip_uses_cpu_brand_when_available(set_platform, run_stub, fake_home, monkeypatch):
+    """chip field must be cpu.brand when it is present (not the sysctl fallback)."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
+
+    hw = _make_hw(cpu=CpuInfo(brand="AMD Ryzen 9 5900X", physical=12, logical=24))
+    monkeypatch.setattr(hardware, "probe", lambda: hw)
+
+    m = detect.profile()
+    assert m.chip == "AMD Ryzen 9 5900X"
+
+
+def test_profile_chip_falls_back_when_brand_none(set_platform, run_stub, fake_home, monkeypatch):
+    """chip field must fall back to chip_name() when cpu.brand is None."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
+
+    # run_stub returns "Apple M4 Pro" for the sysctl brand string fallback
+    run_stub.add("machdep.cpu.brand_string", "Apple M4 Pro\n")
+    hw = _make_hw(cpu=CpuInfo(brand=None, physical=12, logical=12))
+    monkeypatch.setattr(hardware, "probe", lambda: hw)
+
+    m = detect.profile()
+    assert m.chip == "Apple M4 Pro"
+
+
+def test_profile_flat_fields_sourced_from_hw_structures(set_platform, run_stub, fake_home, monkeypatch):
+    """Flat back-compat fields must be sourced from the hardware structures (single truth)."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
+
+    hw = _make_hw(
+        cpu=CpuInfo(brand="Test CPU", physical=8, logical=16),
+        memory=MemoryInfo(total_gb=32.0, available_gb=20.0, swap_gb=4.0),
+        storage=StorageInfo(free_gb=250.0),
+    )
+    monkeypatch.setattr(hardware, "probe", lambda: hw)
+
+    m = detect.profile()
+    assert m.cpu_physical == 8
+    assert m.cpu_logical == 16
+    assert m.ram_total_gb == 32.0
+    assert m.ram_available_gb == 20.0
+    assert m.swap_gb == 4.0
+    assert m.disk_free_gb == 250.0
+
+
+def test_profile_flat_fields_none_when_hw_fields_none(set_platform, run_stub, fake_home, monkeypatch):
+    """Flat fields that come from hw structures must be None when hw fields are None."""
+    set_platform("Linux", "x86_64")
+    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
+    monkeypatch.setattr(detect._engines, "engine_env", detect._engines.engine_env)
+    monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: False)
+
+    hw = _make_hw(
+        cpu=CpuInfo(brand=None, physical=None, logical=None),
+        memory=MemoryInfo(total_gb=None, available_gb=None, swap_gb=None),
+        storage=StorageInfo(free_gb=None),
+    )
+    monkeypatch.setattr(hardware, "probe", lambda: hw)
+
+    m = detect.profile()
+    assert m.cpu_physical is None
+    assert m.cpu_logical is None
+    assert m.ram_total_gb is None
+    assert m.ram_available_gb is None
+    assert m.swap_gb is None
+    assert m.disk_free_gb is None
+
+
+def test_import_no_circular():
+    """Both modules must be importable together without a circular import error."""
+    import importlib
+    importlib.import_module("ara.detect")
+    importlib.import_module("ara.hardware")

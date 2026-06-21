@@ -20,7 +20,7 @@ from pathlib import Path
 
 import psutil
 
-from ara import apps as _apps, engines as _engines, versions as _versions
+from ara import apps as _apps, engines as _engines, hardware as _hardware, versions as _versions
 
 GB = 1024 ** 3
 
@@ -513,6 +513,12 @@ class Machine:
     swap_gb: float | None
     accel: Accelerator
     disk_free_gb: float | None
+    # Detailed hardware structures (Task 6).  All four are always present; fields within
+    # are best-effort / may be None when the OS probe fails or the field doesn't apply.
+    cpu: _hardware.CpuInfo = field(default_factory=_hardware.CpuInfo)
+    memory: _hardware.MemoryInfo = field(default_factory=_hardware.MemoryInfo)
+    storage: _hardware.StorageInfo = field(default_factory=_hardware.StorageInfo)
+    board: _hardware.BoardInfo = field(default_factory=_hardware.BoardInfo)
     runtimes: list[Runtime] = field(default_factory=list)
     framework_python: str | None = None  # interpreter the FRAMEWORKS group was probed in
     model_stores: list[ModelStore] = field(default_factory=list)
@@ -534,13 +540,17 @@ class Machine:
 
 def profile() -> Machine:
     """Observe the host and choose a backend. Read-only — no engine import."""
-    chip = chip_name()
+    # Probe all hardware subsystems once (fail-soft — never raises).
+    hw = _hardware.probe()
+
+    # chip: prefer the detailed cpu.brand (e.g. "AMD Ryzen 9 5900X") when available;
+    # fall back to the legacy chip_name() (sysctl / platform.processor() / platform.machine()).
+    chip = hw.cpu.brand or chip_name()
+
     backend = backend_name()
     key = _engines.for_backend(backend)
     engine = _engines.ENGINES[key]["package"] if key else backend
     engine_ready = key is not None and _engines.is_installed(key)
-    total, available = _memory_gb()
-    physical, logical = _cpu_counts()
     accel = accelerator(chip)
     user_py = _user_python()
     hf_cli, hf_cli_version = _hf_cli()
@@ -549,15 +559,21 @@ def profile() -> Machine:
         os_version=os_version(),
         chip=chip,
         arch=platform.machine() or "unknown",
-        cpu_physical=physical,
-        cpu_logical=logical,
+        # Flat back-compat fields sourced from hw structures (single source of truth).
+        cpu_physical=hw.cpu.physical,
+        cpu_logical=hw.cpu.logical,
         cpu_features=_cpu_features(),
         python_version=_python_version(user_py),
-        ram_total_gb=total,
-        ram_available_gb=available,
-        swap_gb=_swap_gb(),
+        ram_total_gb=hw.memory.total_gb,
+        ram_available_gb=hw.memory.available_gb,
+        swap_gb=hw.memory.swap_gb,
         accel=accel,
-        disk_free_gb=_disk_free_gb(),
+        disk_free_gb=hw.storage.free_gb,
+        # Detailed hardware structures embedded directly.
+        cpu=hw.cpu,
+        memory=hw.memory,
+        storage=hw.storage,
+        board=hw.board,
         runtimes=runtimes(accel.kind, user_py),
         framework_python=user_py,
         model_stores=model_stores(),
