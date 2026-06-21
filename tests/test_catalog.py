@@ -67,7 +67,199 @@ def test_describe_handles_missing_dims(monkeypatch):
 
 def test_describe_none_when_config_unavailable(monkeypatch):
     monkeypatch.setattr(catalog, "_read_config", lambda m: None)
+    monkeypatch.setattr(catalog, "_describe_gguf", lambda m: None)
     assert catalog.describe("m") is None
+
+
+# ---------------------------------------------------------------------------
+# GGUF helpers
+# ---------------------------------------------------------------------------
+
+class _F:
+    """Minimal ReaderField fake."""
+    def __init__(self, v):
+        self.v = v
+
+    def contents(self):
+        return self.v
+
+
+def _gguf_fields_fake(include_kv=True):
+    d = {
+        "general.architecture": _F("llama"),
+        "llama.block_count": _F(30),
+        "llama.attention.head_count": _F(9),
+        "llama.embedding_length": _F(576),
+        "llama.context_length": _F(8192),
+    }
+    if include_kv:
+        d["llama.attention.head_count_kv"] = _F(3)
+    return d
+
+
+# describe() dispatch tests
+
+def test_describe_dispatches_to_gguf_when_no_config(monkeypatch):
+    gguf_meta = {"modality": "text", "n_layers": 30, "hidden_size": 576,
+                 "kv_heads": 3, "head_dim": 64, "max_context": 8192, "quant": "Q4_K_M"}
+    monkeypatch.setattr(catalog, "_read_config", lambda m: None)
+    monkeypatch.setattr(catalog, "_describe_gguf", lambda m: gguf_meta)
+    assert catalog.describe("org/repo-Q4_K_M.gguf") == gguf_meta
+
+
+def test_describe_transformers_path_unchanged(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config", lambda m: {
+        "num_hidden_layers": 30, "hidden_size": 576, "num_attention_heads": 9,
+        "num_key_value_heads": 3, "max_position_embeddings": 8192})
+    d = catalog.describe("smol")
+    assert d["n_layers"] == 30 and d["modality"] == "text"
+
+
+# _describe_gguf mapping
+
+def test_describe_gguf_full_mapping(monkeypatch):
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: "org/repo-Q4_K_M.gguf")
+    monkeypatch.setattr(catalog, "_gguf_fields", lambda p: _gguf_fields_fake(include_kv=True))
+    d = catalog._describe_gguf("org/repo")
+    assert d["modality"] == "text"
+    assert d["n_layers"] == 30
+    assert d["hidden_size"] == 576
+    assert d["kv_heads"] == 3
+    assert d["head_dim"] == 64        # 576 // 9
+    assert d["max_context"] == 8192
+    assert d["quant"] == "Q4_K_M"
+
+
+def test_describe_gguf_kv_heads_falls_back_to_head_count(monkeypatch):
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: "org/repo-Q4_K_M.gguf")
+    monkeypatch.setattr(catalog, "_gguf_fields", lambda p: _gguf_fields_fake(include_kv=False))
+    d = catalog._describe_gguf("org/repo")
+    assert d["kv_heads"] == 9
+
+
+def test_describe_gguf_none_when_not_cached(monkeypatch):
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: None)
+    assert catalog._describe_gguf("org/repo") is None
+
+
+def test_describe_gguf_none_when_arch_missing(monkeypatch):
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: "some.gguf")
+    monkeypatch.setattr(catalog, "_gguf_fields", lambda p: {})
+    assert catalog._describe_gguf("org/repo") is None
+
+
+def test_describe_gguf_none_on_reader_exception(monkeypatch):
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: "some.gguf")
+    def boom(p):
+        raise RuntimeError("bad file")
+    monkeypatch.setattr(catalog, "_gguf_fields", boom)
+    assert catalog._describe_gguf("org/repo") is None
+
+
+# _gguf_fields wrapper
+
+def test_gguf_fields_wrapper(monkeypatch):
+    fake_fields = {"general.architecture": _F("llama")}
+    class FakeReader:
+        def __init__(self, path):
+            self.fields = fake_fields
+    monkeypatch.setattr(catalog.gguf, "GGUFReader", FakeReader)
+    assert catalog._gguf_fields("some/path.gguf") is fake_fields
+
+
+# _cached_gguf_path
+
+import types as _types
+
+
+def _make_cache(repos):
+    return _types.SimpleNamespace(repos=repos)
+
+
+def _make_repo(repo_id, repo_type, files):
+    rev = _types.SimpleNamespace(files=files)
+    return _types.SimpleNamespace(repo_id=repo_id, repo_type=repo_type, revisions=[rev])
+
+
+def _make_file(name, path, size):
+    return _types.SimpleNamespace(file_name=name, file_path=path, size_on_disk=size)
+
+
+def test_cached_gguf_path_returns_smallest(monkeypatch):
+    big = _make_file("big.gguf", "/cache/big.gguf", 2000)
+    small = _make_file("small.gguf", "/cache/small.gguf", 500)
+    repo = _make_repo("org/myrepo", "model", [big, small])
+    cache = _make_cache([repo])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: cache)
+    result = catalog._cached_gguf_path("org/myrepo")
+    assert result == "/cache/small.gguf"
+
+
+def test_cached_gguf_path_none_when_repo_not_present(monkeypatch):
+    repo = _make_repo("org/other", "model", [_make_file("m.gguf", "/c/m.gguf", 100)])
+    cache = _make_cache([repo])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: cache)
+    assert catalog._cached_gguf_path("org/myrepo") is None
+
+
+def test_cached_gguf_path_none_when_no_gguf_files(monkeypatch):
+    # Repo found but has no .gguf files
+    non_gguf = _make_file("tokenizer.json", "/c/tokenizer.json", 100)
+    repo = _make_repo("org/myrepo", "model", [non_gguf])
+    cache = _make_cache([repo])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: cache)
+    assert catalog._cached_gguf_path("org/myrepo") is None
+
+
+def test_cached_gguf_path_none_on_scan_error(monkeypatch):
+    def boom():
+        raise RuntimeError("no cache")
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", boom)
+    assert catalog._cached_gguf_path("org/myrepo") is None
+
+
+# _quant_from_filename
+
+def test_quant_from_filename_iq():
+    assert catalog._quant_from_filename("a-IQ3_XS.gguf") == "IQ3_XS"
+
+
+def test_quant_from_filename_q():
+    assert catalog._quant_from_filename("a.Q4_K_M.gguf") == "Q4_K_M"
+
+
+def test_quant_from_filename_f16():
+    assert catalog._quant_from_filename("a-F16.gguf") == "F16"
+
+
+def test_quant_from_filename_none():
+    assert catalog._quant_from_filename("a-plain.gguf") is None
+
+
+# ---------------------------------------------------------------------------
+# Integration test (real local file, skipped if not present)
+# ---------------------------------------------------------------------------
+
+import os as _os
+import pytest
+
+
+LOCAL_GGUF_DIR = _os.path.expanduser(
+    "~/.cache/huggingface/hub/models--bartowski--SmolLM2-135M-Instruct-GGUF"
+)
+
+
+@pytest.mark.integration
+def test_describe_real_gguf():
+    if not _os.path.isdir(LOCAL_GGUF_DIR):
+        pytest.skip("SmolLM2-135M-Instruct-GGUF not in local HF cache")
+    d = catalog.describe("bartowski/SmolLM2-135M-Instruct-GGUF")
+    assert d is not None, "describe returned None for a cached GGUF repo"
+    assert d["modality"] == "text"
+    assert d["n_layers"] == 30
+    assert d["max_context"] == 8192
+    assert d["kv_heads"] == 3
+    assert d["head_dim"] == 64
 
 
 def test_remember_persists_metadata(store, monkeypatch):
