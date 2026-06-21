@@ -1572,13 +1572,14 @@ def test_gpu_info_unknown_os_returns_empty(monkeypatch):
     assert hw.gpu_info() == []
 
 
-def test_drm_gpu_amd_apu_parsed():
+def test_drm_gpu_amd_returns_none_integrated():
+    """_drm_gpu always returns integrated=None for AMD; the APU heuristic lives in _gpus_linux."""
     from ara import hardware as hw
     g = hw._drm_gpu("0x1002", "0x15bf", 4294967296, "Phoenix1", cpu_vendor="AuthenticAMD")
     assert g.vendor == "amd"
     assert g.name == "Phoenix1"            # lspci name when available
     assert g.vram_gb == 4.3               # 4294967296 / 1e9 rounded (decimal GB)
-    assert g.integrated is True           # AMD GPU + AMD CPU ⇒ APU
+    assert g.integrated is None           # resolved at list level in _gpus_linux, not here
     assert g.compute_runtime is None      # runtime filled in Task 3, not here
 
 
@@ -1618,6 +1619,43 @@ def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
     monkeypatch.setattr(hw, "_lspci_names", lambda: {})
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo())
     assert hw._gpus_linux() == []
+
+
+def test_gpus_linux_sole_amd_gpu_amd_cpu_is_integrated(tmp_path, monkeypatch):
+    """Sole AMD GPU + AMD CPU → integrated=True (APU heuristic in _gpus_linux)."""
+    from ara import hardware as hw
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    (dev / "mem_info_vram_total").write_text("4294967296\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
+    monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1
+    assert gpus[0].vendor == "amd"
+    assert gpus[0].integrated is True   # sole AMD GPU + AMD CPU → APU
+
+
+def test_gpus_linux_two_gpus_amd_integrated_is_none(tmp_path, monkeypatch):
+    """When there are two GPUs (e.g. AMD discrete + another), AMD integrated stays None.
+
+    This prevents mislabelling a discrete AMD GPU as shared-VRAM in an AMD-CPU box.
+    """
+    from ara import hardware as hw
+    for card, vendor, device in [("card0", "0x1002", "0x15bf"), ("card1", "0x10de", "0x2484")]:
+        dev = tmp_path / card / "device"
+        dev.mkdir(parents=True)
+        (dev / "vendor").write_text(f"{vendor}\n")
+        (dev / "device").write_text(f"{device}\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 2
+    amd_gpu = next(g for g in gpus if g.vendor == "amd")
+    assert amd_gpu.integrated is None   # multiple GPUs → honest unknown, not mislabelled
 
 
 def test_video_controller_gpu_nvidia():
@@ -1816,23 +1854,72 @@ def test_lspci_names_returns_empty_when_lspci_absent(monkeypatch):
     assert hw._lspci_names() == {}
 
 
-def test_lspci_names_parses_amd_device(monkeypatch):
+def test_lspci_names_parses_split_ids_real_rog_ally(monkeypatch):
+    """Real ROG Ally lspci -mm -nn line: split IDs, non-empty subsystem name.
+
+    The subsystem name ('Phoenix1 [17f3]') must NOT be selected; only the device field
+    immediately after the vendor field ('Phoenix1 [15bf]') is the correct source.
+    """
     from ara import hardware as hw
-    # Simulate `lspci -mm -nn` output with an AMD GPU line
     lspci_out = (
-        '"0300" "VGA compatible controller [0300]" '
-        '"Advanced Micro Devices, Inc. [AMD/ATI] [1002:15bf]" '
-        '"Phoenix1" "" ""\n'
+        '09:00.0 "VGA compatible controller [0300]" '
+        '"Advanced Micro Devices, Inc. [AMD/ATI] [1002]" '
+        '"Phoenix1 [15bf]" '
+        '-r04 -p00 '
+        '"ASUSTeK Computer Inc. [1043]" '
+        '"Phoenix1 [17f3]"\n'
     )
     monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
     names = hw._lspci_names()
     assert names.get("0x15bf") == "Phoenix1"
+    # Confirm the subsystem name ('Phoenix1 [17f3]') was NOT selected
+    assert names.get("0x17f3") is None
+
+
+def test_lspci_names_parses_combined_ids_nvidia(monkeypatch):
+    """Real discrete NVIDIA lspci -mm -nn line: combined IDs, inner bracket preserved in name.
+
+    The inner '[GeForce RTX 3070]' bracket must NOT be stripped — only the final device-id
+    bracket '[2484]' is removed. Expected name: 'GA104 [GeForce RTX 3070]'.
+    """
+    from ara import hardware as hw
+    lspci_out = (
+        '01:00.0 "VGA compatible controller [0300]" '
+        '"NVIDIA Corporation [10de]" '
+        '"GA104 [GeForce RTX 3070] [2484]" '
+        '-ra1 '
+        '"ASUSTeK Computer Inc. [1043]" '
+        '"Device [8763]"\n'
+    )
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
+    names = hw._lspci_names()
+    assert names.get("0x2484") == "GA104 [GeForce RTX 3070]"
 
 
 def test_lspci_names_skips_lines_without_match(monkeypatch):
     from ara import hardware as hw
     # A line that has no PCI vendor bracket we recognise → skipped cleanly
     lspci_out = '"0300" "Some other device" "Vendor [dead:beef]" "TheName" "" ""\n'
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
+    names = hw._lspci_names()
+    assert names == {}
+
+
+def test_lspci_names_skips_device_field_without_id_bracket(monkeypatch):
+    """Device field immediately after vendor field has no [xxxx] bracket → line skipped."""
+    from ara import hardware as hw
+    # Vendor field has [1002] but device field has no id bracket → no match
+    lspci_out = '"0300" "VGA [0300]" "AMD Corp [1002]" "NoIdBracketHere" "" ""\n'
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
+    names = hw._lspci_names()
+    assert names == {}
+
+
+def test_lspci_names_skips_empty_name_after_bracket_strip(monkeypatch):
+    """Device field is just '[xxxx]' with no name text before it → name is empty, line skipped."""
+    from ara import hardware as hw
+    # Device field only has a bracket id, no name text before it
+    lspci_out = '"0300" "VGA [0300]" "AMD Corp [1002]" "[15bf]" "" ""\n'
     monkeypatch.setattr(hw, "_run", lambda *a, **k: lspci_out)
     names = hw._lspci_names()
     assert names == {}

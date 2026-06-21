@@ -883,20 +883,43 @@ def _read_text(path: str) -> str | None:
 
 
 def _lspci_names() -> dict[str, str]:
-    """Map PCI device-id (lowercased '0x....') → human name via `lspci -mm -nn`. {} if absent."""
+    """Map PCI device-id (lowercased '0x....') → human name via `lspci -mm -nn`. {} if absent.
+
+    Handles two real lspci -mm -nn output formats:
+      - Split IDs: ... "Advanced Micro Devices, Inc. [AMD/ATI] [1002]" "Phoenix1 [15bf]" ...
+      - Combined IDs: ... "NVIDIA Corporation [10de]" "GA104 [GeForce RTX 3070] [2484]" ...
+
+    Strategy: find the quoted field containing a GPU-vendor id bracket ([1002], [10de], or [8086]
+    as a standalone 4-hex bracket); the Device field is immediately after it. Strip the final
+    [xxxx] from the Device field to get the device id and the name. This is position-relative to
+    the vendor field, so it's robust to how many leading class fields lspci emits and ignores
+    subsystem fields entirely.
+    """
     out = _run(["lspci", "-mm", "-nn"])
     names: dict[str, str] = {}
     if not out:
         return names
+    _GPU_VENDOR_BRACKETS = re.compile(r"\[(?:1002|10de|8086)\]$")
+    _DEVICE_ID = re.compile(r"\[([0-9a-fA-F]{4})\]$")
     for line in out.splitlines():
-        m = re.search(
-            r"\[(?:1002|10de|8086):([0-9a-fA-F]{4})\]",
-            line,
-        )
         nm = re.findall(r'"([^"]*)"', line)
-        if m and nm:
-            dev = m.group(1)
-            names[f"0x{dev.lower()}"] = nm[-1] or (nm[-3] if len(nm) >= 3 else nm[-1])
+        # Find the index of the vendor field: quoted field ending with a standalone GPU-vendor bracket
+        vendor_idx = None
+        for i, field in enumerate(nm):
+            if _GPU_VENDOR_BRACKETS.search(field):
+                vendor_idx = i
+                break
+        if vendor_idx is None or vendor_idx + 1 >= len(nm):
+            continue
+        device_field = nm[vendor_idx + 1]
+        m = _DEVICE_ID.search(device_field)
+        if not m:
+            continue
+        device_id = m.group(1).lower()
+        # Name is the device field with the trailing [xxxx] id bracket removed and stripped
+        name = device_field[:m.start()].strip()
+        if name:
+            names[f"0x{device_id}"] = name
     return names
 
 
@@ -905,16 +928,17 @@ def _drm_gpu(vendor_raw, device_raw, vram_bytes, lspci_name, cpu_vendor):
     name = lspci_name or _GENERIC_GPU_NAME.get(vendor)
     if vendor == "intel":
         integrated: bool | None = True
-    elif vendor == "amd":
-        integrated = bool(cpu_vendor and "amd" in cpu_vendor.lower()) or None
     elif vendor == "nvidia":
         integrated = False
     else:
+        # AMD and unknown: integrated is resolved at the list level in _gpus_linux
+        # (APU-vs-discrete heuristic requires knowing the full GPU list)
         integrated = None
     return GpuInfo(vendor=vendor, name=name, vram_gb=_gb_dec(vram_bytes), integrated=integrated)
 
 
 def _gpus_linux() -> list["GpuInfo"]:
+    from dataclasses import replace
     names = _lspci_names()
     cpu_vendor = cpu_info().vendor
     gpus: list[GpuInfo] = []
@@ -927,10 +951,16 @@ def _gpus_linux() -> list["GpuInfo"]:
         vram_bytes = int(vram) if vram and vram.isdigit() else None
         gpus.append(_drm_gpu(vendor_raw, device_raw,
                              vram_bytes, names.get((device_raw or "").lower()), cpu_vendor))
+
+    # APU-vs-discrete heuristic: AMD integrated=True only when the AMD GPU is the sole GPU
+    # enumerated AND the CPU vendor is AMD (the common APU/ROG Ally case). When multiple GPUs
+    # are present (e.g. discrete AMD + iGPU or another vendor), leave AMD integrated=None
+    # (honest unknown) to avoid mislabelling a discrete card as shared-VRAM.
+    if (len(gpus) == 1 and gpus[0].vendor == "amd"
+            and cpu_vendor and "amd" in cpu_vendor.lower()):
+        gpus[0] = replace(gpus[0], integrated=True)
+
     return gpus
-
-
-_UINT32_CAP = 4294967295
 
 
 def _video_controller_gpu(row: dict) -> "GpuInfo":
