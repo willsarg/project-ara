@@ -1720,21 +1720,54 @@ def test_read_text_returns_none_on_missing_file():
 # Task 3: Compute-runtime detection (_vulkan_devices, _rocm_version, _with_runtime)
 # ---------------------------------------------------------------------------
 
+# Real vulkaninfo --summary fixture from a ROG Ally (verbatim, including space-padded fields).
 _VULKANINFO_SUMMARY = """\
 Devices:
 ========
 GPU0:
 \tapiVersion         = 1.4.318
+\tdriverVersion      = 25.2.8
+\tvendorID           = 0x1002
+\tdeviceID           = 0x15bf
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
 \tdeviceName         = AMD Ryzen Z1 Extreme (RADV PHOENIX)
+\tdriverID           = DRIVER_ID_MESA_RADV
 \tdriverName         = radv
+\tdriverInfo         = Mesa 25.2.8-0ubuntu0.24.04.2
+\tconformanceVersion = 1.4.0.0
 GPU1:
 \tapiVersion         = 1.4.318
+\tdriverVersion      = 25.2.8
+\tvendorID           = 0x10005
+\tdeviceID           = 0x0000
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_CPU
 \tdeviceName         = llvmpipe (LLVM 20.1.2, 256 bits)
+\tdriverID           = DRIVER_ID_MESA_LLVMPIPE
 \tdriverName         = llvmpipe
+\tdriverInfo         = Mesa 25.2.8-0ubuntu0.24.04.2 (LLVM 20.1.2)
+\tconformanceVersion = 1.3.1.1
+"""
+
+# Single-GPU fixture (no llvmpipe block) — the flush-on-apiVersion bug made this return [].
+_VULKANINFO_SUMMARY_SINGLE = """\
+Devices:
+========
+GPU0:
+\tapiVersion         = 1.4.318
+\tdriverVersion      = 25.2.8
+\tvendorID           = 0x1002
+\tdeviceID           = 0x15bf
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdeviceName         = AMD Ryzen Z1 Extreme (RADV PHOENIX)
+\tdriverID           = DRIVER_ID_MESA_RADV
+\tdriverName         = radv
+\tdriverInfo         = Mesa 25.2.8-0ubuntu0.24.04.2
+\tconformanceVersion = 1.4.0.0
 """
 
 
 def test_vulkan_devices_parsed_filters_llvmpipe(monkeypatch):
+    """Real multi-GPU fixture: llvmpipe filtered by deviceType _CPU; one AMD device returned."""
     from ara import hardware as hw
     monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
                         if "--summary" in cmd else "cooperativeMatrix = true\n")
@@ -1743,6 +1776,41 @@ def test_vulkan_devices_parsed_filters_llvmpipe(monkeypatch):
     assert devs[0]["vendor"] == "amd"
     assert devs[0]["api"] == "1.4.318" and devs[0]["driver"] == "radv"
     assert devs[0]["coopmat"] is True
+
+
+def test_vulkan_devices_coopmat_space_padded(monkeypatch):
+    """Real vulkaninfo pads the value with spaces: 'cooperativeMatrix                   = true'.
+    The old substring 'cooperativeMatrix = true' never matched → always False on real hardware."""
+    from ara import hardware as hw
+    padded_coop = "\tcooperativeMatrix                   = true\n"
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
+                        if "--summary" in cmd else padded_coop)
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1
+    assert devs[0]["coopmat"] is True
+
+
+def test_vulkan_devices_coopmat_absent(monkeypatch):
+    """No cooperativeMatrix line → coopmat is False."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
+                        if "--summary" in cmd else "some other output\n")
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1
+    assert devs[0]["coopmat"] is False
+
+
+def test_vulkan_devices_single_gpu_no_llvmpipe(monkeypatch):
+    """Single GPU with no trailing llvmpipe block — the flush-on-apiVersion bug dropped this.
+    Must return exactly ONE device (the regression case)."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY_SINGLE
+                        if "--summary" in cmd else "")
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1
+    assert devs[0]["vendor"] == "amd"
+    assert devs[0]["api"] == "1.4.318"
+    assert devs[0]["driver"] == "radv"
 
 
 def test_with_runtime_amd_vulkan_usable(monkeypatch):
@@ -1858,3 +1926,22 @@ def test_vulkan_devices_no_coopmat(monkeypatch):
     devs = hw._vulkan_devices()
     assert len(devs) == 1
     assert devs[0]["coopmat"] is False
+
+
+def test_vulkan_devices_block_without_device_name_skipped(monkeypatch):
+    """A GPU block that has apiVersion + driverName but no deviceName is silently skipped
+    (covers the 'if not name: return' branch in _flush)."""
+    from ara import hardware as hw
+    # A summary with one block that has no deviceName line at all.
+    summary_no_name = """\
+Devices:
+========
+GPU0:
+\tapiVersion         = 1.4.318
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdriverName         = radv
+"""
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: summary_no_name
+                        if "--summary" in cmd else "")
+    devs = hw._vulkan_devices()
+    assert devs == []

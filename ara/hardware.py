@@ -939,23 +939,45 @@ def _vulkan_devices() -> list[dict]:
     if not out:
         return []
     coop_out = _run(["vulkaninfo"]) or ""
-    coopmat = "cooperativeMatrix = true" in coop_out
+    coopmat = re.search(r"cooperativeMatrix\s*=\s*true", coop_out) is not None
     devices: list[dict] = []
     cur: dict = {}
+
+    def _flush(block: dict) -> None:
+        """Append block to devices if it is a real GPU (not a CPU/software device)."""
+        if not block:
+            return
+        device_type = block.get("type", "")
+        driver = block.get("driver", "")
+        name = block.get("name", "")
+        # Filter software rasterizers: deviceType contains _CPU, or driverName is llvmpipe.
+        if "_CPU" in device_type or driver == "llvmpipe" or "llvmpipe" in name.lower():
+            return
+        if not name:
+            return
+        devices.append({
+            "vendor": _gpu_vendor(name),
+            "api": block.get("api"),
+            "driver": driver,
+            "coopmat": coopmat,
+        })
+
     for line in out.splitlines():
         s = line.strip()
-        if s.startswith("deviceName"):
-            cur["name"] = s.split("=", 1)[1].strip()
-        elif s.startswith("driverName"):
-            cur["driver"] = s.split("=", 1)[1].strip()
-        elif s.startswith("apiVersion"):
-            cur["api"] = s.split("=", 1)[1].strip()
-            # apiVersion is the last field per GPU block in --summary → flush
-            name = cur.get("name", "")
-            if name and cur.get("driver") != "llvmpipe" and "llvmpipe" not in name.lower():
-                devices.append({"vendor": _gpu_vendor(name), "api": cur.get("api"),
-                                "driver": cur.get("driver"), "coopmat": coopmat})
+        # Block boundary: a line matching ^GPU\d+:$ starts a new block.
+        if re.match(r"^GPU\d+:$", s):
+            _flush(cur)
             cur = {}
+        elif s.startswith("apiVersion") and "=" in s:
+            cur["api"] = s.split("=", 1)[1].strip()
+        elif s.startswith("deviceName") and "=" in s:
+            cur["name"] = s.split("=", 1)[1].strip()
+        elif s.startswith("driverName") and "=" in s:
+            cur["driver"] = s.split("=", 1)[1].strip()
+        elif s.startswith("deviceType") and "=" in s:
+            cur["type"] = s.split("=", 1)[1].strip()
+
+    _flush(cur)  # flush final block at EOF
     return devices
 
 
