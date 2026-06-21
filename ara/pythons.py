@@ -204,6 +204,16 @@ def _user_default_real() -> str | None:
     return os.path.realpath(py) if py else None
 
 
+def _is_executable(path: str) -> bool:
+    """Can the user run *path*? On Windows os.access(path, os.X_OK) is inert (True for any existing
+    file), so gate on an executable extension (PATHEXT, ';'-delimited); on POSIX use the exec bit."""
+    if os.name == "nt":
+        exts = os.environ.get("PATHEXT", ".EXE;.BAT;.CMD;.COM")
+        allowed = {e.strip().lower() for e in exts.split(";") if e.strip()}
+        return os.path.splitext(path)[1].lower() in allowed
+    return os.access(path, os.X_OK)
+
+
 def _candidates() -> dict[str, set[str]]:
     """Map each interpreter's real path -> the set of paths that resolve to it."""
     cands: list[str] = []
@@ -223,7 +233,7 @@ def _candidates() -> dict[str, set[str]]:
         try:
             if not _PY_NAME.match(os.path.basename(c)):
                 continue  # drop python3-config, python3.13-config, python3-intel64, …
-            if not (os.path.isfile(c) or os.path.islink(c)) or not os.access(c, os.X_OK):
+            if not (os.path.isfile(c) or os.path.islink(c)) or not _is_executable(c):
                 continue
             groups.setdefault(os.path.realpath(c), set()).add(c)
         except Exception:

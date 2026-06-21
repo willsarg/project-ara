@@ -260,6 +260,25 @@ def test_known_patterns_dispatches_to_windows(monkeypatch):
     assert pats and all(p.endswith("python.exe") for p in pats)
 
 
+# --------------------------------------------------------------------------- #
+# _is_executable — Windows PATHEXT gate vs. POSIX exec-bit
+# --------------------------------------------------------------------------- #
+def test_is_executable_windows_uses_pathext(monkeypatch):
+    monkeypatch.setattr(pythons.os, "name", "nt")
+    monkeypatch.setenv("PATHEXT", ".EXE;.BAT;.CMD")
+    assert pythons._is_executable(r"C:\x\python.exe") is True
+    assert pythons._is_executable(r"C:\x\python3") is False       # no extension
+    assert pythons._is_executable(r"C:\x\python3.11") is False    # ".11" not an exec ext
+    assert pythons._is_executable(r"C:\x\run.bat") is True        # .bat is allowed
+
+
+def test_is_executable_posix_uses_access(monkeypatch):
+    monkeypatch.setattr(pythons.os, "name", "posix")
+    monkeypatch.setattr(pythons.os, "access", lambda p, mode: p == "/x/good" and mode == os.X_OK)
+    assert pythons._is_executable("/x/good") is True
+    assert pythons._is_executable("/x/bad") is False
+
+
 def test_candidates_filters_globs_and_skips(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -282,18 +301,9 @@ def test_candidates_filters_globs_and_skips(tmp_path, monkeypatch):
     monkeypatch.setattr(pythons, "_known_patterns",
                         lambda: [str(globpy), str(bindir / "python3-config")])
 
-    # On Windows os.access(p, X_OK) returns True for any existing file, so the
-    # product's executability filter is inert there.  Mock it deterministically so
-    # `noexec` is treated as non-executable regardless of host.
+    # Route through the new _is_executable helper — platform-independent mock.
     noexec_real = os.path.realpath(str(noexec))
-    real_access = os.access
-
-    def fake_access(p, mode):
-        if os.path.realpath(p) == noexec_real:
-            return False
-        return real_access(p, mode)
-
-    monkeypatch.setattr(pythons.os, "access", fake_access)
+    monkeypatch.setattr(pythons, "_is_executable", lambda p: os.path.realpath(p) != noexec_real)
 
     groups = pythons._candidates()
     reals = set(groups)
