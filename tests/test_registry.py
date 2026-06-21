@@ -44,6 +44,9 @@ def test_engine_status_apple_missing_engine(set_platform, monkeypatch):
 def test_engine_status_cpu_fallback(set_platform, monkeypatch):
     set_platform("Linux", "x86_64")
     monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: False)
+    # Suppress nvidia-smi so backend_name() resolves to cpu on any host (including a real
+    # NVIDIA box), matching the sibling test test_get_backend_falls_back_to_cpu.
+    monkeypatch.setattr("shutil.which", lambda n: None)
     installed, name = registry.engine_status()
     assert installed is False and name == "llama.cpp"   # the cpu engine's display name
 

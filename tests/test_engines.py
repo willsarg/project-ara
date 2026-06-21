@@ -198,6 +198,10 @@ def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
 
 
 def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
+    # Force the non-Windows branch deterministically on any host: on Windows the product
+    # takes the prebuilt-wheel path (already covered by test_install_targets_cpu_forces_prebuilt_wheel_on_windows),
+    # and this test exercises the plain source-build path.
+    monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
     monkeypatch.setattr(engines, "is_installed", lambda k: False)
     seen = {}
     monkeypatch.setattr(engines.engine_env, "create",

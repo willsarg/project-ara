@@ -1,6 +1,7 @@
 """detect.py — read-only host recon: backend choice, parsers, inventories."""
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -51,7 +52,11 @@ def test_backend_name_cpu_fallback_on_intel_mac(set_platform, monkeypatch):
 # _run / _sysctl
 # --------------------------------------------------------------------------- #
 def test_run_returns_stdout_for_real_command():
-    assert detect._run(["echo", "hello"]) == "hello\n"
+    # Use the running interpreter instead of `echo` — `echo` is a cmd builtin on Windows,
+    # not an exe, so subprocess can't find it there.  Write without a trailing newline to
+    # avoid CRLF translation differences; _run returns stdout unstripped.
+    result = detect._run([sys.executable, "-c", "import sys; sys.stdout.write('hello')"])
+    assert result == "hello"
 
 
 def test_run_returns_none_on_failure():
@@ -428,20 +433,27 @@ def test_profile_engine_ready_when_spec_found(set_platform, run_stub, fake_home,
 # user-python resolution (the real shell python, not ARA's venv)
 # --------------------------------------------------------------------------- #
 def test_user_python_strips_venv_bin(monkeypatch):
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
-    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
-    monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
+    # Build fixtures with host conventions so the product's os.pathsep / os.name logic
+    # strips the right dir on both POSIX and Windows.
+    sub = "Scripts" if os.name == "nt" else "bin"
+    venv = os.path.normpath("/tmp/venv")
+    vbin = os.path.join(venv, sub)
+    other = os.path.normpath("/usr/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setenv("PATH", os.pathsep.join([vbin, other]))
+    monkeypatch.setattr(detect.sys, "executable", os.path.join(vbin, "python3"))
     monkeypatch.setattr(detect.os.path, "realpath", lambda p, *a, **k: p)  # identity
     seen = {}
 
     def fake_which(name, path=None):
         seen["path"] = path
-        return "/usr/bin/python3" if name == "python3" else None
+        return os.path.join(other, "python3") if name == "python3" else None
 
     monkeypatch.setattr("shutil.which", fake_which)
-    assert detect._user_python() == "/usr/bin/python3"
-    assert "/venv/bin" not in seen["path"]   # the venv's bin was stripped
-    assert "/usr/bin" in seen["path"]
+    assert detect._user_python() == os.path.join(other, "python3")
+    parts = seen["path"].split(os.pathsep)
+    assert vbin not in parts   # the venv's bin was stripped
+    assert other in parts
 
 
 def test_venv_stripped_path_strips_windows_scripts(monkeypatch):
@@ -639,17 +651,24 @@ def test_dir_size_gb_skips_subdirectories(tmp_path):
 # user-PATH command resolution + hf CLI probe
 # --------------------------------------------------------------------------- #
 def test_user_which_strips_venv(monkeypatch):
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
-    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    # Build fixtures with host conventions so the product's os.pathsep / os.name logic
+    # strips the right dir on both POSIX and Windows.
+    sub = "Scripts" if os.name == "nt" else "bin"
+    venv = os.path.normpath("/tmp/venv")
+    vbin = os.path.join(venv, sub)
+    other = os.path.normpath("/usr/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setenv("PATH", os.pathsep.join([vbin, other]))
     seen = {}
 
     def fake_which(cmd, path=None):
         seen["path"] = path
-        return f"/usr/bin/{cmd}"
+        return os.path.join(other, cmd)
 
     monkeypatch.setattr("shutil.which", fake_which)
-    assert detect._user_which("hf") == "/usr/bin/hf"
-    assert "/venv/bin" not in seen["path"]
+    assert detect._user_which("hf") == os.path.join(other, "hf")
+    parts = seen["path"].split(os.pathsep)
+    assert vbin not in parts   # the venv's bin was stripped
 
 
 def test_user_which_none(monkeypatch):

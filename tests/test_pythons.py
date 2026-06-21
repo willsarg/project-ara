@@ -116,18 +116,27 @@ def test_is_venv_true_and_false(tmp_path):
 # default-interpreter resolution (ARA's venv stripped)
 # --------------------------------------------------------------------------- #
 def test_user_default_real_strips_venv(monkeypatch):
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
-    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    # Build fixtures with host conventions so the product's os.pathsep / os.name logic
+    # strips the right dir on both POSIX and Windows.
+    sub = "Scripts" if os.name == "nt" else "bin"
+    venv = os.path.normpath("/tmp/venv")
+    vbin = os.path.join(venv, sub)
+    other = os.path.normpath("/usr/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setenv("PATH", os.pathsep.join([vbin, other]))
     monkeypatch.setattr(pythons.os.path, "realpath", lambda p, *a, **k: p)
     seen = {}
 
     def fake_which(name, path=None):
         seen["path"] = path
-        return "/usr/bin/python3" if name == "python3" else None
+        py_name = "python" if os.name == "nt" else "python3"
+        return os.path.join(other, py_name) if name == py_name else None
 
     monkeypatch.setattr("shutil.which", fake_which)
-    assert pythons._user_default_real() == "/usr/bin/python3"
-    assert "/venv/bin" not in seen["path"]
+    py_name = "python" if os.name == "nt" else "python3"
+    assert pythons._user_default_real() == os.path.join(other, py_name)
+    parts = seen["path"].split(os.pathsep)
+    assert vbin not in parts   # the venv's bin was stripped
 
 
 def test_user_default_real_strips_windows_scripts_dir(monkeypatch):
@@ -203,11 +212,18 @@ def test_run_none_on_failure():
 
 
 def test_known_patterns_covers_standard_homes():
+    # The product returns host-appropriate patterns: Windows globs on nt, POSIX paths
+    # elsewhere.  Assert representative entries for each host to keep the test portable.
     pats = pythons._known_patterns()
-    assert "/usr/bin/python3" in pats
-    assert any("/.pyenv/" in p for p in pats)
-    assert any("/opt/homebrew/" in p for p in pats)
-    assert any(("conda" in p or "miniforge" in p) for p in pats)
+    if os.name == "nt":
+        # Windows: every pattern is a python.exe glob; check a representative one.
+        assert any(r"Programs\Python" in p and p.endswith("python.exe") for p in pats)
+        assert any("pyenv-win" in p for p in pats)
+    else:
+        assert "/usr/bin/python3" in pats
+        assert any("/.pyenv/" in p for p in pats)
+        assert any("/opt/homebrew/" in p for p in pats)
+        assert any(("conda" in p or "miniforge" in p) for p in pats)
 
 
 def test_py_name_matches_windows_exe():
@@ -265,6 +281,19 @@ def test_candidates_filters_globs_and_skips(tmp_path, monkeypatch):
     # glob returns a real interpreter AND a non-interpreter (drops at the basename re-check).
     monkeypatch.setattr(pythons, "_known_patterns",
                         lambda: [str(globpy), str(bindir / "python3-config")])
+
+    # On Windows os.access(p, X_OK) returns True for any existing file, so the
+    # product's executability filter is inert there.  Mock it deterministically so
+    # `noexec` is treated as non-executable regardless of host.
+    noexec_real = os.path.realpath(str(noexec))
+    real_access = os.access
+
+    def fake_access(p, mode):
+        if os.path.realpath(p) == noexec_real:
+            return False
+        return real_access(p, mode)
+
+    monkeypatch.setattr(pythons.os, "access", fake_access)
 
     groups = pythons._candidates()
     reals = set(groups)
