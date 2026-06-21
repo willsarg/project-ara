@@ -205,3 +205,31 @@ def test_decode_context_does_not_change_prefill_ceiling_or_binding(monkeypatch):
     assert r["safe_context"] == 16000
     assert r["binding"] == "context_window"
     assert "decode_context" in r
+
+
+def test_decode_context_computed_in_abort_bisect_regime(monkeypatch):
+    # I2: When a ramp rung aborts (e.g. at 8000), the driver bisects below the abort wall
+    # and safe_context ends up < 8000.  decode_context is still computed from the fit over
+    # the safe measured points — it is NOT suppressed by the abort.  This is intentional:
+    # a prefill abort means the prefill transient blew the budget, which is exactly when
+    # streaming (decode) headroom is largest.  The decode estimate uses the measured base +
+    # conservative analytic KV slope and is unaffected by the prefill abort.
+    # decode_context may legally exceed safe_context in this regime.
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))
+
+    # Shallow linear ramp so the fit exists; abort any ctx >= 8000 to trigger bisect.
+    def measure(model, ctx):
+        if ctx >= 8000:
+            return {"context": ctx, "refused": True, "reason": "engine veto"}
+        return {"context": ctx, "mem_gb": 5.0 + ctx / 1000}
+
+    # steep prefill slope relative to KV slope → decode ceiling > prefill ceiling
+    est = _est(slope_gb_per_k=2.0)
+    r = drv.characterize("m", preflight=lambda m: est, measure=measure,
+                         schedule=[2000, 4000, 8000, 16000])
+    assert 4000 <= r["safe_context"] < 8000         # bisect confirmed below the abort wall
+    assert r.get("decode_context") is not None       # decode is still computed, not suppressed
+    assert isinstance(r["decode_context"], int)
+    assert r["decode_context"] > 0                   # positive — a real estimate was produced

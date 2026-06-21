@@ -1988,7 +1988,7 @@ def test_render_models_decode_gloss_when_greater(make_console, store, monkeypatc
     c, buf = make_console()
     cli.render_models(c)
     out = buf.getvalue()
-    assert "20000" in out and "decode" in out
+    assert "20000" in out and "stream-only" in out
 
 
 def test_render_models_decode_hidden_when_not_greater(make_console, store, monkeypatch):
@@ -2029,7 +2029,7 @@ def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_model_detail(c, "org/Smol") == 0
     out = buf.getvalue()
-    assert "20000" in out and "decode" in out
+    assert "20000" in out and "stream-only" in out
 
 
 def test_model_detail_per_engine_decode_hidden_when_not_greater(make_console, monkeypatch):
@@ -2056,6 +2056,24 @@ def test_model_detail_json_has_decode_context(monkeypatch, capsys):
     assert all(isinstance(v, int) for v in data["engines"].values())
 
 
+def test_model_detail_json_decode_context_paired_with_best_safe_engine(monkeypatch, capsys):
+    # M1: top-level decode_context must come from the same engine that has the highest
+    # safe_context — NOT a global max across engines. Here wcx has safe_context=16000/decode=18000
+    # and cpu has safe_context=8000/decode=25000. Top-level decode_context must be 18000, not 25000.
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    _per_engine = {"wcx": {"safe_context": 16000, "decode_context": 18000},
+                   "cpu": {"safe_context": 8000, "decode_context": 25000}}
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: _per_engine.get(e))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/A", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["safe_context"] == 16000
+    assert data["decode_context"] == 18000   # paired with wcx (best safe), not cpu's 25000
+
+
 def test_emit_characterized_decode_gloss_when_greater(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
@@ -2063,7 +2081,7 @@ def test_emit_characterized_decode_gloss_when_greater(make_console, store, monke
     c, buf = make_console()
     cli._emit_characterized(c, "wcx")
     out = buf.getvalue()
-    assert "20000" in out and "decode" in out
+    assert "20000" in out and "stream-only" in out
 
 
 def test_emit_characterized_decode_hidden_when_not_greater(make_console, store, monkeypatch):

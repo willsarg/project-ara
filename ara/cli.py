@@ -687,7 +687,13 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         if row is not None:
             per_engine[key] = (row["safe_context"], row.get("decode_context"))
     best = max((sc for (sc, _) in per_engine.values() if sc is not None), default=None)
-    best_decode = max((dc for (_, dc) in per_engine.values() if dc is not None), default=None)
+    # Pair decode_context with the engine that owns the best safe_context, so the two
+    # top-level JSON scalars describe the same engine — not independent max() picks.
+    best_engine_pair = max(
+        ((sc, dc) for (sc, dc) in per_engine.values() if sc is not None),
+        key=lambda t: t[0], default=None,
+    )
+    best_decode = best_engine_pair[1] if best_engine_pair is not None else None
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
                           "decode_context": best_decode,
@@ -706,7 +712,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         for key, (sc, dc) in per_engine.items():
             ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
             if sc and dc and dc > sc:
-                ceiling_str += f"  · ~{dc} decode (est.)"
+                ceiling_str += f"  · ~{dc} stream-only (est.)"
             c.emit(c.field(f"{key} ceiling", ceiling_str))
     else:
         c.emit(c.field("ceiling", "not characterized"))
@@ -863,7 +869,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
             ceiling, ekey, decode = best[mid]
             tail = f"~{ceiling} tokens ({ekey})" if ceiling else "no safe ceiling"
             if ceiling and decode and decode > ceiling:
-                tail = f"~{ceiling} tokens ({ekey}) · ~{decode} decode (est.)"
+                tail = f"~{ceiling} tokens ({ekey}) · ~{decode} stream-only (est.)"
             role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
         else:
             tail, role = "not characterized", "dim"
@@ -961,7 +967,7 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
             dc = r.get("decode_context")
             ceiling = f"~{r['safe_context']} tokens"
             if dc and dc > r["safe_context"]:
-                ceiling += f"  · ~{dc} decode (est.)"
+                ceiling += f"  · ~{dc} stream-only (est.)"
         else:
             ceiling = "—"
         c.emit("  " + c.style("metric", name) + c.style("dim", "  →  ")
