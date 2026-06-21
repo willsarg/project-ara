@@ -1683,7 +1683,11 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     if characterize is not None:
         monkeypatch.setattr(cli, "get_backend",
-                            lambda b=None: types.SimpleNamespace(characterize=characterize))
+                            lambda b=None: types.SimpleNamespace(
+                                characterize=characterize,
+                                calibration_model_cached=lambda m: True,   # skip pre-fetch
+                                download_calibration_model=lambda m: None,
+                            ))
 
 
 def test_render_characterize_persists_and_shows(make_console, store, monkeypatch):
@@ -1742,7 +1746,10 @@ def test_render_characterize_engine_flag_overrides_detected_backend(make_console
     def fake_get_backend(b=None):
         seen["backend"] = b
         return types.SimpleNamespace(
-            characterize=lambda m: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]})
+            characterize=lambda m: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
+            calibration_model_cached=lambda m: True,   # skip pre-fetch in this test
+            download_calibration_model=lambda m: None,
+        )
 
     monkeypatch.setattr(cli, "get_backend", fake_get_backend)
     c, _buf = make_console()
@@ -1809,3 +1816,84 @@ def test_main_characterize_passes_engine(monkeypatch):
 def test_main_characterize_no_model(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["characterize"]) == 1
     assert "usage: ara characterize" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# render_characterize — pre-fetch block (task #47)
+# --------------------------------------------------------------------------- #
+def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
+                          size_gb=4.0, free_gb=50.0):
+    """Wire render_characterize with a FakeBackend and stubbed acquire functions."""
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: size_gb)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: free_gb)
+
+
+def _fake_bk_characterize(model):
+    return {"model": model, "safe_context": 16000, "points": [[1024, 1.2]]}
+
+
+def test_render_characterize_prefetch_uncached_transformers(make_console, store, monkeypatch):
+    # Uncached transformers model on a compatible engine → download fired, then characterize runs.
+    bk = FakeBackend(_limits(), cached=False)
+    bk.calibrate_result = None  # not used by characterize path
+    # Give the FakeBackend a characterize method
+    bk.characterize = _fake_bk_characterize
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert bk.downloaded == ["org/Model"]            # download was called
+    assert "downloading" in buf.getvalue()            # status line emitted
+    assert "16000" in buf.getvalue()                  # characterize result shown
+    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    assert row["safe_context"] == 16000               # result persisted
+
+
+def test_render_characterize_prefetch_already_cached(make_console, store, monkeypatch):
+    # Already-cached model → download NOT called; characterize still runs.
+    bk = FakeBackend(_limits(), cached=True)
+    bk.characterize = _fake_bk_characterize
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert bk.downloaded == []                        # no download
+    assert "16000" in buf.getvalue()
+
+
+def test_render_characterize_prefetch_incompatible_engine(make_console, store, monkeypatch):
+    # A .gguf model on the wmx (apple) engine: engine_for_model returns "cpu" != "wmx"
+    # → incompatible=True → download NOT called; existing flow proceeds (engine error path).
+    bk = FakeBackend(_limits(), cached=False)
+    bk.characterize = _fake_bk_characterize
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    # "org/model.gguf" → engine_for_model returns "cpu"; sel.engine_key is "wmx" → incompatible
+    assert cli.render_characterize(c, "org/model.gguf") == 0
+    assert bk.downloaded == []                        # download skipped (incompatible)
+
+
+def test_render_characterize_prefetch_insufficient_disk(make_console, monkeypatch):
+    # Not enough disk → error emitted, returns 1, characterize NOT called.
+    bk = FakeBackend(_limits(), cached=False)
+    bk.characterize = _fake_bk_characterize
+    # size_gb=10, free_gb=5, DISK_BUFFER_GB=2 → 5 < 10+2 → shortfall
+    _wire_characterize_bk(monkeypatch, bk, size_gb=10.0, free_gb=5.0)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Big") == 1
+    assert "not enough disk" in buf.getvalue()
+    assert bk.downloaded == []                        # characterize never reached
+
+
+def test_render_characterize_prefetch_insufficient_disk_json(monkeypatch, capsys):
+    # --json variant of the insufficient-disk branch.
+    bk = FakeBackend(_limits(), cached=False)
+    bk.characterize = _fake_bk_characterize
+    _wire_characterize_bk(monkeypatch, bk, size_gb=10.0, free_gb=5.0)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/Big", as_json=True) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out and "disk" in out["error"]

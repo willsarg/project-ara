@@ -729,9 +729,28 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
+    bk = get_backend(sel.backend)
+    # Pre-fetch: ensure weights are in the HF cache before the engine's preflight runs.
+    # Without this, the worker's blobs/ scan yields weights_gb≈0 for uncached transformers
+    # models, so the a-priori safety gates (L1/L4) under-predict memory on the first rung.
+    # cpu.calibration_model_cached() always returns True, so this only fires for apple/cuda.
+    incompatible = engines.engine_for_model(model) not in (None, sel.engine_key)
+    if not incompatible and not bk.calibration_model_cached(model):
+        size_gb = acquire.repo_size_gb(model)
+        free_gb = acquire.free_disk_gb()
+        if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
+            msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
+                   f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
+            if as_json:
+                print(json.dumps({"error": msg}))
+            else:
+                c.emit(c.style("bad", f"  {msg}"))
+            return 1
+        c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
+        bk.download_calibration_model(model)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
-        result = get_backend(sel.backend).characterize(model)
+        result = bk.characterize(model)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
         c.emit(c.style("bad", f"  characterization failed: {exc}"))
         return 1
