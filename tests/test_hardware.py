@@ -1620,10 +1620,39 @@ def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
     assert hw._gpus_linux() == []
 
 
-def test_gpus_windows_stub_returns_empty():
-    """Direct call to the stub so its body line is covered."""
+def test_video_controller_gpu_nvidia():
     from ara import hardware as hw
-    assert hw._gpus_windows() == []
+    g = hw._video_controller_gpu({
+        "Name": "NVIDIA GeForce RTX 2070", "AdapterCompatibility": "NVIDIA",
+        "DriverVersion": "31.0.15.3623", "AdapterRAM": 4293918720})
+    assert g.vendor == "nvidia" and g.name == "NVIDIA GeForce RTX 2070"
+    assert g.driver_version == "31.0.15.3623"
+    assert g.vram_gb is None          # 4293918720 ≈ uint32 cap ⇒ unknown, not 4.3
+
+
+def test_video_controller_gpu_amd_real_vram():
+    from ara import hardware as hw
+    g = hw._video_controller_gpu({
+        "Name": "AMD Radeon RX 6600", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
+        "DriverVersion": "31.0.21912.14", "AdapterRAM": 2147483648})
+    assert g.vendor == "amd" and g.vram_gb == 2.1   # 2147483648/1e9
+
+
+def test_video_controller_gpu_invalid_ram():
+    from ara import hardware as hw
+    g = hw._video_controller_gpu({
+        "Name": "Intel HD Graphics", "AdapterCompatibility": "Intel",
+        "DriverVersion": "27.20.100.8280", "AdapterRAM": None})
+    assert g.vendor == "intel" and g.vram_gb is None
+
+
+def test_gpus_windows_dispatch(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_pwsh_json", lambda args: [
+        {"Name": "AMD Radeon RX 6600", "AdapterCompatibility": "AMD",
+         "DriverVersion": "1.2", "AdapterRAM": 2147483648}])
+    gpus = hw._gpus_windows()
+    assert len(gpus) == 1 and gpus[0].vendor == "amd"
 
 
 def test_gpus_macos_stub_returns_empty():

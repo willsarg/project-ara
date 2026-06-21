@@ -930,7 +930,33 @@ def _gpus_linux() -> list["GpuInfo"]:
     return gpus
 
 
-def _gpus_windows() -> list["GpuInfo"]: return []
+_UINT32_CAP = 4294967295
+
+
+def _video_controller_gpu(row: dict) -> "GpuInfo":
+    ram = row.get("AdapterRAM")
+    vram = None
+    try:
+        ram_i = int(ram)
+        # AdapterRAM is uint32; any value >= 4 GB decimal is at or near the 32-bit overflow
+        # ceiling and cannot reliably represent actual VRAM (e.g. 0xFFC00000 for an 8 GB card).
+        vram = _gb_dec(ram_i) if 0 < ram_i < 4_000_000_000 else None
+    except (TypeError, ValueError):
+        vram = None
+    return GpuInfo(
+        vendor=_gpu_vendor(row.get("AdapterCompatibility") or row.get("Name")),
+        name=_clean(row.get("Name")),
+        vram_gb=vram,
+        driver_version=_clean(row.get("DriverVersion")),
+        integrated=None,
+    )
+
+
+def _gpus_windows() -> list["GpuInfo"]:
+    rows = _pwsh_json(["Get-CimInstance Win32_VideoController | ConvertTo-Json -Compress"])
+    return [_video_controller_gpu(r) for r in rows]
+
+
 def _gpus_macos() -> list["GpuInfo"]: return []
 
 
