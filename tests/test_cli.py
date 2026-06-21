@@ -83,7 +83,9 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
-    monkeypatch.setattr(cli, "render_characterize", lambda c, m, as_json=False: (rec.update(characterize=m) or 0))
+    monkeypatch.setattr(cli, "render_characterize",
+                        lambda c, m, engine=None, as_json=False:
+                        (rec.update(characterize=m, characterize_engine=engine) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
@@ -1652,12 +1654,12 @@ def test_main_models_id_dispatch(monkeypatch):
 # --------------------------------------------------------------------------- #
 def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
-    monkeypatch.setattr(cli, "engine_status", lambda: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     if characterize is not None:
         monkeypatch.setattr(cli, "get_backend",
-                            lambda: types.SimpleNamespace(characterize=characterize))
+                            lambda b=None: types.SimpleNamespace(characterize=characterize))
 
 
 def test_render_characterize_persists_and_shows(make_console, store, monkeypatch):
@@ -1703,10 +1705,48 @@ def test_render_characterize_json(monkeypatch, capsys, store):
     assert json.loads(capsys.readouterr().out)["safe_context"] == 9000
 
 
+def test_render_characterize_engine_flag_overrides_detected_backend(make_console, store, monkeypatch):
+    # willw11's case: a GPU is detected (cuda), but `--engine cpu` must run on the CPU backend
+    # and store under the cpu engine key — never silently fall through to the detected GPU.
+    seen = {}
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli, "engine_status",
+                        lambda b=None: (seen.update(status_backend=b) or (True, "llama.cpp")))
+    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+
+    def fake_get_backend(b=None):
+        seen["backend"] = b
+        return types.SimpleNamespace(
+            characterize=lambda m: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]})
+
+    monkeypatch.setattr(cli, "get_backend", fake_get_backend)
+    c, _buf = make_console()
+    assert cli.render_characterize(c, "org/G", engine="cpu") == 0
+    assert seen["backend"] == "cpu"          # ran on the CPU backend, not the detected cuda
+    assert seen["status_backend"] == "cpu"   # install check targeted the CPU engine
+    assert cli.db.get_characterization(store, "mkey", "cpu", "org/G")["safe_context"] == 8192
+
+
+def test_render_characterize_unknown_engine_errors(make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "x", engine="bogus") == 1
+    assert "unknown engine" in buf.getvalue().lower()
+
+
 def test_main_characterize_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["characterize", "org/Model"])
     assert rec["characterize"] == "org/Model"
+    assert rec["characterize_engine"] is None    # no --engine → detected backend
+
+
+def test_main_characterize_passes_engine(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/Model", "--engine", "cpu"])
+    assert rec["characterize"] == "org/Model"
+    assert rec["characterize_engine"] == "cpu"
 
 
 def test_main_characterize_no_model(monkeypatch, capsys):

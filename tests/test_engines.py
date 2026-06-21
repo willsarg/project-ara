@@ -91,8 +91,26 @@ def test_source_for_uses_env_override(monkeypatch):
 # --------------------------------------------------------------------------- #
 # _install_targets() — the uv-pip args per engine kind
 # --------------------------------------------------------------------------- #
-def test_install_targets_builtin_is_the_package_list():
+def test_install_targets_builtin_is_the_package_list(monkeypatch):
+    # Off Windows the builtin engine installs its plain package list (source build is the
+    # universal path — Linux/macOS/aarch64/Pi, where no prebuilt wheel index serves them).
+    monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
     assert engines._install_targets("cpu") == engines.ENGINES["cpu"]["packages"]
+
+
+def test_install_targets_cpu_forces_prebuilt_wheel_on_windows(monkeypatch):
+    # llama-cpp-python ships NO PyPI wheels; a stock Windows box has no MSVC, so a source
+    # build fails. On Windows ARA must pull a prebuilt CPU wheel from the project's own index,
+    # and `--only-binary` makes that deterministic (never silently falls back to building).
+    monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
+    targets = engines._install_targets("cpu")
+    spec = engines.ENGINES["cpu"]["wheel_only"]["llama-cpp-python"]
+    assert targets[:4] == [
+        "--only-binary", "llama-cpp-python", "--extra-index-url", spec["index"]]
+    # the llama-cpp-python requirement gets the AVX2-baseline ceiling appended (post-0.3.19
+    # abetlen wheels are AVX-512-only and fault on CPUs without it); other deps pass through.
+    assert targets[4:] == [
+        f"llama-cpp-python>=0.3,<={spec['max_version']}", "psutil", "huggingface_hub"]
 
 
 def test_install_targets_external_git_spec(monkeypatch):

@@ -78,8 +78,8 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.profiles, "get_calibration", lambda con, key: None)
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])
-    monkeypatch.setattr(cli, "engine_status", lambda: (True, "wmx-suite"))
-    monkeypatch.setattr(cli, "get_backend", _FakeBackend)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
     monkeypatch.setattr(cli.engines, "install",
                         lambda key: cli.engines.InstallResult(key, "installed"))
     monkeypatch.setattr(cli.engines, "uninstall",
@@ -146,7 +146,7 @@ def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):
 ])
 def test_json_error_paths_emit_json(mocked_world, monkeypatch, capsys, argv, setup):
     if setup == "engine_off":
-        monkeypatch.setattr(cli, "engine_status", lambda: (False, "wmx-suite"))
+        monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "wmx-suite"))
     else:
         monkeypatch.setattr(cli.catalog, "describe", lambda model_id: None)
     monkeypatch.setattr("sys.argv", ["ara", *argv])

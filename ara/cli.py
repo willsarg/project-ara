@@ -705,29 +705,50 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     return 0
 
 
-def render_characterize(c: Console, model: str, *, as_json: bool = False) -> int:
-    """Measure a model's safe context ceiling on this machine's engine, and store it.
+def _selected_backend(engine: str | None) -> tuple[str | None, str | None]:
+    """Resolve an explicit ``--engine`` value to ``(backend_module, engine_key)``, or the
+    detected backend when *engine* is None/``auto``. ``(None, None)`` if it names no engine.
 
-    Works for whichever engine is active (Apple/MLX, CUDA, or the CPU fallback) — ARA owns the
-    result, so it then shows up in `ara models` regardless of engine."""
-    engine_ok, engine_pkg = engine_status()
+    This is what lets ``--engine cpu`` run on the CPU fallback on a machine whose detected
+    backend is a GPU — the value selects the backend, not just install consent."""
+    if not engine or engine == "auto":
+        backend = detect.backend_name()
+        return backend, engines.for_backend(backend)
+    key = engines.resolve(engine)
+    if key is None or key not in engines.ENGINES:
+        return None, None
+    return engines.ENGINES[key]["backend"], key
+
+
+def render_characterize(c: Console, model: str, *, engine: str | None = None,
+                        as_json: bool = False) -> int:
+    """Measure a model's safe context ceiling on an engine, and store it.
+
+    Defaults to whichever engine is active (Apple/MLX, CUDA, or the CPU fallback); ``--engine``
+    overrides that so you can target a non-detected backend (e.g. the CPU fallback on a GPU
+    box). ARA owns the result, so it shows up in `ara models` regardless of engine."""
+    backend, engine_key = _selected_backend(engine)
+    if backend is None:
+        msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    engine_ok, engine_pkg = engine_status(backend)
     if not engine_ok:
         if as_json:
             print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
         else:
             c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
-                   + c.style("accent", "ara install"))
+                   + c.style("accent", f"ara install --engine {engine_key}"))
         return 1
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
-        result = get_backend().characterize(model)
+        result = get_backend(backend).characterize(model)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
         c.emit(c.style("bad", f"  characterization failed: {exc}"))
         return 1
 
     ceiling = result["safe_context"]
     con = db.connect()
-    engine_key = engines.for_backend(detect.backend_name())
     db.save_characterization(con, profiles.machine_key(), engine_key,
                              model, safe_context=ceiling, points=result["points"])
     catalog.remember(con, model)
@@ -1096,7 +1117,7 @@ def main() -> int:
         if len(rest) < 2:
             c.emit(c.style("warn", "  usage: ara characterize <model>"))
             return 1
-        return render_characterize(c, rest[1], as_json=as_json)
+        return render_characterize(c, rest[1], engine=engine, as_json=as_json)
 
     if cmd == "profile":
         return render_profile(c, recalibrate=recalibrate, as_json=as_json,

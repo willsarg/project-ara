@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 from dataclasses import dataclass
 
@@ -53,6 +54,21 @@ ENGINES: dict[str, dict] = {
         "available": True,
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
+        # llama-cpp-python ships NO PyPI wheels, so a stock Windows box (no MSVC) can't build
+        # it from source. On Windows pull a prebuilt CPU wheel from the project's own index;
+        # `--only-binary` (added in _install_targets) makes that deterministic. Scoped to
+        # Windows so Linux/macOS/aarch64 (Pi) keep the source build — the abetlen index has no
+        # wheel for them, and those platforms ship a toolchain.
+        #   max_version: abetlen's wheels after 0.3.19 are static AVX-512 builds that fault
+        #   (illegal instruction, 0xc000001d) on the many x86 CPUs without AVX-512 — e.g. AMD
+        #   Zen 1–3. 0.3.19 is the newest AVX2-baseline wheel, so it runs on essentially any
+        #   x86-64. Native builds elsewhere pick the host's own ISA, so this cap is Windows-only.
+        "wheel_only": {
+            "llama-cpp-python": {
+                "index": "https://abetlen.github.io/llama-cpp-python/whl/cpu",
+                "max_version": "0.3.19",
+            },
+        },
         "python": "3.12",
     },
 }
@@ -109,17 +125,47 @@ class InstallResult:
     detail: str = ""
 
 
+def _cap_for_windows(req: str, wheels: dict) -> str:
+    """Append a wheel-compatible version ceiling to requirement *req* if it's a ``wheel_only``
+    package with a ``max_version`` (the newest prebuilt wheel that runs on a baseline CPU).
+    Leaves the requirement's own floor intact (``llama-cpp-python>=0.3`` → ``…>=0.3,<=0.3.19``).
+    """
+    name = re.match(r"[A-Za-z0-9._-]+", req).group(0)
+    spec = wheels.get(name)
+    if spec and spec.get("max_version"):
+        return f"{req},<={spec['max_version']}"
+    return req
+
+
+def _builtin_targets(engine: dict) -> list[str]:
+    """uv-pip args for a builtin engine: its package list, with Windows wheel handling.
+
+    On Windows, every ``wheel_only`` package (no PyPI wheel, can't build without MSVC) is
+    forced to a prebuilt wheel from its index (``--only-binary`` makes that deterministic — no
+    silent source-build fallback) and capped at its ``max_version``. Off Windows the source
+    build picks the host's own ISA, so the list passes through untouched.
+    """
+    wheels = engine.get("wheel_only") or {}
+    if not wheels or platform.system() != "Windows":
+        return list(engine["packages"])
+    flags: list[str] = []
+    for pkg, spec in wheels.items():
+        flags += ["--only-binary", pkg, "--extra-index-url", spec["index"]]
+    return [*flags, *(_cap_for_windows(req, wheels) for req in engine["packages"])]
+
+
 def _install_targets(key: str) -> list[str]:
     """The trailing ``uv pip install`` args (pip flags + targets) for engine *key*'s env.
 
-    Built-in engines install a plain package list. External suites install their source:
-    a git/remote ``spec`` (folding in an ``extras`` group via a PEP 508 direct reference) or
-    a local path installed editable (``-e``) for dev. Any ``pip_args`` (e.g.
-    ``--torch-backend=auto`` to fetch the right CUDA torch wheel) come first.
+    Built-in engines install a plain package list (with Windows prebuilt-wheel handling — see
+    :func:`_builtin_targets`). External suites install their source: a git/remote ``spec``
+    (folding in an ``extras`` group via a PEP 508 direct reference) or a local path installed
+    editable (``-e``) for dev. Any ``pip_args`` (e.g. ``--torch-backend=auto`` to fetch the
+    right CUDA torch wheel) come first.
     """
     engine = ENGINES[key]
     if engine.get("builtin"):
-        return list(engine["packages"])
+        return _builtin_targets(engine)
     pip_args = list(engine.get("pip_args", []))
     extras = engine.get("extras")
     suffix = f"[{extras}]" if extras else ""
