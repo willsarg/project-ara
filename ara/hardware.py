@@ -851,6 +851,38 @@ def board_info() -> "BoardInfo":
 _GPU_VENDOR = {"0x1002": "amd", "0x10de": "nvidia", "0x8086": "intel"}
 
 
+def _marketing_gpu_name(vendor_id, device_id, cpu_brand) -> str | None:
+    """Return a verified marketing GPU name or None.
+
+    Keyed on (PCI vendor+device id, CPU model signal) — NOT PCI id alone, because AMD reuses
+    PCI ids across SKUs (e.g. 1002:15bf is shared by 740M/760M/780M). The CPU model
+    disambiguates the SKU; only add entries we've confirmed on real hardware.
+
+    Linux-only for now — that's where the iGPU naming gap lives. macOS/Windows have their
+    own per-OS name sources that already produce good strings.
+    """
+    vid = (vendor_id or "").lower().removeprefix("0x")
+    did = (device_id or "").lower().removeprefix("0x")
+    cpu = (cpu_brand or "").lower()
+    if vid == "1002" and did == "15bf":          # AMD Phoenix iGPU family
+        if "z1 extreme" in cpu:
+            return "AMD Radeon 780M"
+        # other Phoenix SKUs (740M/760M, 7840U, …) not yet verified → fall back, don't guess
+    return None
+
+
+def _vulkan_name(vk: list[dict], vendor: str) -> str | None:
+    """Return the device name of the first vulkan device matching *vendor*, or None.
+
+    Vendor-level match — on a multi-GPU same-vendor box the name could attach to the
+    wrong card; that's acceptable best-effort for now.
+    """
+    for d in vk:
+        if d.get("vendor") == vendor:
+            return d.get("name") or None
+    return None
+
+
 def _gpu_vendor(raw: str | None) -> str:
     s = (raw or "").strip().lower()
     if s in _GPU_VENDOR:
@@ -923,9 +955,14 @@ def _lspci_names() -> dict[str, str]:
     return names
 
 
-def _drm_gpu(vendor_raw, device_raw, vram_bytes, lspci_name, cpu_vendor):
+def _drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor):
+    """Build a GpuInfo from DRM sysfs fields.
+
+    *name* is a fully-resolved display name (marketing → vulkan → lspci tier, applied in
+    _gpus_linux before this call). Falls back to a generic name only if name is None.
+    """
     vendor = _gpu_vendor(vendor_raw)
-    name = lspci_name or _GENERIC_GPU_NAME.get(vendor)
+    resolved_name = name or _GENERIC_GPU_NAME.get(vendor)
     if vendor == "intel":
         integrated: bool | None = True
     elif vendor == "nvidia":
@@ -934,13 +971,16 @@ def _drm_gpu(vendor_raw, device_raw, vram_bytes, lspci_name, cpu_vendor):
         # AMD and unknown: integrated is resolved at the list level in _gpus_linux
         # (APU-vs-discrete heuristic requires knowing the full GPU list)
         integrated = None
-    return GpuInfo(vendor=vendor, name=name, vram_gb=_gb_dec(vram_bytes), integrated=integrated)
+    return GpuInfo(vendor=vendor, name=resolved_name, vram_gb=_gb_dec(vram_bytes),
+                   integrated=integrated)
 
 
 def _gpus_linux() -> list["GpuInfo"]:
     from dataclasses import replace
-    names = _lspci_names()
-    cpu_vendor = cpu_info().vendor
+    lspci_name_map = _lspci_names()
+    cpu = cpu_info()
+    cpu_vendor = cpu.vendor
+    vk = _vulkan_devices()
     gpus: list[GpuInfo] = []
     for card in sorted(_glob_mod.glob(_DRM_GLOB)):
         vendor_raw = _read_text(f"{card}/device/vendor")
@@ -949,8 +989,16 @@ def _gpus_linux() -> list["GpuInfo"]:
         device_raw = _read_text(f"{card}/device/device")
         vram = _read_text(f"{card}/device/mem_info_vram_total")
         vram_bytes = int(vram) if vram and vram.isdigit() else None
-        gpus.append(_drm_gpu(vendor_raw, device_raw,
-                             vram_bytes, names.get((device_raw or "").lower()), cpu_vendor))
+        vendor = _gpu_vendor(vendor_raw)
+        # Name priority: curated marketing map → vulkan device name → lspci name → generic
+        # (generic fallback is applied inside _drm_gpu when name is None).
+        name = (
+            _marketing_gpu_name(vendor_raw, device_raw, cpu.brand)
+            or _vulkan_name(vk, vendor)
+            or lspci_name_map.get((device_raw or "").lower())
+            or None
+        )
+        gpus.append(_drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor))
 
     # APU-vs-discrete heuristic: AMD integrated=True only when the AMD GPU is the sole GPU
     # enumerated AND the CPU vendor is AMD (the common APU/ROG Ally case). When multiple GPUs
@@ -1038,6 +1086,7 @@ def _vulkan_devices() -> list[dict]:
             return
         devices.append({
             "vendor": _gpu_vendor(name),
+            "name": name,
             "api": block.get("api"),
             "driver": driver,
             "coopmat": coopmat,

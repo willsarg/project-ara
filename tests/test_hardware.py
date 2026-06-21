@@ -2160,3 +2160,138 @@ GPU0:
                         if "--summary" in cmd else "")
     devs = hw._vulkan_devices()
     assert devs == []
+
+
+# ---------------------------------------------------------------------------
+# GPU marketing-name policy
+# ---------------------------------------------------------------------------
+
+def test_marketing_gpu_name_z1_extreme_returns_780m():
+    """Phoenix PCI id (1002:15bf) + Z1 Extreme CPU → AMD Radeon 780M (verified)."""
+    from ara import hardware as hw
+    assert hw._marketing_gpu_name("0x1002", "0x15bf", "AMD Ryzen Z1 Extreme") == "AMD Radeon 780M"
+
+
+def test_marketing_gpu_name_z1_non_extreme_returns_none():
+    """Phoenix PCI id but plain Z1 (not Extreme) → None (honest: 740M/760M not confirmed)."""
+    from ara import hardware as hw
+    assert hw._marketing_gpu_name("0x1002", "0x15bf", "AMD Ryzen Z1") is None
+
+
+def test_marketing_gpu_name_nvidia_returns_none():
+    """NVIDIA device → None (map is AMD/Linux-only for now)."""
+    from ara import hardware as hw
+    assert hw._marketing_gpu_name("0x10de", "0x2484", "Intel Core i9") is None
+
+
+def test_marketing_gpu_name_no_cpu_brand_returns_none():
+    """Phoenix PCI id but no CPU brand → None (can't disambiguate SKU)."""
+    from ara import hardware as hw
+    assert hw._marketing_gpu_name("0x1002", "0x15bf", None) is None
+
+
+def test_marketing_gpu_name_normalises_0x_prefix():
+    """Vendor/device ids without 0x prefix also work (normalisation)."""
+    from ara import hardware as hw
+    assert hw._marketing_gpu_name("1002", "15bf", "AMD Ryzen Z1 Extreme") == "AMD Radeon 780M"
+
+
+def test_vulkan_devices_returns_name_key(monkeypatch):
+    """_vulkan_devices() must include a 'name' key with the deviceName string."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_run", lambda cmd, **k: _VULKANINFO_SUMMARY
+                        if "--summary" in cmd else "")
+    devs = hw._vulkan_devices()
+    assert len(devs) == 1
+    assert devs[0]["name"] == "AMD Ryzen Z1 Extreme (RADV PHOENIX)"
+
+
+def test_vulkan_name_returns_first_match():
+    """_vulkan_name returns the name of the first vulkan device whose vendor matches."""
+    from ara import hardware as hw
+    vk = [
+        {"vendor": "amd", "name": "AMD Ryzen Z1 Extreme (RADV PHOENIX)", "api": "1.4", "driver": "radv", "coopmat": False},
+        {"vendor": "intel", "name": "Intel Arc (ANV)", "api": "1.3", "driver": "anv", "coopmat": False},
+    ]
+    assert hw._vulkan_name(vk, "amd") == "AMD Ryzen Z1 Extreme (RADV PHOENIX)"
+    assert hw._vulkan_name(vk, "intel") == "Intel Arc (ANV)"
+    assert hw._vulkan_name(vk, "nvidia") is None
+
+
+def test_vulkan_name_empty_list_returns_none():
+    """Empty vulkan device list → None."""
+    from ara import hardware as hw
+    assert hw._vulkan_name([], "amd") is None
+
+
+def test_gpus_linux_marketing_name_z1_extreme(tmp_path, monkeypatch):
+    """ROG Ally sysfs fixture + cpu_info.brand='AMD Ryzen Z1 Extreme' → name='AMD Radeon 780M'."""
+    from ara import hardware as hw
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    (dev / "mem_info_vram_total").write_text("4294967296\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    monkeypatch.setattr(hw, "cpu_info",
+        lambda: hw.CpuInfo(vendor="AuthenticAMD", brand="AMD Ryzen Z1 Extreme"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1
+    assert gpus[0].name == "AMD Radeon 780M"
+
+
+def test_gpus_linux_vulkan_name_tier(tmp_path, monkeypatch):
+    """AMD GPU not in marketing map (cpu brand without z1 extreme) but vulkan device present
+    → vulkan device name used."""
+    from ara import hardware as hw
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    (dev / "mem_info_vram_total").write_text("4294967296\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices",
+        lambda: [{"vendor": "amd", "name": "AMD Ryzen X (RADV GFX1234)",
+                  "api": "1.4", "driver": "radv", "coopmat": False}])
+    monkeypatch.setattr(hw, "cpu_info",
+        lambda: hw.CpuInfo(vendor="AuthenticAMD", brand="AMD Ryzen 7 7840U"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1
+    assert gpus[0].name == "AMD Ryzen X (RADV GFX1234)"
+
+
+def test_gpus_linux_lspci_name_tier(tmp_path, monkeypatch):
+    """No marketing match, no vulkan, but lspci name present → lspci name used."""
+    from ara import hardware as hw
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    monkeypatch.setattr(hw, "cpu_info",
+        lambda: hw.CpuInfo(vendor="AuthenticAMD", brand="AMD Ryzen 7 7840U"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1
+    assert gpus[0].name == "Phoenix1"
+
+
+def test_gpus_linux_generic_name_tier(tmp_path, monkeypatch):
+    """No marketing, no vulkan, no lspci → generic fallback name."""
+    from ara import hardware as hw
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    monkeypatch.setattr(hw, "cpu_info",
+        lambda: hw.CpuInfo(vendor="AuthenticAMD", brand="AMD Ryzen 7 7840U"))
+    gpus = hw._gpus_linux()
+    assert len(gpus) == 1
+    assert gpus[0].name == "AMD Radeon Graphics"
