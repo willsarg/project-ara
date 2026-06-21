@@ -315,6 +315,194 @@ def _cpu_linux(cpuinfo: str, caches: dict[str, int], logical: int | None) -> "Cp
     )
 
 
+# ---------------------------------------------------------------------------
+# Task 3: Memory detail
+# ---------------------------------------------------------------------------
+
+_SMBIOS_MEM: dict[int, str] = {
+    24: "DDR3",
+    26: "DDR4",
+    27: "LPDDR",
+    28: "LPDDR2",
+    29: "LPDDR3",
+    30: "LPDDR4",
+    34: "DDR5",
+    35: "LPDDR5",
+}
+
+
+def _mem_windows(
+    modules: list[dict],
+    array: dict,
+    totals: tuple[float, float, float],
+) -> "MemoryInfo":
+    """Parse Win32_PhysicalMemory rows + Win32_PhysicalMemoryArray dict → MemoryInfo.
+
+    `totals` is (total_gb, available_gb, swap_gb) from psutil — passed in so the parser
+    is pure/testable without live psutil calls.
+    """
+    total_gb, available_gb, swap_gb = totals
+    parsed: list[MemoryModule] = []
+    for m in modules:
+        parsed.append(MemoryModule(
+            slot=m.get("DeviceLocator"),
+            capacity_gb=_gib(m.get("Capacity")),
+            speed_mts=m.get("ConfiguredClockSpeed"),
+            manufacturer=_clean(m.get("Manufacturer", "")),
+            part_number=_clean(m.get("PartNumber", "")),
+        ))
+
+    kind: str | None = None
+    speed_mts: int | None = None
+    if modules:
+        kind = _SMBIOS_MEM.get(modules[0].get("SMBIOSMemoryType", 0))
+        speeds = [m.get("ConfiguredClockSpeed") for m in modules if m.get("ConfiguredClockSpeed")]
+        speed_mts = max(speeds) if speeds else None
+
+    slots_total = array.get("MemoryDevices") if array else None
+
+    return MemoryInfo(
+        total_gb=total_gb,
+        available_gb=available_gb,
+        swap_gb=swap_gb,
+        kind=kind,
+        speed_mts=speed_mts,
+        slots_used=len(parsed) if parsed else None,
+        slots_total=slots_total,
+        modules=parsed,
+    )
+
+
+def _mem_macos(
+    spmemory_text: str,
+    totals: tuple[float, float, float],
+) -> "MemoryInfo":
+    """Parse `system_profiler SPMemoryDataType` text → MemoryInfo.
+
+    Apple Silicon is soldered — there are no per-module rows, only totals + kind.
+    modules=[] is intentional and honest.
+    """
+    total_gb, available_gb, swap_gb = totals
+    kind: str | None = None
+
+    for line in spmemory_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Type:"):
+            kind = _clean(stripped.removeprefix("Type:").strip()) or None
+            break
+
+    return MemoryInfo(
+        total_gb=total_gb,
+        available_gb=available_gb,
+        swap_gb=swap_gb,
+        kind=kind,
+        modules=[],
+    )
+
+
+def _mem_linux(
+    meminfo_text: str,
+    dmidecode_text: str | None,
+    totals: tuple[float, float, float],
+) -> "MemoryInfo":
+    """Parse /proc/meminfo + optional dmidecode output → MemoryInfo.
+
+    Per-module detail requires root (`dmidecode -t memory`). When dmidecode_text is None
+    (non-root or tool absent) modules=[] — honest gap, renderer shows "needs root".
+    """
+    total_gb, available_gb, swap_gb = totals
+
+    # Parse per-module from dmidecode if we have it.
+    modules: list[MemoryModule] = []
+    kind: str | None = None
+    if dmidecode_text:
+        current: dict[str, str] = {}
+        for line in dmidecode_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Memory Device") and not stripped.startswith("Memory Device Array"):
+                if current:
+                    modules.append(_parse_dmidecode_module(current))
+                    if kind is None:
+                        kind = current.get("Type")
+                current = {}
+            elif ":" in stripped and current is not None:
+                k, _, v = stripped.partition(":")
+                current[k.strip()] = v.strip()
+        if current:
+            modules.append(_parse_dmidecode_module(current))
+            if kind is None and current.get("Type"):
+                kind = current.get("Type")
+
+    return MemoryInfo(
+        total_gb=total_gb,
+        available_gb=available_gb,
+        swap_gb=swap_gb,
+        kind=kind,
+        modules=modules,
+    )
+
+
+def _parse_dmidecode_module(fields: dict[str, str]) -> "MemoryModule":
+    """Turn a dmidecode 'Memory Device' field dict → MemoryModule."""
+    slot = fields.get("Locator") or None
+    manufacturer = _clean(fields.get("Manufacturer", ""))
+    part_number = _clean(fields.get("Part Number", ""))
+
+    # Speed: "Configured Memory Speed" preferred, fallback "Speed".
+    speed_str = fields.get("Configured Memory Speed") or fields.get("Speed") or ""
+    # "3200 MT/s" → 3200
+    speed_mts: int | None = None
+    m = re.match(r"(\d+)", speed_str)
+    if m:
+        speed_mts = int(m.group(1))
+
+    return MemoryModule(
+        slot=slot,
+        speed_mts=speed_mts,
+        manufacturer=manufacturer,
+        part_number=part_number,
+    )
+
+
+def _psutil_totals() -> tuple[float, float, float]:
+    """Return (total_gb, available_gb, swap_gb) from psutil."""
+    import psutil
+    vm = psutil.virtual_memory()
+    sw = psutil.swap_memory()
+    total_gb = round(vm.total / GB, 1)
+    available_gb = round(vm.available / GB, 1)
+    swap_gb = round(sw.total / GB, 1)
+    return total_gb, available_gb, swap_gb
+
+
+def memory_info() -> "MemoryInfo":
+    """Dispatch to the per-OS memory parser and return a MemoryInfo. Never raises."""
+    system = platform.system()
+    try:
+        totals = _psutil_totals()
+        if system == "Darwin":
+            raw = _run(["system_profiler", "SPMemoryDataType"]) or ""
+            return _mem_macos(raw, totals)
+        if system == "Windows":
+            modules = _pwsh_json([
+                "Get-CimInstance Win32_PhysicalMemory | ConvertTo-Json -Compress"
+            ])
+            array_rows = _pwsh_json([
+                "Get-CimInstance Win32_PhysicalMemoryArray | ConvertTo-Json -Compress"
+            ])
+            array = array_rows[0] if array_rows else {}
+            return _mem_windows(modules, array, totals)
+        if system == "Linux":
+            meminfo = _run(["cat", "/proc/meminfo"]) or ""
+            dmidecode_text: str | None = None
+            if os.geteuid() == 0:
+                dmidecode_text = _run(["dmidecode", "-t", "memory"])
+            return _mem_linux(meminfo, dmidecode_text, totals)
+    except Exception:
+        pass
+    return MemoryInfo()
+
+
 _SYSCTL_CPU_KEYS = [
     "machdep.cpu.brand_string",
     "machdep.cpu.vendor",

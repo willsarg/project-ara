@@ -1,4 +1,5 @@
 import datetime as dt
+import os
 import sys
 
 from ara import hardware as hw
@@ -483,3 +484,389 @@ def test_cpu_info_returns_empty_on_internal_exception(monkeypatch):
     c = hw.cpu_info()
     assert isinstance(c, hw.CpuInfo)
     assert c.brand is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Memory detail
+# ---------------------------------------------------------------------------
+
+# Fixtures from the plan (real willw11 output)
+_WIN_MEM_MODULES = [
+    {"DeviceLocator": "DIMM_A1", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
+     "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
+    {"DeviceLocator": "DIMM_A2", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
+     "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
+    {"DeviceLocator": "DIMM_B1", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
+     "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
+    {"DeviceLocator": "DIMM_B2", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
+     "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
+]
+
+_WIN_MEM_ARRAY = {"MemoryDevices": 4, "MaxCapacity": 134217728}
+
+_WIN_TOTALS = (32.0, 28.0, 0.0)   # (total_gb, available_gb, swap_gb)
+
+# macOS SPMemoryDataType text fixture (real Apple M4 Pro output shape)
+_MACOS_SPMEMORY = """\
+Hardware Overview:
+
+      Memory: 24 GB
+      Type: LPDDR5
+      Manufacturer: Micron
+"""
+
+_MACOS_TOTALS = (24.0, 18.0, 0.0)
+
+# Linux /proc/meminfo fixture (minimal)
+_LINUX_MEMINFO = """\
+MemTotal:       32686472 kB
+MemFree:         1234567 kB
+MemAvailable:   16000000 kB
+SwapTotal:       2097152 kB
+SwapFree:        2097152 kB
+"""
+
+# Linux dmidecode -t memory fixture (minimal, 1 DIMM)
+_LINUX_DMIDECODE = """\
+# dmidecode 3.3
+Getting SMBIOS data from sysfs.
+SMBIOS 3.1.1 present.
+
+Handle 0x1100, DMI type 17, 84 bytes
+Memory Device
+\tArray Handle: 0x1000
+\tError Information Handle: 0x1101
+\tTotal Width: 64 bits
+\tData Width: 64 bits
+\tSize: 8 GB
+\tForm Factor: Row Of Chips
+\tSet: None
+\tLocator: Controller0-ChannelA-DIMM0
+\tBank Locator: BANK 0
+\tType: LPDDR4
+\tType Detail: Unbuffered
+\tSpeed: 3200 MT/s
+\tManufacturer: Samsung
+\tSerial Number: --
+\tAsset Tag: --
+\tPart Number: K4EBE304EB-EGCG
+\tRank: 2
+\tConfigured Memory Speed: 3200 MT/s
+\tMinimum Voltage: 1.0 V
+\tMaximum Voltage: 1.2 V
+\tConfigured Voltage: 1.1 V
+\tMemory Technology: DRAM
+"""
+
+
+# --- Windows parser ---
+
+def test_mem_windows_four_modules_ddr4():
+    """Real willw11 fixture: 4 DDR4 DIMM_A1/A2/B1/B2, 8 GiB each, 3400 MT/s."""
+    mi = hw._mem_windows(_WIN_MEM_MODULES, _WIN_MEM_ARRAY, _WIN_TOTALS)
+    assert mi.total_gb == 32.0
+    assert mi.available_gb == 28.0
+    assert mi.swap_gb == 0.0
+    assert mi.kind == "DDR4"
+    assert mi.speed_mts == 3400
+    assert mi.slots_used == 4
+    assert mi.slots_total == 4
+    assert len(mi.modules) == 4
+    m0 = mi.modules[0]
+    assert m0.slot == "DIMM_A1"
+    assert m0.capacity_gb == 8.0
+    assert m0.speed_mts == 3400
+    assert m0.manufacturer == "G-Skill"
+    assert m0.part_number == "F4-3200C14-8GFX"
+
+
+def test_mem_windows_unknown_smbios_type_maps_to_none():
+    """SMBIOSMemoryType 0 (unknown) must map to None kind, not crash."""
+    modules = [{"DeviceLocator": "DIMM_A1", "Capacity": 8589934592,
+                "ConfiguredClockSpeed": 3400, "SMBIOSMemoryType": 0,
+                "Manufacturer": "Unknown", "PartNumber": ""}]
+    array = {"MemoryDevices": 2}
+    mi = hw._mem_windows(modules, array, (8.0, 6.0, 0.0))
+    assert mi.kind is None
+    assert mi.modules[0].part_number is None  # "" → _clean → None
+
+
+def test_mem_windows_single_module_not_array():
+    """A bare dict (single module) must be handled; _pwsh_json normalises to list — we pass list."""
+    modules = [{"DeviceLocator": "DIMM_A1", "Capacity": 8589934592,
+                "ConfiguredClockSpeed": 3200, "SMBIOSMemoryType": 34,
+                "Manufacturer": "Samsung", "PartNumber": "M471A1G44AB0"}]
+    array = {"MemoryDevices": 2}
+    mi = hw._mem_windows(modules, array, (8.0, 6.0, 2.0))
+    assert mi.kind == "DDR5"
+    assert mi.slots_used == 1
+    assert mi.slots_total == 2
+    assert mi.swap_gb == 2.0
+
+
+def test_mem_windows_empty_modules_list():
+    """No modules (e.g. WMI failure) → MemoryInfo with totals but empty modules list."""
+    mi = hw._mem_windows([], {}, (16.0, 8.0, 0.0))
+    assert mi.modules == []
+    assert mi.total_gb == 16.0
+    assert mi.kind is None
+    assert mi.slots_total is None
+
+
+# --- macOS parser ---
+
+def test_mem_macos_apple_silicon_no_modules():
+    """Apple Silicon is soldered — kind and manufacturer parsed, but modules=[]."""
+    mi = hw._mem_macos(_MACOS_SPMEMORY, _MACOS_TOTALS)
+    assert mi.total_gb == 24.0
+    assert mi.available_gb == 18.0
+    assert mi.kind == "LPDDR5"
+    assert mi.modules == []
+    assert mi.slots_used is None
+    assert mi.slots_total is None
+
+
+def test_mem_macos_missing_type_line():
+    """SPMemoryDataType with no 'Type:' line → kind=None (honest gap)."""
+    text = "Hardware Overview:\n\n      Memory: 16 GB\n"
+    mi = hw._mem_macos(text, (16.0, 10.0, 0.0))
+    assert mi.kind is None
+    assert mi.modules == []
+
+
+# --- Linux parser ---
+
+def test_mem_linux_non_root_no_modules():
+    """Non-root Linux: dmidecode_text=None → modules=[], no crash."""
+    mi = hw._mem_linux(_LINUX_MEMINFO, None, (31.2, 15.2, 2.0))
+    assert mi.modules == []
+    assert mi.total_gb == 31.2
+    assert mi.slots_total is None
+
+
+def test_mem_linux_root_parses_dmidecode():
+    """Root Linux with dmidecode output → 1 module parsed."""
+    mi = hw._mem_linux(_LINUX_MEMINFO, _LINUX_DMIDECODE, (31.2, 15.2, 2.0))
+    assert len(mi.modules) == 1
+    m = mi.modules[0]
+    assert m.slot == "Controller0-ChannelA-DIMM0"
+    assert m.manufacturer == "Samsung"
+    assert m.part_number == "K4EBE304EB-EGCG"
+    assert m.speed_mts == 3200
+    assert mi.kind == "LPDDR4"
+
+
+def test_mem_linux_empty_meminfo():
+    """Blank /proc/meminfo → totals from passed-in tuple, no crash."""
+    mi = hw._mem_linux("", None, (0.0, 0.0, 0.0))
+    assert mi.modules == []
+
+
+# Two-module dmidecode fixture — covers the "flush current when new block starts" path.
+_LINUX_DMIDECODE_TWO = """\
+# dmidecode 3.3
+
+Handle 0x1100, DMI type 17, 84 bytes
+Memory Device
+\tLocator: ChannelA-DIMM0
+\tType: DDR4
+\tSpeed: 3200 MT/s
+\tManufacturer: Samsung
+\tPart Number: M471A1G44AB0
+
+Handle 0x1101, DMI type 17, 84 bytes
+Memory Device
+\tLocator: ChannelB-DIMM0
+\tType: DDR4
+\tManufacturer: Samsung
+\tPart Number: M471A1G44AB0
+"""
+
+
+def test_mem_linux_two_modules_dmidecode():
+    """Two-module dmidecode: hits the 'flush current on new block' code path."""
+    mi = hw._mem_linux(_LINUX_MEMINFO, _LINUX_DMIDECODE_TWO, (31.2, 15.2, 0.0))
+    assert len(mi.modules) == 2
+    assert mi.modules[0].slot == "ChannelA-DIMM0"
+    assert mi.modules[1].slot == "ChannelB-DIMM0"
+    assert mi.kind == "DDR4"
+
+
+def test_parse_dmidecode_module_no_speed():
+    """A module block with no Speed or Configured Memory Speed → speed_mts=None."""
+    fields = {
+        "Locator": "DIMM0",
+        "Manufacturer": "Samsung",
+        "Part Number": "M471A1G44AB0",
+        # No 'Speed' or 'Configured Memory Speed'
+    }
+    m = hw._parse_dmidecode_module(fields)
+    assert m.speed_mts is None
+    assert m.slot == "DIMM0"
+
+
+# Two-module fixture where both have Type set: second flush takes 'kind already set' branch.
+_LINUX_DMIDECODE_TWO_TYPED = """\
+Memory Device
+\tLocator: ChannelA-DIMM0
+\tType: DDR4
+\tSpeed: 3200 MT/s
+\tManufacturer: Micron
+\tPart Number: PART-A
+
+Memory Device
+\tLocator: ChannelB-DIMM0
+\tType: DDR4
+\tSpeed: 3200 MT/s
+\tManufacturer: Micron
+\tPart Number: PART-B
+"""
+
+
+def test_mem_linux_two_typed_modules_kind_not_overwritten():
+    """Second flush (kind already set) must not overwrite kind — branch 425->427 False path.
+    Requires 3 modules so the second intermediate flush hits kind-already-set."""
+    # Three modules: first intermediate flush sets kind, second intermediate flush skips it.
+    three_modules = """\
+Memory Device
+\tLocator: DIMM0
+\tType: DDR4
+\tManufacturer: Micron
+\tPart Number: PART-A
+
+Memory Device
+\tLocator: DIMM1
+\tType: DDR4
+\tManufacturer: Micron
+\tPart Number: PART-B
+
+Memory Device
+\tLocator: DIMM2
+\tType: DDR4
+\tManufacturer: Micron
+\tPart Number: PART-C
+"""
+    mi = hw._mem_linux("", three_modules, (0.0, 0.0, 0.0))
+    assert len(mi.modules) == 3
+    assert mi.kind == "DDR4"
+
+
+# A dmidecode text that ends with a 'Memory Device' header but no fields (empty current at EOF).
+_LINUX_DMIDECODE_TRAILING_HEADER = """\
+Memory Device
+\tLocator: ChannelA-DIMM0
+\tType: DDR4
+\tManufacturer: Micron
+\tPart Number: PART-A
+
+Memory Device
+"""
+
+
+def test_mem_linux_dmidecode_trailing_empty_block():
+    """A trailing 'Memory Device' header with no fields → last empty current not appended."""
+    mi = hw._mem_linux("", _LINUX_DMIDECODE_TRAILING_HEADER, (0.0, 0.0, 0.0))
+    # Only the first module (with fields) is parsed; empty trailing block is skipped.
+    assert len(mi.modules) == 1
+    assert mi.modules[0].slot == "ChannelA-DIMM0"
+
+
+# --- _SMBIOS_MEM map ---
+
+def test_smbios_mem_has_required_codes():
+    """The SMBIOS map must include DDR3/DDR4/DDR5/LPDDR4/LPDDR5 at minimum."""
+    assert hw._SMBIOS_MEM[24] == "DDR3"
+    assert hw._SMBIOS_MEM[26] == "DDR4"
+    assert hw._SMBIOS_MEM[34] == "DDR5"
+    assert hw._SMBIOS_MEM[30] == "LPDDR4"
+    assert hw._SMBIOS_MEM[35] == "LPDDR5"
+
+
+# --- memory_info() dispatcher ---
+
+def test_memory_info_dispatches_macos(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: _MACOS_SPMEMORY)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 24 * hw.GB, "available": 18 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    mi = hw.memory_info()
+    assert mi.kind == "LPDDR5"
+    assert mi.modules == []
+    assert mi.total_gb == 24.0
+
+
+def test_memory_info_dispatches_windows(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "Windows")
+
+    def fake_pwsh_json(args):
+        cmd = args[0] if args else ""
+        if "Win32_PhysicalMemory" in cmd and "Array" not in cmd:
+            return _WIN_MEM_MODULES
+        if "Win32_PhysicalMemoryArray" in cmd:
+            return [_WIN_MEM_ARRAY]
+        return []
+
+    monkeypatch.setattr(hw, "_pwsh_json", fake_pwsh_json)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 32 * hw.GB, "available": 28 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    mi = hw.memory_info()
+    assert mi.kind == "DDR4"
+    assert len(mi.modules) == 4
+    assert mi.slots_total == 4
+
+
+def test_memory_info_dispatches_linux_non_root(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: _LINUX_MEMINFO)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)  # non-root
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 31 * hw.GB, "available": 15 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 2 * hw.GB})())
+    mi = hw.memory_info()
+    assert mi.modules == []
+    assert mi.slots_total is None
+
+
+def test_memory_info_dispatches_linux_root(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "Linux")
+
+    def fake_run(cmd, **k):
+        if "dmidecode" in cmd:
+            return _LINUX_DMIDECODE
+        return _LINUX_MEMINFO
+
+    monkeypatch.setattr(hw, "_run", fake_run)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)  # root
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 31 * hw.GB, "available": 15 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 2 * hw.GB})())
+    mi = hw.memory_info()
+    assert len(mi.modules) == 1
+    assert mi.kind == "LPDDR4"
+
+
+def test_memory_info_unknown_platform_returns_empty(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "FreeBSD")
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: type("vm", (), {"total": 16 * hw.GB, "available": 8 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    mi = hw.memory_info()
+    assert isinstance(mi, hw.MemoryInfo)
+    assert mi.modules == []
+
+
+def test_memory_info_exception_returns_empty(monkeypatch):
+    import platform as _platform
+    import psutil
+    monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    mi = hw.memory_info()
+    assert isinstance(mi, hw.MemoryInfo)
