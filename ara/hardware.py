@@ -109,10 +109,13 @@ def _gb_dec(n) -> float | None:
         return None
 
 
-def _run(cmd: list[str], timeout: float = 3) -> str | None:
+def _run(cmd: list[str], timeout: float = 3, ignore_rc: bool = False) -> str | None:
+    """Run *cmd*, return stdout (or None on error/timeout). With ``ignore_rc=True`` keep stdout
+    even on a non-zero exit — some tools partial-succeed (e.g. `sysctl` exits 1 when one of many
+    requested keys is unknown, yet still prints the keys that exist)."""
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return out.stdout if out.returncode == 0 else None
+        return out.stdout if (ignore_rc or out.returncode == 0) else None
     except Exception:
         return None
 
@@ -145,12 +148,12 @@ def _wmi_date(s: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _sysctl_many(keys: list[str]) -> dict[str, str]:
-    """Run `sysctl -n` for many keys at once; parse 'key: value' lines → dict.
-    Returns {} on failure or if output is empty."""
-    raw = _run(["sysctl", "-n", *keys])
-    if not raw:
-        # Try the verbose form (key: value) which works for a list of keys
-        raw = _run(["sysctl", *keys])
+    """Run `sysctl <keys>` (NOT `-n`) and parse 'key: value' lines → dict.
+
+    `-n` prints values only (no key labels), so they can't be mapped; the plain form prints
+    `key: value` for the keys that exist and silently omits absent ones (e.g. hw.cpufrequency on
+    Apple Silicon) — note sysctl then exits non-zero, so keep stdout via ignore_rc. {} on failure."""
+    raw = _run(["sysctl", *keys], ignore_rc=True)
     if not raw:
         return {}
     result: dict[str, str] = {}

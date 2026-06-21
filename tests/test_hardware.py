@@ -1,4 +1,6 @@
 import datetime as dt
+import sys
+
 from ara import hardware as hw
 
 
@@ -207,10 +209,31 @@ def test_cpu_linux_empty_cpuinfo():
 # --- _sysctl_many ---
 
 def test_sysctl_many_parses_multi_key(monkeypatch):
+    seen = {}
     output = "hw.physicalcpu: 12\nhw.logicalcpu: 12\n"
-    monkeypatch.setattr(hw, "_run", lambda *a, **k: output)
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = cmd
+        seen["kw"] = k
+        return output
+
+    monkeypatch.setattr(hw, "_run", fake_run)
     result = hw._sysctl_many(["hw.physicalcpu", "hw.logicalcpu"])
     assert result == {"hw.physicalcpu": "12", "hw.logicalcpu": "12"}
+    # Regression: must call `sysctl <keys>` WITHOUT `-n` (`-n` prints values only, no key labels)
+    # AND with ignore_rc=True — sysctl exits non-zero when any requested key is unknown (e.g.
+    # machdep.cpu.vendor on Apple Silicon) yet still prints the keys that exist. Both bugs made
+    # real-macOS cpu_info() return all-None while the mocked tests passed.
+    assert seen["cmd"] == ["sysctl", "hw.physicalcpu", "hw.logicalcpu"]
+    assert "-n" not in seen["cmd"]
+    assert seen["kw"].get("ignore_rc") is True
+
+
+def test_run_ignore_rc_keeps_stdout_on_nonzero():
+    # Real subprocess (cross-platform): prints to stdout, then exits 1.
+    cmd = [sys.executable, "-c", "import sys; sys.stdout.write('hi'); sys.exit(1)"]
+    assert hw._run(cmd) is None                       # default: gated on a 0 exit
+    assert hw._run(cmd, ignore_rc=True) == "hi"       # ignore_rc keeps the partial stdout
 
 
 def test_sysctl_many_returns_empty_on_failure(monkeypatch):
@@ -302,39 +325,6 @@ def test_sysctl_many_skips_lines_without_colon_separator(monkeypatch):
     assert result == {"hw.physicalcpu": "12", "hw.logicalcpu": "12"}
 
 
-# --- _sysctl_many: first _run returns output (no fallback needed) ---
-
-def test_sysctl_many_uses_first_run_if_successful(monkeypatch):
-    """When the first _run call succeeds, the second fallback call is never needed."""
-    calls = []
-
-    def fake_run(cmd, **k):
-        calls.append(cmd)
-        if "-n" in cmd:
-            return "hw.physicalcpu: 8\n"
-        return None  # fallback should not be reached
-
-    monkeypatch.setattr(hw, "_run", fake_run)
-    result = hw._sysctl_many(["hw.physicalcpu"])
-    assert result == {"hw.physicalcpu": "8"}
-    # Only the first call (-n form) should have been made
-    assert any("-n" in c for c in calls)
-
-
-# --- _sysctl_many: both _run calls fail (second fallback also None) ---
-
-def test_sysctl_many_both_run_calls_fail(monkeypatch):
-    """When both _run calls return None, return {}."""
-    call_count = [0]
-
-    def fake_run(cmd, **k):
-        call_count[0] += 1
-        return None
-
-    monkeypatch.setattr(hw, "_run", fake_run)
-    result = hw._sysctl_many(["hw.physicalcpu"])
-    assert result == {}
-    assert call_count[0] == 2
 
 
 # --- _winreg_str on "Windows" with a mock winreg module ---
