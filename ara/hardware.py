@@ -77,11 +77,23 @@ class BoardInfo:
 
 
 @dataclass(frozen=True)
+class GpuInfo:
+    vendor: str = "unknown"          # "nvidia" | "amd" | "intel" | "apple" | "unknown"
+    name: str | None = None
+    vram_gb: float | None = None     # dedicated/carveout VRAM; None = unified/unknown
+    integrated: bool | None = None   # True iGPU/APU/Apple, False discrete, None unknown
+    driver_version: str | None = None
+    compute_runtime: str | None = None   # "Vulkan 1.4 · RADV · coopmat" / "CUDA 13.1" / "Metal"
+    usable_backend: str | None = None    # "cuda" | "mlx" | "vulkan" | None
+
+
+@dataclass(frozen=True)
 class Hardware:
     cpu: CpuInfo
     memory: MemoryInfo
     storage: StorageInfo
     board: BoardInfo
+    gpus: list[GpuInfo] = field(default_factory=list)
 
 
 _PLACEHOLDERS = {"system manufacturer", "system product name", "to be filled by o.e.m.",
@@ -833,6 +845,51 @@ def board_info() -> "BoardInfo":
 
 
 # ---------------------------------------------------------------------------
+# Task 6: GPU inventory scaffold
+# ---------------------------------------------------------------------------
+
+_GPU_VENDOR = {"0x1002": "amd", "0x10de": "nvidia", "0x8086": "intel"}
+
+
+def _gpu_vendor(raw: str | None) -> str:
+    s = (raw or "").strip().lower()
+    if s in _GPU_VENDOR:
+        return _GPU_VENDOR[s]
+    if "amd" in s or " ati" in s or "[ati]" in s or "advanced micro" in s or "radeon" in s:
+        return "amd"
+    if "nvidia" in s:
+        return "nvidia"
+    if "intel" in s:
+        return "intel"
+    if "apple" in s:
+        return "apple"
+    return "unknown"
+
+
+def _gpus_linux() -> list["GpuInfo"]: return []
+def _gpus_windows() -> list["GpuInfo"]: return []
+def _gpus_macos() -> list["GpuInfo"]: return []
+def _with_runtime(g: "GpuInfo") -> "GpuInfo": return g
+
+
+def gpu_info() -> list["GpuInfo"]:
+    """Enumerate all GPUs, then enrich each with its compute runtime. Never raises."""
+    system = platform.system()
+    try:
+        if system == "Linux":
+            gpus = _gpus_linux()
+        elif system == "Windows":
+            gpus = _gpus_windows()
+        elif system == "Darwin":
+            gpus = _gpus_macos()
+        else:
+            return []
+    except Exception:
+        return []
+    return [_with_runtime(g) for g in gpus]
+
+
+# ---------------------------------------------------------------------------
 # probe() — bundle all four into a Hardware
 # ---------------------------------------------------------------------------
 
@@ -847,6 +904,7 @@ def probe() -> "Hardware":
         memory=memory_info(),
         storage=storage_info(),
         board=board_info(),
+        gpus=gpu_info(),
     )
 
 

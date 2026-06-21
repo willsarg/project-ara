@@ -1536,3 +1536,88 @@ def test_probe_returns_hardware_bundle(monkeypatch):
     assert result.board is fake_board
     assert result.cpu.brand == "Apple M4 Pro"
     assert result.board.system_vendor == "Apple"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: GpuInfo dataclass, vendor map, gpu_info() scaffold
+# ---------------------------------------------------------------------------
+
+def test_gpuinfo_defaults_and_vendor_map():
+    from ara import hardware as hw
+    g = hw.GpuInfo(vendor="amd")
+    assert g.vendor == "amd"
+    assert g.name is None and g.vram_gb is None and g.integrated is None
+    assert g.driver_version is None and g.compute_runtime is None
+    assert g.usable_backend is None
+    # vendor map: PCI IDs and vendor strings normalise to canonical tokens
+    assert hw._gpu_vendor("0x1002") == "amd"
+    assert hw._gpu_vendor("0x10de") == "nvidia"
+    assert hw._gpu_vendor("Advanced Micro Devices, Inc. [AMD/ATI]") == "amd"
+    assert hw._gpu_vendor("NVIDIA Corporation") == "nvidia"
+    assert hw._gpu_vendor("Intel Corporation") == "intel"
+    assert hw._gpu_vendor("Apple") == "apple"
+    assert hw._gpu_vendor("something else") == "unknown"
+
+
+def test_hardware_has_gpus_and_probe_returns_list(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "gpu_info", lambda: [hw.GpuInfo(vendor="amd")])
+    h = hw.probe()
+    assert isinstance(h.gpus, list) and h.gpus[0].vendor == "amd"
+
+
+def test_gpu_info_unknown_os_returns_empty(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Plan9")
+    assert hw.gpu_info() == []
+
+
+def test_gpus_linux_stub_returns_empty():
+    """Direct call to the stub so its body line is covered."""
+    from ara import hardware as hw
+    assert hw._gpus_linux() == []
+
+
+def test_gpus_windows_stub_returns_empty():
+    """Direct call to the stub so its body line is covered."""
+    from ara import hardware as hw
+    assert hw._gpus_windows() == []
+
+
+def test_gpus_macos_stub_returns_empty():
+    """Direct call to the stub so its body line is covered."""
+    from ara import hardware as hw
+    assert hw._gpus_macos() == []
+
+
+def test_with_runtime_stub_identity():
+    """Direct call to the stub so its body line is covered."""
+    from ara import hardware as hw
+    g = hw.GpuInfo(vendor="nvidia")
+    assert hw._with_runtime(g) is g
+
+
+def test_gpu_info_dispatches_linux(monkeypatch):
+    """gpu_info() on Linux hits the Linux branch (line 880)."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hw, "_gpus_linux", lambda: [hw.GpuInfo(vendor="amd")])
+    result = hw.gpu_info()
+    assert len(result) == 1 and result[0].vendor == "amd"
+
+
+def test_gpu_info_dispatches_windows(monkeypatch):
+    """gpu_info() on Windows hits the Windows branch (line 882)."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hw, "_gpus_windows", lambda: [hw.GpuInfo(vendor="nvidia")])
+    result = hw.gpu_info()
+    assert len(result) == 1 and result[0].vendor == "nvidia"
+
+
+def test_gpu_info_exception_returns_empty(monkeypatch):
+    """If _gpus_linux raises, gpu_info() returns [] (exception branch lines 887-888)."""
+    from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hw, "_gpus_linux", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert hw.gpu_info() == []
