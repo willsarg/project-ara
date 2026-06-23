@@ -422,6 +422,9 @@ def _wire_profile(monkeypatch, set_platform, bk, *, engine_ok=True, isatty=False
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+    # profile.capture() runs on the success path; keep it engine-free + hardware-free in tests.
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
 
 
 def test_profile_engine_not_installed(make_console, monkeypatch, set_platform):
@@ -467,6 +470,17 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_profile(c, engine="bogus") == 1
     assert "unknown engine" in buf.getvalue().lower()
+
+
+def test_profile_command_persists_system_profile(make_console, monkeypatch, set_platform, store):
+    # Spec 2026-06-23-capability-pipeline (Slice 1, Task 3): the profile command persists the
+    # system profile via profile.capture().
+    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits(calibrated=True)))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    c, _ = make_console()
+    cli.render_profile(c)
+    assert cli.db.get_latest_profile(store, "mkey") is not None   # profile was persisted
 
 
 # --- persistence wiring: overlay a stored calibration / persist a fresh one ---

@@ -1184,6 +1184,11 @@ def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = Fal
             c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
         return 1
 
+    # Persist this machine's profile (the engine-free Machine snapshot; history kept).
+    # Spec 2026-06-23-capability-pipeline. Transitional placement: Slice 2 makes `profile` the
+    # engine-free persist command and moves calibration into `characterize`.
+    profile.capture(db.connect())
+
     engine_key = sel.engine_key
     _overlay_stored_calibration(m, engine_key)   # reuse a stored measurement if we have one
 
