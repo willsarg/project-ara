@@ -772,7 +772,7 @@ def _board_windows(baseboard: dict, bios: dict, system: dict) -> "BoardInfo":
     """Parse Win32_BaseBoard + Win32_BIOS + Win32_ComputerSystem WMI dicts → BoardInfo.
 
     system_vendor/model run through _clean so custom-build placeholders ("System manufacturer",
-    "System Product Name") → None — exactly what willw11 returns.
+    "System Product Name") → None — exactly what winbox returns.
     """
     return BoardInfo(
         board_vendor=_clean(baseboard.get("Manufacturer")),

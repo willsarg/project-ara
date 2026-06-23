@@ -493,7 +493,7 @@ def test_cpu_info_returns_empty_on_internal_exception(monkeypatch):
 # Task 3: Memory detail
 # ---------------------------------------------------------------------------
 
-# Fixtures from the plan (real willw11 output)
+# Fixtures from the plan (real winbox output)
 _WIN_MEM_MODULES = [
     {"DeviceLocator": "DIMM_A1", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
      "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
@@ -585,7 +585,7 @@ Memory Device
 # --- Windows parser ---
 
 def test_mem_windows_four_modules_ddr4():
-    """Real willw11 fixture: 4 DDR4 DIMM_A1/A2/B1/B2, 8 GiB each, 3400 MT/s."""
+    """Real winbox fixture: 4 DDR4 DIMM_A1/A2/B1/B2, 8 GiB each, 3400 MT/s."""
     mi = hw._mem_windows(_WIN_MEM_MODULES, _WIN_MEM_ARRAY, _WIN_TOTALS)
     assert mi.total_gb == 32.0
     assert mi.available_gb == 28.0
@@ -935,7 +935,7 @@ def test_memory_info_exception_returns_empty(monkeypatch):
 # Task 4: Storage detail
 # ---------------------------------------------------------------------------
 
-# --- Windows fixture (real willw11 Get-PhysicalDisk output) ---
+# --- Windows fixture (real winbox Get-PhysicalDisk output) ---
 _WIN_PHYSICAL_DISKS = [
     {"FriendlyName": "Samsung SSD 990 EVO 1TB", "MediaType": "SSD", "BusType": "NVMe",
      "Size": 1000204886016},
@@ -1054,8 +1054,8 @@ def test_drives_windows_unknown_classification():
     assert drives[0].media == "unknown"
 
 
-def test_drives_windows_full_willw11_fixture():
-    """Full willw11 Get-PhysicalDisk fixture: NVMe SSD + HDD + USB → 3 drives, correct media."""
+def test_drives_windows_full_winbox_fixture():
+    """Full winbox Get-PhysicalDisk fixture: NVMe SSD + HDD + USB → 3 drives, correct media."""
     drives = hw._drives_windows(_WIN_PHYSICAL_DISKS)
     assert len(drives) == 3
     assert drives[0].media == "nvme-ssd"
@@ -1294,7 +1294,7 @@ Hardware Overview:
       Activation Lock Status: Disabled
 """
 
-# Windows WMI fixture objects (real willw11)
+# Windows WMI fixture objects (real winbox)
 _WIN_BASEBOARD = {"Manufacturer": "ASUSTeK COMPUTER INC.", "Product": "ROG STRIX X470-F GAMING"}
 _WIN_BIOS = {"SMBIOSBIOSVersion": "6042", "ReleaseDate": "\\/Date(1651104000000)\\/"}
 _WIN_SYSTEM = {"Manufacturer": "System manufacturer", "Model": "System Product Name"}
@@ -1341,8 +1341,8 @@ def test_board_macos_sets_vendor_apple_always():
 
 # --- _board_windows parser ---
 
-def test_board_windows_asus_rog_willw11():
-    """Real willw11 fixture: board=ASUS ROG STRIX X470-F, bios=6042@2022-04-28,
+def test_board_windows_asus_rog_winbox():
+    """Real winbox fixture: board=ASUS ROG STRIX X470-F, bios=6042@2022-04-28,
     system=None/None (placeholders stripped by _clean)."""
     b = hw._board_windows(_WIN_BASEBOARD, _WIN_BIOS, _WIN_SYSTEM)
     assert b.board_vendor == "ASUSTeK COMPUTER INC."

@@ -79,12 +79,12 @@ def test_origin_classification():
 def test_origin_classification_windows_paths():
     # Backslash paths normalize to '/', so the same rules classify Windows installs.
     cases = {
-        r"C:\Users\Will\AppData\Local\Programs\Python\Python312\python.exe": "python.org",
+        r"C:\Users\dev\AppData\Local\Programs\Python\Python312\python.exe": "python.org",
         r"C:\Program Files\Python313\python.exe": "python.org",
         r"C:\Program Files (x86)\Python311\python.exe": "python.org",
-        r"C:\Users\Will\.pyenv\pyenv-win\versions\3.12.0\python.exe": "pyenv",
-        r"C:\Users\Will\miniconda3\python.exe": "conda",
-        r"C:\Users\Will\AppData\Roaming\uv\python\cpython-3.12\python.exe": "uv",
+        r"C:\Users\dev\.pyenv\pyenv-win\versions\3.12.0\python.exe": "pyenv",
+        r"C:\Users\dev\miniconda3\python.exe": "conda",
+        r"C:\Users\dev\AppData\Roaming\uv\python\cpython-3.12\python.exe": "uv",
     }
     for real, expected in cases.items():
         assert pythons._origin(real, [real]) == expected, real
@@ -237,11 +237,11 @@ def test_py_name_matches_windows_exe():
 
 
 def test_windows_patterns_content(monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Will\AppData\Local")
-    monkeypatch.setenv("APPDATA", r"C:\Users\Will\AppData\Roaming")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\dev\AppData\Local")
+    monkeypatch.setenv("APPDATA", r"C:\Users\dev\AppData\Roaming")
     monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
     monkeypatch.delenv("ProgramFiles(x86)", raising=False)   # unset → its entry is dropped
-    pats = pythons._windows_patterns(r"C:\Users\Will")
+    pats = pythons._windows_patterns(r"C:\Users\dev")
     assert all(p.endswith("python.exe") for p in pats)
     assert any(r"Programs\Python" in p for p in pats)
     assert any(r"pyenv-win" in p for p in pats)
@@ -256,8 +256,8 @@ def test_known_patterns_dispatches_to_windows(monkeypatch):
     # os.name='nt' flips pathlib to WindowsPath (uninstantiable on posix), so stub Path.
     monkeypatch.setattr(pythons.os, "name", "nt")
     monkeypatch.setattr(pythons, "Path",
-                        types.SimpleNamespace(home=lambda: r"C:\Users\Will"))
-    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Will\AppData\Local")
+                        types.SimpleNamespace(home=lambda: r"C:\Users\dev"))
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\dev\AppData\Local")
     pats = pythons._known_patterns()
     assert pats and all(p.endswith("python.exe") for p in pats)
 

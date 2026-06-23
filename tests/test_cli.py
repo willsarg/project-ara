@@ -897,7 +897,7 @@ def test_render_python_text(make_console, monkeypatch):
 def test_render_python_help_text_is_windows_aware(make_console, monkeypatch):
     monkeypatch.setattr(cli.os, "name", "nt")
     # os.name='nt' breaks pathlib on posix; _tilde only needs Path.home() → stub it.
-    monkeypatch.setattr(cli, "Path", types.SimpleNamespace(home=lambda: r"C:\Users\Will"))
+    monkeypatch.setattr(cli, "Path", types.SimpleNamespace(home=lambda: r"C:\Users\dev"))
     ints = [_interp(path=r"C:\Python312\python.exe", real=r"C:\Python312\python.exe",
                     origin="python.org", version="3.12.5")]
     monkeypatch.setattr(cli.pythons, "discover", lambda probe=True: ints)
@@ -1515,7 +1515,7 @@ def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
 
 def test_render_models_best_fit_across_engines(make_console, store, monkeypatch):
     """A model characterized under two engines shows the LARGER ceiling + which engine reached
-    it — the willw11 case (GPU 3500 vs CPU 8192 for one model → 8192, cpu)."""
+    it — the winbox case (GPU 3500 vs CPU 8192 for one model → 8192, cpu)."""
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/L", "modality": "text"}])
@@ -1753,7 +1753,7 @@ def test_render_characterize_json(monkeypatch, capsys, store):
 
 
 def test_render_characterize_engine_flag_overrides_detected_backend(make_console, store, monkeypatch):
-    # willw11's case: a GPU is detected (cuda), but `--engine cpu` must run on the CPU backend
+    # winbox's case: a GPU is detected (cuda), but `--engine cpu` must run on the CPU backend
     # and store under the cpu engine key — never silently fall through to the detected GPU.
     seen = {}
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
@@ -2123,7 +2123,7 @@ def _windows_cpu() -> CpuInfo:
 
 
 def _windows_memory() -> MemoryInfo:
-    """willw11-shaped MemoryInfo: 4×DDR4 8 GB DIMMs, 4/4 slots used."""
+    """winbox-shaped MemoryInfo: 4×DDR4 8 GB DIMMs, 4/4 slots used."""
     modules = [
         MemoryModule(slot=f"DIMM_A{i}", capacity_gb=8.0, speed_mts=3400,
                      manufacturer="G-Skill", part_number="F4-3200C14-8GFX")
@@ -2148,7 +2148,7 @@ def _apple_memory() -> MemoryInfo:
 
 
 def _windows_storage() -> StorageInfo:
-    """willw11-shaped StorageInfo: NVMe SSD + HDD."""
+    """winbox-shaped StorageInfo: NVMe SSD + HDD."""
     return StorageInfo(
         free_gb=500.0,
         drives=[
@@ -2167,7 +2167,7 @@ def _apple_storage() -> StorageInfo:
 
 
 def _windows_board() -> BoardInfo:
-    """willw11-shaped BoardInfo: ASUS ROG STRIX; system_* → None (custom PC)."""
+    """winbox-shaped BoardInfo: ASUS ROG STRIX; system_* → None (custom PC)."""
     return BoardInfo(
         board_vendor="ASUSTeK COMPUTER INC.", board_model="ROG STRIX X470-F GAMING",
         bios_version="6042", bios_date="2022-04-28",
