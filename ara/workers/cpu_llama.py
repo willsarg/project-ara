@@ -290,6 +290,31 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
     return {"context": ctx, "mem_gb": round(statistics.median(deltas), 3)}
 
 
+def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb: float,
+             max_tokens: int) -> dict:
+    """Gate (L4) then, if safe, load the model with the KV cache capped at *ctx* (the governed
+    safe ceiling) and return a one-shot completion. The cap keeps the footprint under the wall;
+    the same a-priori gate as ``run`` refuses-before-load. Returns ``{context, completion}`` or a
+    refusal. ``ctx`` is ARA's characterized ceiling, so generation never allocates past it."""
+    try:
+        gguf = _resolve_gguf(model)
+        meta = _read_meta(gguf)
+    except Exception as e:
+        return _refused(ctx, str(e))
+    total = _total_gb()
+    budget = safe_threshold_gb(total, effective_margin_gb(total, margin_gb))
+    base_gb = _used_gb() + _model_base_gb(gguf, overhead_gb)
+    reason = safety_gate(base_gb=base_gb, slope_gb_per_k=kv_slope_gb_per_k(meta),
+                         ctx=ctx, budget_gb=budget)
+    if reason is not None:
+        return _refused(ctx, reason)
+    from llama_cpp import Llama
+
+    llm = Llama(model_path=gguf, n_ctx=ctx, verbose=False)
+    out = llm.create_completion(prompt, max_tokens=max_tokens)
+    return {"context": ctx, "completion": out["choices"][0]["text"]}
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Safe single-context CPU memory measurement.")
     ap.add_argument("model", nargs="?", help="local .gguf, HF repo id, or repo:filename.gguf")
@@ -305,6 +330,9 @@ def main(argv=None) -> None:
     ap.add_argument("--abort-gb", type=float, default=None,
                     help="internal: L5 watchdog wall for --probe")
     ap.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
+    ap.add_argument("--generate", action="store_true",
+                    help="one-shot completion at <ctx> (the governed ceiling); prompt on stdin")
+    ap.add_argument("--max-tokens", type=int, default=256)
     args = ap.parse_args(argv)
 
     if args.limits:
@@ -313,6 +341,10 @@ def main(argv=None) -> None:
         result = _probe(args.model, args.ctx, args.abort_gb)
     elif args.preflight:
         result = preflight(args.model, margin_gb=args.margin, overhead_gb=args.overhead)
+    elif args.generate:
+        result = generate(args.model, args.ctx, sys.stdin.read(),
+                          margin_gb=args.margin, overhead_gb=args.overhead,
+                          max_tokens=args.max_tokens)
     else:
         result = run(args.model, args.ctx, margin_gb=args.margin,
                      overhead_gb=args.overhead, repeats=args.repeats)

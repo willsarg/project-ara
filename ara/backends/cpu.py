@@ -111,3 +111,21 @@ def characterize(model: str) -> dict:
             ENV_NAME, _worker_argv(m, ctx, margin, overhead)),
         schedule=RAMP_SCHEDULE,
     )
+
+
+DEFAULT_MAX_TOKENS = 256
+
+
+def generate(model: str, prompt: str, *, max_context: int,
+             max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+    """One-shot completion on CPU, governed: ``max_context`` is the characterized safe ceiling,
+    so the worker's KV cache is capped under the wall (the worker still self-vetoes, L4/L5).
+    Out-of-process in the isolated ``cpu`` env; the prompt goes over stdin, never argv. Returns
+    ``{context, completion}`` or a refusal (``{refused, reason}``)."""
+    margin, overhead = _budget_params()
+    return engine_env.run_worker(
+        ENV_NAME,
+        [str(WORKER), model, str(max_context), "--generate",
+         "--margin", str(margin), "--overhead", str(overhead),
+         "--max-tokens", str(max_tokens)],
+        input=prompt)

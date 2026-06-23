@@ -69,3 +69,19 @@ def test_characterize_finds_a_sane_ceiling(cpu_engine):
     assert isinstance(r["safe_context"], int) and r["safe_context"] >= 2048
     assert r["binding"] == "context_window"
     assert r["points"] and all(p["mem_gb"] > 0 for p in r["points"])
+
+
+def test_generate_produces_a_real_completion(cpu_engine):
+    # The governed run, end to end: load the real model under a safe ceiling and generate. Same
+    # fetch-first discipline as characterize — an offline fetch is a skip, not a failure.
+    from ara.workers import cpu_llama
+    try:
+        cpu_llama._resolve_gguf(SMOKE_MODEL)
+    except Exception as e:
+        pytest.skip(f"{SMOKE_MODEL} unavailable (offline?): {e}")
+
+    out = cpu_engine.generate(SMOKE_MODEL, "The capital of France is",
+                              max_context=2048, max_tokens=8)
+    assert "refused" not in out, f"governed generate was refused: {out.get('reason')}"
+    assert out["context"] == 2048                       # KV capped at the governed ceiling
+    assert isinstance(out["completion"], str) and out["completion"].strip()

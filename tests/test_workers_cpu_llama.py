@@ -93,3 +93,54 @@ def test_probe_refuses_without_an_l5_abort_limit():
     # L5 must never fail open: probing with no abort wall is refused (no model load attempted).
     out = w._probe("/nonexistent.gguf", 2000, None)
     assert out["status"] == "error" and "abort" in out["note"].lower()
+
+
+# --- generate: governed one-shot inference (Spec 2026-06-23-capability-pipeline, Slice 4) ---
+_GEN_META = {"general.architecture": "llama", "llama.block_count": "2",
+             "llama.embedding_length": "16", "llama.attention.head_count": "4"}
+
+
+def test_generate_refuses_when_gate_blocks(monkeypatch):
+    # The a-priori L4 gate refuses before any model load when the base alone busts the budget.
+    monkeypatch.setattr(w, "_resolve_gguf", lambda m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda p: _GEN_META)
+    monkeypatch.setattr(w, "_total_gb", lambda: 8.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda p, o: 50.0)   # base alone > budget
+    out = w.generate("org/m", 4000, "hi", margin_gb=2.0, overhead_gb=1.0, max_tokens=16)
+    assert out["refused"] is True and out["reason"]
+
+
+def test_generate_refuses_on_resolve_error(monkeypatch):
+    def boom(m):
+        raise RuntimeError("no gguf for model")
+    monkeypatch.setattr(w, "_resolve_gguf", boom)
+    out = w.generate("bad/m", 4000, "hi", margin_gb=2.0, overhead_gb=1.0, max_tokens=16)
+    assert out["refused"] is True and "no gguf" in out["reason"]
+
+
+def test_generate_returns_completion_when_safe(monkeypatch):
+    import sys as _sys
+    import types as _t
+
+    monkeypatch.setattr(w, "_resolve_gguf", lambda m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda p: _GEN_META)
+    monkeypatch.setattr(w, "_total_gb", lambda: 64.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda p, o: 2.0)
+    monkeypatch.setattr(w, "safety_gate", lambda **k: None)        # safe
+
+    seen = {}
+
+    class _Llama:
+        def __init__(self, **kw):
+            seen["n_ctx"] = kw.get("n_ctx")
+
+        def create_completion(self, prompt, max_tokens):
+            seen["prompt"], seen["max_tokens"] = prompt, max_tokens
+            return {"choices": [{"text": " 42"}]}
+
+    monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_Llama))
+    out = w.generate("org/m", 4000, "meaning?", margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
+    assert out == {"context": 4000, "completion": " 42"}
+    assert seen == {"n_ctx": 4000, "prompt": "meaning?", "max_tokens": 8}   # KV capped at ceiling

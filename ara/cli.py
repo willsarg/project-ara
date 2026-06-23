@@ -1084,6 +1084,71 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
     return 0
 
 
+RUN_MAX_TOKENS = 256
+
+
+def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
+               assume_yes: bool = False, as_json: bool = False,
+               max_tokens: int = RUN_MAX_TOKENS) -> int:
+    """Governed one-shot inference: generate a completion for *model*, capped at its characterized
+    safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
+    the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
+    engine + model out-of-process. Spec 2026-06-23-capability-pipeline."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    try:
+        sel = resolve_engine(engine)
+    except UnknownEngine:
+        return err(f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}")
+    if not prompt:
+        return err("usage: ara run <model> <prompt>")
+
+    row = db.get_characterization(db.connect(), profile.machine_key(), sel.engine_key, model)
+    suffix = "" if engine is None else f" --engine {sel.engine_key}"
+    if row is None:
+        return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                   f"ara characterize {model}{suffix}")
+    if row.get("safe_context") is None:
+        return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
+                   f"too big for this machine")
+    safe = row["safe_context"]
+
+    engine_ok, engine_pkg = engine_status(sel.backend)
+    if not engine_ok:
+        return err(f"the {engine_pkg} engine isn't installed — run: ara install{suffix}")
+    bk = get_backend(sel.backend)
+    if not hasattr(bk, "generate"):
+        return err(f"run isn't supported on the {engine_pkg} engine yet")
+
+    # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
+    # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
+    if not as_json and not assume_yes and sys.stdin.isatty():
+        if not _confirm(f"Load {model} on {engine_pkg} and generate (≤ ~{safe} tokens)?"):
+            c.emit(c.style("dim", "  skipped."))
+            return 0
+
+    if not as_json:
+        c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
+    try:
+        result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens)
+    except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
+        return err(f"run failed: {exc}")
+    if result.get("refused"):
+        return err(f"the {engine_pkg} engine refused: {result.get('reason', 'no reason given')}")
+
+    completion = result.get("completion", "")
+    if as_json:
+        print(json.dumps({"model": model, "engine": sel.engine_key,
+                          "safe_context": safe, "completion": completion}, indent=2))
+        return 0
+    c.emit()
+    c.emit(completion)
+    c.emit()
+    return 0
+
+
 def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
     """Install the matched engine. ``--engine`` is the consent; exit 0 once the
     engine is present (installed or already), nonzero otherwise."""
@@ -1249,6 +1314,7 @@ def main() -> int:
     argv = sys.argv[1:]
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
+    assume_yes = "--yes" in argv or "-y" in argv
 
     # --model / --engine / --include / --exclude take values; pull them out first.
     model: str | None = None
@@ -1286,7 +1352,7 @@ def main() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json"):
+        if a in ("--verbose", "-v", "--json", "--yes", "-y"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
@@ -1342,6 +1408,13 @@ def main() -> int:
 
     if cmd == "recommend":
         return render_recommend(c, as_json=as_json)
+
+    if cmd == "run":
+        if len(rest) < 2:
+            c.emit(c.style("warn", "  usage: ara run <model> <prompt>"))
+            return 1
+        return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
+                          engine=engine, assume_yes=assume_yes, as_json=as_json)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)

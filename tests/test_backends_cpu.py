@@ -128,3 +128,26 @@ def test_calibrate_attaches_characterization(monkeypatch):
     out = cpu.calibrate("org/m")
     assert out["calibrated"] is True
     assert out["characterization"]["safe_context"] == 8192
+
+
+# --------------------------------------------------------------------------- #
+# generate — governed one-shot inference (Spec 2026-06-23-capability-pipeline, Slice 4)
+# --------------------------------------------------------------------------- #
+def test_generate_drives_worker_capped_at_context(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["name"], seen["argv"], seen["input"] = name, argv, input
+        return {"context": 8192, "completion": "hello there"}
+
+    monkeypatch.setattr(cpu, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(cpu, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = cpu.generate("org/model", "say hi", max_context=8192, max_tokens=64)
+    assert out["completion"] == "hello there"
+    assert seen["name"] == "cpu"
+    assert seen["argv"][0].endswith("cpu_llama.py")
+    assert seen["argv"][1] == "org/model" and seen["argv"][2] == "8192"   # governed ceiling
+    assert "--generate" in seen["argv"]
+    assert "--max-tokens" in seen["argv"] and "64" in seen["argv"]
+    assert seen["input"] == "say hi"          # prompt over stdin, not argv

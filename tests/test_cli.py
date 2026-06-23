@@ -93,6 +93,8 @@ def _capture_dispatch(monkeypatch):
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
                         lambda c, as_json=False: (rec.update(recommend=as_json) or 0))
+    monkeypatch.setattr(cli, "render_run",
+                        lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
     monkeypatch.setattr(cli, "render_uninstall", lambda c, **kw: (rec.update(uninstall=kw) or 0))
     return rec
@@ -1459,6 +1461,150 @@ def test_main_recommend_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["recommend", "--json"])
     assert rec["recommend"] is True
+
+
+# --------------------------------------------------------------------------- #
+# ara run — governed one-shot inference (Spec 2026-06-23-capability-pipeline, Slice 4)
+# --------------------------------------------------------------------------- #
+_CHAR = {"model_id": "org/m", "safe_context": 8192, "decode_context": None}
+
+
+def _wire_run(monkeypatch, *, engine_ok=True, generate=None, characterization=None, isatty=False):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "llama.cpp"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: characterization)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+    bk = types.SimpleNamespace()
+    if generate is not None:
+        bk.generate = generate
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
+
+
+def test_run_refuses_uncharacterized(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=None)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    out = buf.getvalue()
+    assert "isn't characterized" in out and "ara characterize org/m" in out
+
+
+def test_run_refuses_when_no_safe_ceiling(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={"model_id": "org/m", "safe_context": None})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "didn't fit" in buf.getvalue()
+
+
+def test_run_engine_not_installed(make_console, monkeypatch):
+    _wire_run(monkeypatch, engine_ok=False, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "isn't installed" in buf.getvalue()
+
+
+def test_run_unsupported_engine(make_console, monkeypatch):
+    # A backend with no generate method (apple/cuda until their repos add the verb).
+    _wire_run(monkeypatch, characterization=_CHAR, generate=None)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "isn't supported" in buf.getvalue()
+
+
+def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
+    seen = {}
+
+    def gen(model, prompt, *, max_context, max_tokens):
+        seen.update(model=model, prompt=prompt, max_context=max_context)
+        return {"context": max_context, "completion": "the answer is 42"}
+
+    _wire_run(monkeypatch, characterization=_CHAR, generate=gen, isatty=False)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="meaning?") == 0
+    assert "the answer is 42" in buf.getvalue()
+    assert seen["max_context"] == 8192 and seen["prompt"] == "meaning?"   # governed ceiling
+
+
+def test_run_confirm_declined_skips(make_console, monkeypatch):
+    called = []
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: called.append(1) or {"completion": "x"}, isatty=True)
+    monkeypatch.setattr(cli, "_confirm", lambda q: False)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 0
+    assert "skipped" in buf.getvalue() and called == []
+
+
+def test_run_yes_skips_confirm(make_console, monkeypatch):
+    def no_ask(q):
+        raise AssertionError("should not prompt with --yes")
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: {"completion": "ok"}, isatty=True)
+    monkeypatch.setattr(cli, "_confirm", no_ask)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+    assert "ok" in buf.getvalue()
+
+
+def test_run_confirm_accepted_runs(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: {"completion": "done"}, isatty=True)
+    monkeypatch.setattr(cli, "_confirm", lambda q: True)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 0
+    assert "done" in buf.getvalue()
+
+
+def test_run_worker_refused(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: {"refused": True, "reason": "memory pressure"})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "memory pressure" in buf.getvalue()
+
+
+def test_run_failure(make_console, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("worker died")
+    _wire_run(monkeypatch, characterization=_CHAR, generate=boom)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "run failed" in buf.getvalue()
+
+
+def test_run_json(monkeypatch, capsys):
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: {"completion": "hello"})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["completion"] == "hello" and payload["safe_context"] == 8192
+
+
+def test_run_usage_without_prompt(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt=None) == 1
+    assert "usage" in buf.getvalue()
+
+
+def test_run_unknown_engine(make_console):
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="bogus") == 1
+    assert "unknown engine" in buf.getvalue().lower()
+
+
+def test_main_run_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["run", "org/m", "hello", "world"])
+    assert rec["run"]["model"] == "org/m"
+    assert rec["run"]["prompt"] == "hello world"
+
+
+def test_main_run_usage_no_model(make_console, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["ara", "run"])
+    assert cli.main() == 1
 
 
 # --------------------------------------------------------------------------- #
