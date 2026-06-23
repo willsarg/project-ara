@@ -91,6 +91,8 @@ def _capture_dispatch(monkeypatch):
                         (rec.update(characterize=m, characterize_engine=engine) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
+    monkeypatch.setattr(cli, "render_recommend",
+                        lambda c, as_json=False: (rec.update(recommend=as_json) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
     monkeypatch.setattr(cli, "render_uninstall", lambda c, **kw: (rec.update(uninstall=kw) or 0))
     return rec
@@ -1367,6 +1369,96 @@ def test_main_models_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["models", "--json"])
     assert rec["models"] is True
+
+
+# --------------------------------------------------------------------------- #
+# ara recommend — analytic: catalog models that fit, ranked by context
+# Spec 2026-06-23-capability-pipeline (Slice 3)
+# --------------------------------------------------------------------------- #
+def _model_row(model_id, *, weights_gb=4.0, max_context=8192, **over):
+    base = dict(model_id=model_id, modality="text", params=None, quant=None,
+                n_layers=32, hidden_size=4096, kv_heads=8, head_dim=128,
+                weights_gb=weights_gb, max_context=max_context, updated_at="t")
+    base.update(over)
+    return base
+
+
+def _wire_recommend(monkeypatch, set_platform, models, machine=None):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.detect, "machine",
+                        lambda: machine if machine is not None
+                        else _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models", lambda con: models)
+    monkeypatch.setattr(cli.db, "list_characterizations", lambda con, mk, e: [])
+
+
+def test_recommend_ranks_fits_by_context(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Small", max_context=8192),
+                     _model_row("org/Big", max_context=131072)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "RECOMMENDED MODELS" in out
+    assert out.index("org/Big") < out.index("org/Small")   # most context first
+    assert "full window" in out                            # both window-bound on a 48 GB Mac
+
+
+def test_recommend_excludes_models_that_dont_fit(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Fits", weights_gb=4.0),
+                     _model_row("org/TooBig", weights_gb=200.0)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "org/Fits" in out and "org/TooBig" not in out
+
+
+def test_recommend_memory_bound_label(make_console, monkeypatch, set_platform):
+    # A tiny CPU budget binds before a huge window → ranked, but not "full window".
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/BigCtx", weights_gb=4.0, max_context=131072)],
+                    machine=_machine(backend="cpu", ram_total_gb=8.0))
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "org/BigCtx" in out and "tok est." in out
+    assert "full window" not in out
+
+
+def test_recommend_marks_characterized(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Known")])
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, e: [{"model_id": "org/Known", "safe_context": 12000,
+                                             "decode_context": None}] if e == "wmx" else [])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "characterized" in buf.getvalue()
+
+
+def test_recommend_none_fit(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/TooBig", weights_gb=500.0)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "nothing in the catalog fits" in buf.getvalue()
+
+
+def test_recommend_json(monkeypatch, set_platform, capsys):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Big", max_context=131072)])
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["model_id"] == "org/Big"
+    assert payload[0]["fits"] is True and "est_context" in payload[0]
+
+
+def test_main_recommend_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["recommend", "--json"])
+    assert rec["recommend"] is True
 
 
 # --------------------------------------------------------------------------- #

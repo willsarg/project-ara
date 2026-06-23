@@ -134,12 +134,30 @@ def describe(model_id: str) -> dict | None:
     }
 
 
+def _cache_size_gb(model_id: str) -> float | None:
+    """On-disk size of *model_id* in the local HF cache, in GB (decimal). None if it isn't cached
+    or the cache can't be read. No network — a weights-footprint proxy for the analytic estimate."""
+    from huggingface_hub import scan_cache_dir
+
+    try:
+        repo = next((r for r in scan_cache_dir().repos
+                     if r.repo_id == model_id and r.repo_type == "model"), None)
+        if repo is None or not repo.size_on_disk:
+            return None
+        return round(repo.size_on_disk / 1e9, 3)
+    except Exception:
+        return None
+
+
 def remember(con, model_id: str) -> dict | None:
-    """Describe *model_id* and store it in the catalog; return the stored row (or None)."""
+    """Describe *model_id* and store it in the catalog; return the stored row (or None).
+
+    Also records the model's on-disk weight (``weights_gb``) from the local cache, so the
+    analytic estimate (profile/recommend) has a footprint without a network call."""
     meta = describe(model_id)
     if meta is None:
         return None
-    db.upsert_model(con, model_id, **meta)
+    db.upsert_model(con, model_id, weights_gb=_cache_size_gb(model_id), **meta)
     return db.get_model(con, model_id)
 
 

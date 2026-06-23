@@ -220,6 +220,34 @@ def test_cached_gguf_path_none_on_scan_error(monkeypatch):
     assert catalog._cached_gguf_path("org/myrepo") is None
 
 
+# _cache_size_gb — on-disk weight, no network (Spec 2026-06-23-capability-pipeline, Slice 3)
+
+def test_cache_size_gb_reads_local_cache(monkeypatch):
+    repo = _make_repo("org/myrepo", "model", [])
+    repo.size_on_disk = 4_200_000_000
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+    assert catalog._cache_size_gb("org/myrepo") == 4.2
+
+
+def test_cache_size_gb_none_when_not_cached(monkeypatch):
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([]))
+    assert catalog._cache_size_gb("org/myrepo") is None
+
+
+def test_cache_size_gb_none_when_size_zero(monkeypatch):
+    repo = _make_repo("org/myrepo", "model", [])
+    repo.size_on_disk = 0
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+    assert catalog._cache_size_gb("org/myrepo") is None
+
+
+def test_cache_size_gb_none_on_error(monkeypatch):
+    def boom():
+        raise RuntimeError("no cache")
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", boom)
+    assert catalog._cache_size_gb("org/x") is None
+
+
 # _quant_from_filename
 
 def test_quant_from_filename_iq():
@@ -266,9 +294,18 @@ def test_describe_real_gguf():
 
 def test_remember_persists_metadata(store, monkeypatch):
     monkeypatch.setattr(catalog, "describe", lambda m: {"modality": "text", "n_layers": 30})
+    monkeypatch.setattr(catalog, "_cache_size_gb", lambda m: None)
     row = catalog.remember(store, "smol")
     assert row["n_layers"] == 30
     assert catalog.get(store, "smol")["n_layers"] == 30
+
+
+def test_remember_records_cache_weight(store, monkeypatch):
+    # Spec 2026-06-23-capability-pipeline (Slice 3): the catalog stores each model's on-disk
+    # weight (no network) so recommend can rank fits without re-reading the cache.
+    monkeypatch.setattr(catalog, "describe", lambda m: {"modality": "text", "n_layers": 30})
+    monkeypatch.setattr(catalog, "_cache_size_gb", lambda m: 4.2)
+    assert catalog.remember(store, "smol")["weights_gb"] == 4.2
 
 
 def test_remember_none_when_undescribable(store, monkeypatch):
@@ -279,6 +316,7 @@ def test_remember_none_when_undescribable(store, monkeypatch):
 
 def test_all_models(store, monkeypatch):
     monkeypatch.setattr(catalog, "describe", lambda m: {"modality": "text"})
+    monkeypatch.setattr(catalog, "_cache_size_gb", lambda m: None)
     catalog.remember(store, "a")
     catalog.remember(store, "b")
     assert {m["model_id"] for m in catalog.all_models(store)} == {"a", "b"}
@@ -301,6 +339,7 @@ def test_read_config_none_on_error(monkeypatch):
 def test_scan_catalogs_cached_models(store, monkeypatch):
     monkeypatch.setattr(catalog, "_hf_cache_models", lambda: ["a/m1", "b/m2"])
     monkeypatch.setattr(catalog, "describe", lambda mid: {"modality": "text"})
+    monkeypatch.setattr(catalog, "_cache_size_gb", lambda m: None)
     assert catalog.scan(store) == 2
     assert {m["model_id"] for m in catalog.all_models(store)} == {"a/m1", "b/m2"}
 
@@ -309,6 +348,7 @@ def test_scan_skips_undescribable(store, monkeypatch):
     monkeypatch.setattr(catalog, "_hf_cache_models", lambda: ["a/m1", "bad/m"])
     monkeypatch.setattr(catalog, "describe",
                         lambda mid: {"modality": "text"} if mid == "a/m1" else None)
+    monkeypatch.setattr(catalog, "_cache_size_gb", lambda m: None)
     assert catalog.scan(store) == 1
 
 

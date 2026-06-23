@@ -134,8 +134,8 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
     c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
-    c.emit(_cmd(c, "profile", "measure this machine's safe memory limits"))
-    c.emit(_cmd(c, "recommend", "best model per modality that fits this machine"))
+    c.emit(_cmd(c, "profile", "estimate this machine's capability (analytic — no engine)"))
+    c.emit(_cmd(c, "recommend", "catalog models that fit, ranked by usable context"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit()
     if not accelerated:
@@ -143,7 +143,7 @@ def render_landing(c: Console) -> None:
                               "install with ") + c.style("accent", "ara install --engine cpu"))
     c.emit(
         c.style("dim", "  try ") + c.style("accent", "ara detect")
-        + c.style("dim", "  ·  recommend / run are next")
+        + c.style("dim", "  ·  run is next")
     )
 
 
@@ -1034,6 +1034,56 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     c.emit()
 
 
+def render_recommend(c: Console, *, as_json: bool = False) -> int:
+    """Analytic recommendations — which cataloged models fit this machine, ranked by the context
+    the estimated budget supports (most first), marking those already characterized here.
+
+    Engine-free: reuses ``estimate.limits``/``model_fit`` (profile's math, anti-silo) over the
+    catalog (which records each model's on-disk weight). No engine, no model load. Only models
+    with a rankable context estimate are listed. Spec 2026-06-23-capability-pipeline."""
+    con = db.connect()
+    catalog.scan(con)                 # refresh the catalog from the local cache first
+    lim = estimate.limits(detect.machine())
+    best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
+
+    recs = []
+    for row in catalog.all_models(con):
+        fit = estimate.model_fit(lim, row, row.get("weights_gb"))
+        if not fit["fits"] or fit["est_context"] is None:
+            continue
+        recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
+                     "est_context": fit["est_context"], "max_context": fit["max_context"],
+                     "binding": fit["binding"], "fits": True,
+                     "characterized": row["model_id"] in best})
+    recs.sort(key=lambda r: r["est_context"], reverse=True)
+
+    if as_json:
+        print(json.dumps(recs, indent=2))
+        return 0
+
+    c.emit()
+    c.emit(c.section("  RECOMMENDED MODELS")
+           + c.style("dim", "  (estimated — fits this machine, most context first)"))
+    if not recs:
+        c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
+                              "try a smaller / more-quantized model"))
+        c.emit()
+        return 0
+    for r in recs:
+        tail = f"~{r['est_context']} tok est."
+        if r["binding"] == "context_window":
+            tail += " (full window)"
+        mark = c.style("good", "  · characterized here") if r["characterized"] else ""
+        c.emit("  " + c.style("metric", r["model_id"])
+               + c.style("dim", f"  {r['modality'] or '?'}  →  ")
+               + c.style("accent", tail) + mark)
+    n_char = sum(1 for r in recs if r["characterized"])
+    c.emit()
+    c.emit(c.style("dim", f"  {len(recs)} fit · {n_char} characterized here"))
+    c.emit()
+    return 0
+
+
 def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
     """Install the matched engine. ``--engine`` is the consent; exit 0 once the
     engine is present (installed or already), nonzero otherwise."""
@@ -1289,6 +1339,9 @@ def main() -> int:
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
+
+    if cmd == "recommend":
+        return render_recommend(c, as_json=as_json)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)
