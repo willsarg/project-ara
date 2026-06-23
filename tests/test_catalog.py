@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """catalog.py — model metadata (describe) + the db-backed model catalog."""
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Intel NPU (Meteor Lake / Lunar Lake AI Boost) — STUB (no implementation yet).
 
 Contract class: **graph-fit** (not a context ramp). The on-die NPU, programmed via

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """versions.py — version lookups from brew + .app Info.plist (lru-cached)."""
 from __future__ import annotations
 

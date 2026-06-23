@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The worker response contract: one leaf ``(context, memory)`` measurement.
 
 This is the seam between ARA and an engine's isolated worker. The worker — running in the

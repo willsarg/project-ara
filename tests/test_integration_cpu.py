@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Real-engine integration smoke — the CPU/llama.cpp path, end to end, for real.
 
 Everything else in the suite mocks the engine seam; this is the one tier that actually creates

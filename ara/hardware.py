@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Comprehensive hardware recon — OS-specific probes behind pure parsers.
 
 I/O (subprocess/winreg/file reads) is isolated from parsing so parsers are unit-tested against

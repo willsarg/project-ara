@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Methodology invariant matrix — the safe-context math across realistic model shapes.
 
 100% line+branch coverage proved every line *runs*; it did not prove the methodology is

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """ARA's persistent store — the one place that remembers across runs.
 
 A small SQLite database in the per-OS user data dir. Three concerns, cleanly separated:

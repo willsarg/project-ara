@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Google Coral / Edge TPU — STUB (no implementation yet).
 
 Contract class: **graph-fit** (not a context ramp). A fixed-function edge accelerator

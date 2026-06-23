@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """CLI contract matrix — every command's public surface, end-to-end through ``cli.main``.
 
 Each command is dispatched through the real entry point with all external boundaries mocked to

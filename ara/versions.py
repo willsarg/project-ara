@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Shared version lookups for installed AI/ML software — from the reliable, non-fragile
 sources: a macOS .app's Info.plist (CFBundleShortVersionString) and `brew list --versions`.
 

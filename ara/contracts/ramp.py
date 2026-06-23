@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The ramp contract: fit memory-vs-context, solve for the safe context ceiling.
 
 For hardware with a hard memory wall (Apple, CUDA, ROCm, …), a model's footprint grows

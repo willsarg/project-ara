@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """status.py — live AI/ML process recon: classification + scan."""
 from __future__ import annotations
 

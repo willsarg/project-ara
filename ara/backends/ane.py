@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Apple Neural Engine (ANE / CoreML) — STUB (no implementation yet).
 
 Contract class: **graph-fit** (not a context ramp). The question here isn't "how far

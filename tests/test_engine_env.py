@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Isolated per-engine uv environments + the worker IPC seam.
 
 These tests mock only the subprocess boundary (`engine_env._run`, an unavoidable

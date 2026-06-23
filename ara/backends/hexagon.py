@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Qualcomm Hexagon NPU (Snapdragon X / mobile) — STUB (no implementation yet).
 
 Contract class: **graph-fit** (not a context ramp). The Hexagon DSP/NPU, programmed

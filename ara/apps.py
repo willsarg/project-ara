@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Inventory of AI/ML applications installed on the machine — GUI apps in /Applications
 plus Homebrew packages — matched against a curated catalog of known AI/ML software.
 

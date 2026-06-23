@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """CPU backend — system-RAM inference via llama.cpp (GGUF) — the second real engine.
 
 Contract class: **ramp** (safe context ceiling). Wall source: **physical RAM** (swap is

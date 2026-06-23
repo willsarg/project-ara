@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """apps.py — curated AI/ML app inventory + drift/duplicate classification."""
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Apple-Silicon backend adapter — drives wmx-suite's MLX measurement out-of-process.
 
 A lean device oracle, symmetric with backends/cuda.py: it reads the machine's memory wall and

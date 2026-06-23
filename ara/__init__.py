@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Project ARA — AI Runs Anywhere.
 
 Backend-agnostic local inference. Core is pure Python; hardware-specific

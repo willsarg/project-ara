@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Hugging Face Hub search via the ``hf`` CLI — no Python hub dependency for the query.
 
 Engine-agnostic: unlike wmx-suite's MLX-defaulted search, this searches the whole Hub

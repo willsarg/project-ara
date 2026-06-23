@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """backends/cpu.py — the second real engine, proving the abstraction isn't Apple-shaped.
 
 The CPU/llama.cpp adapter is intentionally a near-twin of backends/apple.py: it supplies only

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """engines.py — the engine catalog + isolated-env install lifecycle (`ara install`)."""
 from __future__ import annotations
 

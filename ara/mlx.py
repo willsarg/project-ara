@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Detect the MLX ecosystem: which MLX libraries are installed (and where), plus the
 surrounding readiness picture (Metal GPU, cached mlx-community models, LM Studio's MLX
 runtime). MLX is Apple-Silicon only, so this is meaningful only there.

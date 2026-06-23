@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Microcontroller / TinyML (ESP32, Arduino, RP2040 …) — STUB (no implementation yet).
 
 Contract class: **static-fit** (not a context ramp, not even runtime probing). The

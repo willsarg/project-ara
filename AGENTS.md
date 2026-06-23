@@ -69,3 +69,20 @@ is present. Apple Silicon is the first running backend; recon works everywhere.
   `os.name` (`Scripts\python.exe` vs `bin/python`), keep OS-specific recon (sysctl, Homebrew
   paths) behind a platform guard. But ARA is developed and tested on macOS (Apple Silicon),
   with Linux supported; **make no Windows support claims until it's actually been run there.**
+
+## License & AI agents (Apache 2.0)
+
+Project ARA is licensed **Apache-2.0** (`LICENSE`, `NOTICE`). Abide by it in both directions.
+
+**Contributing here (inbound — Apache §5, inbound = outbound; no CLA/DCO):**
+- All contributions are under Apache-2.0.
+- Add only original code, or code under an Apache-2.0-compatible permissive license (MIT/BSD/ISC/Apache-2.0); preserve its copyright/license and record third-party components in `NOTICE`.
+- Never introduce GPL/LGPL/AGPL, proprietary, or unknown-provenance code.
+- Start every new source file with: `# SPDX-License-Identifier: Apache-2.0` and `# Copyright 2026 Will Sarg`.
+- Do not alter or remove `LICENSE`, `NOTICE`, or existing SPDX headers.
+
+**Cloning / forking / redistributing (outbound — Apache §4):**
+- Keep `LICENSE` and `NOTICE` intact in any copy or fork.
+- Retain all SPDX headers and copyright notices in files you carry.
+- State significant changes you make.
+- You may relicense *your own* additions; the Apache-2.0-covered files stay Apache-2.0.

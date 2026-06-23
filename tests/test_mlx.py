@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """mlx.py — MLX ecosystem discovery (libraries by modality + Apple readiness)."""
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """hub.py — Hugging Face Hub search via the `hf` CLI (engine-agnostic)."""
 from __future__ import annotations
 

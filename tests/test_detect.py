@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """detect.py — read-only host recon: backend choice, parsers, inventories."""
 from __future__ import annotations
 

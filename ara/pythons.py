@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Find every Python interpreter on the system and what AI libraries each one has.
 
 Python provenance is a notorious source of confusion — macOS ships one, Homebrew

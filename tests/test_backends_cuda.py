@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """backends/cuda.py — a lean wcx-suite seam (stateless; ARA owns persistence).
 
 The CUDA twin of test_backends_apple.py: cuda drives wcx-suite's device + measure_one workers

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Minimal CLI rendering for ARA — semantic roles over raw ANSI. Stdlib only.
 
 Mirrors the wmx-suite Console feel (accent/dim/gloss/section) but trimmed to

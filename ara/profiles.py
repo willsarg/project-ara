@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """This machine's identity, for keying its stored calibration.
 
 ARA owns this, not the engine: the key is built from ARA's own recon — the CPU, the

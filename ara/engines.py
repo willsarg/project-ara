@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The engine catalog and hardware-matched resolution.
 
 ARA's core is engine-free; every hardware engine is installed on demand (`ara install`) into

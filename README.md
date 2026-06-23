@@ -4,7 +4,7 @@
 
 ### `ara` — **AI Runs Anywhere**: assess any computer for AI workloads, then run local models safely on whatever hardware you've got
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](./LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12+-3776AB.svg?style=for-the-badge&logo=python&logoColor=white)](./pyproject.toml)
 [![packaged with uv](https://img.shields.io/badge/packaged_with-uv-DE5FE9.svg?style=for-the-badge)](https://github.com/astral-sh/uv)
 [![Backend-agnostic](https://img.shields.io/badge/backend-agnostic-4C9A2A.svg?style=for-the-badge)](#-architecture)
@@ -118,4 +118,4 @@ conventions, and [AGENTS.md](./AGENTS.md) for the project's purpose and boundari
 
 ## 📄 License
 
-[MIT](./LICENSE) © Will Sarg
+[Apache 2.0](./LICENSE) © Will Sarg

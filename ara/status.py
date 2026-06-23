@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Live recon: find AI/ML processes running right now. Read-only — observes, never acts.
 
 The dynamic counterpart to ``detect``: detect reports what's *installed*, status reports

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Isolated per-engine environments + the worker IPC seam.
 
 Each hardware engine lives in its own uv environment under the data dir

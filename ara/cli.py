@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """ARA command-line front door.
 
 ``ara`` with no arguments renders the landing screen (mirrors wmx-suite's feel).

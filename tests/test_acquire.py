@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """acquire.py — backend-neutral HF downloads + the pre-download disk check."""
 from __future__ import annotations
 

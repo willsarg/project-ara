@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Architectural invariant: the core stays wmx-free until a calibration call runs.
 
 Importing any ``ara`` module — including the Apple backend adapter — must NOT pull

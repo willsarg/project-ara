@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """NVIDIA / CUDA backend adapter — drives wcx-suite's VRAM measurement out-of-process.
 
 The CUDA twin of backends/apple.py: it reads the GPU's VRAM wall and runs wcx-suite's crash-safe

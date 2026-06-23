@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """profiles.py — this machine's identity + its stored per-engine calibration."""
 from __future__ import annotations
 

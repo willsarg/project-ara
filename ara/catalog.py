@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The model catalog — metadata ARA knows about each model, and where it's remembered.
 
 ``describe`` reads a model's architecture from its Hugging Face ``config.json`` (the

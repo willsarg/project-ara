@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """CPU/llama.cpp measurement worker — built into ARA, runs in the isolated ``cpu`` env.
 
 The CPU engine is built into ARA (only the huge CUDA/MLX suites get their own repos), but its

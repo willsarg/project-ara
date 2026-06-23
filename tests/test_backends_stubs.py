@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Backend namespace stubs — placeholders, no implementation yet.
 
 These modules stake out where each device/runtime *will* live in ARA's hierarchy

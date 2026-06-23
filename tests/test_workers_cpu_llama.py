@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Pure logic of the built-in CPU/llama.cpp worker (ara/workers/cpu_llama.py).
 
 The worker runs in the isolated ``cpu`` env (with llama-cpp-python); ARA's venv can't load

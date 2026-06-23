@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Backend selection and the cheap engine-presence check."""
 from __future__ import annotations
 

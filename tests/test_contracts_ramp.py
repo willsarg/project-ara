@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The ramp contract — linear fit of memory vs context + safe-ceiling solve.
 
 Pure math, no engine. Mirrors wmx-suite's proven methodology (least-squares

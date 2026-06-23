@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Map detected hardware to a backend, importing only the chosen one.
 
 The whole independence/leanness trick lives here: ``get_backend`` lazy-imports

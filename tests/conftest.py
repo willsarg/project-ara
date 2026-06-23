@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Shared fixtures for the ARA test suite.
 
 The suite runs with NO real ``wmx_suite`` and NO real host probing: the

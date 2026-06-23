@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Recon: observe the machine and pick a backend. Read-only — no profiling.
 
 Everything here just *reads* what's already true about the host — memory, GPU,

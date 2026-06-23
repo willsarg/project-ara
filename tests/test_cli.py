@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """cli.py — formatters, arg parsing/dispatch, and the render_* surfaces."""
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Intel GPU backend (Arc / iGPU) — STUB (no implementation yet).
 
 Contract class: **ramp** (safe context ceiling).

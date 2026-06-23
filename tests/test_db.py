@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """db.py — the SQLite persistence foundation (machines, models, characterizations)."""
 from __future__ import annotations
 

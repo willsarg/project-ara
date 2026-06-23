@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Engine contract conformance — every backend adapter speaks the same interface and shapes.
 
 ARA's whole design is a swappable backend behind a fixed contract. These tests assert that

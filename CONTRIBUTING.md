@@ -55,6 +55,19 @@ From [AGENTS.md](./AGENTS.md) — a change must not violate these:
    `ara <command>` before/after) so reviewers can see the behavior.
 4. Note any new tool/app/store you added to a curated catalog and how you verified it.
 
+## License
+
+Project ARA is licensed under the **Apache License 2.0** (`LICENSE` / `NOTICE`). By submitting a
+contribution you agree it is provided under Apache 2.0 — the "inbound = outbound" rule of Apache §5
+(no separate CLA or DCO). Contribute only code you have the right to license this way: code you
+wrote, or code under an Apache-2.0-**compatible** permissive license (MIT/BSD/ISC/Apache-2.0) with
+its notice preserved in `NOTICE`. Never paste in GPL/LGPL/AGPL, proprietary, or unknown-provenance
+code. Start every new source file with `# SPDX-License-Identifier: Apache-2.0` and
+`# Copyright 2026 Will Sarg`.
+
+**AI coding agents** are welcome under the same rules; the human who opens the PR is responsible
+for the assurances above. See "License & AI agents" in [AGENTS.md](./AGENTS.md).
+
 ## Reporting issues
 
 Use the issue templates (bug / feature). For anything security-related, see

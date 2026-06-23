@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The engine-agnostic thin-path driver: methodology in ARA, facts from the engine.
 
 Every ramp-class backend (Apple, CPU/llama.cpp, CUDA, …) measures the same way — a no-load

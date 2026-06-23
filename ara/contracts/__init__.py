@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Measurement contracts — the methodology ARA owns, shared across backends.
 
 A *contract class* defines what "assessment" means for a family of hardware with the

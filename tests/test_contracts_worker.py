@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """The worker response contract — ARA-side strict parsing of a leaf measurement.
 
 The worker runs inside the engine env (mlx/torch), which has no ``ara`` installed, so it

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
 """Model acquisition — backend-neutral downloads into the HF cache.
 
 ``download(repo_id)`` fetches a model; ``repo_size_gb`` / ``free_disk_gb`` back the
