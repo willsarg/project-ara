@@ -10,23 +10,38 @@ workflow (setup, landing a change); this covers the **why** and the **rules**.
 with a Python runtime for AI workloads**, then run local models safely on whatever hardware
 is present. Apple Silicon is the first running backend; recon works everywhere.
 
-### Design values (in priority order)
+### The three rules (the invariant core)
 
-1. **Honesty.** Report the user's *real* environment, never ARA's own internals. Never claim
-   something ARA didn't observe. When detection is uncertain, say so; don't guess.
-2. **Well-scoped tools.** Each command does one clear job with a predictable boundary:
-   - `detect` — **read-only recon**. Observes the machine; never stresses, benchmarks, or
-     loads an ML engine.
-   - `status` — running AI/ML processes, right now.
-   - `python` — every interpreter + its AI libraries + install cautions.
-   - `apps` — installed AI/ML apps, versions, source, and Homebrew drift.
-   - `mlx` — the MLX ecosystem + Apple readiness.
-   - `profile` — **the only command that measures**; opt-in and consent-gated; crosses the
-     seam into the engine.
-   - `recommend` / `run` — *planned* (curated catalog × measured wall; safe launch).
-3. **Broad compatibility.** Cover the open-source AI ecosystem widely — engines (MLX,
-   llama.cpp, Ollama, LM Studio, vLLM), model stores (HF, Ollama, LM Studio, Jan, GPT4All),
-   frameworks (PyTorch, transformers, TensorFlow), and apps — not one vendor's corner.
+ARA's mission — *"AI Runs Anywhere: safely, reliably, and accurately — train, run, and govern AI
+workloads on any infrastructure"* — **is** three numbered rules. Every change, in every part of the
+system, answers to all three. Canonical statement: the private vault's `ARA - Product` note.
+
+1. **Safety** — *don't crash the system.* Never exceed the memory wall; run right up to the safe
+   edge and no further. In ARA's core this means **recon is read-only** and **`profile` is
+   consent-gated** (see Hard rules); the engines (wmx/wcx) enforce the wall when they measure and
+   launch.
+2. **Reliability** — *every component is properly tested.* `fail_under = 100` (statement + branch);
+   new code lands with tests (see Conventions). A component you can't trust isn't shipped.
+3. **Accuracy** — *report true data; never lie to the user.* For deterministic recon **and**
+   non-deterministic model output alike: report the user's *real* environment, never ARA's
+   internals; never claim something ARA didn't observe; `unknown` is a first-class answer
+   (distinguish measured / curated / unknown); never surface a model's hallucination as fact.
+
+### ARA-specific design values
+
+- **Well-scoped tools.** Each command does one clear job with a predictable boundary:
+  - `detect` — **read-only recon**. Observes the machine; never stresses, benchmarks, or
+    loads an ML engine.
+  - `status` — running AI/ML processes, right now.
+  - `python` — every interpreter + its AI libraries + install cautions.
+  - `apps` — installed AI/ML apps, versions, source, and Homebrew drift.
+  - `mlx` — the MLX ecosystem + Apple readiness.
+  - `profile` — **the only command that measures**; opt-in and consent-gated; crosses the
+    seam into the engine.
+  - `recommend` / `run` — *planned* (curated catalog × measured wall; safe launch).
+- **Broad compatibility.** Cover the open-source AI ecosystem widely — engines (MLX,
+  llama.cpp, Ollama, LM Studio, vLLM), model stores (HF, Ollama, LM Studio, Jan, GPT4All),
+  frameworks (PyTorch, transformers, TensorFlow), and apps — not one vendor's corner.
 
 ## The architecture boundary (don't break this)
 
@@ -44,6 +59,8 @@ is present. Apple Silicon is the first running backend; recon works everywhere.
   (the flag itself authorizes the install, so it stays scriptable).
 
 ## Hard rules
+
+These are how **Rule #1 (Safety)** and **Rule #3 (Accuracy)** are enforced in the recon core:
 
 - **Recon is read-only.** Nothing under `detect`/`status`/`python`/`apps`/`mlx` may stress
   the machine, load a model, or mutate state.
