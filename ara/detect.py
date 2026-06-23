@@ -541,7 +541,7 @@ class Machine:
         return self.backend in ("apple", "cuda")
 
 
-def profile() -> Machine:
+def machine() -> Machine:
     """Observe the host and choose a backend. Read-only — no engine import."""
     # Probe all hardware subsystems once (fail-soft — never raises).
     hw = _hardware.probe()

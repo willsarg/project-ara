@@ -20,7 +20,7 @@ from pathlib import Path
 import platformdirs
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS machines (
+CREATE TABLE IF NOT EXISTS calibrations (
     machine_key       TEXT NOT NULL,
     engine            TEXT NOT NULL,
     fixed_overhead_gb REAL,
@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS characterizations (
     measured_at   TEXT,
     PRIMARY KEY (machine_key, engine, model_id)
 );
+
+CREATE TABLE IF NOT EXISTS profiles (
+    machine_key  TEXT NOT NULL,
+    captured_at  TEXT NOT NULL,
+    profile_json TEXT NOT NULL
+);
 """
 
 
@@ -81,19 +87,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --- machine profiles (per machine + engine) ---
-def upsert_machine(con: sqlite3.Connection, machine_key: str, engine: str, *,
+# --- per-engine calibration ---
+def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *,
                    fixed_overhead_gb: float, calibrated_at: str) -> None:
     con.execute(
-        "INSERT INTO machines (machine_key, engine, fixed_overhead_gb, calibrated_at) "
+        "INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, calibrated_at) "
         "VALUES (?,?,?,?) ON CONFLICT(machine_key, engine) DO UPDATE SET "
         "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at",
         (machine_key, engine, fixed_overhead_gb, calibrated_at))
     con.commit()
 
 
-def get_machine(con: sqlite3.Connection, machine_key: str, engine: str) -> dict | None:
-    row = con.execute("SELECT * FROM machines WHERE machine_key=? AND engine=?",
+def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str) -> dict | None:
+    row = con.execute("SELECT * FROM calibrations WHERE machine_key=? AND engine=?",
                       (machine_key, engine)).fetchone()
     return dict(row) if row else None
 
@@ -162,3 +168,29 @@ def list_characterizations(con: sqlite3.Connection, machine_key: str,
         d["points"] = json.loads(d["points_json"]) if d["points_json"] else []
         out.append(d)
     return out
+
+
+# --- system profiles (the persisted Machine snapshot; Spec 2026-06-23-capability-pipeline) ---
+def save_profile(con: sqlite3.Connection, machine_key: str, profile_json: str,
+                 captured_at: str | None = None) -> None:
+    """Append a profile capture. History is kept — one row per capture."""
+    con.execute(
+        "INSERT INTO profiles (machine_key, captured_at, profile_json) VALUES (?,?,?)",
+        (machine_key, captured_at or _now(), profile_json))
+    con.commit()
+
+
+def get_latest_profile(con: sqlite3.Connection, machine_key: str) -> dict | None:
+    """The most recent profile capture for this machine, or None."""
+    row = con.execute(
+        "SELECT * FROM profiles WHERE machine_key=? ORDER BY captured_at DESC, rowid DESC LIMIT 1",
+        (machine_key,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_profiles(con: sqlite3.Connection, machine_key: str) -> list[dict]:
+    """Every profile capture for this machine, newest first."""
+    rows = con.execute(
+        "SELECT * FROM profiles WHERE machine_key=? ORDER BY captured_at DESC, rowid DESC",
+        (machine_key,)).fetchall()
+    return [dict(r) for r in rows]

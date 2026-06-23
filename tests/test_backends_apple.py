@@ -202,7 +202,7 @@ def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatc
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
     monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
-    monkeypatch.setattr(apple, "profiles",
+    monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng: {"fixed_overhead_gb": 5.5})}), raising=False)
     margin, overhead = apple._budget_params()
@@ -211,7 +211,7 @@ def test_budget_params_uses_stored_calibration(monkeypatch):
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
     monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
-    monkeypatch.setattr(apple, "profiles",
+    monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
                         raising=False)
     margin, overhead = apple._budget_params()

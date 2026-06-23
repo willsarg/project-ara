@@ -11,7 +11,7 @@ in ARA's interpreter and the core stays engine-free at runtime, not just at lock
 from __future__ import annotations
 
 # Core, engine-free helpers (no wmx) — safe to import at module load and patchable in tests.
-from ara import db, engine_env, profiles
+from ara import calibration, db, engine_env
 from ara.contracts import driver
 
 # The wmx worker modules ARA drives in the isolated apple env (never imported in-process).
@@ -85,7 +85,7 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
     calibration for the wmx engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
-    stored = profiles.get_calibration(db.connect(), "wmx")
+    stored = calibration.get_calibration(db.connect(), "wmx")
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead

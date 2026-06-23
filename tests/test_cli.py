@@ -239,7 +239,7 @@ def _machine(**over) -> Machine:
 
 def test_render_detect_text(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=3)
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
@@ -260,7 +260,7 @@ def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1,
                                    compute="8.9", cuda_version="12.4", driver_version="550.00"))
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
@@ -274,7 +274,7 @@ def test_render_detect_multi_gpu_shows_count(make_console, monkeypatch, stub_pyt
     stub_pythons(count=1)
     m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2,
                                    compute="8.9", cuda_version="550"))
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
@@ -287,7 +287,7 @@ def test_render_detect_cpu_without_features_and_no_python_version(
     # at all (skip the whole python row).
     stub_pythons(count=1)
     m = _machine(cpu_features=[], python_version=None)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -297,7 +297,7 @@ def test_render_detect_cpu_without_features_and_no_python_version(
 
 
 def test_render_detect_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -471,8 +471,8 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
 
 # --- persistence wiring: overlay a stored calibration / persist a fresh one ---
 def test_overlay_stored_calibration_applies(store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
-    cli.profiles.save_calibration(store, "wmx", fixed_overhead_gb=5.5,
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=5.5,
                                   calibrated_at="2026-06-18T09:30:00Z")
     m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
     cli._overlay_stored_calibration(m, "wmx")
@@ -481,7 +481,7 @@ def test_overlay_stored_calibration_applies(store, monkeypatch):
 
 
 def test_overlay_no_stored_leaves_limits(store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
     cli._overlay_stored_calibration(m, "wmx")     # nothing stored
     assert m["calibrated"] is False
@@ -494,13 +494,13 @@ def test_overlay_none_engine_key_is_noop():
 
 
 def test_persist_saves_overhead(store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     cli._persist_calibration({"overhead_gb": 1.2}, "wmx")
-    assert cli.profiles.get_calibration(store, "wmx")["fixed_overhead_gb"] == 1.2
+    assert cli.calibration.get_calibration(store, "wmx")["fixed_overhead_gb"] == 1.2
 
 
 def test_persist_saves_characterization_and_catalogs(store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     seen = {}
     monkeypatch.setattr(cli.catalog, "remember", lambda con, mid: seen.setdefault("model", mid))
     m = {"overhead_gb": None,
@@ -512,11 +512,11 @@ def test_persist_saves_characterization_and_catalogs(store, monkeypatch):
 
 def test_persist_none_engine_key_is_noop(store):
     cli._persist_calibration({"overhead_gb": 1.0}, None)
-    assert cli.db.get_machine(store, "any", "wmx") is None
+    assert cli.db.get_calibration(store, "any", "wmx") is None
 
 
 def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     cli.db.save_characterization(store, "mkey", "wcx", "org/SmolLM", safe_context=16000, points=[],
                                  decode_context=None)
     cli.db.save_characterization(store, "mkey", "wcx", "org/Unbound", safe_context=None, points=[],
@@ -529,7 +529,7 @@ def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch
 
 
 def test_emit_characterized_empty_shows_nothing(make_console, store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     c, buf = make_console()
     cli._emit_characterized(c, "wcx")
     assert buf.getvalue() == ""
@@ -734,7 +734,7 @@ def test_render_detect_verbose_and_cpu_fallback(monkeypatch, make_console, stub_
                   Runtime("PyTorch", False, None, kind="framework")],
         model_stores=[ModelStore("HF cache", False)],
     )
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -760,7 +760,7 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pytho
         framework_python=None,
         model_stores=[ModelStore("HF cache", False)],
     )
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -784,7 +784,7 @@ def test_render_detect_frameworks_surfaced_from_other_interpreter(
     stub_pythons(count=2, discover=[other])
     m = _machine(runtimes=[Runtime("PyTorch", False, None, kind="framework")],
                  framework_python="/usr/bin/python3")
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
@@ -1207,7 +1207,7 @@ def test_resolve_want_no_filter_returns_none_quietly(make_console):
 
 def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine())
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
     c, buf = make_console()
     cli.render_detect(c, want=lambda k: k == "system")
     out = buf.getvalue()
@@ -1426,7 +1426,7 @@ def test_render_models_lists_catalog(make_console, store, monkeypatch):
                         lambda con: [{"model_id": "org/A", "modality": "text"},
                                      {"model_id": "org/B", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
                                              "decode_context": None}])
@@ -1449,7 +1449,7 @@ def test_render_models_distinguishes_measured_no_ceiling(make_console, store, mo
                                      {"model_id": "org/NoCeiling", "modality": "text"},
                                      {"model_id": "org/Never", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000,
                                              "decode_context": None},
@@ -1479,7 +1479,7 @@ def test_render_models_json(monkeypatch, capsys, store):
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/A", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 9000,
                                              "decode_context": None}])
@@ -1498,7 +1498,7 @@ def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
                                      {"model_id": "org/NoCeiling", "modality": "text"},
                                      {"model_id": "org/Never", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/Fits", "safe_context": 16000,
                                              "decode_context": None},
@@ -1520,7 +1520,7 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/L", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = wcx
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     per_engine = {"wcx": [{"model_id": "org/L", "safe_context": 3500, "decode_context": None}],
                   "cpu": [{"model_id": "org/L", "safe_context": 8192, "decode_context": None}]}
     monkeypatch.setattr(cli.db, "list_characterizations",
@@ -1596,7 +1596,7 @@ def _meta(**over):
 def test_model_detail_full(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": None})
     c, buf = make_console()
@@ -1627,7 +1627,7 @@ def test_model_detail_not_found(make_console, monkeypatch):
 def test_model_detail_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": None})
     c = cli.Console(color=False, stream=sys.stderr)
@@ -1642,7 +1642,7 @@ def test_model_detail_measured_no_ceiling(make_console, monkeypatch):
     not 'not characterized' — consistent with `ara models` and `ara profile`."""
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": None, "decode_context": None})
     c, buf = make_console()
@@ -1656,7 +1656,7 @@ def test_model_detail_json_characterized_flag(monkeypatch, capsys):
     """Detail JSON flags a measured-but-unfit model as characterized with a null ceiling."""
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": None, "decode_context": None})
     c = cli.Console(color=False, stream=sys.stderr)
@@ -1693,7 +1693,7 @@ def test_main_models_id_dispatch(monkeypatch):
 def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     if characterize is not None:
         monkeypatch.setattr(cli, "get_backend",
@@ -1759,7 +1759,7 @@ def test_render_characterize_engine_flag_overrides_detected_backend(make_console
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli, "engine_status",
                         lambda b=None: (seen.update(status_backend=b) or (True, "llama.cpp")))
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
 
     def fake_get_backend(b=None):
@@ -1845,7 +1845,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     """Wire render_characterize with a FakeBackend and stubbed acquire functions."""
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: size_gb)
@@ -1984,7 +1984,7 @@ def test_render_models_decode_gloss_when_greater(make_console, store, monkeypatc
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/A", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
                                              "decode_context": 20000}])
@@ -1999,7 +1999,7 @@ def test_render_models_decode_hidden_when_not_greater(make_console, store, monke
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/A", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
                                              "decode_context": 8000}])
@@ -2013,7 +2013,7 @@ def test_render_models_json_includes_decode_context(monkeypatch, capsys, store):
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/A", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
                                              "decode_context": 20000}])
@@ -2026,7 +2026,7 @@ def test_render_models_json_includes_decode_context(monkeypatch, capsys, store):
 def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": 20000})
     c, buf = make_console()
@@ -2038,7 +2038,7 @@ def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
 def test_model_detail_per_engine_decode_hidden_when_not_greater(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": 8000})
     c, buf = make_console()
@@ -2049,7 +2049,7 @@ def test_model_detail_per_engine_decode_hidden_when_not_greater(make_console, mo
 def test_model_detail_json_has_decode_context(monkeypatch, capsys):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": 12000})
     c = cli.Console(color=False, stream=sys.stderr)
@@ -2065,7 +2065,7 @@ def test_model_detail_json_decode_context_paired_with_best_safe_engine(monkeypat
     # and cpu has safe_context=8000/decode=25000. Top-level decode_context must be 18000, not 25000.
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     _per_engine = {"wcx": {"safe_context": 16000, "decode_context": 18000},
                    "cpu": {"safe_context": 8000, "decode_context": 25000}}
     monkeypatch.setattr(cli.db, "get_characterization",
@@ -2078,7 +2078,7 @@ def test_model_detail_json_decode_context_paired_with_best_safe_engine(monkeypat
 
 
 def test_emit_characterized_decode_gloss_when_greater(make_console, store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
                                  safe_context=16000, points=[], decode_context=20000)
     c, buf = make_console()
@@ -2088,7 +2088,7 @@ def test_emit_characterized_decode_gloss_when_greater(make_console, store, monke
 
 
 def test_emit_characterized_decode_hidden_when_not_greater(make_console, store, monkeypatch):
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
                                  safe_context=16000, points=[], decode_context=8000)
     c, buf = make_console()
@@ -2193,7 +2193,7 @@ def test_verbose_cpu_detail_apple_silicon(make_console, monkeypatch, stub_python
     stub_pythons(count=1)
     m = _machine(cpu=_apple_cpu(), memory=_apple_memory(), storage=_apple_storage(),
                  board=_apple_board())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2213,7 +2213,7 @@ def test_verbose_cpu_detail_windows_ryzen(make_console, monkeypatch, stub_python
                  cpu_physical=12, cpu_logical=24,
                  accel=Accelerator("none", "none detected", None, None),
                  backend="cpu", engine="llama.cpp", engine_ready=False)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2231,7 +2231,7 @@ def test_verbose_cpu_detail_with_features(make_console, monkeypatch, stub_python
     cpu = CpuInfo(brand="Intel Core i9", vendor="GenuineIntel", logical=16,
                   features=["AVX-512", "AVX2"])
     m = _machine(cpu=cpu)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2243,7 +2243,7 @@ def test_verbose_cpu_detail_base_clock_only(make_console, monkeypatch, stub_pyth
     stub_pythons(count=1)
     cpu = CpuInfo(brand="FakeCPU", base_mhz=2400)
     m = _machine(cpu=cpu)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2255,7 +2255,7 @@ def test_verbose_cpu_all_none_no_detail_lines(make_console, monkeypatch, stub_py
     """All CpuInfo fields None → no vendor/threads/clocks/L1/L2/L3/features lines."""
     stub_pythons(count=1)
     m = _machine(cpu=CpuInfo())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2271,7 +2271,7 @@ def test_non_verbose_no_cpu_detail(make_console, monkeypatch, stub_pythons):
     """Non-verbose: CPU detail block not shown."""
     stub_pythons(count=1)
     m = _machine(cpu=_windows_cpu())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2288,7 +2288,7 @@ def test_verbose_memory_detail_windows_4modules(make_console, monkeypatch, stub_
     stub_pythons(count=1)
     m = _machine(memory=_windows_memory(), cpu=_windows_cpu(), storage=_windows_storage(),
                  board=_windows_board())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2305,7 +2305,7 @@ def test_verbose_memory_detail_apple_no_modules(make_console, monkeypatch, stub_
     stub_pythons(count=1)
     m = _machine(memory=_apple_memory(), cpu=_apple_cpu(), storage=_apple_storage(),
                  board=_apple_board())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2319,7 +2319,7 @@ def test_verbose_memory_kind_none_skipped(make_console, monkeypatch, stub_python
     stub_pythons(count=1)
     mem = MemoryInfo(total_gb=16.0, kind=None, modules=[])
     m = _machine(memory=mem)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     assert "kind" not in buf.getvalue()
@@ -2333,7 +2333,7 @@ def test_verbose_memory_partial_slots(make_console, monkeypatch, stub_pythons):
         MemoryModule(slot="A2", capacity_gb=8.0, speed_mts=3200),
     ])
     m = _machine(memory=mem)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2344,7 +2344,7 @@ def test_non_verbose_no_memory_detail(make_console, monkeypatch, stub_pythons):
     """Non-verbose: memory detail block not shown."""
     stub_pythons(count=1)
     m = _machine(memory=_windows_memory())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2361,7 +2361,7 @@ def test_verbose_storage_detail_drives(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(storage=_windows_storage(), cpu=_windows_cpu(), memory=_windows_memory(),
                  board=_windows_board())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2377,7 +2377,7 @@ def test_verbose_storage_drive_none_fields_skipped(make_console, monkeypatch, st
     stub_pythons(count=1)
     storage = StorageInfo(free_gb=100.0, drives=[Drive(model=None, media=None, size_gb=500.0)])
     m = _machine(storage=storage)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2390,7 +2390,7 @@ def test_verbose_storage_no_drives(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     storage = StorageInfo(free_gb=200.0, drives=[])
     m = _machine(storage=storage)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     assert "  drive" not in buf.getvalue()
@@ -2400,7 +2400,7 @@ def test_non_verbose_no_storage_detail(make_console, monkeypatch, stub_pythons):
     """Non-verbose: drives not listed."""
     stub_pythons(count=1)
     m = _machine(storage=_windows_storage())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     assert "Samsung SSD" not in buf.getvalue()
@@ -2415,7 +2415,7 @@ def test_verbose_board_windows(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(board=_windows_board(), cpu=_windows_cpu(), memory=_windows_memory(),
                  storage=_windows_storage())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2434,7 +2434,7 @@ def test_verbose_board_apple(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(board=_apple_board(), cpu=_apple_cpu(), memory=_apple_memory(),
                  storage=_apple_storage())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2450,7 +2450,7 @@ def test_board_all_none_no_section(make_console, monkeypatch, stub_pythons):
     """BoardInfo with all fields None → BOARD section not rendered at all."""
     stub_pythons(count=1)
     m = _machine(board=BoardInfo())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     assert "BOARD" not in buf.getvalue()
@@ -2460,7 +2460,7 @@ def test_non_verbose_no_board_section(make_console, monkeypatch, stub_pythons):
     """Non-verbose: BOARD section never shown even with board data."""
     stub_pythons(count=1)
     m = _machine(board=_windows_board())
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
     assert "BOARD" not in buf.getvalue()
@@ -2472,7 +2472,7 @@ def test_non_verbose_no_board_section(make_console, monkeypatch, stub_pythons):
 
 def test_render_detect_json_has_cpu_nested(monkeypatch, capsys):
     """--json includes cpu as a nested dict with all CpuInfo fields."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(cpu=_apple_cpu()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(cpu=_apple_cpu()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2485,7 +2485,7 @@ def test_render_detect_json_has_cpu_nested(monkeypatch, capsys):
 
 def test_render_detect_json_has_memory_nested(monkeypatch, capsys):
     """--json includes memory as a nested dict with modules list."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(memory=_windows_memory()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(memory=_windows_memory()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2499,7 +2499,7 @@ def test_render_detect_json_has_memory_nested(monkeypatch, capsys):
 
 def test_render_detect_json_has_storage_nested(monkeypatch, capsys):
     """--json includes storage as a nested dict with drives list."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(storage=_windows_storage()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(storage=_windows_storage()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2512,7 +2512,7 @@ def test_render_detect_json_has_storage_nested(monkeypatch, capsys):
 
 def test_render_detect_json_has_board_nested(monkeypatch, capsys):
     """--json includes board as a nested dict."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(board=_windows_board()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(board=_windows_board()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2524,7 +2524,7 @@ def test_render_detect_json_has_board_nested(monkeypatch, capsys):
 
 def test_render_detect_json_existing_keys_intact(monkeypatch, capsys):
     """--json still has the existing flat keys (chip, backend, accel, etc.)."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(cpu=_apple_cpu()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(cpu=_apple_cpu()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2538,7 +2538,7 @@ def test_render_detect_json_existing_keys_intact(monkeypatch, capsys):
 
 def test_render_detect_json_apple_memory_no_modules(monkeypatch, capsys):
     """Apple-shaped memory: modules=[] in JSON, no slots info."""
-    monkeypatch.setattr(cli.detect, "profile", lambda: _machine(memory=_apple_memory()))
+    monkeypatch.setattr(cli.detect, "machine", lambda: _machine(memory=_apple_memory()))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_detect(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -2562,7 +2562,7 @@ def test_verbose_memory_module_with_some_none_fields(make_console, monkeypatch, 
                         manufacturer="Kingston", part_number="KVR32N22D8/16")
     mem = MemoryInfo(total_gb=32.0, slots_used=2, slots_total=4, modules=[mod1, mod2])
     m = _machine(memory=mem)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2579,7 +2579,7 @@ def test_verbose_storage_drive_all_none_fields_no_row(make_console, monkeypatch,
     stub_pythons(count=1)
     storage = StorageInfo(free_gb=100.0, drives=[Drive(model=None, media=None, size_gb=None)])
     m = _machine(storage=storage)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     # The drive exists but all fields None → no "drive" row
@@ -2591,7 +2591,7 @@ def test_verbose_board_bios_version_none_bios_date_present(make_console, monkeyp
     stub_pythons(count=1)
     board = BoardInfo(board_vendor="ACME", bios_version=None, bios_date="2023-01-01")
     m = _machine(board=board)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2610,7 +2610,7 @@ def test_verbose_memory_module_all_none_then_real(make_console, monkeypatch, stu
                             part_number=None)
     mem = MemoryInfo(total_gb=8.0, slots_used=1, slots_total=2, modules=[empty_mod, real_mod])
     m = _machine(memory=mem)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2626,7 +2626,7 @@ def test_verbose_memory_no_modules_but_slots_known_no_not_reported(
     # Rare case: slot count known but no per-module data (e.g. Linux non-root dmidecode)
     mem = MemoryInfo(total_gb=32.0, slots_used=2, slots_total=4, modules=[])
     m = _machine(memory=mem)
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
@@ -2796,7 +2796,7 @@ def test_accelerator_apple_with_other_gpu_shows_it(make_console):
 
 def test_render_detect_json_has_gpus_key(monkeypatch, capsys):
     # --json must emit a 'gpus' key (Task 6 plumbing, confirmed via asdict)
-    monkeypatch.setattr(cli.detect, "profile",
+    monkeypatch.setattr(cli.detect, "machine",
                         lambda: _machine(gpus=[GpuInfo(vendor="amd", name="Radeon 780M",
                                                         vram_gb=4.0, integrated=True)]))
     c = cli.Console(color=False, stream=sys.stderr)

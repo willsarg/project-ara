@@ -213,7 +213,7 @@ def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatc
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
     monkeypatch.setattr(cuda, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
-    monkeypatch.setattr(cuda, "profiles",
+    monkeypatch.setattr(cuda, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng: {"fixed_overhead_gb": 1.2})}), raising=False)
     margin, overhead = cuda._budget_params()
@@ -222,7 +222,7 @@ def test_budget_params_uses_stored_calibration(monkeypatch):
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
     monkeypatch.setattr(cuda, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
-    monkeypatch.setattr(cuda, "profiles",
+    monkeypatch.setattr(cuda, "calibration",
                         type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
                         raising=False)
     margin, overhead = cuda._budget_params()

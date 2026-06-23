@@ -456,7 +456,7 @@ def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)  # engine absent
     run_stub.add("machdep.cpu.brand_string", "Apple M4 Pro\n")
 
-    m = detect.profile()
+    m = detect.machine()
     assert isinstance(m, Machine)
     assert m.backend == "apple"
     assert m.engine == "wmx-suite"
@@ -474,7 +474,7 @@ def test_profile_engine_ready_when_spec_found(set_platform, run_stub, fake_home,
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: True)
-    m = detect.profile()
+    m = detect.machine()
     assert m.engine_ready is True
 
 
@@ -572,7 +572,7 @@ def test_profile_cpu_fallback(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: False)
-    m = detect.profile()
+    m = detect.machine()
     assert m.backend == "cpu"             # universal fallback — every machine has a backend
     assert m.accelerated is False         # but no GPU-class acceleration
     assert m.engine == "llama.cpp"
@@ -586,7 +586,7 @@ def test_profile_cpu_fallback_engine_ready_when_env_present(set_platform, run_st
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: name == "cpu")
-    m = detect.profile()
+    m = detect.machine()
     assert m.backend == "cpu" and m.engine_ready is True
 
 
@@ -765,7 +765,7 @@ def test_profile_embeds_hardware_structures(set_platform, run_stub, fake_home, m
     hw = _make_hw()
     monkeypatch.setattr(hardware, "probe", lambda: hw)
 
-    m = detect.profile()
+    m = detect.machine()
     assert isinstance(m, Machine)
     assert m.cpu is hw.cpu
     assert m.memory is hw.memory
@@ -783,7 +783,7 @@ def test_profile_chip_uses_cpu_brand_when_available(set_platform, run_stub, fake
     hw = _make_hw(cpu=CpuInfo(brand="AMD Ryzen 9 5900X", physical=12, logical=24))
     monkeypatch.setattr(hardware, "probe", lambda: hw)
 
-    m = detect.profile()
+    m = detect.machine()
     assert m.chip == "AMD Ryzen 9 5900X"
 
 
@@ -799,7 +799,7 @@ def test_profile_chip_falls_back_when_brand_none(set_platform, run_stub, fake_ho
     hw = _make_hw(cpu=CpuInfo(brand=None, physical=12, logical=12))
     monkeypatch.setattr(hardware, "probe", lambda: hw)
 
-    m = detect.profile()
+    m = detect.machine()
     assert m.chip == "Apple M4 Pro"
 
 
@@ -817,7 +817,7 @@ def test_profile_flat_fields_sourced_from_hw_structures(set_platform, run_stub, 
     )
     monkeypatch.setattr(hardware, "probe", lambda: hw)
 
-    m = detect.profile()
+    m = detect.machine()
     assert m.cpu_physical == 8
     assert m.cpu_logical == 16
     assert m.ram_total_gb == 32.0
@@ -840,7 +840,7 @@ def test_profile_flat_fields_none_when_hw_fields_none(set_platform, run_stub, fa
     )
     monkeypatch.setattr(hardware, "probe", lambda: hw)
 
-    m = detect.profile()
+    m = detect.machine()
     assert m.cpu_physical is None
     assert m.cpu_logical is None
     assert m.ram_total_gb is None
@@ -867,6 +867,6 @@ def test_machine_carries_gpus(monkeypatch):
         storage=hardware.StorageInfo(), board=hardware.BoardInfo(),
         gpus=[hardware.GpuInfo(vendor="amd", name="Phoenix1", usable_backend="vulkan")])
     monkeypatch.setattr(detect._hardware, "probe", lambda: fake)
-    m = detect.profile()
+    m = detect.machine()
     assert m.gpus and m.gpus[0].vendor == "amd"
     assert m.gpus[0].usable_backend == "vulkan"

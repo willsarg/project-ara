@@ -14,7 +14,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, catalog, db, detect, engines, hub, mlx, profiles,
+from ara import (acquire, apps, catalog, db, detect, engines, hub, mlx, profile, calibration,
                  pythons, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
@@ -501,7 +501,7 @@ _DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
 
 
 def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
-    m = detect.profile()
+    m = detect.machine()
     if as_json:
         # asdict() omits @property fields, so add `accelerated` explicitly — otherwise the very
         # distinction the CPU-fallback design introduced is invisible to machine consumers.
@@ -840,7 +840,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
             c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
         return 1
     con = db.connect()
-    mk = profiles.machine_key()
+    mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
     per_engine = {}                       # engine_key -> (safe_context, decode_context)
     for key in engines.ENGINES:
@@ -943,7 +943,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     ceiling = result["safe_context"]
     con = db.connect()
-    db.save_characterization(con, profiles.machine_key(), sel.engine_key,
+    db.save_characterization(con, profile.machine_key(), sel.engine_key,
                              model, safe_context=ceiling, points=result["points"],
                              decode_context=result.get("decode_context"))
     catalog.remember(con, model)
@@ -992,7 +992,7 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
     A model can be characterized under several engines on one machine (GPU + CPU); ``ara models``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
-    mk = profiles.machine_key()
+    mk = profile.machine_key()
     default = engines.for_backend(detect.backend_name())
     best: dict[str, tuple[int | None, str, int | None]] = {}
     for key in dict.fromkeys([default, *engines.ENGINES]):
@@ -1107,7 +1107,7 @@ def _overlay_stored_calibration(m: dict, engine_key: str | None) -> None:
     now — so a machine calibrated once shows as calibrated without re-measuring."""
     if engine_key is None:
         return
-    stored = profiles.get_calibration(db.connect(), engine_key)
+    stored = calibration.get_calibration(db.connect(), engine_key)
     if stored and stored.get("fixed_overhead_gb") is not None:
         m["overhead_gb"] = stored["fixed_overhead_gb"]
         m["calibrated"] = True
@@ -1118,7 +1118,7 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     """Show models ARA has characterized on this machine + engine (from the store)."""
     if engine_key is None:
         return
-    rows = db.list_characterizations(db.connect(), profiles.machine_key(), engine_key)
+    rows = db.list_characterizations(db.connect(), profile.machine_key(), engine_key)
     if not rows:
         return
     c.emit(c.section("  CHARACTERIZED MODELS"))
@@ -1142,10 +1142,10 @@ def _persist_calibration(m: dict, engine_key: str | None) -> None:
         return
     con = db.connect()
     if m.get("overhead_gb") is not None:
-        profiles.save_calibration(con, engine_key, fixed_overhead_gb=m["overhead_gb"])
+        calibration.save_calibration(con, engine_key, fixed_overhead_gb=m["overhead_gb"])
     ch = m.get("characterization")
     if ch and ch.get("safe_context") is not None:
-        db.save_characterization(con, profiles.machine_key(), engine_key, ch["model"],
+        db.save_characterization(con, profile.machine_key(), engine_key, ch["model"],
                                  safe_context=ch["safe_context"], points=ch["points"])
         catalog.remember(con, ch["model"])
 

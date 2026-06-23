@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
-from ara import db, engine_env, profiles
+from ara import calibration, db, engine_env
 from ara.contracts import driver
 
 # The built-in worker script (ships in the ARA repo, runs in the isolated cpu env by path).
@@ -78,7 +78,7 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
     calibration for the cpu engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
-    stored = profiles.get_calibration(db.connect(), CALIBRATION_ENGINE)
+    stored = calibration.get_calibration(db.connect(), CALIBRATION_ENGINE)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead

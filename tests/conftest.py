@@ -17,7 +17,7 @@ from ara.ui import Console
 
 # --------------------------------------------------------------------------- #
 # version-lookup caches — brew calls are lru_cached at module level, so results
-# leak across tests (and detect.profile()/apps.scan() consume them). Clear before
+# leak across tests (and detect.machine()/apps.scan() consume them). Clear before
 # AND after every test so each starts from a cold, deterministic cache.
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)

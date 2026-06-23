@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""db.py — the SQLite persistence foundation (machines, models, characterizations)."""
+"""db.py — the SQLite persistence foundation (calibrations, models, characterizations, profiles).
+
+Profiles persistence: Spec 2026-06-23-capability-pipeline (Slice 1)."""
 from __future__ import annotations
 
 from ara import db
@@ -9,7 +11,7 @@ from ara import db
 def test_connect_creates_schema(store):
     tables = {r[0] for r in store.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"machines", "models", "characterizations"} <= tables
+    assert {"calibrations", "models", "characterizations"} <= tables
 
 
 def test_db_path_uses_override(tmp_path, monkeypatch):
@@ -23,21 +25,21 @@ def test_db_path_defaults_to_platform_dir(monkeypatch):
     assert p.name == "ara.db" and "ara" in str(p)
 
 
-# --- machine profiles (per machine + engine) ---
-def test_machine_upsert_and_get(store):
-    db.upsert_machine(store, "machine-abc", "wmx", fixed_overhead_gb=1.5, calibrated_at="2026-06-19")
-    row = db.get_machine(store, "machine-abc", "wmx")
+# --- per-engine calibration ---
+def test_calibration_upsert_and_get(store):
+    db.upsert_calibration(store, "machine-abc", "wmx", fixed_overhead_gb=1.5, calibrated_at="2026-06-19")
+    row = db.get_calibration(store, "machine-abc", "wmx")
     assert row["fixed_overhead_gb"] == 1.5 and row["calibrated_at"] == "2026-06-19"
 
 
-def test_machine_get_missing_is_none(store):
-    assert db.get_machine(store, "nope", "wmx") is None
+def test_calibration_get_missing_is_none(store):
+    assert db.get_calibration(store, "nope", "wmx") is None
 
 
-def test_machine_upsert_replaces(store):
-    db.upsert_machine(store, "m", "wcx", fixed_overhead_gb=1.0, calibrated_at="t1")
-    db.upsert_machine(store, "m", "wcx", fixed_overhead_gb=2.0, calibrated_at="t2")
-    assert db.get_machine(store, "m", "wcx")["fixed_overhead_gb"] == 2.0
+def test_calibration_upsert_replaces(store):
+    db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=1.0, calibrated_at="t1")
+    db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=2.0, calibrated_at="t2")
+    assert db.get_calibration(store, "m", "wcx")["fixed_overhead_gb"] == 2.0
 
 
 # --- model catalog ---
@@ -150,3 +152,29 @@ def test_migration_adds_decode_context_column_to_old_schema(tmp_path, monkeypatc
     assert row is not None
     assert row["safe_context"] == 8000
     assert row["decode_context"] is None
+
+
+# --- system profiles (Slice 1; Spec 2026-06-23-capability-pipeline) ---
+def test_connect_creates_profiles_table(store):
+    tables = {r[0] for r in store.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "profiles" in tables
+
+
+def test_profile_save_and_get_latest(store):
+    db.save_profile(store, "machine-abc", '{"chip": "Apple M4 Pro"}')
+    row = db.get_latest_profile(store, "machine-abc")
+    assert row["profile_json"] == '{"chip": "Apple M4 Pro"}'
+    assert row["captured_at"]   # default timestamp filled in when not given
+
+
+def test_profile_get_latest_missing_is_none(store):
+    assert db.get_latest_profile(store, "nope") is None
+
+
+def test_profile_history_kept_latest_wins(store):
+    db.save_profile(store, "m", '{"v": 1}', captured_at="2026-06-23T01:00:00+00:00")
+    db.save_profile(store, "m", '{"v": 2}', captured_at="2026-06-23T02:00:00+00:00")
+    assert db.get_latest_profile(store, "m")["profile_json"] == '{"v": 2}'
+    rows = db.list_profiles(store, "m")
+    assert [r["profile_json"] for r in rows] == ['{"v": 2}', '{"v": 1}']   # newest first, history kept

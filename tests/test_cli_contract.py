@@ -60,7 +60,7 @@ class _FakeBackend:
 def mocked_world(monkeypatch, store):
     """Stub every external boundary cli touches, so any command can run through main()."""
     m = _machine()
-    monkeypatch.setattr(cli.detect, "profile", lambda: m)
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
     monkeypatch.setattr(cli.detect, "accelerator",
@@ -78,8 +78,8 @@ def mocked_world(monkeypatch, store):
                         lambda con: [{"model_id": "org/m", "modality": "text"}])
     monkeypatch.setattr(cli.catalog, "describe", lambda model_id: {"modality": "text"})
     monkeypatch.setattr(cli.catalog, "remember", lambda con, model: None)
-    monkeypatch.setattr(cli.profiles, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.profiles, "get_calibration", lambda con, key: None)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key: None)
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
