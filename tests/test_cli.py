@@ -411,7 +411,7 @@ class FakeBackend:
     def download_calibration_model(self, model):
         self.downloaded.append(model)
 
-    def calibrate(self, model):
+    def calibrate(self, model=None):   # real backends default model=CALIBRATION_MODEL
         if self.calibrate_exc:
             raise self.calibrate_exc
         return self.calibrate_result
@@ -1729,6 +1729,48 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
 
 
+def test_characterize_self_calibrates_when_uncalibrated(make_console, store, monkeypatch):
+    # Spec 2026-06-23-capability-pipeline (Slice 2): characterize owns calibration — it measures +
+    # persists the engine baseline once when none is stored, before the ramp.
+    calls = []
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7}),
+    ))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert calls == ["cal"]                                            # calibrated once, before ramp
+    assert cli.db.get_calibration(store, "mkey", "wmx")["fixed_overhead_gb"] == 1.7   # persisted
+
+
+def test_characterize_skips_calibration_when_already_calibrated(make_console, store, monkeypatch):
+    # Already calibrated → characterize does NOT recalibrate (idempotent).
+    calls = []
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=2.0)   # already calibrated
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: (calls.append("cal") or {"overhead_gb": 9.9}),
+    ))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert calls == []                                                 # not recalibrated
+    assert cli.db.get_calibration(store, "mkey", "wmx")["fixed_overhead_gb"] == 2.0   # unchanged
+
+
 def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     _wire_characterize(monkeypatch,
                        characterize=lambda m: {"model": m, "safe_context": None,
@@ -1873,7 +1915,7 @@ def _fake_bk_characterize(model):
 def test_render_characterize_prefetch_uncached_transformers(make_console, store, monkeypatch):
     # Uncached transformers model on a compatible engine → download fired, then characterize runs.
     bk = FakeBackend(_limits(), cached=False)
-    bk.calibrate_result = None  # not used by characterize path
+    bk.calibrate_result = None  # self-calibrate runs but returns None → nothing persisted
     # Give the FakeBackend a characterize method
     bk.characterize = _fake_bk_characterize
     _wire_characterize_bk(monkeypatch, bk)

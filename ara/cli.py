@@ -921,6 +921,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             return 1
         c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
         bk.download_calibration_model(model)
+    # characterize owns calibration: measure + persist the engine baseline once (when none is
+    # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
+    cal_con = db.connect()
+    if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
+        c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+        cal = bk.calibrate()
+        overhead = (cal or {}).get("overhead_gb")
+        if overhead is not None:
+            calibration.save_calibration(cal_con, sel.engine_key, fixed_overhead_gb=overhead)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
         result = bk.characterize(model)
