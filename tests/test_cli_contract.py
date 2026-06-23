@@ -144,14 +144,15 @@ def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):
 # `ara <cmd> --json` should always get parseable output, even on failure).
 @pytest.mark.parametrize("argv, setup", [
     (["characterize", "org/m", "--json"], "engine_off"),
-    (["profile", "--json"], "engine_off"),
-    (["models", "bad/x", "--json"], "undescribable"),
+    (["profile", "--engine", "bogus", "--json"], "bad_engine"),   # profile is engine-free; only
+    (["models", "bad/x", "--json"], "undescribable"),             # an unknown engine errors
 ])
 def test_json_error_paths_emit_json(mocked_world, monkeypatch, capsys, argv, setup):
     if setup == "engine_off":
         monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "wmx-suite"))
-    else:
+    elif setup == "undescribable":
         monkeypatch.setattr(cli.catalog, "describe", lambda model_id: None)
+    # bad_engine needs no stub: resolve_engine raises UnknownEngine for 'bogus'
     monkeypatch.setattr("sys.argv", ["ara", *argv])
     assert cli.main() == 1
     payload = _extract_json(capsys.readouterr().out)

@@ -14,8 +14,8 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, catalog, db, detect, engines, hub, mlx, profile, calibration,
-                 pythons, status, versions)
+from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, mlx, profile,
+                 calibration, pythons, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -792,7 +792,8 @@ def _emit_limits(c: Console, m: dict) -> None:
                    "the hard ceiling — never cross", value_role="bad"))
     c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
                    f"wall − {m['margin_gb']:.0f} GB margin", value_role="good"))
-    c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
+    if m.get("headroom_gb") is not None:
+        c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
     if m["overhead_gb"] is not None:
         gloss = "default estimate" if not m["calibrated"] else \
             f"measured cold-start · calibrated {m['calibrated_at']}"
@@ -807,27 +808,6 @@ def _confirm(question: str) -> bool:
         return input(f"  {question} [y/N] ").strip().lower() in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
-
-
-def _emit_calibration(c: Console, m: dict, fallback_model: str) -> None:
-    """One honest line on what calibration measured vs the built-in default."""
-    cal = m.get("calibration") or {}
-    measured = cal.get("measured_overhead_gb")
-    default = cal.get("default_overhead_gb")
-    n = cal.get("n_points")
-    short = cal.get("hf_id", fallback_model).split("/")[-1]
-    if measured is None or default is None:
-        return
-    if measured < default:
-        verdict = (f"hardware is lean — measured overhead under the {default:.0f} GB "
-                   f"default, keeping the default")
-    elif measured > default:
-        verdict = (f"measured {measured:.1f} GB → {measured - default:.1f} GB more "
-                   f"conservative than the {default:.0f} GB default")
-    else:
-        verdict = f"measured {measured:.1f} GB, matching the default"
-    rungs = f" · {n} rungs" if n else ""
-    c.emit(c.style("dim", f"  overhead: {verdict}{rungs} · {short}"))
 
 
 def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
@@ -1111,18 +1091,6 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
     return 0 if result.status in ("removed", "absent") else 1
 
 
-def _overlay_stored_calibration(m: dict, engine_key: str | None) -> None:
-    """Reuse ARA's stored overhead for this machine+engine, if any. ARA owns this record
-    now — so a machine calibrated once shows as calibrated without re-measuring."""
-    if engine_key is None:
-        return
-    stored = calibration.get_calibration(db.connect(), engine_key)
-    if stored and stored.get("fixed_overhead_gb") is not None:
-        m["overhead_gb"] = stored["fixed_overhead_gb"]
-        m["calibrated"] = True
-        m["calibrated_at"] = (stored.get("calibrated_at") or "")[:10] or None
-
-
 def _emit_characterized(c: Console, engine_key: str | None) -> None:
     """Show models ARA has characterized on this machine + engine (from the store)."""
     if engine_key is None:
@@ -1145,127 +1113,82 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     c.emit()
 
 
-def _persist_calibration(m: dict, engine_key: str | None) -> None:
-    """Remember what the engine just measured: an overhead and/or a characterization."""
-    if engine_key is None:
+def _model_fit(lim: dict, model: str) -> dict | None:
+    """Analytic fit for *model* against the estimated limits — no engine, no model load.
+
+    Combines the model's architecture (for the KV slope) with its on-disk size (a weights-
+    footprint proxy). Returns None when the model can't be described (bad repo / not cached)."""
+    meta = catalog.describe(model)
+    if meta is None:
+        return None
+    return estimate.model_fit(lim, meta, acquire.repo_size_gb(model))
+
+
+def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
+    """Render the per-model analytic verdict: does it fit, and what context does the budget hold?"""
+    fit = _model_fit(lim, model)
+    c.emit()
+    c.emit(c.section(f"  MODEL FIT: {model}") + c.style("dim", "  (estimated)"))
+    if fit is None:
+        c.emit(c.style("warn", f"  couldn't describe {model} — is it a valid repo / downloaded?"))
+        c.emit()
         return
-    con = db.connect()
-    if m.get("overhead_gb") is not None:
-        calibration.save_calibration(con, engine_key, fixed_overhead_gb=m["overhead_gb"])
-    ch = m.get("characterization")
-    if ch and ch.get("safe_context") is not None:
-        db.save_characterization(con, profile.machine_key(), engine_key, ch["model"],
-                                 safe_context=ch["safe_context"], points=ch["points"])
-        catalog.remember(con, ch["model"])
+    c.emit(c.field("weights", _fmt_gb(fit["weights_gb"], 1), "estimated in-memory footprint"))
+    if not fit["fits"]:
+        c.emit(c.field("verdict", "won't fit", "weights alone exceed the estimated budget",
+                       value_role="bad"))
+    elif fit["binding"] == "context_window":
+        c.emit(c.field("verdict", f"fits — full {fit['max_context']} ctx",
+                       "budget covers the model's whole window", value_role="good"))
+    elif fit["est_context"]:
+        c.emit(c.field("verdict", f"context-limited ~{fit['est_context']} tok",
+                       f"the budget binds before the model's {fit['max_context']} window",
+                       value_role="warn"))
+    else:
+        c.emit(c.field("verdict", "fits", "context estimate unavailable (unknown architecture)",
+                       value_role="good"))
+    c.emit(c.style("dim", "  estimated — run ") + c.style("accent", f"ara characterize {model}")
+           + c.style("dim", " to measure the real ceiling"))
+    c.emit()
 
 
-def render_profile(c: Console, *, recalibrate: bool = False, as_json: bool = False,
-                   assume_yes: bool = False, model: str | None = None,
+def render_profile(c: Console, *, as_json: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
+    """Analytic capability assessment — engine-free. Reasons over ``detect.machine()`` facts +
+    ARA's heuristics to estimate the memory budget, persists the profile, and (with ``--model``)
+    checks whether a model's weights + context window fit the estimate. It never loads an engine
+    or a model; ``characterize`` does that to measure the real ceiling.
+    Spec 2026-06-23-capability-pipeline."""
     try:
         sel = resolve_engine(engine)
     except UnknownEngine:
         msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    engine_ok, engine_pkg = engine_status(sel.backend)
-    if not engine_ok:
-        if as_json:
-            print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
-            return 1
-        # --engine is consent to install. We can't import a just-installed package
-        # in this process, so install then ask for a re-run rather than fake it.
-        if engine is not None:
-            if render_install(c, engine=engine) == 0:
-                c.emit(c.style("accent", "  re-run ara profile") + c.style("dim", " to measure"))
-            return 1
-        c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed here — run: ")
-               + c.style("accent", "ara install"))
-        return 1
 
-    bk = get_backend(sel.backend)
-    try:
-        m = bk.safe_limits()
-    except Exception as exc:
-        if as_json:
-            print(json.dumps({"error": f"couldn't read limits: {exc}"}))
-        else:
-            c.emit(c.style("bad", f"  couldn't read limits: {exc}"))
-        return 1
+    m = detect.machine()
+    lim = estimate.limits(m)
 
-    # Persist this machine's profile (the engine-free Machine snapshot; history kept).
-    # Spec 2026-06-23-capability-pipeline. Transitional placement: Slice 2 makes `profile` the
-    # engine-free persist command and moves calibration into `characterize`.
+    # profile is the persister (detect stays ephemeral): record this analytic snapshot, history kept.
     profile.capture(db.connect())
 
-    engine_key = sel.engine_key
-    _overlay_stored_calibration(m, engine_key)   # reuse a stored measurement if we have one
-
     if as_json:
-        print(json.dumps(m, indent=2))
+        payload = {**lim}
+        if model is not None:
+            payload["model_fit"] = _model_fit(lim, model)
+        print(json.dumps(payload, indent=2))
         return 0
 
-    _emit_limits(c, m)
-    _emit_characterized(c, engine_key)   # models ARA has already measured here
+    _emit_limits(c, lim)
+    _emit_characterized(c, sel.engine_key)   # models ARA has already measured here
 
-    # Naming an explicit --model means "calibrate against this", so it bypasses the
-    # cached early-return the way --recalibrate does.
-    explicit_model = model is not None
-    model = model or bk.CALIBRATION_MODEL
-
-    # Calibration is opt-in: offered only when it'd help, and only interactively.
-    if m["calibrated"] and not recalibrate and not explicit_model:
-        # Offer a re-measure only when there's a measured overhead to redo. An exactly-read
-        # wall (e.g. CUDA VRAM) is calibrated with nothing to recalibrate.
-        if m["overhead_gb"] is not None:
-            c.emit(c.style("dim", "  cached — ") + c.style("accent", "ara profile --recalibrate")
-                   + c.style("dim", " to re-measure"))
-        c.emit()
-        return 0
-
-    interactive = assume_yes or sys.stdin.isatty()
-    if not interactive:
-        c.emit(c.style("dim", "  estimated — run ") + c.style("accent", "ara profile")
-               + c.style("dim", " in a terminal (or pass ") + c.style("accent", "--yes")
-               + c.style("dim", ") to calibrate against a real model"))
-        c.emit()
-        return 0
-
-    cached = bk.calibration_model_cached(model)
-    if cached:
-        q = f"Calibrate now against {model}?  (loads it, stays under the safe budget)"
+    if model is not None:
+        _emit_model_fit(c, lim, model)
     else:
-        size_gb = acquire.repo_size_gb(model)
-        free_gb = acquire.free_disk_gb()
-        if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
-            c.emit(c.style("bad",
-                           f"  not enough disk for {model}: needs ~{size_gb:.1f} GB + "
-                           f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free."))
-            c.emit()
-            return 1
-        q = f"Download {model} from Hugging Face and calibrate?  ({_fmt_size(size_gb)})"
-
-    if not (assume_yes or _confirm(q)):
-        c.emit(c.style("dim", "  skipped — showing estimated limits."))
+        c.emit(c.style("dim", "  estimated — run ")
+               + c.style("accent", "ara characterize <model>")
+               + c.style("dim", " to measure a real ceiling"))
         c.emit()
-        return 0
-
-    try:
-        if not cached:
-            c.emit(c.style("dim", f"  downloading {model} …"))
-            bk.download_calibration_model(model)
-        m = bk.calibrate(model)
-    except SystemExit:
-        return 1  # engine printed a clean reason
-    except Exception as exc:
-        c.emit(c.style("bad", f"  calibration failed: {exc}"))
-        return 1
-
-    _persist_calibration(m, engine_key)   # ARA remembers it, so next run is cached
-    _overlay_stored_calibration(m, engine_key)  # reflect the stored timestamp in the readout
-    c.emit(c.style("good", "  calibrated."))
-    _emit_calibration(c, m, model)
-    _emit_limits(c, m)
     return 0
 
 
@@ -1276,8 +1199,6 @@ def main() -> int:
     argv = sys.argv[1:]
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
-    recalibrate = "--recalibrate" in argv
-    assume_yes = "--yes" in argv or "-y" in argv
 
     # --model / --engine / --include / --exclude take values; pull them out first.
     model: str | None = None
@@ -1315,7 +1236,7 @@ def main() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--recalibrate", "--yes", "-y"):
+        if a in ("--verbose", "-v", "--json"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
@@ -1367,8 +1288,7 @@ def main() -> int:
         return render_characterize(c, rest[1], engine=engine, as_json=as_json)
 
     if cmd == "profile":
-        return render_profile(c, recalibrate=recalibrate, as_json=as_json,
-                              assume_yes=assume_yes, model=model, engine=engine)
+        return render_profile(c, as_json=as_json, model=model, engine=engine)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)

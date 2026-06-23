@@ -150,11 +150,11 @@ def test_main_profile_model_equals_form(monkeypatch):
     assert rec["profile"]["model"] == "org/repo"
 
 
-def test_main_profile_flags(monkeypatch):
+def test_main_profile_passes_json(monkeypatch):
+    # profile is engine-free analytic now — it takes --json/--model/--engine, no calibrate flags.
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["profile", "--recalibrate", "--yes", "--json"])
-    kw = rec["profile"]
-    assert kw["recalibrate"] is True and kw["assume_yes"] is True and kw["as_json"] is True
+    _run_main(monkeypatch, ["profile", "--json"])
+    assert rec["profile"]["as_json"] is True
 
 
 def test_main_unknown_command_returns_1(monkeypatch, capsys):
@@ -417,47 +417,109 @@ class FakeBackend:
         return self.calibrate_result
 
 
-def _wire_profile(monkeypatch, set_platform, bk, *, engine_ok=True, isatty=False):
-    set_platform("Darwin", "arm64")  # backend_name() -> "apple"
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
-    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
-    # profile.capture() runs on the success path; keep it engine-free + hardware-free in tests.
-    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
+def _wire_profile(monkeypatch, set_platform, machine=None):
+    """Wire render_profile engine-free (Spec 2026-06-23-capability-pipeline, Slice 2 Task 2):
+    a stubbed Machine + machine_key on Apple. profile makes NO engine call — there is
+    deliberately no backend wired here."""
+    set_platform("Darwin", "arm64")  # resolve_engine(None) -> apple/wmx
+    monkeypatch.setattr(cli.detect, "machine", lambda: machine if machine is not None else _machine())
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
 
 
-def test_profile_engine_not_installed(make_console, monkeypatch, set_platform):
-    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
+def test_profile_never_loads_an_engine(make_console, monkeypatch, set_platform, store):
+    # The defining property: profile is analytic. If it reached for a backend, this would blow up.
+    _wire_profile(monkeypatch, set_platform)
+    monkeypatch.setattr(cli, "get_backend",
+                        lambda *a, **k: pytest.fail("profile loaded an engine"))
     c, buf = make_console()
-    assert cli.render_profile(c) == 1            # no --engine → report the gap
+    assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "isn't installed" in out
-    assert "ara install" in out      # the engine is installed on demand now,
-    assert "uv sync" not in out      # not pulled in by `uv sync`
+    assert "SAFE LIMITS" in out and "estimated" in out
+    assert "ara characterize" in out                              # points at the empirical step
+    assert cli.db.get_latest_profile(store, "mkey") is not None   # profile is the persister
 
 
-def test_profile_engine_flag_installs_then_asks_rerun(make_console, monkeypatch, set_platform):
-    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
-
-    def fake_install(c, *, engine, as_json=False):
-        c.emit("  installed wmx-suite")
-        return 0   # freshly installed — can't import it in THIS process
-
-    monkeypatch.setattr(cli, "render_install", fake_install)
+def test_profile_estimated_budget_mirrors_wall(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     c, buf = make_console()
-    assert cli.render_profile(c, engine="wmx") == 1   # not measured this run
+    assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "installed wmx-suite" in out
-    assert "re-run ara profile" in out
+    assert "36.0 GB" in out          # Apple working set: 0.75 × 48
+    assert "34.0 GB" in out          # safe budget: wall − 2 GB margin
 
 
-def test_profile_engine_flag_install_fails_no_rerun(make_console, monkeypatch, set_platform):
-    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits()), engine_ok=False)
-    monkeypatch.setattr(cli, "render_install", lambda c, *, engine, as_json=False: 1)
+def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_profile(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "estimated"
+    assert payload["calibrated"] is False
+    assert payload["safe_budget_gb"] == 48.0 * 0.75 - 2.0
+
+
+def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
     c, buf = make_console()
-    assert cli.render_profile(c, engine="wcx") == 1
-    assert "re-run ara profile" not in buf.getvalue()
+    assert cli.render_profile(c, model="org/small") == 0
+    out = buf.getvalue()
+    assert "MODEL FIT: org/small" in out
+    assert "full 8192 ctx" in out
+
+
+def test_profile_model_context_limited(make_console, monkeypatch, set_platform):
+    # A tiny budget binds before the model's window → context-limited verdict.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="cpu", ram_total_gb=8.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=131072))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/big-ctx") == 0
+    assert "context-limited" in buf.getvalue()
+
+
+def test_profile_model_wont_fit(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="cpu", ram_total_gb=8.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 20.0)   # weights > budget
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/huge") == 0
+    assert "won't fit" in buf.getvalue()
+
+
+def test_profile_model_fits_unknown_architecture(make_console, monkeypatch, set_platform):
+    # Describable + fits, but missing dims → no slope → "fits" with an honest unknown-context note.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=None, kv_heads=None, head_dim=None, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/odd") == 0
+    assert "context estimate unavailable" in buf.getvalue()
+
+
+def test_profile_model_undescribable(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform)
+    monkeypatch.setattr(cli.catalog, "describe", lambda m: None)
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/mystery") == 0
+    assert "couldn't describe org/mystery" in buf.getvalue()
+
+
+def test_profile_model_json_includes_fit(monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_profile(c, as_json=True, model="org/small") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["model_fit"]["fits"] is True
+    assert payload["model_fit"]["max_context"] == 8192
 
 
 def test_main_profile_passes_engine(monkeypatch):
@@ -470,63 +532,6 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_profile(c, engine="bogus") == 1
     assert "unknown engine" in buf.getvalue().lower()
-
-
-def test_profile_command_persists_system_profile(make_console, monkeypatch, set_platform, store):
-    # Spec 2026-06-23-capability-pipeline (Slice 1, Task 3): the profile command persists the
-    # system profile via profile.capture().
-    _wire_profile(monkeypatch, set_platform, FakeBackend(_limits(calibrated=True)))
-    monkeypatch.setattr(cli.detect, "machine", lambda: _machine())
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    c, _ = make_console()
-    cli.render_profile(c)
-    assert cli.db.get_latest_profile(store, "mkey") is not None   # profile was persisted
-
-
-# --- persistence wiring: overlay a stored calibration / persist a fresh one ---
-def test_overlay_stored_calibration_applies(store, monkeypatch):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=5.5,
-                                  calibrated_at="2026-06-18T09:30:00Z")
-    m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
-    cli._overlay_stored_calibration(m, "wmx")
-    assert m["overhead_gb"] == 5.5 and m["calibrated"] is True
-    assert m["calibrated_at"] == "2026-06-18"
-
-
-def test_overlay_no_stored_leaves_limits(store, monkeypatch):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    m = {"overhead_gb": None, "calibrated": False, "calibrated_at": None}
-    cli._overlay_stored_calibration(m, "wmx")     # nothing stored
-    assert m["calibrated"] is False
-
-
-def test_overlay_none_engine_key_is_noop():
-    m = {"overhead_gb": None, "calibrated": False}
-    cli._overlay_stored_calibration(m, None)
-    assert m["calibrated"] is False
-
-
-def test_persist_saves_overhead(store, monkeypatch):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli._persist_calibration({"overhead_gb": 1.2}, "wmx")
-    assert cli.calibration.get_calibration(store, "wmx")["fixed_overhead_gb"] == 1.2
-
-
-def test_persist_saves_characterization_and_catalogs(store, monkeypatch):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    seen = {}
-    monkeypatch.setattr(cli.catalog, "remember", lambda con, mid: seen.setdefault("model", mid))
-    m = {"overhead_gb": None,
-         "characterization": {"model": "smol", "safe_context": 16000, "points": [[512, 1.4]]}}
-    cli._persist_calibration(m, "wcx")
-    row = cli.db.get_characterization(store, "mkey", "wcx", "smol")
-    assert row["safe_context"] == 16000 and seen["model"] == "smol"
-
-
-def test_persist_none_engine_key_is_noop(store):
-    cli._persist_calibration({"overhead_gb": 1.0}, None)
-    assert cli.db.get_calibration(store, "any", "wmx") is None
 
 
 def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
@@ -555,149 +560,8 @@ def test_emit_characterized_none_engine_key(make_console):
     assert buf.getvalue() == ""
 
 
-def test_profile_safe_limits_error(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits())
-    bk.safe_limits_exc = RuntimeError("sysctl exploded")
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c) == 1
-    assert "couldn't read limits" in buf.getvalue()
-
-
-def test_profile_safe_limits_error_json(make_console, monkeypatch, set_platform, capsys):
-    # --json must emit a JSON error, not human text, when limits can't be read
-    import json as _json
-    bk = FakeBackend(_limits())
-    bk.safe_limits_exc = RuntimeError("sysctl exploded")
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, _ = make_console()
-    assert cli.render_profile(c, as_json=True) == 1
-    assert "error" in _json.loads(capsys.readouterr().out.strip())
-
-
-def test_profile_json(monkeypatch, set_platform, capsys):
-    bk = FakeBackend(_limits(calibrated=True))
-    _wire_profile(monkeypatch, set_platform, bk)
-    c = cli.Console(color=False, stream=sys.stderr)
-    assert cli.render_profile(c, as_json=True) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["safe_budget_gb"] == 36.0
-
-
-def test_profile_cached_early_return(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=True))
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c) == 0
-    out = buf.getvalue()
-    assert "cached" in out and "--recalibrate" in out
-
-
-def test_profile_calibrated_without_overhead_skips_recalibrate_hint(
-        make_console, monkeypatch, set_platform):
-    # The cuda case: the VRAM wall is exact (calibrated) but there's no measured
-    # cold-start overhead to redo — so no "recalibrate" hint, just the limits.
-    bk = FakeBackend(_limits(calibrated=True, overhead_gb=None))
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c) == 0
-    out = buf.getvalue()
-    assert "SAFE LIMITS" in out
-    assert "--recalibrate" not in out
-
-
-def test_profile_non_interactive_estimated(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False))
-    _wire_profile(monkeypatch, set_platform, bk, isatty=False)
-    c, buf = make_console()
-    assert cli.render_profile(c) == 0
-    assert "estimated" in buf.getvalue()
-
-
-def test_profile_insufficient_disk(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False), cached=False)
-    _wire_profile(monkeypatch, set_platform, bk)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 10.0)
-    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 5.0)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 1
-    assert "not enough disk" in buf.getvalue()
-
-
-def test_profile_disk_exactly_at_threshold_proceeds(make_console, monkeypatch, set_platform):
-    # boundary: free == size + buffer is NOT "insufficient" (the check is strict <).
-    bk = FakeBackend(_limits(calibrated=False), cached=False)
-    _wire_profile(monkeypatch, set_platform, bk)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 10.0)
-    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 10.0 + cli.acquire.DISK_BUFFER_GB)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 0   # proceeds to calibrate, no disk error
-    assert "not enough disk" not in buf.getvalue()
-
-
-def test_profile_confirm_declined(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False), cached=True)
-    _wire_profile(monkeypatch, set_platform, bk, isatty=True)
-    monkeypatch.setattr(cli, "_confirm", lambda q: False)
-    c, buf = make_console()
-    assert cli.render_profile(c) == 0
-    assert "skipped" in buf.getvalue()
-
-
-def test_profile_calibrate_success(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False), cached=True)
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 0
-    out = buf.getvalue()
-    assert "calibrated." in out
-    assert "overhead" in out  # _emit_calibration line rendered
-
-
-def test_profile_calibrate_failure(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False), cached=True)
-    bk.calibrate_exc = RuntimeError("OOM during ramp")
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 1
-    assert "calibration failed" in buf.getvalue()
-
-
-def test_profile_explicit_model_bypasses_cache(make_console, monkeypatch, set_platform):
-    # Calibrated already, but naming --model forces a re-measure path.
-    bk = FakeBackend(_limits(calibrated=True), cached=True)
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True, model="org/other") == 0
-    assert "calibrated." in buf.getvalue()
-    assert "cached" not in buf.getvalue()  # did NOT take the early return
-
-
-def test_profile_downloads_when_not_cached(make_console, monkeypatch, set_platform):
-    bk = FakeBackend(_limits(calibrated=False), cached=False)
-    _wire_profile(monkeypatch, set_platform, bk)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 0.1)
-    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 500.0)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 0
-    assert bk.downloaded == ["org/calib"]  # fetched before calibrating
-    assert "calibrated." in buf.getvalue()
-
-
 # --------------------------------------------------------------------------- #
-# render_profile end-to-end through the REAL Apple backend on the fake engine
-# --------------------------------------------------------------------------- #
-def test_profile_calibrate_clean_systemexit(make_console, monkeypatch, set_platform):
-    # The engine may sys.exit() after printing its own clean reason → rc 1, no traceback.
-    bk = FakeBackend(_limits(calibrated=False), cached=True)
-    bk.calibrate_exc = SystemExit(1)
-    _wire_profile(monkeypatch, set_platform, bk)
-    c, buf = make_console()
-    assert cli.render_profile(c, assume_yes=True) == 1
-
-
-# --------------------------------------------------------------------------- #
-# _emit_limits / _emit_calibration helpers
+# _emit_limits helper
 # --------------------------------------------------------------------------- #
 def test_emit_limits_omits_overhead_when_none(make_console):
     c, buf = make_console()
@@ -713,25 +577,6 @@ def test_emit_limits_omits_swap_when_none(make_console):
     out = buf.getvalue()
     assert "SAFE LIMITS" in out
     assert "swap" not in out
-
-
-@pytest.mark.parametrize("measured,default,phrase", [
-    (5.0, 6.0, "lean"),                 # under the default → keep default
-    (8.0, 6.0, "more conservative"),    # over the default → tighten
-    (6.0, 6.0, "matching the default"), # equal
-])
-def test_emit_calibration_verdicts(make_console, measured, default, phrase):
-    c, buf = make_console()
-    m = {"calibration": {"measured_overhead_gb": measured, "default_overhead_gb": default,
-                         "n_points": 4, "hf_id": "org/calib-model"}}
-    cli._emit_calibration(c, m, "org/calib-model")
-    assert phrase in buf.getvalue()
-
-
-def test_emit_calibration_silent_without_measurements(make_console):
-    c, buf = make_console()
-    cli._emit_calibration(c, {"calibration": {}}, "org/calib")
-    assert buf.getvalue() == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -817,33 +662,6 @@ def test_render_status_gpu_and_no_port(make_console, monkeypatch):
     out = buf.getvalue()
     assert "8192 MB GPU" in out
     assert ":" not in out.split("Ollama")[-1].split("\n")[0].replace("pid", "")
-
-
-def test_profile_through_real_apple_backend(make_console, monkeypatch, set_platform):
-    from ara.backends import apple
-    set_platform("Darwin", "arm64")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr(apple, "calibration_model_cached", lambda *a: True)  # no download
-    facts = {"device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
-             "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0,
-             "swap_free_gb": 2.0}
-    calls = []
-
-    def worker(name, argv):
-        calls.append(argv[2])
-        return {"measured_overhead_gb": 5.0, "default_overhead_gb": 6.0,
-                "n_points": 4} if argv[2] == "calibrate" else dict(facts)
-
-    monkeypatch.setattr(apple, "engine_env",
-                        type("E", (), {"run_worker": staticmethod(worker)}))
-    c, buf = make_console()
-    rc = cli.render_profile(c, assume_yes=True)
-    out = buf.getvalue()
-    assert rc == 0
-    assert "SAFE LIMITS" in out
-    assert "calibrated." in out
-    assert "calibrate" in calls   # real apple.calibrate drove the device worker
 
 
 # --------------------------------------------------------------------------- #
