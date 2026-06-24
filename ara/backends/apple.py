@@ -119,3 +119,19 @@ def characterize(model: str) -> dict:
             "apple", _worker_argv(m, ctx, margin, overhead)),
         schedule=RAMP_SCHEDULE,
     )
+
+
+DEFAULT_MAX_TOKENS = 256
+
+
+def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS) -> dict:
+    """One-shot MLX completion, governed: max_context is the characterized safe ceiling, so the
+    worker generates under the wall. Out-of-process in the isolated `apple` env via wmx-suite's
+    generate worker; the prompt goes over stdin, never argv. Returns {context, completion} or a
+    refusal {refused, reason}. ARA never imports MLX in-process."""
+    margin, overhead = _budget_params()
+    return engine_env.run_worker("apple",
+        ["-m", "wmx_suite.generate", model, str(max_context),
+         "--margin", str(margin), "--overhead", str(overhead),
+         "--max-tokens", str(max_tokens)],
+        input=prompt)
