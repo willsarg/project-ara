@@ -12,11 +12,15 @@ from ara.profile import machine_key
 
 
 def save_calibration(con, engine: str, *, fixed_overhead_gb: float,
-                     calibrated_at: str | None = None) -> None:
-    """Persist this machine's measured overhead for *engine*."""
+                     calibrated_at: str | None = None,
+                     wall_gb: float | None = None,
+                     safe_budget_gb: float | None = None) -> None:
+    """Persist this machine's measured overhead for *engine* (and, when known, the measured
+    memory wall + safe budget the engine read, so profile/recommend can report reality)."""
     db.upsert_calibration(con, machine_key(), engine,
                           fixed_overhead_gb=fixed_overhead_gb,
-                          calibrated_at=calibrated_at or db._now())
+                          calibrated_at=calibrated_at or db._now(),
+                          wall_gb=wall_gb, safe_budget_gb=safe_budget_gb)
 
 
 def get_calibration(con, engine: str) -> dict | None:

@@ -42,6 +42,57 @@ def test_calibration_upsert_replaces(store):
     assert db.get_calibration(store, "m", "wcx")["fixed_overhead_gb"] == 2.0
 
 
+# --- measured wall persistence (Spec 2026-06-23-capability-pipeline) ---
+def test_calibration_persists_measured_wall(store):
+    # The measured wall + safe budget ride alongside the overhead so profile/recommend can
+    # report what the engine actually measured, not just the heuristic.
+    db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=0.6, calibrated_at="t",
+                          wall_gb=24.0, safe_budget_gb=23.0)
+    row = db.get_calibration(store, "m", "wcx")
+    assert row["wall_gb"] == 24.0 and row["safe_budget_gb"] == 23.0
+
+
+def test_calibration_wall_defaults_to_none(store):
+    # Existing callers that don't pass a wall keep working — the columns stay NULL.
+    db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=0.6, calibrated_at="t")
+    row = db.get_calibration(store, "m", "wcx")
+    assert row["wall_gb"] is None and row["safe_budget_gb"] is None
+
+
+def test_migration_adds_wall_columns_to_old_schema(tmp_path, monkeypatch):
+    """An existing DB without wall_gb/safe_budget_gb gets the columns after connect()."""
+    import sqlite3 as _sqlite3
+    db_path = tmp_path / "old.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(db_path))
+
+    # Build an old-schema calibrations table (no wall columns) and seed one row.
+    OLD_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS calibrations (
+        machine_key       TEXT NOT NULL,
+        engine            TEXT NOT NULL,
+        fixed_overhead_gb REAL,
+        calibrated_at     TEXT,
+        PRIMARY KEY (machine_key, engine)
+    );
+    """
+    old_con = _sqlite3.connect(str(db_path))
+    old_con.row_factory = _sqlite3.Row
+    old_con.executescript(OLD_SCHEMA)
+    old_con.execute(
+        "INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, calibrated_at) "
+        "VALUES (?, ?, ?, ?)", ("m", "wcx", 0.6, "2026-01-01T00:00:00+00:00"))
+    old_con.commit()
+    old_con.close()
+
+    # connect() must run the migration, leaving the old row readable with NULL wall columns.
+    con = db.connect()
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(calibrations)")}
+    assert {"wall_gb", "safe_budget_gb"} <= cols
+    row = db.get_calibration(con, "m", "wcx")
+    assert row["fixed_overhead_gb"] == 0.6
+    assert row["wall_gb"] is None and row["safe_budget_gb"] is None
+
+
 # --- model catalog ---
 def test_model_upsert_and_get(store):
     db.upsert_model(store, "org/m", modality="text", params=135_000_000, quant="fp16",

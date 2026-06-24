@@ -22,3 +22,21 @@ def test_save_calibration_defaults_timestamp(store, monkeypatch):
     monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")
     calibration.save_calibration(store, "wcx", fixed_overhead_gb=0.2)   # no calibrated_at
     assert calibration.get_calibration(store, "wcx")["calibrated_at"]   # something was stamped
+
+
+def test_save_calibration_persists_measured_wall(store, monkeypatch):
+    # Spec 2026-06-23-capability-pipeline: the measured wall rides with the overhead so profile
+    # can report the engine's real numbers, not the heuristic.
+    monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")
+    calibration.save_calibration(store, "wcx", fixed_overhead_gb=0.6,
+                                 wall_gb=24.0, safe_budget_gb=23.0)
+    row = calibration.get_calibration(store, "wcx")
+    assert row["wall_gb"] == 24.0 and row["safe_budget_gb"] == 23.0
+
+
+def test_save_calibration_wall_defaults_none(store, monkeypatch):
+    # Existing callers (overhead only) still work — wall columns stay NULL.
+    monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")
+    calibration.save_calibration(store, "wcx", fixed_overhead_gb=0.6)
+    row = calibration.get_calibration(store, "wcx")
+    assert row["wall_gb"] is None and row["safe_budget_gb"] is None

@@ -784,9 +784,12 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
 # profile (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
+    # The tag must match the data source: a measured wall reads as measured; without one it's
+    # honestly flagged as an uncalibrated estimate. Spec 2026-06-23-capability-pipeline.
+    measured = m.get("basis") == "measured"
+    tag = "  (measured)" if measured else "  (estimated — not calibrated)"
     c.emit()
-    c.emit(c.section("  SAFE LIMITS")
-           + c.style("dim", "" if m["calibrated"] else "  (estimated — not calibrated)"))
+    c.emit(c.section("  SAFE LIMITS") + c.style("dim", tag))
     c.emit(c.field("device", f"{m['device']} · {m['total_gb']:.0f} GB"))
     c.emit(c.field("crash wall", _fmt_gb(m["wall_gb"], 1),
                    "the hard ceiling — never cross", value_role="bad"))
@@ -908,8 +911,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
         cal = bk.calibrate()
         overhead = (cal or {}).get("overhead_gb")
-        if overhead is not None:
-            calibration.save_calibration(cal_con, sel.engine_key, fixed_overhead_gb=overhead)
+        wall = (cal or {}).get("wall_gb")
+        # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
+        # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
+        # wall regardless of overhead is what lets profile/recommend report reality on every engine,
+        # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
+        if overhead is not None or wall is not None:
+            calibration.save_calibration(
+                cal_con, sel.engine_key, fixed_overhead_gb=overhead,
+                wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
         result = bk.characterize(model)
@@ -1043,7 +1053,11 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
     with a rankable context estimate are listed. Spec 2026-06-23-capability-pipeline."""
     con = db.connect()
     catalog.scan(con)                 # refresh the catalog from the local cache first
-    lim = estimate.limits(detect.machine())
+    # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
+    default_engine = engines.for_backend(detect.backend_name())
+    measured = (calibration.get_calibration(con, default_engine)
+                if default_engine is not None else None)
+    lim = estimate.limits(detect.machine(), measured=measured)
     best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
 
     recs = []
@@ -1105,20 +1119,58 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if not prompt:
         return err("usage: ara run <model> <prompt>")
 
-    row = db.get_characterization(db.connect(), profile.machine_key(), sel.engine_key, model)
+    con = db.connect()
+    mk = profile.machine_key()
     suffix = "" if engine is None else f" --engine {sel.engine_key}"
-    if row is None:
-        return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
-                   f"ara characterize {model}{suffix}")
-    if row.get("safe_context") is None:
-        return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
-                   f"too big for this machine")
-    safe = row["safe_context"]
 
-    engine_ok, engine_pkg = engine_status(sel.backend)
+    if engine is not None:
+        # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
+        row = db.get_characterization(con, mk, sel.engine_key, model)
+        if row is None:
+            return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                       f"ara characterize {model}{suffix}")
+        if row.get("safe_context") is None:
+            return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
+                       f"too big for this machine")
+        engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
+    else:
+        # No --engine: scan every engine this model is characterized under on this machine and pick
+        # the largest measured ceiling whose backend can actually run (has `generate`). A model
+        # characterized on the CPU fallback runs there even when the detected backend differs.
+        # Mirror _best_ceilings' iteration: detected default first so ties favour it. The default
+        # is never None here — resolve_engine(None) above would have raised if the detected backend
+        # had no engine — so [default, *ENGINES] holds only real keys.
+        default = engines.for_backend(detect.backend_name())
+        per_engine = {}                  # engine_key -> (safe_context, backend, can_run)
+        for key in dict.fromkeys([default, *engines.ENGINES]):
+            row = db.get_characterization(con, mk, key, model)
+            if row is None:
+                continue
+            backend = engines.ENGINES[key]["backend"]
+            per_engine[key] = (row.get("safe_context"), backend,
+                               hasattr(get_backend(backend), "generate"))
+        if not per_engine:
+            return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                       f"ara characterize {model}")
+        fitted = {k: v for k, v in per_engine.items() if v[0] is not None}
+        if not fitted:
+            return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
+                       f"too big for this machine")
+        runnable = {k: v for k, v in fitted.items() if v[2]}
+        if not runnable:
+            # Characterized + fits, but only on engine(s) ARA can't run through yet (apple/cuda).
+            # Be honest about that — don't masquerade as uncharacterized.
+            where = ", ".join(fitted)
+            return err(f"{model} is characterized on {where}, but run isn't supported on "
+                       f"that engine yet")
+        # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
+        engine_key = max(runnable, key=lambda k: runnable[k][0])
+        safe, backend, _ = runnable[engine_key]
+
+    engine_ok, engine_pkg = engine_status(backend)
     if not engine_ok:
         return err(f"the {engine_pkg} engine isn't installed — run: ara install{suffix}")
-    bk = get_backend(sel.backend)
+    bk = get_backend(backend)
     if not hasattr(bk, "generate"):
         return err(f"run isn't supported on the {engine_pkg} engine yet")
 
@@ -1140,7 +1192,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     completion = result.get("completion", "")
     if as_json:
-        print(json.dumps({"model": model, "engine": sel.engine_key,
+        print(json.dumps({"model": model, "engine": engine_key,
                           "safe_context": safe, "completion": completion}, indent=2))
         return 0
     c.emit()
@@ -1231,12 +1283,20 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
 def _model_fit(lim: dict, model: str) -> dict | None:
     """Analytic fit for *model* against the estimated limits — no engine, no model load.
 
-    Combines the model's architecture (for the KV slope) with its on-disk size (a weights-
-    footprint proxy). Returns None when the model can't be described (bad repo / not cached)."""
+    Combines the model's architecture (for the KV slope) with its weight footprint. The weight
+    comes from the catalog's stored ``weights_gb`` first (local, from the HF cache — exactly what
+    ``recommend`` uses, so the two compute identically with no network call); only when the
+    catalog has no weight for it do we fall back to the HF API (``acquire.repo_size_gb``). Returns
+    None when the model can't be described (bad repo / not cached)."""
     meta = catalog.describe(model)
     if meta is None:
         return None
-    return estimate.model_fit(lim, meta, acquire.repo_size_gb(model))
+    con = db.connect()
+    row = catalog.get(con, model) or catalog.remember(con, model)
+    weights_gb = row.get("weights_gb") if row else None
+    if weights_gb is None:
+        weights_gb = acquire.repo_size_gb(model)
+    return estimate.model_fit(lim, meta, weights_gb)
 
 
 def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
@@ -1282,7 +1342,11 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         return 1
 
     m = detect.machine()
-    lim = estimate.limits(m)
+    # Ground the estimate in reality: if this engine has a measured wall stored from a prior
+    # characterize, report the MEASURED budget (labelled), not the heuristic. Read-only — still
+    # engine-free (no engine import/load). Spec 2026-06-23-capability-pipeline.
+    measured = calibration.get_calibration(db.connect(), sel.engine_key)
+    lim = estimate.limits(m, measured=measured)
 
     # profile is the persister (detect stays ephemeral): record this analytic snapshot, history kept.
     profile.capture(db.connect())

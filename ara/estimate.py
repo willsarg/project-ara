@@ -17,13 +17,20 @@ MARGIN_GB = 2.0
 APPLE_WORKING_SET = 0.75
 
 
-def limits(machine) -> dict:
+def limits(machine, measured: dict | None = None) -> dict:
     """Analytic memory limits from detect facts — no engine, no model load.
 
     Mirrors the wall each backend would read: CUDA → total VRAM, Apple → a working-set fraction
     of unified RAM, CPU → physical RAM. The safe budget is the wall minus ARA's margin. Shape is
-    compatible with the limits dict the engines return, but ``calibrated`` is always False and
-    ``basis`` is ``"estimated"`` — this is predicted, not measured.
+    compatible with the limits dict the engines return.
+
+    Pure: the heuristic never touches a database. The CALLER may pass *measured* — a stored
+    calibration dict carrying ``wall_gb``/``safe_budget_gb`` from the engine's own ``safe_limits``.
+    When it holds a usable wall, those measured numbers replace the heuristic and the result is
+    labelled ``basis="measured"`` / ``calibrated=True`` (the heuristic value is kept alongside as
+    ``estimated_wall_gb``/``estimated_safe_budget_gb`` so the correction is visible). Otherwise the
+    result is the honest heuristic: ``basis="estimated"`` / ``calibrated=False``. The label always
+    matches the data source — a heuristic is never reported as measured.
     """
     if machine.backend == "cuda":
         vram = machine.accel.vram_gb
@@ -36,7 +43,7 @@ def limits(machine) -> dict:
         wall = total * APPLE_WORKING_SET if (machine.backend == "apple" and total is not None) \
             else total
     safe_budget = wall - MARGIN_GB if wall is not None else None
-    return {
+    out = {
         "device": device,
         "total_gb": total,
         "wall_gb": wall,
@@ -49,6 +56,18 @@ def limits(machine) -> dict:
         "calibrated_at": None,
         "basis": "estimated",
     }
+    # A real measurement for this machine + engine wins over the heuristic — but only when it
+    # actually carries a wall (older/partial calibration rows fall back to the estimate honestly).
+    measured_wall = (measured or {}).get("wall_gb")
+    if measured_wall is not None:
+        out["estimated_wall_gb"] = wall              # keep the heuristic visible for comparison
+        out["estimated_safe_budget_gb"] = safe_budget
+        out["wall_gb"] = measured_wall
+        out["safe_budget_gb"] = (measured or {}).get("safe_budget_gb")
+        out["calibrated"] = True
+        out["calibrated_at"] = (measured or {}).get("calibrated_at")
+        out["basis"] = "measured"
+    return out
 
 
 def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:

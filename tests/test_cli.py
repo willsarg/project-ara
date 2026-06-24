@@ -386,6 +386,7 @@ def _limits(calibrated=False, **over):
         device="Apple M4 Pro", total_gb=48.0, wall_gb=40.0, safe_budget_gb=36.0,
         margin_gb=4.0, headroom_gb=28.0, overhead_gb=6.0, swap_free_gb=2.0,
         calibrated=calibrated, calibrated_at="2026-06-18" if calibrated else None,
+        basis="estimated",
     )
     base.update(over)
     return base
@@ -462,6 +463,43 @@ def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
     assert payload["safe_budget_gb"] == 48.0 * 0.75 - 2.0
 
 
+def test_profile_reports_measured_wall_after_calibration(make_console, monkeypatch, set_platform, store):
+    # Spec 2026-06-23-capability-pipeline: once a measured wall is stored for the detected engine,
+    # profile reports the MEASURED numbers (labelled), not the heuristic.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+                                     wall_gb=41.3, safe_budget_gb=39.3)
+    c, buf = make_console()
+    assert cli.render_profile(c) == 0
+    out = buf.getvalue()
+    assert "41.3 GB" in out and "39.3 GB" in out      # the measured wall + budget
+    assert "not calibrated" not in out                # not an estimate anymore
+
+
+def test_profile_json_reports_measured_basis(monkeypatch, set_platform, capsys, store):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+                                     wall_gb=41.3, safe_budget_gb=39.3)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_profile(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "measured"
+    assert payload["calibrated"] is True
+    assert payload["wall_gb"] == 41.3 and payload["safe_budget_gb"] == 39.3
+
+
+def test_profile_uncalibrated_stays_estimated(monkeypatch, set_platform, capsys, store):
+    # No stored wall → profile must STILL say estimated (no fabrication).
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_profile(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "estimated" and payload["calibrated"] is False
+
+
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.catalog, "describe",
@@ -512,6 +550,37 @@ def test_profile_model_undescribable(make_console, monkeypatch, set_platform):
     c, buf = make_console()
     assert cli.render_profile(c, model="org/mystery") == 0
     assert "couldn't describe org/mystery" in buf.getvalue()
+
+
+def test_profile_model_uses_cataloged_weight_no_network(make_console, monkeypatch, set_platform):
+    # profile --model and recommend must compute identically: a cataloged model's weight comes
+    # from the local catalog (catalog.get → weights_gb), never a network repo_size_gb call.
+    # Spec 2026-06-23-capability-pipeline.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get",
+                        lambda con, m: {"model_id": m, "weights_gb": 4.0})
+    monkeypatch.setattr(cli.acquire, "repo_size_gb",
+                        lambda m: pytest.fail("repo_size_gb hit the network for a cataloged model"))
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/small") == 0
+    assert "full 8192 ctx" in buf.getvalue()        # the 4.0 GB cataloged weight drove the fit
+
+
+def test_profile_model_falls_back_to_network_when_uncataloged(make_console, monkeypatch, set_platform):
+    # No catalog weight (model not cataloged, or weights_gb None) → fall back to repo_size_gb.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    called = []
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: called.append(m) or 4.0)
+    c, buf = make_console()
+    assert cli.render_profile(c, model="org/fresh") == 0
+    assert called == ["org/fresh"]                   # network fallback fired
+    assert "full 8192 ctx" in buf.getvalue()
 
 
 def test_profile_model_json_includes_fit(monkeypatch, set_platform, capsys):
@@ -581,6 +650,21 @@ def test_emit_limits_omits_swap_when_none(make_console):
     out = buf.getvalue()
     assert "SAFE LIMITS" in out
     assert "swap" not in out
+
+
+def test_emit_limits_measured_reads_as_measured(make_console):
+    # A measured profile must NOT read as estimated. Spec 2026-06-23-capability-pipeline.
+    c, buf = make_console()
+    cli._emit_limits(c, _limits(calibrated=True, basis="measured"))
+    out = buf.getvalue()
+    assert "measured" in out
+    assert "estimated" not in out and "not calibrated" not in out
+
+
+def test_emit_limits_estimated_says_estimated(make_console):
+    c, buf = make_console()
+    cli._emit_limits(c, _limits(calibrated=False, basis="estimated"))
+    assert "not calibrated" in buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -1448,6 +1532,28 @@ def test_recommend_none_fit(make_console, monkeypatch, set_platform):
     assert "nothing in the catalog fits" in buf.getvalue()
 
 
+def test_recommend_uses_measured_wall(make_console, monkeypatch, set_platform, store):
+    # Spec 2026-06-23-capability-pipeline: after the detected engine is calibrated, recommend ranks
+    # against the MEASURED budget, not the heuristic. A measured wall that's tighter than the
+    # heuristic must actually bind the fit — proving the measurement drove the math.
+    captured = {}
+    real_limits = cli.estimate.limits
+
+    def spy_limits(machine, measured=None):
+        captured["measured"] = measured
+        return real_limits(machine, measured=measured)
+
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small", max_context=8192)])
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.estimate, "limits", spy_limits)
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+                                     wall_gb=41.3, safe_budget_gb=39.3)
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert captured["measured"] is not None
+    assert captured["measured"]["wall_gb"] == 41.3        # the stored measurement was passed in
+
+
 def test_recommend_json(monkeypatch, set_platform, capsys):
     _wire_recommend(monkeypatch, set_platform, [_model_row("org/Big", max_context=131072)])
     c = cli.Console(color=False, stream=sys.stderr)
@@ -1469,7 +1575,12 @@ def test_main_recommend_dispatch(monkeypatch):
 _CHAR = {"model_id": "org/m", "safe_context": 8192, "decode_context": None}
 
 
-def _wire_run(monkeypatch, *, engine_ok=True, generate=None, characterization=None, isatty=False):
+def _ok_generate(*a, **k):
+    return {"completion": "ok"}
+
+
+def _wire_run(monkeypatch, *, engine_ok=True, generate=_ok_generate, characterization=None,
+              isatty=False):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "llama.cpp"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
@@ -1593,6 +1704,109 @@ def test_run_unknown_engine(make_console):
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", engine="bogus") == 1
     assert "unknown engine" in buf.getvalue().lower()
+
+
+# Cross-engine selection: with no --engine, run scans every engine this model is characterized
+# under on this machine and picks the largest safe_context whose backend can actually generate —
+# not just the detected engine. Spec 2026-06-23-capability-pipeline.
+def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, isatty=False):
+    """chars: {engine_key: characterization|None}; supports: {backend: bool} (has .generate)."""
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: detected)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, f"{b} pkg"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: chars.get(e))
+
+    def backend(b=None):
+        bk = types.SimpleNamespace()
+        if supports.get(b):
+            bk.generate = lambda model, prompt, *, max_context, max_tokens: {
+                "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
+        return bk
+    monkeypatch.setattr(cli, "get_backend", backend)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+
+
+def test_run_picks_characterized_engine_across_backends(make_console, monkeypatch):
+    # Detected apple (no run support), but the model is characterized on cpu → run on cpu.
+    _wire_run_cross(
+        monkeypatch, detected="apple",
+        chars={"cpu": {"model_id": "org/m", "safe_context": 4096}},
+        supports={"cpu": True, "apple": False})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+    assert "ran on cpu" in buf.getvalue()
+
+
+def test_run_picks_largest_safe_context_engine(monkeypatch, capsys):
+    # Characterized on two run-capable engines → pick the largest safe_context.
+    _wire_run_cross(
+        monkeypatch, detected="cpu",
+        chars={"cpu": {"model_id": "org/m", "safe_context": 4096},
+               "wcx": {"model_id": "org/m", "safe_context": 16000}},
+        supports={"cpu": True, "cuda": True})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["engine"] == "wcx" and payload["safe_context"] == 16000
+
+
+def test_run_engine_override_pins_named_engine(make_console, monkeypatch):
+    # --engine pins exactly that engine even if another engine has a bigger ceiling.
+    _wire_run_cross(
+        monkeypatch, detected="cpu",
+        chars={"cpu": {"model_id": "org/m", "safe_context": 4096},
+               "wcx": {"model_id": "org/m", "safe_context": 16000}},
+        supports={"cpu": True, "cuda": True})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu", assume_yes=True) == 0
+    assert "ran on cpu" in buf.getvalue()        # pinned to cpu (4096), not the bigger wcx
+
+
+def test_run_characterized_only_on_unsupported_engine(make_console, monkeypatch):
+    # Characterized on apple alone, whose backend can't generate yet → honest "not supported",
+    # NOT a silent "uncharacterized" refusal.
+    _wire_run_cross(
+        monkeypatch, detected="apple",
+        chars={"wmx": {"model_id": "org/m", "safe_context": 8192}},
+        supports={"apple": False, "cpu": True})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    out = buf.getvalue()
+    assert "wmx" in out and "isn't supported" in out
+    assert "ara characterize" not in out         # it IS characterized — don't point at characterize
+
+
+def test_run_uncharacterized_on_every_engine_refuses(make_console, monkeypatch):
+    # Characterized nowhere → refuse, pointing at characterize.
+    _wire_run_cross(monkeypatch, detected="apple", chars={}, supports={"cpu": True})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "isn't characterized" in buf.getvalue() and "ara characterize org/m" in buf.getvalue()
+
+
+def test_run_pinned_refuses_uncharacterized(make_console, monkeypatch):
+    # --engine pins exactly that engine: uncharacterized THERE refuses, pointing at characterize.
+    _wire_run(monkeypatch, characterization=None)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    out = buf.getvalue()
+    assert "isn't characterized on cpu" in out and "ara characterize org/m --engine cpu" in out
+
+
+def test_run_pinned_refuses_when_no_safe_ceiling(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={"model_id": "org/m", "safe_context": None})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "didn't fit on cpu" in buf.getvalue()
+
+
+def test_run_pinned_unsupported_engine(make_console, monkeypatch):
+    # --engine pins an engine whose backend can't generate yet → honest "isn't supported".
+    _wire_run(monkeypatch, characterization=_CHAR, generate=None)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "isn't supported on the" in buf.getvalue()
 
 
 def test_main_run_dispatch(monkeypatch):
@@ -1798,12 +2012,38 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
         characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m: None,
-        calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7}),
+        calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7,
+                                                    "wall_gb": 41.3, "safe_budget_gb": 39.3}),
     ))
     c, _ = make_console()
     assert cli.render_characterize(c, "org/M") == 0
     assert calls == ["cal"]                                            # calibrated once, before ramp
-    assert cli.db.get_calibration(store, "mkey", "wmx")["fixed_overhead_gb"] == 1.7   # persisted
+    row = cli.db.get_calibration(store, "mkey", "wmx")
+    assert row["fixed_overhead_gb"] == 1.7                             # persisted
+    # The measured wall + budget ride alongside so profile/recommend can report reality.
+    assert row["wall_gb"] == 41.3 and row["safe_budget_gb"] == 39.3
+
+
+def test_characterize_persists_measured_wall_when_overhead_none(make_console, store, monkeypatch):
+    # CPU/CUDA read an EXACT wall, so calibrate returns overhead_gb=None. The measured wall must
+    # still be stored — otherwise profile/recommend report a perpetual estimate on the very engines
+    # `run` works on. Spec 2026-06-23-capability-pipeline.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "llama.cpp"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: {"overhead_gb": None, "wall_gb": 30.0, "safe_budget_gb": 28.0},
+    ))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    row = cli.db.get_calibration(store, "mkey", "cpu")
+    assert row is not None                                    # persisted despite overhead None
+    assert row["wall_gb"] == 30.0 and row["safe_budget_gb"] == 28.0
 
 
 def test_characterize_skips_calibration_when_already_calibrated(make_console, store, monkeypatch):

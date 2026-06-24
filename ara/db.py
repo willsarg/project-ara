@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS calibrations (
     engine            TEXT NOT NULL,
     fixed_overhead_gb REAL,
     calibrated_at     TEXT,
+    wall_gb           REAL,
+    safe_budget_gb    REAL,
     PRIMARY KEY (machine_key, engine)
 );
 
@@ -80,6 +82,12 @@ def connect() -> sqlite3.Connection:
     cols = {r["name"] for r in con.execute("PRAGMA table_info(characterizations)")}
     if "decode_context" not in cols:
         con.execute("ALTER TABLE characterizations ADD COLUMN decode_context INTEGER")
+    # Measured wall + safe budget joined the calibration store later — add to old DBs.
+    cal_cols = {r["name"] for r in con.execute("PRAGMA table_info(calibrations)")}
+    if "wall_gb" not in cal_cols:
+        con.execute("ALTER TABLE calibrations ADD COLUMN wall_gb REAL")
+    if "safe_budget_gb" not in cal_cols:
+        con.execute("ALTER TABLE calibrations ADD COLUMN safe_budget_gb REAL")
     return con
 
 
@@ -89,12 +97,15 @@ def _now() -> str:
 
 # --- per-engine calibration ---
 def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *,
-                   fixed_overhead_gb: float, calibrated_at: str) -> None:
+                   fixed_overhead_gb: float, calibrated_at: str,
+                   wall_gb: float | None = None, safe_budget_gb: float | None = None) -> None:
     con.execute(
-        "INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, calibrated_at) "
-        "VALUES (?,?,?,?) ON CONFLICT(machine_key, engine) DO UPDATE SET "
-        "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at",
-        (machine_key, engine, fixed_overhead_gb, calibrated_at))
+        "INSERT INTO calibrations "
+        "(machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT(machine_key, engine) DO UPDATE SET "
+        "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at, "
+        "wall_gb=excluded.wall_gb, safe_budget_gb=excluded.safe_budget_gb",
+        (machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb))
     con.commit()
 
 
