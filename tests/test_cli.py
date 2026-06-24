@@ -1532,6 +1532,40 @@ def test_recommend_none_fit(make_console, monkeypatch, set_platform):
     assert "nothing in the catalog fits" in buf.getvalue()
 
 
+def test_recommend_notes_fitting_but_unrankable(make_console, monkeypatch, set_platform):
+    # Spec 2026-06-23-capability-pipeline: a model whose weights fit but whose architecture ARA
+    # can't read (no slope → est_context None) used to be dropped silently. It must now be counted
+    # and honestly disclosed, pointing at ara profile --model.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Rankable", weights_gb=4.0),
+                     _model_row("org/Unknown", weights_gb=4.0, n_layers=None)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "org/Rankable" in out
+    assert "1 more fit but can't be ranked (architecture unknown)" in out
+    assert "ara profile --model" in out
+
+
+def test_recommend_no_unrankable_no_note(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Rankable", weights_gb=4.0)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "can't be ranked" not in buf.getvalue()
+
+
+def test_recommend_none_ranked_but_unrankable_exist(make_console, monkeypatch, set_platform):
+    # The empty-recs path must still disclose models that fit but can't be ranked, instead of only
+    # saying nothing fits. Spec 2026-06-23-capability-pipeline.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Unknown", weights_gb=4.0, n_layers=None)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "1 more fit but can't be ranked (architecture unknown)" in out
+    assert "ara profile --model" in out
+
+
 def test_recommend_uses_measured_wall(make_console, monkeypatch, set_platform, store):
     # Spec 2026-06-23-capability-pipeline: after the detected engine is calibrated, recommend ranks
     # against the MEASURED budget, not the heuristic. A measured wall that's tighter than the

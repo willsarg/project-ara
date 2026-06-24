@@ -1061,9 +1061,13 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
     best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
 
     recs = []
+    unrankable = 0                    # weights fit, but we can't read the arch to estimate context
     for row in catalog.all_models(con):
         fit = estimate.model_fit(lim, row, row.get("weights_gb"))
-        if not fit["fits"] or fit["est_context"] is None:
+        if not fit["fits"]:
+            continue
+        if fit["est_context"] is None:
+            unrankable += 1           # honest: count it rather than drop it silently
             continue
         recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
                      "est_context": fit["est_context"], "max_context": fit["max_context"],
@@ -1075,12 +1079,18 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
         print(json.dumps(recs, indent=2))
         return 0
 
+    def _unrankable_note() -> None:
+        if unrankable:
+            c.emit(c.style("dim", f"  {unrankable} more fit but can't be ranked "
+                                   "(architecture unknown) — try ara profile --model <model>"))
+
     c.emit()
     c.emit(c.section("  RECOMMENDED MODELS")
            + c.style("dim", "  (estimated — fits this machine, most context first)"))
     if not recs:
         c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                               "try a smaller / more-quantized model"))
+        _unrankable_note()
         c.emit()
         return 0
     for r in recs:
@@ -1094,6 +1104,7 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
     n_char = sum(1 for r in recs if r["characterized"])
     c.emit()
     c.emit(c.style("dim", f"  {len(recs)} fit · {n_char} characterized here"))
+    _unrankable_note()
     c.emit()
     return 0
 
