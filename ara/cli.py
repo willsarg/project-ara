@@ -15,7 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, mlx, profile,
-                 calibration, pythons, status, versions)
+                 calibration, pythons, serialize, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -503,11 +503,11 @@ _DETECT_RENDERERS: tuple[tuple[str, object], ...] = (
 def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     m = detect.machine()
     if as_json:
-        # asdict() omits @property fields, so add `accelerated` explicitly — otherwise the very
-        # distinction the CPU-fallback design introduced is invisible to machine consumers.
-        # cpu/memory/storage/board are already dataclass fields on Machine, so asdict(m)
-        # already includes them as nested dicts — no extra work needed.
-        print(json.dumps({**asdict(m), "accelerated": m.accelerated}, indent=2))
+        # serialize.machine(m) is the single source of truth for the detect --json shape:
+        # asdict(m) (nested cpu/memory/storage/board already included as dicts) PLUS the
+        # `accelerated` @property asdict drops — otherwise the CPU-fallback distinction the
+        # design introduced would be invisible to machine consumers.
+        print(json.dumps(serialize.machine(m), indent=2))
         return
     want = want or (lambda _key: True)
     c.emit()
