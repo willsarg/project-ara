@@ -920,6 +920,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             calibration.save_calibration(
                 cal_con, sel.engine_key, fixed_overhead_gb=overhead,
                 wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
+        # Surface the measured wall right where it's measured — otherwise the user sees only the
+        # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
+        # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
+        if wall is not None:
+            budget = (cal or {}).get("safe_budget_gb")
+            line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
+            if budget is not None:
+                line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
+            c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
         result = bk.characterize(model)

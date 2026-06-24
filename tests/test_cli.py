@@ -2084,6 +2084,67 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     assert row["wall_gb"] == 41.3 and row["safe_budget_gb"] == 39.3
 
 
+def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
+    # Spec 2026-06-23-capability-pipeline: on first run characterize must SHOW the measured wall
+    # (and safe budget) at the moment it's measured, not just persist it silently.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": 15.2},
+    ))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    out = buf.getvalue()
+    assert "measured wall" in out and "17.2 GB" in out
+    assert "safe budget" in out and "15.2 GB" in out
+
+
+def test_characterize_wall_line_without_budget(make_console, store, monkeypatch):
+    # A wall with no safe budget: show the wall, but don't append a budget clause.
+    # Spec 2026-06-23-capability-pipeline.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": None},
+    ))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    out = buf.getvalue()
+    assert "measured wall" in out and "17.2 GB" in out
+    assert "safe budget" not in out
+
+
+def test_characterize_omits_wall_line_when_wall_none(make_console, store, monkeypatch):
+    # An engine that only measures cold-start overhead (wall_gb=None) must NOT print an empty/
+    # misleading wall line. Spec 2026-06-23-capability-pipeline.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": None, "safe_budget_gb": None},
+    ))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert "measured wall" not in buf.getvalue()
+
+
 def test_characterize_persists_measured_wall_when_overhead_none(make_console, store, monkeypatch):
     # CPU/CUDA read an EXACT wall, so calibrate returns overhead_gb=None. The measured wall must
     # still be stored — otherwise profile/recommend report a perpetual estimate on the very engines
