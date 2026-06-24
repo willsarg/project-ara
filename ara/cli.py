@@ -1375,9 +1375,16 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     if model is not None:
         _emit_model_fit(c, lim, model)
     else:
-        c.emit(c.style("dim", "  estimated — run ")
-               + c.style("accent", "ara characterize <model>")
-               + c.style("dim", " to measure a real ceiling"))
+        # The footer must agree with the SAFE LIMITS tag: once the wall is measured, dropping the
+        # "estimated —" framing keeps it honest. Spec 2026-06-23-capability-pipeline.
+        if lim["basis"] == "measured":
+            c.emit(c.style("dim", "  run ")
+                   + c.style("accent", "ara characterize <model>")
+                   + c.style("dim", " to measure a model's real ceiling"))
+        else:
+            c.emit(c.style("dim", "  estimated — run ")
+                   + c.style("accent", "ara characterize <model>")
+                   + c.style("dim", " to measure a real ceiling"))
         c.emit()
     return 0
 

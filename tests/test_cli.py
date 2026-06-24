@@ -500,6 +500,32 @@ def test_profile_uncalibrated_stays_estimated(monkeypatch, set_platform, capsys,
     assert payload["basis"] == "estimated" and payload["calibrated"] is False
 
 
+def test_profile_footer_drops_estimated_when_measured(make_console, monkeypatch, set_platform, store):
+    # Spec 2026-06-23-capability-pipeline: once a wall is measured, the header reads (measured),
+    # so the footer must NOT contradict it with the "estimated —" framing.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+                                     wall_gb=41.3, safe_budget_gb=39.3)
+    c, buf = make_console()
+    assert cli.render_profile(c) == 0
+    out = buf.getvalue()
+    assert "estimated" not in out                       # header is (measured); footer must agree
+    assert "ara characterize <model>" in out            # still nudges to measure more models
+    assert "a model's real ceiling" in out
+
+
+def test_profile_footer_keeps_estimated_when_uncalibrated(make_console, monkeypatch, set_platform, store):
+    # No measured wall → the footer keeps the honest "estimated —" framing.
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    c, buf = make_console()
+    assert cli.render_profile(c) == 0
+    out = buf.getvalue()
+    assert "estimated — run " in out
+    assert "ara characterize <model>" in out
+
+
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.catalog, "describe",
