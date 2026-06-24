@@ -232,3 +232,24 @@ def test_budget_params_falls_back_to_default_overhead(monkeypatch):
 def test_calibration_model_constant_is_transformers_format():
     # transformers-format (torch loads this), NOT the mlx-community 4-bit build apple uses
     assert cuda.CALIBRATION_MODEL == "HuggingFaceTB/SmolLM-135M-Instruct"
+
+
+# --------------------------------------------------------------------------- #
+# generate — governed one-shot CUDA inference (Spec 2026-06-23-capability-pipeline)
+# --------------------------------------------------------------------------- #
+def test_generate_drives_worker_capped_at_context(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["name"], seen["argv"], seen["input"] = name, argv, input
+        return {"context": 8192, "completion": "hello there"}
+
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = cuda.generate("org/m", "hi", max_context=8192, max_tokens=64)
+    assert out == {"context": 8192, "completion": "hello there"}   # worker dict verbatim
+    assert seen["name"] == "cuda"
+    assert seen["argv"] == ["-m", "wcx_suite.generate", "org/m", "8192",
+                            "--margin", "1.0", "--overhead", "0.6", "--max-tokens", "64"]
+    assert seen["input"] == "hi"               # prompt over stdin, not argv
