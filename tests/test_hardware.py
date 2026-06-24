@@ -1610,6 +1610,10 @@ def test_gpus_linux_reads_sysfs(tmp_path, monkeypatch):
     monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
     monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
+    # Stub the live Vulkan probe: the name priority is marketing-map → vulkaninfo → lspci, so on a
+    # real Linux host with a Vulkan GPU the actual device name would win and mask the lspci fallback
+    # this test exercises (caught on rog-ubuntu: real RADV name beat the mocked "Phoenix1").
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
     gpus = hw._gpus_linux()
     assert len(gpus) == 1 and gpus[0].name == "Phoenix1" and gpus[0].vendor == "amd"
 
