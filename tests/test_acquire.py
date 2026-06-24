@@ -108,3 +108,19 @@ def test_download_restores_bars_even_on_error(monkeypatch):
     except RuntimeError:
         pass
     assert enabled == [True]  # finally-block restored bars despite the error
+
+
+def test_valid_model_id_accepts_well_formed_repo_ids():
+    # org/name and bare name, with the chars HF allows in a segment.
+    for ok in ("mlx-community/Qwen3-0.6B-4bit", "meta-llama/Llama-3.2-1B",
+               "SmolLM-135M", "org_1/model.v2", "a/b"):
+        assert acquire.valid_model_id(ok) is True
+
+
+def test_valid_model_id_rejects_flag_like_and_malformed():
+    # The model becomes a worker argv positional, so flag-like / traversal / malformed ids must be
+    # rejected before they leave ARA (the argv-injection sink). Empty, leading '-', '=', spaces,
+    # path traversal, and extra path segments all fail.
+    for bad in ("", "-rf", "--evil", "a=b", "a b", "../etc/passwd", "a/b/c",
+                "/abs", ".hidden", "org/", "/name"):
+        assert acquire.valid_model_id(bad) is False

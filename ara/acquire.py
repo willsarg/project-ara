@@ -11,9 +11,24 @@ HUGGING_FACE_HUB_TOKEN for gated ones, or HF_ENDPOINT for a mirror.
 """
 from __future__ import annotations
 
+import re
+
 # Headroom we insist on beyond the raw download, so a fetch never fills the disk
 # (unpacking, the snapshot's own .incomplete temp files, normal system churn).
 DISK_BUFFER_GB = 2.0
+
+# A well-formed Hugging Face repo id: ``name`` or ``org/name``, each segment starting with an
+# alphanumeric. Rejects anything an out-of-process worker's argparse could mis-read as a flag or
+# path — a leading ``-``, an ``=``, whitespace, ``..`` traversal, extra slashes. The model is a
+# *sink arg* (it becomes argv for the engine worker), so ARA validates its shape before it ever
+# leaves the process. Defensive: the value is a local CLI arg, but cheap to get right.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+
+
+def valid_model_id(model: str) -> bool:
+    """True if *model* is a well-formed HF repo id (``org/name`` or ``name``), safe to pass as a
+    worker argv positional. Rejects flag-like / traversal / malformed values."""
+    return isinstance(model, str) and _MODEL_ID_RE.match(model) is not None
 
 
 def repo_size_gb(repo_id: str) -> float | None:

@@ -3277,3 +3277,20 @@ def test_render_detect_json_has_gpus_key(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert "gpus" in payload
     assert payload["gpus"][0]["vendor"] == "amd"
+
+
+def test_run_rejects_malformed_model_id(make_console, monkeypatch):
+    # Security: the model becomes a worker argv positional, so a flag-like id is rejected before
+    # dispatch rather than handed to the engine worker. Spec 2026-06-23-capability-pipeline.
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "--oops", prompt="hi") == 1
+    assert "invalid model id" in buf.getvalue()
+
+
+def test_characterize_rejects_malformed_model_id(make_console, monkeypatch):
+    # Same argv-injection guard on the other worker-exec'ing command.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "bad=id") == 1
+    assert "invalid model id" in buf.getvalue()
