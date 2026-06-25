@@ -1851,7 +1851,7 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
     def backend(b=None):
         bk = types.SimpleNamespace()
         if supports.get(b):
-            bk.generate = lambda model, prompt, *, max_context, max_tokens: {
+            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16": {
                 "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
         return bk
     monkeypatch.setattr(cli, "get_backend", backend)

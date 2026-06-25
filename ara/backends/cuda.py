@@ -116,16 +116,25 @@ def _budget_params() -> tuple[float, float]:
     return DEFAULT_MARGIN_GB, overhead
 
 
+# Cross-engine --kv-quant → wcx --kv-bits. fp16 is the default; q8/q4 opt in. Effective bytes/elem
+# (group 64, fp16 scale+zero) drives the analytic decode-ceiling estimate — same scheme as MLX.
+_CUDA_KV_BITS = {"f16": None, "q8_0": 8, "q4_0": 4}
+_CUDA_KV_BYTES = {"f16": 2.0, "q8_0": 8 / 8 + 2 * 2 / 64, "q4_0": 4 / 8 + 2 * 2 / 64}
+
+
 def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
-                 preflight: bool = False) -> list[str]:
+                 preflight: bool = False, kv_quant: str = "f16") -> list[str]:
     argv = ["-m", WORKER_MODULE, model, str(ctx),
             "--margin", str(margin), "--overhead", str(overhead)]
     if preflight:
         argv.append("--preflight")
+    bits = _CUDA_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
     return argv
 
 
-def characterize(model: str, *, progress: bool = False) -> dict:
+def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -> dict:
     """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
@@ -133,7 +142,8 @@ def characterize(model: str, *, progress: bool = False) -> dict:
     worker, the budget params, and the schedule. ARA never imports wcx in-process. Crash-safety is
     layered: the driver gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine
     refuses-before-load (L4) and a VRAM watchdog aborts mid-probe (L5). Returns
-    ``{model, safe_context, points}``.
+    ``{model, safe_context, points}``. ``kv_quant`` (default ``"f16"``) measures with that KV
+    precision, so the certified ceiling matches how ``run`` will execute.
 
     ``progress`` is accepted for interface symmetry with the cpu backend but has no effect
     here: the HF download bar already ran in-process during the pre-fetch step.
@@ -142,24 +152,29 @@ def characterize(model: str, *, progress: bool = False) -> dict:
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
-            "cuda", _worker_argv(m, 0, margin, overhead, preflight=True)),
+            "cuda", _worker_argv(m, 0, margin, overhead, preflight=True, kv_quant=kv_quant)),
         measure=lambda m, ctx: engine_env.run_worker(
-            "cuda", _worker_argv(m, ctx, margin, overhead)),
+            "cuda", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant)),
         schedule=RAMP_SCHEDULE,
+        kv_dtype_bytes=_CUDA_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
     )
 
 
 DEFAULT_MAX_TOKENS = 256
 
 
-def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS) -> dict:
+def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
+             kv_quant: str = "f16") -> dict:
     """One-shot CUDA completion, governed: max_context is the characterized safe ceiling, so the
     worker generates under the wall. Out-of-process in the isolated `cuda` env via wcx-suite's
-    generate worker; the prompt goes over stdin, never argv. Returns {context, completion} or a
-    refusal {refused, reason}. ARA never imports torch in-process."""
+    generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``)
+    should match how *model* was characterized. Returns {context, completion} or a refusal
+    {refused, reason}. ARA never imports torch in-process."""
     margin, overhead = _budget_params()
-    return engine_env.run_worker("cuda",
-        ["-m", "wcx_suite.generate", model, str(max_context),
-         "--margin", str(margin), "--overhead", str(overhead),
-         "--max-tokens", str(max_tokens)],
-        input=prompt)
+    argv = ["-m", "wcx_suite.generate", model, str(max_context),
+            "--margin", str(margin), "--overhead", str(overhead),
+            "--max-tokens", str(max_tokens)]
+    bits = _CUDA_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
+    return engine_env.run_worker("cuda", argv, input=prompt)

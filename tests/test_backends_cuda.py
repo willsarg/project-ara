@@ -331,3 +331,33 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     assert seen["argv"] == ["-m", "wcx_suite.generate", "org/m", "8192",
                             "--margin", "1.0", "--overhead", "0.6", "--max-tokens", "64"]
     assert seen["input"] == "hi"               # prompt over stdin, not argv
+
+
+# --------------------------------------------------------------------------- #
+# KV-quant lever: --kv-quant {f16,q8_0,q4_0} → wcx --kv-bits {None,8,4}
+# --------------------------------------------------------------------------- #
+def test_worker_argv_appends_kv_bits_for_quant():
+    q4 = cuda._worker_argv("org/m", 2000, 1.0, 0.6, kv_quant="q4_0")
+    assert q4[q4.index("--kv-bits") + 1] == "4"
+    q8 = cuda._worker_argv("org/m", 2000, 1.0, 0.6, kv_quant="q8_0")
+    assert q8[q8.index("--kv-bits") + 1] == "8"
+    assert "--kv-bits" not in cuda._worker_argv("org/m", 2000, 1.0, 0.6)   # f16 default omits it
+
+
+def test_characterize_passes_kv_dtype_bytes_to_driver(monkeypatch):
+    # The decode-ceiling estimate must reflect the chosen cache size (the slope-bug class).
+    _patch_budget(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(cuda.driver, "characterize",
+                        lambda model, **kw: seen.update(kw) or {"model": model})
+    cuda.characterize("org/m", kv_quant="q4_0")
+    assert seen["kv_dtype_bytes"] == cuda._CUDA_KV_BYTES["q4_0"]
+
+
+def test_generate_appends_kv_bits_for_quant(monkeypatch):
+    seen = {}
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 8192, "completion": "x"})}))
+    cuda.generate("org/m", "hi", max_context=8192, max_tokens=64, kv_quant="q8_0")
+    assert seen["argv"][seen["argv"].index("--kv-bits") + 1] == "8"

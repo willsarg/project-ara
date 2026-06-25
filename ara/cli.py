@@ -888,12 +888,13 @@ def _kv_quant_error(kv_quant: str) -> str:
 
 
 def _kv_fa_kwargs(backend: str, *, flash_attn: bool, kv_quant: str) -> dict:
-    """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a
-    lever on both the AMD iGPU (vulkan) and Apple (wmx) lanes; flash-attention is a vulkan-only
-    knob (MLX's SDPA is always fused). Other engines accept neither."""
+    """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
+    on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes; flash-attention is a
+    vulkan-only knob here (MLX's SDPA is always fused; CUDA's attention selector is a later slice).
+    Other engines accept neither."""
     if backend == "vulkan":
         return {"flash_attn": flash_attn, "kv_quant": kv_quant}
-    if backend == "apple":
+    if backend in ("apple", "cuda"):
         return {"kv_quant": kv_quant}
     return {}
 
