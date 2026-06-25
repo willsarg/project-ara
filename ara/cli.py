@@ -937,6 +937,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         cal = bk.calibrate()
         overhead = (cal or {}).get("overhead_gb")
         wall = (cal or {}).get("wall_gb")
+        # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
+        # never let the conservative default masquerade as a measurement. The ramp still proceeds
+        # safely on the default overhead; we just don't hide that it's a fallback.
+        cal_err = (cal or {}).get("calibration_error")
+        if cal_err:
+            c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
+                                   " — using conservative default overhead"))
         # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
         # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
         # wall regardless of overhead is what lets profile/recommend report reality on every engine,

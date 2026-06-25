@@ -2084,6 +2084,30 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     assert row["wall_gb"] == 41.3 and row["safe_budget_gb"] == 39.3
 
 
+def test_characterize_warns_when_calibration_unavailable(make_console, store, monkeypatch):
+    # Honesty (Rule #3): a failed calibration must be surfaced, not silently replaced by the
+    # conservative default. The ramp still proceeds; the user is just told it's a fallback.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m: None,
+        calibrate=lambda: {"calibrated": False, "overhead_gb": None, "wall_gb": None,
+                           "calibration_error": "calibration unavailable for 'x': boom"},
+    ))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M") == 0          # ramp still proceeds on the default
+    out = buf.getvalue()
+    assert "calibration skipped" in out and "boom" in out    # the failure is surfaced, with reason
+    assert "conservative default" in out
+    # nothing measured (overhead and wall both None) → no calibration row persisted
+    assert cli.db.get_calibration(store, "mkey", "wmx") is None
+
+
 def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     # Spec 2026-06-23-capability-pipeline: on first run characterize must SHOW the measured wall
     # (and safe budget) at the moment it's measured, not just persist it silently.
