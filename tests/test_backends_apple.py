@@ -279,6 +279,89 @@ def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatc
     assert fake.measured == [2000] and r["safe_context"] is None
 
 
+# --- KV-quant lever (parity with the Vulkan lane) ----------------------------------- #
+
+def test_worker_argv_omits_kv_bits_for_fp16():
+    argv = apple._worker_argv("m", 4000, 2.0, 1.0, kv_quant="f16")
+    assert "--kv-bits" not in argv
+
+
+@pytest.mark.parametrize("kv_quant,bits", [("q8_0", "8"), ("q4_0", "4")])
+def test_worker_argv_maps_kv_quant_to_kv_bits(kv_quant, bits):
+    argv = apple._worker_argv("m", 4000, 2.0, 1.0, kv_quant=kv_quant)
+    assert argv[argv.index("--kv-bits") + 1] == bits
+
+
+def _capture_driver_kv_dtype_bytes(monkeypatch):
+    captured = {}
+
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0):
+        captured["kv_dtype_bytes"] = kv_dtype_bytes
+        return {"model": model, "safe_context": 1, "points": []}
+
+    monkeypatch.setattr(apple.driver, "characterize", fake_characterize)
+    _patch_budget(monkeypatch)
+    return captured
+
+
+def test_characterize_decode_estimate_defaults_to_fp16(monkeypatch):
+    captured = _capture_driver_kv_dtype_bytes(monkeypatch)
+    apple.characterize("org/m")
+    assert captured["kv_dtype_bytes"] == 2.0
+
+
+def test_characterize_decode_estimate_reflects_kv_quant(monkeypatch):
+    captured = _capture_driver_kv_dtype_bytes(monkeypatch)
+    apple.characterize("org/m", kv_quant="q8_0")
+    assert captured["kv_dtype_bytes"] == pytest.approx(apple._MLX_KV_BYTES["q8_0"])
+
+
+def test_characterize_threads_kv_bits_to_worker(monkeypatch):
+    _patch_budget(monkeypatch)
+    seen = []
+    est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
+           "max_context": 8000, "ref_baseline_gb": 0.0}
+
+    def worker(name, argv):
+        seen.append(argv)
+        if "--preflight" in argv:
+            return dict(est)
+        return {"context": int(argv[3]), "mem_gb": 5.0 + int(argv[3]) / 1000}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.characterize("org/m", kv_quant="q8_0")
+    assert seen and all(a[a.index("--kv-bits") + 1] == "8" for a in seen)
+
+
+def test_generate_threads_kv_bits_to_worker(monkeypatch):
+    _patch_budget(monkeypatch)
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4000, "completion": "ok"}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.generate("org/m", "hi", max_context=4000, max_tokens=16, kv_quant="q4_0")
+    assert seen["argv"][seen["argv"].index("--kv-bits") + 1] == "4"
+
+
+def test_generate_omits_kv_bits_for_fp16(monkeypatch):
+    _patch_budget(monkeypatch)
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4000, "completion": "ok"}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.generate("org/m", "hi", max_context=4000, max_tokens=16)
+    assert "--kv-bits" not in seen["argv"]
+
+
 def test_budget_params_uses_stored_calibration(monkeypatch):
     monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
     monkeypatch.setattr(apple, "calibration",

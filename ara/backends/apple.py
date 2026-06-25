@@ -113,16 +113,27 @@ def _budget_params() -> tuple[float, float]:
     return DEFAULT_MARGIN_GB, overhead
 
 
+# KV-cache quant lever (parity with the Vulkan lane). ARA's cross-engine `--kv-quant`
+# {f16,q8_0,q4_0} maps to MLX's integer kv-bits (fp16 = no quant). The effective bytes/elem
+# (8-bit/4-bit payload + an fp16 scale+bias per 64-elem group) feeds the KV-aware decode
+# estimate so it reflects the cache actually in use — not always fp16.
+_MLX_KV_BITS = {"f16": None, "q8_0": 8, "q4_0": 4}
+_MLX_KV_BYTES = {"f16": 2.0, "q8_0": 8 / 8 + 2 * 2 / 64, "q4_0": 4 / 8 + 2 * 2 / 64}
+
+
 def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
-                 preflight: bool = False) -> list[str]:
+                 preflight: bool = False, kv_quant: str = "f16") -> list[str]:
     argv = ["-m", WORKER_MODULE, model, str(ctx),
             "--margin", str(margin), "--overhead", str(overhead)]
     if preflight:
         argv.append("--preflight")
+    bits = _MLX_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
     return argv
 
 
-def characterize(model: str, *, progress: bool = False) -> dict:
+def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -> dict:
     """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver`` (the
@@ -139,24 +150,29 @@ def characterize(model: str, *, progress: bool = False) -> dict:
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
-            "apple", _worker_argv(m, 0, margin, overhead, preflight=True)),
+            "apple", _worker_argv(m, 0, margin, overhead, preflight=True, kv_quant=kv_quant)),
         measure=lambda m, ctx: engine_env.run_worker(
-            "apple", _worker_argv(m, ctx, margin, overhead)),
+            "apple", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant)),
         schedule=RAMP_SCHEDULE,
+        kv_dtype_bytes=_MLX_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
     )
 
 
 DEFAULT_MAX_TOKENS = 256
 
 
-def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS) -> dict:
+def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
+             kv_quant: str = "f16") -> dict:
     """One-shot MLX completion, governed: max_context is the characterized safe ceiling, so the
     worker generates under the wall. Out-of-process in the isolated `apple` env via wmx-suite's
-    generate worker; the prompt goes over stdin, never argv. Returns {context, completion} or a
-    refusal {refused, reason}. ARA never imports MLX in-process."""
+    generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``)
+    should match how *model* was characterized. Returns {context, completion} or a refusal
+    {refused, reason}. ARA never imports MLX in-process."""
     margin, overhead = _budget_params()
-    return engine_env.run_worker("apple",
-        ["-m", "wmx_suite.generate", model, str(max_context),
-         "--margin", str(margin), "--overhead", str(overhead),
-         "--max-tokens", str(max_tokens)],
-        input=prompt)
+    argv = ["-m", "wmx_suite.generate", model, str(max_context),
+            "--margin", str(margin), "--overhead", str(overhead),
+            "--max-tokens", str(max_tokens)]
+    bits = _MLX_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
+    return engine_env.run_worker("apple", argv, input=prompt)

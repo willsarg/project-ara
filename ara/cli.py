@@ -884,6 +884,17 @@ def _kv_quant_error(kv_quant: str) -> str:
     return (f"invalid --kv-quant {kv_quant!r} — choose one of: {', '.join(_KV_QUANT_CHOICES)}")
 
 
+def _kv_fa_kwargs(backend: str, *, flash_attn: bool, kv_quant: str) -> dict:
+    """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a
+    lever on both the AMD iGPU (vulkan) and Apple (wmx) lanes; flash-attention is a vulkan-only
+    knob (MLX's SDPA is always fused). Other engines accept neither."""
+    if backend == "vulkan":
+        return {"flash_attn": flash_attn, "kv_quant": kv_quant}
+    if backend == "apple":
+        return {"kv_quant": kv_quant}
+    return {}
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
                         kv_quant: str = "f16") -> int:
@@ -974,10 +985,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    # flash-attention + KV-quant are vulkan-only levers (more context on an AMD iGPU); other
-    # engines don't accept the kwargs, so only pass them through when running on vulkan.
-    fa_kw = ({"flash_attn": flash_attn, "kv_quant": kv_quant}
-             if sel.backend == "vulkan" else {})
+    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, kv_quant=kv_quant)
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
@@ -1257,9 +1265,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
-    # flash-attention + KV-quant are vulkan-only levers; pass them only when running on vulkan.
-    fa_kw = ({"flash_attn": flash_attn, "kv_quant": kv_quant}
-             if backend == "vulkan" else {})
+    fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, kv_quant=kv_quant)
     try:
         result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard

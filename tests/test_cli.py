@@ -2099,7 +2099,7 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     if characterize is not None:
         # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
         _char = characterize
-        def _char_wrapper(m, *, progress=False):
+        def _char_wrapper(m, *, progress=False, kv_quant="f16"):
             return _char(m)
         monkeypatch.setattr(cli, "get_backend",
                             lambda b=None: types.SimpleNamespace(
@@ -2130,7 +2130,7 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7,
@@ -2154,7 +2154,7 @@ def test_characterize_warns_when_calibration_unavailable(make_console, store, mo
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"calibrated": False, "overhead_gb": None, "wall_gb": None,
@@ -2178,7 +2178,7 @@ def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": 15.2},
@@ -2199,7 +2199,7 @@ def test_characterize_wall_line_without_budget(make_console, store, monkeypatch)
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": None},
@@ -2220,7 +2220,7 @@ def test_characterize_omits_wall_line_when_wall_none(make_console, store, monkey
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": None, "safe_budget_gb": None},
@@ -2240,7 +2240,7 @@ def test_characterize_persists_measured_wall_when_overhead_none(make_console, st
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": None, "wall_gb": 30.0, "safe_budget_gb": 28.0},
@@ -2262,7 +2262,7 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=2.0)   # already calibrated
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 9.9}),
@@ -2323,7 +2323,7 @@ def test_render_characterize_engine_flag_overrides_detected_backend(make_console
     def fake_get_backend(b=None):
         seen["backend"] = b
         return types.SimpleNamespace(
-            characterize=lambda m, *, progress=False: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
+            characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
             calibration_model_cached=lambda m: True,   # skip pre-fetch in this test
             download_calibration_model=lambda m, *, progress=False: None,
         )
@@ -2410,7 +2410,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: free_gb)
 
 
-def _fake_bk_characterize(model, *, progress=False):
+def _fake_bk_characterize(model, *, progress=False, kv_quant="f16"):
     return {"model": model, "safe_context": 16000, "decode_context": None, "points": [[1024, 1.2]]}
 
 
@@ -2589,7 +2589,7 @@ def _wire_characterize_progress(monkeypatch, *, backend="apple", cached=True):
     def _download(model, *, progress=False):
         captured["download_progress"] = progress
 
-    def _characterize(model, *, progress=False):
+    def _characterize(model, *, progress=False, kv_quant="f16"):
         captured["characterize_progress"] = progress
         return {"model": model, "safe_context": 8000, "decode_context": None, "points": []}
 
@@ -3675,6 +3675,47 @@ def test_run_rejects_invalid_kv_quant(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", engine="vulkan", kv_quant="nope") == 1
     assert "invalid --kv-quant" in buf.getvalue()
+
+
+def test_characterize_threads_kv_quant_to_apple_backend(make_console, store, monkeypatch):
+    # KV-quant is also a wmx(apple) lever; render_characterize passes kv_quant (NOT flash_attn,
+    # which MLX has no knob for). Slug: 2026-06-25-mlx-kv-quant-lever
+    seen = {}
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+
+    def char(m, *, progress=False, kv_quant="f16"):  # note: no flash_attn kwarg
+        seen["kv_quant"] = kv_quant
+        return {"model": m, "safe_context": 9000, "decode_context": None, "points": [[512, 1.0]]}
+
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=char, calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m, *, progress=False: None))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/m", engine="wmx", kv_quant="q8_0") == 0
+    assert seen["kv_quant"] == "q8_0"
+
+
+def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
+    # Slug: 2026-06-25-mlx-kv-quant-lever
+    seen = {}
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": 8000})
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+
+    def gen(model, prompt, *, max_context, max_tokens, kv_quant="f16"):  # no flash_attn
+        seen["kv_quant"] = kv_quant
+        return {"context": max_context, "completion": "hi"}
+
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(generate=gen))
+    c, _ = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="wmx", kv_quant="q4_0") == 0
+    assert seen["kv_quant"] == "q4_0"
 
 
 # =========================================================================== #
