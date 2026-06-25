@@ -87,9 +87,9 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
-                        lambda c, m, engine=None, as_json=False, flash_attn=True:
+                        lambda c, m, engine=None, as_json=False, flash_attn=True, kv_quant="f16":
                         (rec.update(characterize=m, characterize_engine=engine,
-                                    characterize_fa=flash_attn) or 0))
+                                    characterize_fa=flash_attn, characterize_kv=kv_quant) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
@@ -164,6 +164,32 @@ def test_main_characterize_flash_attn_on_by_default(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["characterize", "org/m"])
     assert rec["characterize_fa"] is True
+
+
+# --kv-quant flag threading (default f16). Slug: 2026-06-25-vulkan-kv-cache-quant
+def test_main_characterize_kv_quant_value(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/m", "--kv-quant", "q8_0"])
+    assert rec["characterize_kv"] == "q8_0"
+
+
+def test_main_characterize_kv_quant_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/m", "--kv-quant=q4_0"])
+    assert rec["characterize_kv"] == "q4_0"
+
+
+def test_main_characterize_kv_quant_default_f16(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/m"])
+    assert rec["characterize_kv"] == "f16"
+
+
+def test_main_run_kv_quant_value_not_in_prompt(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["run", "org/m", "hello", "--kv-quant", "q8_0"])
+    assert rec["run"]["kv_quant"] == "q8_0"
+    assert rec["run"]["prompt"] == "hello"   # the value flag + its value are filtered from prompt
 
 
 def test_main_profile_model_separate_value(monkeypatch):
@@ -3599,16 +3625,26 @@ def test_characterize_threads_flash_attn_to_vulkan_backend(make_console, store, 
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
 
-    def char(m, *, progress=False, flash_attn=True):
-        seen["flash_attn"] = flash_attn
+    def char(m, *, progress=False, flash_attn=True, kv_quant="f16"):
+        seen["flash_attn"], seen["kv_quant"] = flash_attn, kv_quant
         return {"model": m, "safe_context": 9000, "decode_context": None, "points": [[512, 1.0]]}
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         characterize=char, calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None))
     c, _ = make_console()
-    assert cli.render_characterize(c, "org/m", engine="vulkan", flash_attn=False) == 0
+    assert cli.render_characterize(c, "org/m", engine="vulkan", flash_attn=False,
+                                   kv_quant="q8_0") == 0
     assert seen["flash_attn"] is False
+    assert seen["kv_quant"] == "q8_0"
+
+
+def test_characterize_rejects_invalid_kv_quant(make_console, monkeypatch):
+    # Slug: 2026-06-25-vulkan-kv-cache-quant
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "vulkan")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/m", engine="vulkan", kv_quant="q3") == 1
+    assert "invalid --kv-quant" in buf.getvalue()
 
 
 def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
@@ -3621,14 +3657,24 @@ def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
                         lambda con, mk, e, m: {"safe_context": 8000})
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
-    def gen(model, prompt, *, max_context, max_tokens, flash_attn=True):
-        seen["flash_attn"] = flash_attn
+    def gen(model, prompt, *, max_context, max_tokens, flash_attn=True, kv_quant="f16"):
+        seen["flash_attn"], seen["kv_quant"] = flash_attn, kv_quant
         return {"context": max_context, "completion": "hi"}
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(generate=gen))
     c, _ = make_console()
-    assert cli.render_run(c, "org/m", prompt="hi", engine="vulkan", flash_attn=False) == 0
+    assert cli.render_run(c, "org/m", prompt="hi", engine="vulkan", flash_attn=False,
+                          kv_quant="q4_0") == 0
     assert seen["flash_attn"] is False
+    assert seen["kv_quant"] == "q4_0"
+
+
+def test_run_rejects_invalid_kv_quant(make_console, monkeypatch):
+    # Slug: 2026-06-25-vulkan-kv-cache-quant
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="vulkan", kv_quant="nope") == 1
+    assert "invalid --kv-quant" in buf.getvalue()
 
 
 # =========================================================================== #

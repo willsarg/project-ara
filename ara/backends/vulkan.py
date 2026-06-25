@@ -101,17 +101,21 @@ def _budget_params() -> tuple[float, float]:
 
 
 def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
-                 preflight: bool = False, flash_attn: bool = True) -> list[str]:
+                 preflight: bool = False, flash_attn: bool = True,
+                 kv_quant: str = "f16") -> list[str]:
     argv = [str(WORKER), model, str(ctx),
             "--margin", str(margin), "--overhead", str(overhead)]
     if preflight:
         argv.append("--preflight")
     if not flash_attn:
         argv.append("--no-flash-attn")
+    if kv_quant != "f16":
+        argv += ["--kv-quant", kv_quant]
     return argv
 
 
-def characterize(model: str, *, progress: bool = False, flash_attn: bool = True) -> dict:
+def characterize(model: str, *, progress: bool = False, flash_attn: bool = True,
+                 kv_quant: str = "f16") -> dict:
     """Measure *model*'s safe context ceiling on the GPU — the thin path, same driver as CPU/Apple.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this
@@ -121,18 +125,22 @@ def characterize(model: str, *, progress: bool = False, flash_attn: bool = True)
     Returns ``{model, safe_context, points}``.
 
     ``flash_attn`` (default True): measure with Vulkan flash-attention, which ~doubles the context
-    ceiling on this memory-bound APU at no quality cost (small prefill penalty). Keep it consistent
-    with ``generate`` — the ceiling is measured under the same attention path the run will use.
-    ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible.
+    ceiling on this memory-bound APU at no quality cost (small prefill penalty). ``kv_quant``
+    (default ``"f16"``, lossless): ``"q8_0"`` ~halves KV memory near-losslessly, ``"q4_0"`` ~quarters
+    it at a quality cost — a further context lever that forces flash-attention on. Keep both
+    consistent with ``generate`` — the ceiling is measured under the same attention/KV path the run
+    will use. ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible.
     """
     margin, overhead = _budget_params()
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
-            ENV_NAME, _worker_argv(m, 0, margin, overhead, preflight=True, flash_attn=flash_attn),
+            ENV_NAME, _worker_argv(m, 0, margin, overhead, preflight=True,
+                                   flash_attn=flash_attn, kv_quant=kv_quant),
             stream=progress),
         measure=lambda m, ctx: engine_env.run_worker(
-            ENV_NAME, _worker_argv(m, ctx, margin, overhead, flash_attn=flash_attn),
+            ENV_NAME, _worker_argv(m, ctx, margin, overhead,
+                                   flash_attn=flash_attn, kv_quant=kv_quant),
             stream=progress),
         schedule=RAMP_SCHEDULE,
     )
@@ -142,18 +150,22 @@ DEFAULT_MAX_TOKENS = 256
 
 
 def generate(model: str, prompt: str, *, max_context: int,
-             max_tokens: int = DEFAULT_MAX_TOKENS, flash_attn: bool = True) -> dict:
+             max_tokens: int = DEFAULT_MAX_TOKENS, flash_attn: bool = True,
+             kv_quant: str = "f16") -> dict:
     """One-shot completion on the GPU, governed: ``max_context`` is the characterized safe ceiling,
     so the worker's KV cache is capped under the wall (the worker still self-vetoes, L4/L5).
     Out-of-process in the isolated ``vulkan`` env; the prompt goes over stdin, never argv. Returns
     ``{context, completion}`` or a refusal (``{refused, reason}``).
 
-    ``flash_attn`` (default True) should match how *model* was characterized; if it doesn't, the
-    worker's L4/L5 gates still keep the run wall-safe (worst case a refusal, never a crash)."""
+    ``flash_attn`` (default True) and ``kv_quant`` (default ``"f16"``) should match how *model* was
+    characterized; if they don't, the worker's L4/L5 gates still keep the run wall-safe (worst case
+    a refusal, never a crash)."""
     margin, overhead = _budget_params()
     argv = [str(WORKER), model, str(max_context), "--generate",
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     if not flash_attn:
         argv.append("--no-flash-attn")
+    if kv_quant != "f16":
+        argv += ["--kv-quant", kv_quant]
     return engine_env.run_worker(ENV_NAME, argv, input=prompt)

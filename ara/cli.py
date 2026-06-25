@@ -261,6 +261,7 @@ def _det_memory_detail(c: Console, m) -> None:
 
 
 _ARA_ENGINE_BACKENDS = {"cuda", "mlx", "vulkan"}   # backends ARA can actually run today
+_KV_QUANT_CHOICES = ("f16", "q8_0", "q4_0")        # vulkan KV-cache quant (symmetric K=V)
 _RUNTIME_LABEL = {"vulkan": "Vulkan", "cuda": "CUDA", "mlx": "MLX", "rocm": "ROCm"}
 
 
@@ -879,8 +880,13 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     return 0
 
 
+def _kv_quant_error(kv_quant: str) -> str:
+    return (f"invalid --kv-quant {kv_quant!r} — choose one of: {', '.join(_KV_QUANT_CHOICES)}")
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
-                        as_json: bool = False, flash_attn: bool = True) -> int:
+                        as_json: bool = False, flash_attn: bool = True,
+                        kv_quant: str = "f16") -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
@@ -895,6 +901,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if not acquire.valid_model_ref(model):
         msg = (f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                f"or a local .gguf file path")
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    if kv_quant not in _KV_QUANT_CHOICES:
+        msg = _kv_quant_error(kv_quant)
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
     engine_ok, engine_pkg = engine_status(sel.backend)
@@ -964,9 +974,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    # flash-attention is a vulkan-only lever (FA ~doubles the context ceiling on an AMD iGPU);
-    # other engines don't accept the kwarg, so only pass it through when it applies.
-    fa_kw = {"flash_attn": flash_attn} if sel.backend == "vulkan" else {}
+    # flash-attention + KV-quant are vulkan-only levers (more context on an AMD iGPU); other
+    # engines don't accept the kwargs, so only pass them through when running on vulkan.
+    fa_kw = ({"flash_attn": flash_attn, "kv_quant": kv_quant}
+             if sel.backend == "vulkan" else {})
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
@@ -1160,7 +1171,8 @@ RUN_MAX_TOKENS = 256
 
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
                assume_yes: bool = False, as_json: bool = False,
-               max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True) -> int:
+               max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
+               kv_quant: str = "f16") -> int:
     """Governed one-shot inference: generate a completion for *model*, capped at its characterized
     safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
     the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
@@ -1178,6 +1190,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if not acquire.valid_model_ref(model):
         return err(f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                    f"or a local .gguf file path")
+    if kv_quant not in _KV_QUANT_CHOICES:
+        return err(_kv_quant_error(kv_quant))
 
     con = db.connect()
     mk = profile.machine_key()
@@ -1243,8 +1257,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
-    # flash-attention is a vulkan-only lever; pass it through only when running on that engine.
-    fa_kw = {"flash_attn": flash_attn} if backend == "vulkan" else {}
+    # flash-attention + KV-quant are vulkan-only levers; pass them only when running on vulkan.
+    fa_kw = ({"flash_attn": flash_attn, "kv_quant": kv_quant}
+             if backend == "vulkan" else {})
     try:
         result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
@@ -1536,10 +1551,11 @@ def main() -> int:
     assume_yes = "--yes" in argv or "-y" in argv
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
 
-    # --model / --engine / --token / --include / --exclude take values; pull them out first.
+    # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
     model: str | None = None
     engine: str | None = None
     token: str | None = None
+    kv_quant: str = "f16"
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1568,6 +1584,13 @@ def main() -> int:
             continue
         if a.startswith("--token="):
             token = a.split("=", 1)[1]
+            continue
+        if a == "--kv-quant":
+            kv_quant = argv[i + 1] if i + 1 < len(argv) else ""
+            skip = True
+            continue
+        if a.startswith("--kv-quant="):
+            kv_quant = a.split("=", 1)[1]
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -1630,7 +1653,7 @@ def main() -> int:
             c.emit(c.style("warn", "  usage: ara characterize <model>"))
             return 1
         return render_characterize(c, rest[1], engine=engine, as_json=as_json,
-                                   flash_attn=flash_attn)
+                                   flash_attn=flash_attn, kv_quant=kv_quant)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -1644,7 +1667,7 @@ def main() -> int:
             return 1
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
                           engine=engine, assume_yes=assume_yes, as_json=as_json,
-                          flash_attn=flash_attn)
+                          flash_attn=flash_attn, kv_quant=kv_quant)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)

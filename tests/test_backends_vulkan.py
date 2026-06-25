@@ -161,6 +161,49 @@ def test_generate_adds_no_flash_attn_when_disabled(monkeypatch):
     assert "--no-flash-attn" not in seen["argv"]
 
 
+# --------------------------------------------------------------------------- #
+# KV-cache quantization plumbing (default f16 = no flag; symmetric K=V)
+# Slug: 2026-06-25-vulkan-kv-cache-quant
+# --------------------------------------------------------------------------- #
+def test_worker_argv_carries_kv_quant_only_when_not_f16():
+    assert "--kv-quant" not in vulkan._worker_argv("m", 100, 2.0, 1.0)            # f16 default
+    argv = vulkan._worker_argv("m", 100, 2.0, 1.0, kv_quant="q8_0")
+    assert argv[-2:] == ["--kv-quant", "q8_0"]
+
+
+def test_characterize_threads_kv_quant_to_every_worker_call(monkeypatch):
+    seen = []
+
+    def fake(name, argv, *, stream=False):
+        seen.append(argv)
+        if "--preflight" in argv:
+            return dict(_EST)
+        return {"context": int(argv[2]), "mem_gb": 5.0 + int(argv[2]) / 1000}
+
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    vulkan.characterize("org/model", kv_quant="q8_0")
+    assert seen and all(a[-2:] == ["--kv-quant", "q8_0"] for a in seen)
+
+
+def test_generate_adds_kv_quant_when_not_f16(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 8192, "completion": "x"}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    vulkan.generate("org/model", "hi", max_context=8192, kv_quant="q4_0")
+    assert seen["argv"][-2:] == ["--kv-quant", "q4_0"]
+    vulkan.generate("org/model", "hi", max_context=8192)   # f16 default → no flag
+    assert "--kv-quant" not in seen["argv"]
+
+
 def test_characterize_drives_shared_driver_over_vulkan_env(monkeypatch):
     est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
            "max_context": 16000, "ref_baseline_gb": 0.0}

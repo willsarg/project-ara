@@ -150,6 +150,27 @@ def test_kv_slope_uses_gqa_kv_heads():
     assert w.kv_slope_gb_per_k(meta) == (2 * 2 * 8 * 2) * 1000 / w.GIB
 
 
+def test_kv_ggml_type_map_matches_ggml_ids():
+    # The ggml type ids passed to Llama(type_k/type_v) — must match llama_cpp.GGML_TYPE_*.
+    # Slug: 2026-06-25-vulkan-kv-cache-quant
+    assert w._KV_GGML_TYPE == {"f16": 1, "q8_0": 8, "q4_0": 2}
+
+
+def test_kv_bytes_scales_the_apriori_slope():
+    # The fix that makes KV-quant actually raise the ceiling: the a-priori memory slope must shrink
+    # with the cache type, or the L1/L4 gate refuses contexts the quantized cache can hold.
+    # Slug: 2026-06-25-vulkan-kv-cache-quant
+    assert w._KV_BYTES == {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}
+    meta = {"general.architecture": "llama", "llama.block_count": "2",
+            "llama.embedding_length": "16", "llama.attention.head_count": "4",
+            "llama.attention.head_count_kv": "2"}
+    s_f16 = w.kv_slope_gb_per_k(meta, kv_bytes=w._KV_BYTES["f16"])
+    s_q8 = w.kv_slope_gb_per_k(meta, kv_bytes=w._KV_BYTES["q8_0"])
+    s_q4 = w.kv_slope_gb_per_k(meta, kv_bytes=w._KV_BYTES["q4_0"])
+    assert s_q4 < s_q8 < s_f16            # q4_0 lightest, q8_0 ~half f16
+    assert s_q8 == s_f16 * (34 / 32) / 2.0
+
+
 def test_limits_from_reports_shared_ram_wall():
     d = w.limits_from(total_gb=11.0, used_gb=1.0, swap_free_gb=2.0, device="GPU (Vulkan)",
                       margin_gb=1.1)

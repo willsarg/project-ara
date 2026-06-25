@@ -52,6 +52,19 @@ DEFAULT_REPEATS = 3
 KV_BYTES_F16 = 2          # llama.cpp default KV cache element size (no KV quantization)
 RESIDENT_FACTOR = 1.0     # GGUF weights are fully resident once offloaded (GTT-backed)
 
+# KV-cache quantization → the ggml type id passed to Llama(type_k/type_v). Symmetric only (K==V):
+# asymmetric types drop off the fused-FA fast path and hit an offload bug on Vulkan. q8_0 is the
+# near-lossless ~half-KV sweet spot; q4_0 is ~quarter-KV at a real quality cost. ids match
+# llama_cpp.GGML_TYPE_{F16,Q8_0,Q4_0} (verified on the engine wheel). Quantized KV requires FA.
+_KV_GGML_TYPE = {"f16": 1, "q8_0": 8, "q4_0": 2}
+
+# Effective bytes per KV element by quant type, for the a-priori memory slope. The L1/L4 gate must
+# predict the SAME memory the quantized cache actually uses — otherwise it refuses contexts that
+# fit and KV-quant buys no extra ceiling (caught on rog-ubuntu). f16=2; q8_0=34B/32 (int8 + one
+# f16 scale per 32-block); q4_0=18B/32 (int4 + one f16 scale). Measurement (L2/L5) still backstops
+# these against the real wall, so a small inaccuracy can't breach safety.
+_KV_BYTES = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}
+
 # amdgpu exposes live memory accounting here, readable WITHOUT root. Module-level so tests can
 # point it at a fixture tree. GTT is the pool weights/KV/compute buffers actually land in on a
 # RADV APU; VRAM is the small BIOS carveout (usually barely moves) — sum both to be safe.
@@ -212,7 +225,8 @@ def _read_meta(gguf_path: str) -> dict:
     return dict(llm.metadata)
 
 
-def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True) -> dict:
+def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True,
+           kv_quant: str = "f16") -> dict:
     """Load *gguf_path* at *ctx* fully offloaded to the GPU; return its footprint.
 
     Footprint = Δ(GPU used, from GTT/VRAM sysfs) + Δ(process RSS) — the total system memory the
@@ -222,6 +236,8 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True) -
     """
     if abort_gb is None:
         return {"status": "error", "note": "refusing to probe without an L5 abort limit"}
+    if kv_quant != "f16":
+        flash_attn = True            # quantized KV cache requires flash-attention
 
     import threading
 
@@ -242,8 +258,10 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True) -
     try:
         from llama_cpp import Llama
 
+        kv = ({} if kv_quant == "f16"
+              else {"type_k": _KV_GGML_TYPE[kv_quant], "type_v": _KV_GGML_TYPE[kv_quant]})
         llm = Llama(model_path=gguf_path, n_ctx=ctx, n_gpu_layers=-1,
-                    flash_attn=flash_attn, verbose=True)
+                    flash_attn=flash_attn, verbose=True, **kv)
         llm.eval([llm.token_bos()])         # fault weights resident + touch the KV cache
         gpu_delta = max(0.0, _gpu_used_gb() - gpu0)
         rss_delta = max(0.0, proc.memory_info().rss / GIB - rss0)
@@ -256,7 +274,7 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True) -
 
 
 def _run_probe_child(gguf_path: str, ctx: int, abort_gb: float,
-                     flash_attn: bool = True) -> dict:
+                     flash_attn: bool = True, kv_quant: str = "f16") -> dict:
     """Run one ``--probe`` child (clean baseline per repeat) and capture its stderr.
 
     The child's stderr carries llama.cpp's device + offload logs (C-level fd-2 writes, captured
@@ -266,6 +284,8 @@ def _run_probe_child(gguf_path: str, ctx: int, abort_gb: float,
            "--abort-gb", str(abort_gb)]
     if not flash_attn:
         cmd.append("--no-flash-attn")
+    if kv_quant != "f16":
+        cmd += ["--kv-quant", kv_quant]
     out = subprocess.run(cmd, capture_output=True, text=True)
     line = next((ln for ln in out.stdout.splitlines() if ln.lstrip().startswith("{")), None)
     if line is None:
@@ -294,8 +314,10 @@ def _model_base_gb(gguf_path: str, overhead_gb: float) -> float:
     return weights_gb * RESIDENT_FACTOR + overhead_gb
 
 
-def preflight(model: str, *, margin_gb: float, overhead_gb: float) -> dict:
-    """No-load estimate for ARA's scheduler: absolute base, a-priori slope, budget, window."""
+def preflight(model: str, *, margin_gb: float, overhead_gb: float,
+              kv_quant: str = "f16") -> dict:
+    """No-load estimate for ARA's scheduler: absolute base, a-priori slope, budget, window. The
+    slope is KV-quant-aware so the a-priori gate predicts the cache size actually in use."""
     try:
         gguf = _resolve_gguf(model)
         meta = _read_meta(gguf)
@@ -307,7 +329,7 @@ def preflight(model: str, *, margin_gb: float, overhead_gb: float) -> dict:
     return {
         "base_gb": round(live_base + model_base, 4),
         "ref_baseline_gb": round(live_base, 4),
-        "slope_gb_per_k": kv_slope_gb_per_k(meta),
+        "slope_gb_per_k": kv_slope_gb_per_k(meta, kv_bytes=_KV_BYTES[kv_quant]),
         "budget_gb": safe_threshold_gb(total, effective_margin_gb(total, margin_gb)),
         "max_context": max_context_from(meta),
     }
@@ -334,7 +356,8 @@ def _refused(ctx: int, reason: str) -> dict:
 
 
 def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
-        flash_attn: bool = True, repeats: int = DEFAULT_REPEATS) -> dict:
+        flash_attn: bool = True, kv_quant: str = "f16",
+        repeats: int = DEFAULT_REPEATS) -> dict:
     """Gate (L4) then, if safe, measure the GPU+CPU footprint at *ctx* (median of repeats)."""
     try:
         gguf = _resolve_gguf(model)
@@ -344,13 +367,14 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
     total = _total_gb()
     budget = safe_threshold_gb(total, effective_margin_gb(total, margin_gb))
     base_gb = _used_gb() + _model_base_gb(gguf, overhead_gb)
-    reason = safety_gate(base_gb=base_gb, slope_gb_per_k=kv_slope_gb_per_k(meta),
+    reason = safety_gate(base_gb=base_gb,
+                         slope_gb_per_k=kv_slope_gb_per_k(meta, kv_bytes=_KV_BYTES[kv_quant]),
                          ctx=ctx, budget_gb=budget)
     if reason is not None:
         return _refused(ctx, reason)
     deltas = []
     for _ in range(max(1, repeats)):
-        raw = _run_probe_child(gguf, ctx, budget, flash_attn)
+        raw = _run_probe_child(gguf, ctx, budget, flash_attn, kv_quant)
         if raw.get("status") != "ok":
             return _refused(ctx, f"probe failed: {raw.get('note', 'no output')}")
         deltas.append(raw["delta_gb"])
@@ -358,7 +382,7 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
 
 
 def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb: float,
-             max_tokens: int, flash_attn: bool = True) -> dict:
+             max_tokens: int, flash_attn: bool = True, kv_quant: str = "f16") -> dict:
     """Gate (L4) then, if safe, load fully offloaded with the KV cache capped at *ctx* (the
     governed safe ceiling) and return a one-shot completion. ``ctx`` is ARA's characterized
     ceiling, so generation never allocates past it."""
@@ -370,14 +394,19 @@ def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb
     total = _total_gb()
     budget = safe_threshold_gb(total, effective_margin_gb(total, margin_gb))
     base_gb = _used_gb() + _model_base_gb(gguf, overhead_gb)
-    reason = safety_gate(base_gb=base_gb, slope_gb_per_k=kv_slope_gb_per_k(meta),
+    reason = safety_gate(base_gb=base_gb,
+                         slope_gb_per_k=kv_slope_gb_per_k(meta, kv_bytes=_KV_BYTES[kv_quant]),
                          ctx=ctx, budget_gb=budget)
     if reason is not None:
         return _refused(ctx, reason)
+    if kv_quant != "f16":
+        flash_attn = True            # quantized KV cache requires flash-attention
     from llama_cpp import Llama
 
+    kv = ({} if kv_quant == "f16"
+          else {"type_k": _KV_GGML_TYPE[kv_quant], "type_v": _KV_GGML_TYPE[kv_quant]})
     llm = Llama(model_path=gguf, n_ctx=ctx, n_gpu_layers=-1,
-                flash_attn=flash_attn, verbose=False)
+                flash_attn=flash_attn, verbose=False, **kv)
     out = llm.create_completion(prompt, max_tokens=max_tokens)
     return {"context": ctx, "completion": out["choices"][0]["text"]}
 
@@ -403,22 +432,27 @@ def main(argv=None) -> None:
     ap.add_argument("--no-flash-attn", action="store_true",
                     help="disable Vulkan flash-attention (on by default; FA ~doubles the context "
                          "ceiling at a small prefill cost). Off favours prompt-processing speed.")
+    ap.add_argument("--kv-quant", choices=tuple(_KV_GGML_TYPE), default="f16",
+                    help="KV-cache quantization (symmetric K=V): q8_0 ~half KV memory near-lossless, "
+                         "q4_0 ~quarter at a quality cost. Requires (and forces on) flash-attention.")
     args = ap.parse_args(argv)
     flash_attn = not args.no_flash_attn
+    kv_quant = args.kv_quant
 
     if args.limits:
         result = limits(margin_gb=args.margin)
     elif args.probe:
-        result = _probe(args.model, args.ctx, args.abort_gb, flash_attn)
+        result = _probe(args.model, args.ctx, args.abort_gb, flash_attn, kv_quant)
     elif args.preflight:
-        result = preflight(args.model, margin_gb=args.margin, overhead_gb=args.overhead)
+        result = preflight(args.model, margin_gb=args.margin, overhead_gb=args.overhead,
+                           kv_quant=kv_quant)
     elif args.generate:
         result = generate(args.model, args.ctx, sys.stdin.read(),
                           margin_gb=args.margin, overhead_gb=args.overhead,
-                          max_tokens=args.max_tokens, flash_attn=flash_attn)
+                          max_tokens=args.max_tokens, flash_attn=flash_attn, kv_quant=kv_quant)
     else:
-        result = run(args.model, args.ctx, margin_gb=args.margin,
-                     overhead_gb=args.overhead, flash_attn=flash_attn, repeats=args.repeats)
+        result = run(args.model, args.ctx, margin_gb=args.margin, overhead_gb=args.overhead,
+                     flash_attn=flash_attn, kv_quant=kv_quant, repeats=args.repeats)
     print(json.dumps(result), flush=True)
 
 
