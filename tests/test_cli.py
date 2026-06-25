@@ -88,10 +88,10 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
                         lambda c, m, engine=None, as_json=False, flash_attn=True,
-                        flash_attn_optin=False, kv_quant="f16":
+                        flash_attn_optin=False, kv_quant="f16", weight_quant="none":
                         (rec.update(characterize=m, characterize_engine=engine,
                                     characterize_fa=flash_attn, characterize_fa_optin=flash_attn_optin,
-                                    characterize_kv=kv_quant) or 0))
+                                    characterize_kv=kv_quant, characterize_wq=weight_quant) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
@@ -1853,7 +1853,7 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
     def backend(b=None):
         bk = types.SimpleNamespace()
         if supports.get(b):
-            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False: {
+            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False, weight_quant="none": {
                 "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
         return bk
     monkeypatch.setattr(cli, "get_backend", backend)
@@ -2014,9 +2014,10 @@ def test_main_search_no_query(monkeypatch, capsys):
 def test_kv_fa_kwargs_per_backend():
     assert cli._kv_fa_kwargs("vulkan", flash_attn=True, flash_attn_optin=False,
                              kv_quant="q4_0") == {"flash_attn": True, "kv_quant": "q4_0"}
-    # cuda: flash is the OPT-IN (default off → SDPA), kv-quant carried
-    assert cli._kv_fa_kwargs("cuda", flash_attn=True, flash_attn_optin=True,
-                             kv_quant="q8_0") == {"kv_quant": "q8_0", "flash_attn": True}
+    # cuda: flash is the OPT-IN (default off → SDPA); kv-quant + weight-quant carried
+    assert cli._kv_fa_kwargs("cuda", flash_attn=True, flash_attn_optin=True, kv_quant="q8_0",
+                             weight_quant="int4") == {"kv_quant": "q8_0", "flash_attn": True,
+                                                      "weight_quant": "int4"}
     assert cli._kv_fa_kwargs("apple", flash_attn=True, flash_attn_optin=True,
                              kv_quant="f16") == {"kv_quant": "f16"}
     assert cli._kv_fa_kwargs("cpu", flash_attn=True, flash_attn_optin=True, kv_quant="f16") == {}
@@ -2037,6 +2038,75 @@ def test_unsupported_lever_error():
         "apple", kv_quant="q8_0", flash_attn=True, flash_attn_optin=False) is None
     assert cli._unsupported_lever_error(
         "cpu", kv_quant="f16", flash_attn=True, flash_attn_optin=False) is None
+
+
+def test_unsupported_lever_error_weight_quant():
+    # --weight-quant only on cuda; rejected on apple/vulkan/cpu
+    assert "weight-quant" in cli._unsupported_lever_error(
+        "apple", kv_quant="f16", flash_attn=True, flash_attn_optin=False, weight_quant="int4")
+    assert cli._unsupported_lever_error(
+        "cuda", kv_quant="f16", flash_attn=True, flash_attn_optin=False, weight_quant="int4") is None
+    assert cli._unsupported_lever_error(
+        "cpu", kv_quant="f16", flash_attn=True, flash_attn_optin=False, weight_quant="none") is None
+
+
+def test_weight_quant_hw_error_fp8():
+    incapable = types.SimpleNamespace(fp8_capable=lambda: False)
+    capable = types.SimpleNamespace(fp8_capable=lambda: True)
+    assert "Ada/Hopper" in cli._weight_quant_hw_error(incapable, "cuda", "fp8")
+    assert cli._weight_quant_hw_error(capable, "cuda", "fp8") is None       # capable → ok
+    assert cli._weight_quant_hw_error(incapable, "cuda", "int4") is None    # only fp8 is gated
+    assert cli._weight_quant_hw_error(object(), "cpu", "fp8") is None       # non-cuda never reaches
+
+
+def test_render_characterize_rejects_invalid_weight_quant(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cuda")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M", weight_quant="int3") == 1
+    assert "invalid --weight-quant" in buf.getvalue()
+
+
+def test_render_characterize_rejects_fp8_on_incapable_gpu(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cuda")
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        fp8_capable=lambda: False,
+        characterize=lambda m, **k: {"model": m, "safe_context": 1, "points": []}))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M", weight_quant="fp8") == 1
+    assert "Ada/Hopper" in buf.getvalue()
+
+
+def test_render_run_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
+    _wire_run_cross(monkeypatch, detected="cuda",
+                    chars={"wcx": {"model_id": "org/m", "safe_context": 4096}},
+                    supports={"cuda": True})
+    # the fake backend must expose generate (run-selectable) + fp8_capable (False → reject fp8)
+    bk = types.SimpleNamespace(generate=lambda *a, **k: {"completion": "x"},
+                               fp8_capable=lambda: False)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True,
+                          weight_quant="fp8") == 1
+    assert "Ada/Hopper" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_render_run_rejects_invalid_weight_quant(monkeypatch, capsys):
+    _wire_run_cross(monkeypatch, detected="cuda",
+                    chars={"wcx": {"model_id": "org/m", "safe_context": 4096}},
+                    supports={"cuda": True})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True,
+                          weight_quant="int3") == 1
+    assert "invalid --weight-quant" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_characterize_threads_weight_quant(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--weight-quant", "int4"])
+    assert rec["characterize_wq"] == "int4"
+    rec2 = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--weight-quant=int8"])   # = form
+    assert rec2["characterize_wq"] == "int8"
 
 
 def test_render_characterize_rejects_unsupported_lever(make_console, monkeypatch):

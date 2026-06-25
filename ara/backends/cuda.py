@@ -124,7 +124,7 @@ _CUDA_KV_BYTES = {"f16": 2.0, "q8_0": 8 / 8 + 2 * 2 / 64, "q4_0": 4 / 8 + 2 * 2 
 
 def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
                  preflight: bool = False, kv_quant: str = "f16",
-                 flash_attn: bool = False) -> list[str]:
+                 flash_attn: bool = False, weight_quant: str = "none") -> list[str]:
     argv = ["-m", WORKER_MODULE, model, str(ctx),
             "--margin", str(margin), "--overhead", str(overhead)]
     if preflight:
@@ -134,6 +134,8 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
         argv += ["--kv-bits", str(bits)]
     if flash_attn:                 # opt into FA2; the worker falls back to SDPA if unsupported
         argv.append("--flash-attn")
+    if weight_quant != "none":     # load weights quantized (bitsandbytes int8/int4, FP8)
+        argv += ["--weight-quant", weight_quant]
     return argv
 
 
@@ -146,8 +148,17 @@ def flash_attn_capable() -> bool:
         return False
 
 
+def fp8_capable() -> bool:
+    """Whether this GPU has hardware FP8 (Ada/Hopper, sm_89+), per the wcx device worker. Lets the
+    CLI reject --weight-quant fp8 on older GPUs instead of failing deep in a model load."""
+    try:
+        return bool(safe_limits().get("fp8_capable"))
+    except Exception:
+        return False
+
+
 def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
-                 flash_attn: bool = False) -> dict:
+                 flash_attn: bool = False, weight_quant: str = "none") -> dict:
     """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
@@ -168,7 +179,7 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
             "cuda", _worker_argv(m, 0, margin, overhead, preflight=True, kv_quant=kv_quant)),
         measure=lambda m, ctx: engine_env.run_worker(
             "cuda", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant,
-                                 flash_attn=flash_attn)),
+                                 flash_attn=flash_attn, weight_quant=weight_quant)),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_CUDA_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
     )
@@ -178,7 +189,7 @@ DEFAULT_MAX_TOKENS = 256
 
 
 def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
-             kv_quant: str = "f16", flash_attn: bool = False) -> dict:
+             kv_quant: str = "f16", flash_attn: bool = False, weight_quant: str = "none") -> dict:
     """One-shot CUDA completion, governed: max_context is the characterized safe ceiling, so the
     worker generates under the wall. Out-of-process in the isolated `cuda` env via wcx-suite's
     generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``) and
@@ -193,4 +204,6 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
         argv += ["--kv-bits", str(bits)]
     if flash_attn:
         argv.append("--flash-attn")
+    if weight_quant != "none":
+        argv += ["--weight-quant", weight_quant]
     return engine_env.run_worker("cuda", argv, input=prompt)

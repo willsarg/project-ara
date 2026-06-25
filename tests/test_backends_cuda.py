@@ -392,3 +392,35 @@ def test_flash_attn_capable_false_when_worker_errors(monkeypatch):
         raise RuntimeError("no GPU")
     monkeypatch.setattr(cuda, "safe_limits", boom)
     assert cuda.flash_attn_capable() is False
+
+
+# --------------------------------------------------------------------------- #
+# Weight-quant lever (--weight-quant {none,int8,int4,fp8}) + FP8 capability
+# --------------------------------------------------------------------------- #
+def test_worker_argv_appends_weight_quant():
+    assert cuda._worker_argv("org/m", 2000, 1.0, 0.6, weight_quant="int4")[-2:] == \
+        ["--weight-quant", "int4"]
+    assert "--weight-quant" not in cuda._worker_argv("org/m", 2000, 1.0, 0.6)   # none → omitted
+
+
+def test_generate_appends_weight_quant(monkeypatch):
+    seen = {}
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 8192, "completion": "x"})}))
+    cuda.generate("org/m", "hi", max_context=8192, max_tokens=64, weight_quant="int8")
+    assert seen["argv"][-2:] == ["--weight-quant", "int8"]
+
+
+def test_fp8_capable_reads_device_worker(monkeypatch):
+    monkeypatch.setattr(cuda, "safe_limits", lambda: {"fp8_capable": True})
+    assert cuda.fp8_capable() is True
+    monkeypatch.setattr(cuda, "safe_limits", lambda: {"fp8_capable": False})
+    assert cuda.fp8_capable() is False
+
+
+def test_fp8_capable_false_when_worker_errors(monkeypatch):
+    def boom():
+        raise RuntimeError("no GPU")
+    monkeypatch.setattr(cuda, "safe_limits", boom)
+    assert cuda.fp8_capable() is False

@@ -265,6 +265,7 @@ def _det_memory_detail(c: Console, m) -> None:
 
 _ARA_ENGINE_BACKENDS = {"cuda", "mlx", "vulkan"}   # backends ARA can actually run today
 _KV_QUANT_CHOICES = ("f16", "q8_0", "q4_0")        # vulkan KV-cache quant (symmetric K=V)
+_WEIGHT_QUANT_CHOICES = ("none", "int8", "int4", "fp8")   # CUDA runtime weight quant (bitsandbytes/FP8)
 _RUNTIME_LABEL = {"vulkan": "Vulkan", "cuda": "CUDA", "mlx": "MLX", "rocm": "ROCm"}
 
 
@@ -891,14 +892,14 @@ def _kv_quant_error(kv_quant: str) -> str:
 # can't honor is REJECTED with a clear message, never silently dropped. Mirrors _kv_fa_kwargs.
 _ENGINE_LEVERS = {
     "vulkan": {"kv_quant", "flash_attn"},
-    "cuda": {"kv_quant", "flash_attn"},
+    "cuda": {"kv_quant", "flash_attn", "weight_quant"},   # NVIDIA-native runtime weight quant
     "apple": {"kv_quant"},        # MLX's SDPA is always fused — no flash-attn knob
     "cpu": set(),                  # llama.cpp cache-type / flash aren't wired at the ARA level yet
 }
 
 
 def _unsupported_lever_error(backend: str, *, kv_quant: str, flash_attn: bool,
-                             flash_attn_optin: bool) -> str | None:
+                             flash_attn_optin: bool, weight_quant: str = "none") -> str | None:
     """A clear message when the user EXPLICITLY set a context lever the selected engine can't honor
     — else None. Honesty (Rule #3): reject rather than silently ignore the flag. A flash flag is
     'explicit' when --no-flash-attn turned the default off, or --flash-attn opted in."""
@@ -907,20 +908,23 @@ def _unsupported_lever_error(backend: str, *, kv_quant: str, flash_attn: bool,
         return f"--kv-quant isn't supported on the {backend} engine (it runs an fp16 KV cache)"
     if ((not flash_attn) or flash_attn_optin) and "flash_attn" not in levers:
         return f"flash-attention isn't a tunable setting on the {backend} engine"
+    if weight_quant != "none" and "weight_quant" not in levers:
+        return f"--weight-quant is only supported on the cuda engine (not {backend})"
     return None
 
 
 def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
-                 kv_quant: str) -> dict:
+                 kv_quant: str, weight_quant: str = "none") -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
     on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes. Flash-attention has
     OPPOSITE defaults per engine: vulkan's llama.cpp FA is on-by-default (``flash_attn``, the
     ``--no-flash-attn`` opt-out), while CUDA defaults to SDPA with FA2 an availability-gated opt-in
-    (``flash_attn_optin``, the ``--flash-attn`` flag). MLX's SDPA is always fused (no knob)."""
+    (``flash_attn_optin``, the ``--flash-attn`` flag). MLX's SDPA is always fused (no knob). Runtime
+    weight-quant is CUDA-only (the others ship pre-quantized files)."""
     if backend == "vulkan":
         return {"flash_attn": flash_attn, "kv_quant": kv_quant}
     if backend == "cuda":
-        return {"kv_quant": kv_quant, "flash_attn": flash_attn_optin}
+        return {"kv_quant": kv_quant, "flash_attn": flash_attn_optin, "weight_quant": weight_quant}
     if backend == "apple":
         return {"kv_quant": kv_quant}
     return {}
@@ -936,9 +940,19 @@ def _flash_sdpa_note(c: Console, bk, backend: str, flash_attn_optin: bool,
         c.emit(c.style("dim", "  flash-attn (FA2) needs an Ampere+ GPU — using SDPA"))
 
 
+def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
+    """FP8 weights need Ada/Hopper (sm_89+); reject upfront on older CUDA GPUs (Rule #3) rather
+    than failing deep in the model load. Only CUDA reaches here (weight-quant is CUDA-only)."""
+    if (weight_quant == "fp8" and backend == "cuda"
+            and hasattr(bk, "fp8_capable") and not bk.fp8_capable()):
+        return "--weight-quant fp8 needs an Ada/Hopper GPU (sm_89+) — this GPU can't run FP8"
+    return None
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
-                        flash_attn_optin: bool = False, kv_quant: str = "f16") -> int:
+                        flash_attn_optin: bool = False, kv_quant: str = "f16",
+                        weight_quant: str = "none") -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
@@ -959,8 +973,12 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = _kv_quant_error(kv_quant)
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant,
-                                         flash_attn=flash_attn, flash_attn_optin=flash_attn_optin)
+    if weight_quant not in _WEIGHT_QUANT_CHOICES:
+        msg = f"invalid --weight-quant {weight_quant!r} — choose one of: {', '.join(_WEIGHT_QUANT_CHOICES)}"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant, flash_attn=flash_attn,
+                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant)
     if lever_err is not None:
         print(json.dumps({"error": lever_err})) if as_json else c.emit(c.style("bad", f"  {lever_err}"))
         return 1
@@ -973,6 +991,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     bk = get_backend(sel.backend)
+    hw_err = _weight_quant_hw_error(bk, sel.backend, weight_quant)
+    if hw_err is not None:
+        print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
+        return 1
     progress = (not as_json) and sys.stderr.isatty()
     # Pre-fetch: ensure weights are in the HF cache before the engine's preflight runs.
     # Without this, the worker's blobs/ scan yields weights_gb≈0 for uncached transformers
@@ -1031,8 +1053,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn,
-                          flash_attn_optin=flash_attn_optin, kv_quant=kv_quant)
+    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                          kv_quant=kv_quant, weight_quant=weight_quant)
     _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
@@ -1235,7 +1257,8 @@ RUN_MAX_TOKENS = 256
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
                assume_yes: bool = False, as_json: bool = False,
                max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
-               flash_attn_optin: bool = False, kv_quant: str = "f16") -> int:
+               flash_attn_optin: bool = False, kv_quant: str = "f16",
+               weight_quant: str = "none") -> int:
     """Governed one-shot inference: generate a completion for *model*, capped at its characterized
     safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
     the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
@@ -1255,6 +1278,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                    f"or a local .gguf file path")
     if kv_quant not in _KV_QUANT_CHOICES:
         return err(_kv_quant_error(kv_quant))
+    if weight_quant not in _WEIGHT_QUANT_CHOICES:
+        return err(f"invalid --weight-quant {weight_quant!r} — choose one of: "
+                   f"{', '.join(_WEIGHT_QUANT_CHOICES)}")
 
     con = db.connect()
     mk = profile.machine_key()
@@ -1304,8 +1330,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         engine_key = max(runnable, key=lambda k: runnable[k][0])
         safe, backend, _ = runnable[engine_key]
 
-    lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant,
-                                         flash_attn=flash_attn, flash_attn_optin=flash_attn_optin)
+    lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
+                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant)
     if lever_err is not None:
         return err(lever_err)
 
@@ -1315,6 +1341,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     bk = get_backend(backend)
     if not hasattr(bk, "generate"):
         return err(f"run isn't supported on the {engine_pkg} engine yet")
+    hw_err = _weight_quant_hw_error(bk, backend, weight_quant)
+    if hw_err is not None:
+        return err(hw_err)
 
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
     # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
@@ -1325,8 +1354,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
-    fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn,
-                          flash_attn_optin=flash_attn_optin, kv_quant=kv_quant)
+    fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                          kv_quant=kv_quant, weight_quant=weight_quant)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
         result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
@@ -1639,6 +1668,7 @@ def _main_impl() -> int:
     engine: str | None = None
     token: str | None = None
     kv_quant: str = "f16"
+    weight_quant: str = "none"
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1674,6 +1704,13 @@ def _main_impl() -> int:
             continue
         if a.startswith("--kv-quant="):
             kv_quant = a.split("=", 1)[1]
+            continue
+        if a == "--weight-quant":
+            weight_quant = argv[i + 1] if i + 1 < len(argv) else ""
+            skip = True
+            continue
+        if a.startswith("--weight-quant="):
+            weight_quant = a.split("=", 1)[1]
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -1741,7 +1778,7 @@ def _main_impl() -> int:
             return _arg_err("usage: ara characterize <model>")
         return render_characterize(c, rest[1], engine=engine, as_json=as_json,
                                    flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                                   kv_quant=kv_quant)
+                                   kv_quant=kv_quant, weight_quant=weight_quant)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -1755,7 +1792,7 @@ def _main_impl() -> int:
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
                           engine=engine, assume_yes=assume_yes, as_json=as_json,
                           flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant)
+                          kv_quant=kv_quant, weight_quant=weight_quant)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)
