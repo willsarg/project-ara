@@ -43,6 +43,9 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
   - `recommend` — ranks cached models that fit this machine's budget, by estimated usable context.
   - `run` — governed one-shot inference, capped under the measured safe ceiling (CPU · MLX · CUDA).
   - `models` / `search` — catalog cached models (with measured ceilings) / search the HF Hub.
+  - `hf login` / `logout` / `status` — manage the Hugging Face token (needed for gated models). An
+    **action** command (writes the standard HF token store, so every fetch + worker reads it), not
+    recon; verifies via the Hub and never prints the token.
 - **Broad compatibility.** Cover the open-source AI ecosystem widely — engines (MLX,
   llama.cpp, Ollama, LM Studio, vLLM), model stores (HF, Ollama, LM Studio, Jan, GPT4All),
   frameworks (PyTorch, transformers, TensorFlow), and apps — not one vendor's corner.

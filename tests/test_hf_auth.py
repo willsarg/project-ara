@@ -14,6 +14,7 @@ Strategy for patching whoami:
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,28 @@ def test_set_token_creates_parent_dirs(monkeypatch, tmp_path):
     res = hf_auth.set_token("hf_deep")
     assert res["saved"] is True
     assert deep.read_text() == "hf_deep"
+
+
+def test_set_token_writes_owner_only_permissions(monkeypatch, token_path):
+    """A token is a credential — the file must be owner read/write only (0o600), parent 0o700."""
+    monkeypatch.setattr(hf_auth, "_whoami", lambda token: {"name": "alice"})
+    hf_auth.set_token("hf_secret")
+    if os.name == "posix":   # POSIX modes are meaningless on Windows
+        assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(token_path.parent.stat().st_mode) == 0o700
+
+
+def test_set_token_tolerates_chmod_failure(monkeypatch, token_path):
+    """chmod is best-effort (a no-op on non-POSIX filesystems); a failure must not block saving."""
+    monkeypatch.setattr(hf_auth, "_whoami", lambda token: {"name": "alice"})
+
+    def _boom(*a, **k):
+        raise OSError("no chmod here")
+
+    monkeypatch.setattr(hf_auth.os, "chmod", _boom)
+    res = hf_auth.set_token("hf_secret")
+    assert res["saved"] is True
+    assert token_path.read_text() == "hf_secret"
 
 
 # --------------------------------------------------------------------------- #

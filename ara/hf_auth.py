@@ -51,6 +51,28 @@ def _env_token_present() -> bool:
     return "HF_TOKEN" in os.environ or "HUGGING_FACE_HUB_TOKEN" in os.environ
 
 
+def _write_token(path: Path, token: str) -> None:
+    """Write *token* to *path* with owner-only permissions — a token is a credential, never
+    leave it world-readable. Creates the dir 0o700 and the file 0o600 (atomically at create via
+    os.open, then chmod to enforce on a pre-existing file too). chmod is best-effort: on
+    filesystems/OSes without POSIX modes (e.g. Windows) it's a harmless no-op, so failures are
+    swallowed rather than blocking the user from saving their token."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode())
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _classify_whoami_error(exc: BaseException) -> str:
     """Classify a whoami exception into a small honest reason string.
 
@@ -109,9 +131,7 @@ def set_token(token: str, *, verify: bool = True) -> dict:
             # offline or unknown: still save — user explicitly asked
             user, verified, error = None, False, err
 
-    p = _token_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(token)
+    _write_token(_token_path(), token)
     return {"saved": True, "user": user, "verified": verified, "error": error}
 
 

@@ -3707,6 +3707,7 @@ def test_render_hf_none_sub_returns_1(make_console, monkeypatch):
     c, buf = make_console()
     rc = cli.render_hf(c, None)
     assert rc == 1
+    assert "specify an hf subcommand" in buf.getvalue()
 
 
 def test_render_hf_unknown_sub_json(monkeypatch, capsys):

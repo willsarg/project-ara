@@ -1513,6 +1513,8 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
                            f"  token present ({st['source']}) but couldn't verify ({st['error']})"))
         return 0
 
+    if sub is None:
+        return _err("specify an hf subcommand — try one of: login, logout, status")
     return _err(f"unknown hf subcommand {sub!r} — try one of: login, logout, status")
 
 

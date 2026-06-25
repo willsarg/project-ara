@@ -75,6 +75,7 @@ stays lean and works the same on every platform.
 | `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on CPU, MLX, and CUDA. |
 | `ara models [<model>]` | Catalog the models in your HF cache with each one's best measured safe-context ceiling; pass a model id for its architecture + per-engine ceiling detail. |
 | `ara search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
+| `ara hf login` / `logout` / `status` | Manage your Hugging Face token (needed for gated models). `login` reads it from a hidden prompt, piped stdin, or `--token`, verifies it against the Hub, and stores it in the **standard HF token file** — so every fetch and engine worker picks it up. `status` shows who you're logged in as (never the token); `logout` removes it. |
 
 Recon commands share `--json` (machine-readable) and `--include` / `--exclude` (show only
 or hide specific sections, e.g. `ara detect --exclude models`).
