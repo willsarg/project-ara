@@ -989,7 +989,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
-        c.emit(c.style("bad", f"  characterization failed: {exc}"))
+        msg = f"characterization failed: {exc}"
+        # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
+        # styled text or a traceback that would break the parse.
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't

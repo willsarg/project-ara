@@ -2299,6 +2299,19 @@ def test_render_characterize_engine_error(make_console, monkeypatch):
     assert "characterization failed" in buf.getvalue()
 
 
+def test_render_characterize_engine_exception_json(monkeypatch, capsys):
+    # Rule #3 (Honesty): when the engine RAISES mid-characterize (refuse/abort/OOM-guard), --json
+    # must emit {"error": ...}, not styled text — a --json consumer would choke on the styled
+    # line. (Distinct from the returned-{"error":...} path tested below.)
+    def boom(m):
+        raise RuntimeError("OOM guard tripped")
+    _wire_characterize(monkeypatch, characterize=boom)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "x", as_json=True) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out and "characterization failed" in out["error"]
+
+
 def test_render_characterize_json(monkeypatch, capsys, store):
     _wire_characterize(monkeypatch,
                        characterize=lambda m: {"model": m, "safe_context": 9000,
