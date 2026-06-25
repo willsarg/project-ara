@@ -2392,6 +2392,107 @@ def test_render_characterize_prefetch_insufficient_disk_json(monkeypatch, capsys
 
 
 # --------------------------------------------------------------------------- #
+# render_characterize — download failure: honest, actionable error messages
+# --------------------------------------------------------------------------- #
+def _bk_download_raises(exc):
+    """FakeBackend whose download_calibration_model raises *exc*."""
+    bk = FakeBackend(_limits(), cached=False)
+    bk.characterize = _fake_bk_characterize
+
+    def _boom(model):
+        raise exc
+    bk.download_calibration_model = _boom
+    return bk
+
+
+def _fake_response_stub(code):
+    class FakeResp:
+        headers = {}
+        request = None
+        status_code = code
+    return FakeResp()
+
+
+def test_render_characterize_gated_gives_actionable_message(make_console, monkeypatch):
+    # A GatedRepoError must tell the user WHY and HOW to fix it — not swallow the reason.
+    from huggingface_hub.errors import GatedRepoError
+    exc = GatedRepoError("403 gated", response=_fake_response_stub(403))
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/gated-model") == 1
+    out = buf.getvalue()
+    assert "gated" in out
+    assert "HF_TOKEN" in out or "terms" in out   # actionable: how to fix it
+
+
+def test_render_characterize_gated_json(monkeypatch, capsys):
+    from huggingface_hub.errors import GatedRepoError
+    exc = GatedRepoError("403 gated", response=_fake_response_stub(403))
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/gated-model", as_json=True) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out and "gated" in out["error"]
+
+
+def test_render_characterize_not_found_gives_actionable_message(make_console, monkeypatch):
+    from huggingface_hub.errors import RepositoryNotFoundError
+    exc = RepositoryNotFoundError("404", response=_fake_response_stub(404))
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/missing") == 1
+    out = buf.getvalue()
+    # "not found" or "don't have access" — either phrasing is honest
+    assert "not found" in out or "access" in out
+
+
+def test_render_characterize_offline_gives_actionable_message(make_console, monkeypatch):
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    exc = LocalEntryNotFoundError("not cached")
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/model") == 1
+    out = buf.getvalue()
+    assert "offline" in out or "connection" in out or "cached" in out
+
+
+def test_render_characterize_download_error_json(monkeypatch, capsys):
+    # Any download failure emits {"error": ...} in --json mode (not a traceback).
+    exc = ConnectionError("no route")
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/model", as_json=True) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out
+
+
+def test_render_characterize_auth_error_mentions_token(make_console, monkeypatch):
+    # 401 HfHubHTTPError → auth reason → message mentions HF_TOKEN.
+    from huggingface_hub.errors import HfHubHTTPError
+    exc = HfHubHTTPError("unauthorized", response=_fake_response_stub(401))
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/private") == 1
+    assert "HF_TOKEN" in buf.getvalue()
+
+
+def test_render_characterize_unknown_download_error(make_console, monkeypatch):
+    # A totally unknown exception (not a HF type) → "unknown error" fallback message.
+    exc = RuntimeError("some strange error")
+    bk = _bk_download_raises(exc)
+    _wire_characterize_bk(monkeypatch, bk)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/model") == 1
+    assert "couldn't fetch" in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 # decode-safe ceiling display (task #48b)
 # --------------------------------------------------------------------------- #
 def test_render_characterize_decode_shown_when_greater(make_console, store, monkeypatch):

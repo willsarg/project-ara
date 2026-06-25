@@ -40,6 +40,21 @@ def _fmt_size(gb: float | None) -> str:
     return f"~{gb * 1000:.0f} MB" if gb < 1 else f"~{gb:.1f} GB"
 
 
+def _fetch_error_msg(model: str, reason: str) -> str:
+    """Turn an acquire reason code into a one-line, actionable user message."""
+    if reason == "gated":
+        return (f"{model} is gated — accept its terms on huggingface.co/{model} "
+                f"then set HF_TOKEN")
+    if reason == "not_found":
+        return f"{model} not found or you don't have access"
+    if reason == "offline":
+        return (f"can't reach hugging face (and {model} isn't cached) "
+                f"— check your connection")
+    if reason == "auth":
+        return f"{model}: authentication failed — check your HF_TOKEN"
+    return f"couldn't fetch {model}: unknown error"
+
+
 # --------------------------------------------------------------------------- #
 # section filtering — shared across the recon commands (--include / --exclude)
 # --------------------------------------------------------------------------- #
@@ -907,7 +922,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 c.emit(c.style("bad", f"  {msg}"))
             return 1
         c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
-        bk.download_calibration_model(model)
+        try:
+            bk.download_calibration_model(model)
+        except Exception as exc:
+            reason = acquire.classify_repo_error(exc)
+            msg = _fetch_error_msg(model, reason)
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return 1
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     cal_con = db.connect()

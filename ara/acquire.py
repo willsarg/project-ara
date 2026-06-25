@@ -31,17 +31,61 @@ def valid_model_id(model: str) -> bool:
     return isinstance(model, str) and _MODEL_ID_RE.match(model) is not None
 
 
-def repo_size_gb(repo_id: str) -> float | None:
-    """Total download size of *repo_id* in GB (decimal). None if it can't be read
-    (offline, private, or an API hiccup) — callers treat None as 'size unknown'."""
+_REASON_GATED = "gated"
+_REASON_NOT_FOUND = "not_found"
+_REASON_AUTH = "auth"
+_REASON_OFFLINE = "offline"
+_REASON_UNKNOWN = "unknown"
+
+
+def classify_repo_error(exc: BaseException) -> str:
+    """Map a Hugging Face (or network) exception to a small honest reason string.
+
+    Returns one of: ``"gated"``, ``"not_found"``, ``"auth"``, ``"offline"``, ``"unknown"``.
+    Pure function — safe to call with any exception type, including non-HF ones.
+    Imported lazily so this module stays cheap at import time.
+    """
+    from huggingface_hub.errors import (
+        GatedRepoError, HfHubHTTPError, LocalEntryNotFoundError,
+        OfflineModeIsEnabled, RepositoryNotFoundError,
+    )
+
+    if isinstance(exc, GatedRepoError):
+        return _REASON_GATED
+    if isinstance(exc, RepositoryNotFoundError):
+        return _REASON_NOT_FOUND
+    if isinstance(exc, (LocalEntryNotFoundError, OfflineModeIsEnabled)):
+        return _REASON_OFFLINE
+    if isinstance(exc, ConnectionError):
+        return _REASON_OFFLINE
+    if isinstance(exc, HfHubHTTPError) and getattr(
+            getattr(exc, "response", None), "status_code", None) == 401:
+        return _REASON_AUTH
+    return _REASON_UNKNOWN
+
+
+def probe_repo(repo_id: str) -> dict:
+    """Probe *repo_id* and return ``{"size_gb": float|None, "reason": str|None}``.
+
+    ``reason`` is None on success; one of the ``classify_repo_error`` strings on failure.
+    ``size_gb`` is None when the size can't be read (empty repo or any error).
+    Use this when the caller needs to surface *why* a fetch failed (e.g. the CLI).
+    ``repo_size_gb`` is still the right call when only the size matters.
+    """
     from huggingface_hub import HfApi
 
     try:
         info = HfApi().model_info(repo_id, files_metadata=True)
         total = sum(s.size for s in (info.siblings or []) if s.size)
-        return round(total / 1e9, 3) if total else None
-    except Exception:
-        return None
+        return {"size_gb": round(total / 1e9, 3) if total else None, "reason": None}
+    except Exception as exc:
+        return {"size_gb": None, "reason": classify_repo_error(exc)}
+
+
+def repo_size_gb(repo_id: str) -> float | None:
+    """Total download size of *repo_id* in GB (decimal). None if it can't be read
+    (offline, private, or an API hiccup) — callers treat None as 'size unknown'."""
+    return probe_repo(repo_id)["size_gb"]
 
 
 def free_disk_gb() -> float | None:
