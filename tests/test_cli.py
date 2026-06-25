@@ -97,6 +97,9 @@ def _capture_dispatch(monkeypatch):
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
     monkeypatch.setattr(cli, "render_uninstall", lambda c, **kw: (rec.update(uninstall=kw) or 0))
+    monkeypatch.setattr(cli, "render_hf",
+                        lambda c, sub, token=None, as_json=False:
+                        (rec.update(hf=sub, hf_token=token) or 0))
     return rec
 
 
@@ -3419,3 +3422,335 @@ def test_characterize_rejects_malformed_model_id(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "bad=id") == 1
     assert "invalid model id" in buf.getvalue()
+
+
+# =========================================================================== #
+# render_hf — hf login / logout / status
+# Slug: 2026-06-24-hf-token-auth
+# =========================================================================== #
+
+def _stub_hf_auth(monkeypatch):
+    """Replace hf_auth.set_token / clear_token / status with controllable fakes.
+    Returns a dict of 'last' call args/results so tests can assert what was called."""
+    import ara.hf_auth as hf_auth
+    state = {}
+
+    def fake_set_token(token, *, verify=True):
+        state["set_token_called"] = token
+        return state.get("set_token_result",
+                         {"saved": True, "user": "alice", "verified": True, "error": None})
+
+    def fake_clear_token():
+        state["clear_token_called"] = True
+        return state.get("clear_token_result", {"removed": True, "shadowed_by_env": False})
+
+    def fake_status():
+        state["status_called"] = True
+        return state.get("status_result",
+                         {"present": True, "source": "file", "user": "alice",
+                          "verified": True, "error": None})
+
+    monkeypatch.setattr(cli.hf_auth, "set_token", fake_set_token)
+    monkeypatch.setattr(cli.hf_auth, "clear_token", fake_clear_token)
+    monkeypatch.setattr(cli.hf_auth, "status", fake_status)
+    return state
+
+
+# --------------------------------------------------------------------------- #
+# _read_token — both branches
+# --------------------------------------------------------------------------- #
+
+def test_read_token_tty_calls_getpass(monkeypatch):
+    import io
+    import ara.cli as _cli
+    monkeypatch.setattr("sys.stdin", type("FakeTTY", (), {"isatty": lambda self: True})())
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "hf_from_getpass")
+    c, _ = make_console_bare = __import__("io").StringIO(), None
+    result = _cli._read_token(None)
+    assert result == "hf_from_getpass"
+
+
+def test_read_token_non_tty_reads_stdin(monkeypatch):
+    import io
+    import ara.cli as _cli
+    fake_stdin = io.StringIO("hf_from_pipe\n")
+    monkeypatch.setattr("sys.stdin", fake_stdin)
+    result = _cli._read_token(None)
+    assert result == "hf_from_pipe\n"
+
+
+# --------------------------------------------------------------------------- #
+# login
+# --------------------------------------------------------------------------- #
+
+def test_render_hf_login_with_token_emits_warning(make_console, monkeypatch):
+    """--token flag → warn about shell history leakage, then proceed."""
+    state = _stub_hf_auth(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="hf_mytok")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "history" in out.lower() or "shell" in out.lower()
+    assert state.get("set_token_called") == "hf_mytok"
+
+
+def test_render_hf_login_token_logs_in_as_user(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": True, "user": "alice", "verified": True, "error": None}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="hf_tok")
+    assert rc == 0
+    assert "logged in as alice" in buf.getvalue()
+
+
+def test_render_hf_login_stdin(make_console, monkeypatch):
+    """No --token → read from _read_token (monkeypatched)."""
+    state = _stub_hf_auth(monkeypatch)
+    monkeypatch.setattr(cli, "_read_token", lambda c: "hf_stdin_tok")
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login")
+    assert rc == 0
+    assert state.get("set_token_called") == "hf_stdin_tok"
+
+
+def test_render_hf_login_rejected_returns_1(make_console, monkeypatch):
+    """set_token says saved=False/invalid → exit 1, 'rejected' message."""
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": False, "user": None, "verified": False, "error": "invalid"}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="hf_bad")
+    assert rc == 1
+    assert "rejected" in buf.getvalue().lower()
+
+
+def test_render_hf_login_empty_token_returns_1(make_console, monkeypatch):
+    """Empty token from stdin → exit 1."""
+    state = _stub_hf_auth(monkeypatch)
+    monkeypatch.setattr(cli, "_read_token", lambda c: "   ")
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login")
+    assert rc == 1
+    out = buf.getvalue()
+    assert "no token" in out.lower()
+
+
+def test_render_hf_login_empty_flag_token_returns_1(make_console, monkeypatch):
+    """--token '' (empty string) → exit 1 before calling set_token."""
+    state = _stub_hf_auth(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="")
+    assert rc == 1
+    assert "set_token_called" not in state
+
+
+def test_render_hf_login_json(monkeypatch, capsys):
+    """--json → prints JSON result, no styled output."""
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": True, "user": "alice", "verified": True, "error": None}
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "login", token="hf_tok", as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["saved"] is True and payload["user"] == "alice"
+
+
+def test_render_hf_login_offline_save_warns(make_console, monkeypatch):
+    """Offline error during verify → saved=True but emits a warn about not verified."""
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": True, "user": None, "verified": False, "error": "offline"}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="hf_tok")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "couldn't verify" in out.lower() or "offline" in out.lower()
+
+
+def test_render_hf_login_non_invalid_save_error(make_console, monkeypatch):
+    """saved=False with error not 'invalid' → 'no token provided' fallback message."""
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": False, "user": None, "verified": False, "error": "empty"}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "login", token="   x")  # non-empty so we get past the pre-check
+    assert rc == 1
+    out = buf.getvalue()
+    # "empty" error from set_token → "no token provided" message per spec
+    assert "no token" in out.lower()
+
+
+def test_render_hf_login_json_rejected(monkeypatch, capsys):
+    """--json + rejected token → JSON error, exit 1."""
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": False, "user": None, "verified": False, "error": "invalid"}
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "login", token="hf_bad", as_json=True)
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload
+
+
+def test_render_hf_login_json_empty_token(monkeypatch, capsys):
+    """--json + empty token → JSON error, exit 1."""
+    state = _stub_hf_auth(monkeypatch)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "login", token="", as_json=True)
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload
+
+
+# --------------------------------------------------------------------------- #
+# logout
+# --------------------------------------------------------------------------- #
+
+def test_render_hf_logout_present(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["clear_token_result"] = {"removed": True, "shadowed_by_env": False}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "logout")
+    assert rc == 0
+    assert "removed" in buf.getvalue().lower()
+
+
+def test_render_hf_logout_absent(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["clear_token_result"] = {"removed": False, "shadowed_by_env": False}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "logout")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "no stored" in out.lower() or "nothing" in out.lower() or "no" in out.lower()
+
+
+def test_render_hf_logout_env_shadowed(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["clear_token_result"] = {"removed": True, "shadowed_by_env": True}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "logout")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "HF_TOKEN" in out or "env" in out.lower()
+
+
+def test_render_hf_logout_json(monkeypatch, capsys):
+    state = _stub_hf_auth(monkeypatch)
+    state["clear_token_result"] = {"removed": True, "shadowed_by_env": False}
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "logout", as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] is True
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+
+def test_render_hf_status_none(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["status_result"] = {"present": False, "source": None, "user": None,
+                              "verified": None, "error": None}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "status")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "not logged in" in out.lower() or "ara hf login" in out
+
+
+def test_render_hf_status_verified(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["status_result"] = {"present": True, "source": "file", "user": "alice",
+                              "verified": True, "error": None}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "status")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "alice" in out
+
+
+def test_render_hf_status_unverified(make_console, monkeypatch):
+    state = _stub_hf_auth(monkeypatch)
+    state["status_result"] = {"present": True, "source": "env", "user": None,
+                              "verified": False, "error": "offline"}
+    c, buf = make_console()
+    rc = cli.render_hf(c, "status")
+    assert rc == 0
+    out = buf.getvalue()
+    assert "couldn't verify" in out.lower() or "offline" in out.lower()
+
+
+def test_render_hf_status_json(monkeypatch, capsys):
+    state = _stub_hf_auth(monkeypatch)
+    state["status_result"] = {"present": True, "source": "file", "user": "alice",
+                              "verified": True, "error": None}
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "status", as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["user"] == "alice" and payload["present"] is True
+
+
+# --------------------------------------------------------------------------- #
+# unknown / missing subcommand
+# --------------------------------------------------------------------------- #
+
+def test_render_hf_unknown_sub_returns_1(make_console, monkeypatch):
+    _stub_hf_auth(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_hf(c, "bogus")
+    assert rc == 1
+    out = buf.getvalue()
+    assert "bogus" in out and ("login" in out or "logout" in out or "status" in out)
+
+
+def test_render_hf_none_sub_returns_1(make_console, monkeypatch):
+    _stub_hf_auth(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_hf(c, None)
+    assert rc == 1
+
+
+def test_render_hf_unknown_sub_json(monkeypatch, capsys):
+    _stub_hf_auth(monkeypatch)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_hf(c, "bogus", as_json=True)
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "error" in payload
+
+
+# --------------------------------------------------------------------------- #
+# main() dispatch for hf
+# --------------------------------------------------------------------------- #
+
+def test_main_hf_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_hf",
+                        lambda c, sub, token=None, as_json=False: rec.update(hf=sub) or 0)
+    _run_main(monkeypatch, ["hf", "status"])
+    assert rec.get("hf") == "status"
+
+
+def test_main_hf_with_token_flag(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_hf",
+                        lambda c, sub, token=None, as_json=False:
+                        rec.update(hf=sub, hf_token=token) or 0)
+    _run_main(monkeypatch, ["hf", "login", "--token", "hf_mytok"])
+    assert rec.get("hf_token") == "hf_mytok"
+
+
+def test_main_hf_with_token_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_hf",
+                        lambda c, sub, token=None, as_json=False:
+                        rec.update(hf=sub, hf_token=token) or 0)
+    _run_main(monkeypatch, ["hf", "login", "--token=hf_eqtok"])
+    assert rec.get("hf_token") == "hf_eqtok"
+
+
+def test_main_hf_no_sub_dispatches_none(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_hf",
+                        lambda c, sub, token=None, as_json=False: rec.update(hf=sub) or 1)
+    _run_main(monkeypatch, ["hf"])
+    assert rec.get("hf") is None

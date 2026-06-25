@@ -14,8 +14,8 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, mlx, profile,
-                 calibration, pythons, serialize, status, versions)
+from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, hf_auth, mlx,
+                 profile, calibration, pythons, serialize, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -1433,6 +1433,90 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
 
 
 # --------------------------------------------------------------------------- #
+# hf login / logout / status
+# --------------------------------------------------------------------------- #
+
+def _read_token(c) -> str:
+    """Read a HF token interactively (TTY) or from piped stdin. Testable seam."""
+    import getpass
+    if sys.stdin.isatty():
+        return getpass.getpass("  paste your hugging face token (hidden): ")
+    return sys.stdin.readline()
+
+
+def render_hf(c: Console, sub: str | None, *, token: str | None = None,
+              as_json: bool = False) -> int:
+    """Dispatch hf subcommands: login / logout / status."""
+
+    def _err(msg: str) -> int:
+        if as_json:
+            print(json.dumps({"error": msg}))
+        else:
+            c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if sub == "login":
+        # Warn when token comes from --token flag (may persist in shell history).
+        if token is not None and not as_json:
+            c.emit(c.style("warn",
+                           "  note: --token may be saved in your shell history; "
+                           "prefer the interactive prompt"))
+        if token is None:
+            token = _read_token(c)
+        if not token or not token.strip():
+            return _err("no token provided")
+        res = hf_auth.set_token(token)
+        if not res["saved"]:
+            msg = ("that token was rejected by the hub"
+                   if res["error"] == "invalid" else "no token provided")
+            return _err(msg)
+        if as_json:
+            print(json.dumps({"saved": True, "user": res["user"], "verified": res["verified"]}))
+            return 0
+        if res["verified"]:
+            c.emit(c.style("good", f"  logged in as {res['user']}"))
+        else:
+            c.emit(c.style("warn",
+                           f"  token saved — couldn't verify ({res['error']})"))
+        return 0
+
+    if sub == "logout":
+        res = hf_auth.clear_token()
+        if as_json:
+            print(json.dumps(res))
+            return 0
+        if res["removed"]:
+            c.emit(c.style("good", "  removed the stored hugging face token"))
+        else:
+            c.emit(c.style("dim", "  no stored hugging face token to remove"))
+        if res["shadowed_by_env"]:
+            c.emit(c.style("warn",
+                           "  an HF_TOKEN env var is still set — "
+                           "ARA can't unset your environment"))
+        return 0
+
+    if sub == "status":
+        st = hf_auth.status()
+        if as_json:
+            print(json.dumps(st))
+            return 0
+        if not st["present"]:
+            c.emit(c.style("dim", "  not logged in — run ")
+                   + c.style("accent", "ara hf login")
+                   + c.style("dim", " (needed for gated models)"))
+            return 0
+        if st["verified"]:
+            c.emit(c.style("good", f"  logged in as {st['user']}"))
+            c.emit(c.style("dim", f"  · token from {st['source']}"))
+        else:
+            c.emit(c.style("warn",
+                           f"  token present ({st['source']}) but couldn't verify ({st['error']})"))
+        return 0
+
+    return _err(f"unknown hf subcommand {sub!r} — try one of: login, logout, status")
+
+
+# --------------------------------------------------------------------------- #
 # entry
 # --------------------------------------------------------------------------- #
 def main() -> int:
@@ -1441,9 +1525,10 @@ def main() -> int:
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
 
-    # --model / --engine / --include / --exclude take values; pull them out first.
+    # --model / --engine / --token / --include / --exclude take values; pull them out first.
     model: str | None = None
     engine: str | None = None
+    token: str | None = None
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1465,6 +1550,13 @@ def main() -> int:
             continue
         if a.startswith("--engine="):
             engine = a.split("=", 1)[1] or None
+            continue
+        if a == "--token":
+            token = argv[i + 1] if i + 1 < len(argv) else None
+            skip = True
+            continue
+        if a.startswith("--token="):
+            token = a.split("=", 1)[1]
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -1546,6 +1638,9 @@ def main() -> int:
 
     if cmd == "uninstall":
         return render_uninstall(c, engine=engine or "auto", as_json=as_json)
+
+    if cmd == "hf":
+        return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
 
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(
