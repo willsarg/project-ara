@@ -73,9 +73,30 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     ARA only invokes it (out-of-process in the cuda env). Surfaces the **effective** overhead
     (clamped to the engine's floor: ``max(default, measured)``) as ``overhead_gb`` so ARA can
     persist it; the raw measurement is in the ``"calibration"`` sub-dict for the caller to show.
+
+    If the worker fails (error dict or exception), returns an uncalibrated result with a
+    ``calibration_error`` field (never ``calibrated=True`` for unobserved data — Rule #3).
+    The safe default overhead is still in effect via ``_budget_params``; callers can detect the
+    condition via ``calibrated=False`` + presence of ``calibration_error``.
     """
-    result = engine_env.run_worker("cuda", ["-m", DEVICE_MODULE, "calibrate", model])
     limits = safe_limits()
+    try:
+        result = engine_env.run_worker("cuda", ["-m", DEVICE_MODULE, "calibrate", model])
+    except Exception as exc:
+        limits["calibrated"] = False
+        limits["overhead_gb"] = None
+        limits["calibration_error"] = (
+            f"calibration unavailable for {model!r}: {exc}"
+        )
+        return limits
+    if result.get("error"):
+        limits["calibrated"] = False
+        limits["overhead_gb"] = None
+        limits["calibration_error"] = (
+            f"calibration unavailable for {model!r}: {result['error']}"
+        )
+        limits["calibration"] = result
+        return limits
     overheads = [v for v in (result.get("measured_overhead_gb"),
                              result.get("default_overhead_gb")) if v is not None]
     limits["overhead_gb"] = max(overheads) if overheads else None

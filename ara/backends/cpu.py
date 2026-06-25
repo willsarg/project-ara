@@ -68,9 +68,22 @@ def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
-    """Characterize *model* on CPU and attach it to the limits (for the profile flow)."""
+    """Characterize *model* on CPU and attach it to the limits (for the profile flow).
+
+    If characterization fails (model unavailable, worker error), returns an uncalibrated result
+    with a ``calibration_error`` field (never ``calibrated=True`` for unobserved data — Rule #3).
+    The safe default overhead is still in effect via ``_budget_params``; callers can detect the
+    condition via ``calibrated=False`` + presence of ``calibration_error``.
+    """
     out = safe_limits()
-    out["characterization"] = characterize(model)
+    char = characterize(model)
+    if char.get("error"):
+        out["calibrated"] = False
+        out["calibration_error"] = (
+            f"calibration unavailable for {model!r}: {char['error']}"
+        )
+    else:
+        out["characterization"] = char
     return out
 
 

@@ -117,6 +117,36 @@ def test_calibrate_overhead_none_when_nothing_measured(monkeypatch):
     assert cuda.calibrate("org/calib-model")["overhead_gb"] is None
 
 
+def test_calibrate_returns_uncalibrated_on_worker_error(monkeypatch):
+    """Worker returns an error dict → calibrate() must NOT claim calibrated=True (Rule #3)."""
+    def worker(name, argv):
+        if argv[2] == "calibrate":
+            return {"error": "CUDA context initialisation failed"}
+        return dict(_LIMITS_FACTS)
+    _fake_worker(monkeypatch, worker)
+    m = cuda.calibrate("org/calib-model")
+    assert m["calibrated"] is False
+    assert m["overhead_gb"] is None
+    assert "calibration_error" in m
+    assert "org/calib-model" in m["calibration_error"]
+    assert "CUDA context initialisation failed" in m["calibration_error"]
+
+
+def test_calibrate_returns_uncalibrated_on_worker_exception(monkeypatch):
+    """Worker raises → calibrate() must NOT crash; must return uncalibrated + error (Rule #3)."""
+    def worker(name, argv):
+        if argv[2] == "calibrate":
+            raise RuntimeError("wcx engine env not installed")
+        return dict(_LIMITS_FACTS)
+    _fake_worker(monkeypatch, worker)
+    m = cuda.calibrate("org/calib-model")
+    assert m["calibrated"] is False
+    assert m["overhead_gb"] is None
+    assert "calibration_error" in m
+    assert "org/calib-model" in m["calibration_error"]
+    assert "wcx engine env not installed" in m["calibration_error"]
+
+
 class _FakeEngine:
     """Stand-in for engine_env.run_worker: answers preflight + per-ctx measurements, driven by a
     canned estimate and a linear memory model. Records every spawn."""

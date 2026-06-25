@@ -130,6 +130,20 @@ def test_calibrate_attaches_characterization(monkeypatch):
     assert out["characterization"]["safe_context"] == 8192
 
 
+def test_calibrate_returns_uncalibrated_when_characterize_errors(monkeypatch):
+    """characterize() returns an error → calibrate() must NOT claim calibrated=True (Rule #3)."""
+    monkeypatch.setattr(cpu, "safe_limits",
+                        lambda: {"wall_gb": 24.0, "calibrated": True, "overhead_gb": None})
+    monkeypatch.setattr(cpu, "characterize",
+                        lambda model: {"model": model, "safe_context": None,
+                                       "points": [], "error": "no GGUF found for org/m"})
+    out = cpu.calibrate("org/m")
+    assert out["calibrated"] is False
+    assert "calibration_error" in out
+    assert "org/m" in out["calibration_error"]
+    assert "no GGUF found for org/m" in out["calibration_error"]
+
+
 # --------------------------------------------------------------------------- #
 # generate — governed one-shot inference (Spec 2026-06-23-capability-pipeline, Slice 4)
 # --------------------------------------------------------------------------- #
