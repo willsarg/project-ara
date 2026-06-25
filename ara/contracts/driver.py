@@ -44,8 +44,15 @@ def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
 
 
 def characterize(model: str, *, preflight: Callable[[str], dict],
-                 measure: Callable[[str, int], dict], schedule: list[int]) -> dict:
-    """Drive the safe ramp for *model* using engine-supplied *preflight*/*measure* callables."""
+                 measure: Callable[[str, int], dict], schedule: list[int],
+                 kv_dtype_bytes: float = 2.0) -> dict:
+    """Drive the safe ramp for *model* using engine-supplied *preflight*/*measure* callables.
+
+    *kv_dtype_bytes* is the engine's KV-cache element size for the analytic **decode** ceiling —
+    default 2 (fp16). An engine that quantizes its KV cache passes the smaller per-element size
+    (e.g. ~1.06 for q8_0, ~0.56 for q4_0) so the decode estimate reflects the cache actually in
+    use; the driver stays engine-agnostic — it just takes a byte count, not a quant name.
+    """
     est = preflight(model)
     if "error" in est:
         return {"model": model, "safe_context": None, "points": [], "error": est["error"]}
@@ -69,7 +76,8 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     if res.fit is not None:
         meta = catalog.describe(model) or {}
         kv_slope = ramp.analytic_kv_slope_gb_per_k(
-            meta.get("n_layers"), meta.get("kv_heads"), meta.get("head_dim"))
+            meta.get("n_layers"), meta.get("kv_heads"), meta.get("head_dim"),
+            kv_dtype_bytes=kv_dtype_bytes)
         if kv_slope:
             decode_context, _ = ramp.decode_ceiling(
                 res.fit.intercept_gb, kv_slope, est["budget_gb"],

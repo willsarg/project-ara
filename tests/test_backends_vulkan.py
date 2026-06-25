@@ -204,6 +204,23 @@ def test_generate_adds_kv_quant_when_not_f16(monkeypatch):
     assert "--kv-quant" not in seen["argv"]
 
 
+def test_characterize_passes_kv_dtype_bytes_from_quant_to_driver(monkeypatch):
+    # The decode-ceiling estimate is engine-agnostic in the driver; vulkan maps kv_quant → the
+    # per-element byte count so the estimate reflects the KV cache type. Slug: 2026-06-25-vulkan-kv-cache-quant
+    seen = {}
+
+    def fake_driver(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0):
+        seen["kv_dtype_bytes"] = kv_dtype_bytes
+        return {"model": model, "safe_context": 1, "points": []}
+
+    monkeypatch.setattr(vulkan.driver, "characterize", fake_driver)
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    vulkan.characterize("org/model", kv_quant="q8_0")
+    assert seen["kv_dtype_bytes"] == vulkan._KV_BYTES["q8_0"]
+    vulkan.characterize("org/model")                       # f16 default
+    assert seen["kv_dtype_bytes"] == vulkan._KV_BYTES["f16"]
+
+
 def test_characterize_drives_shared_driver_over_vulkan_env(monkeypatch):
     est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
            "max_context": 16000, "ref_baseline_gb": 0.0}

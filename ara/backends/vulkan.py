@@ -26,6 +26,9 @@ from pathlib import Path
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
 from ara import calibration, db, engine_env
 from ara.contracts import driver
+# The worker's KV-byte map is the single source of truth for KV-quant element sizes; its module
+# top level is stdlib-only (no llama.cpp), so importing it here is engine-free.
+from ara.workers.vulkan_llama import _KV_BYTES
 
 # The built-in worker script (ships in the ARA repo, runs in the isolated vulkan env by path).
 WORKER = Path(__file__).resolve().parent.parent / "workers" / "vulkan_llama.py"
@@ -143,6 +146,7 @@ def characterize(model: str, *, progress: bool = False, flash_attn: bool = True,
                                    flash_attn=flash_attn, kv_quant=kv_quant),
             stream=progress),
         schedule=RAMP_SCHEDULE,
+        kv_dtype_bytes=_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the KV cache type
     )
 
 

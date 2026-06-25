@@ -173,6 +173,20 @@ def test_decode_context_larger_than_safe_context_when_meta_available(monkeypatch
     assert r["decode_context"] > r["safe_context"]
 
 
+def test_decode_context_scales_with_kv_dtype_bytes(monkeypatch):
+    # KV-quant: a smaller per-element byte count → smaller analytic KV slope → larger decode
+    # ceiling. The driver stays engine-agnostic (just a byte count). Slug: 2026-06-25-vulkan-kv-cache-quant
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))
+    est = _est(slope_gb_per_k=2.0)              # max_context=None → decode is memory-bound
+    common = dict(preflight=lambda m: est, measure=_linear(5.0, 2.0), schedule=[2000, 4000, 8000])
+    r_f16 = drv.characterize("m", **common, kv_dtype_bytes=2.0)
+    r_q8 = drv.characterize("m", **common, kv_dtype_bytes=34 / 32)   # q8_0
+    assert r_f16["decode_context"] is not None
+    assert r_q8["decode_context"] > r_f16["decode_context"]
+
+
 def test_decode_context_none_when_describe_returns_none(monkeypatch):
     from ara.contracts import driver as drv
     from ara import catalog
