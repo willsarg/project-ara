@@ -99,19 +99,26 @@ def free_disk_gb() -> float | None:
         return None
 
 
-def download(repo_id: str) -> None:
+def download(repo_id: str, *, progress: bool = False) -> None:
     """Download *repo_id* into the HF cache. Network + disk only, no engine load.
 
-    Hugging Face's tqdm progress bars are silenced so the caller owns the output
-    (ARA prints its own one-line status); we restore the prior setting afterward.
+    ``progress=True`` enables HF's native tqdm bars for the duration of this call;
+    ``progress=False`` (default) silences them so the caller owns the output.
+    The prior bar state is always restored in ``finally`` regardless of which path
+    ran or whether the download succeeded.
     """
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
 
     was_disabled = are_progress_bars_disabled()
-    disable_progress_bars()
+    if progress:
+        enable_progress_bars()
+    else:
+        disable_progress_bars()
     try:
         snapshot_download(repo_id)
     finally:
-        if not was_disabled:
+        if was_disabled:
+            disable_progress_bars()
+        else:
             enable_progress_bars()

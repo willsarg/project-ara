@@ -34,7 +34,7 @@ class _FakeEngine:
         self.refuse_at = refuse_at
         self.measured: list[int] = []
 
-    def __call__(self, name, argv):
+    def __call__(self, name, argv, *, stream=False):
         assert name == "cpu"
         assert argv[0].endswith("cpu_llama.py")     # script by path, no ``-m``
         model = argv[1]
@@ -52,6 +52,58 @@ def _patch(monkeypatch, fake, margin=2.0, overhead=1.0):
     monkeypatch.setattr(cpu, "_budget_params", lambda: (margin, overhead))
     monkeypatch.setattr(cpu, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
+
+
+# --------------------------------------------------------------------------- #
+# characterize(progress=...) — stream kwarg threading (2026-06-24-download-progress)
+# --------------------------------------------------------------------------- #
+class _StreamCaptureFakeEngine:
+    """Like _FakeEngine but records the stream= kwarg on every call."""
+    def __init__(self, est, intercept=5.0, slope_per_k=1.0):
+        self.est, self.intercept, self.slope = est, intercept, slope_per_k
+        self.stream_kwargs: list[bool] = []
+
+    def __call__(self, name, argv, *, stream=False):
+        self.stream_kwargs.append(stream)
+        if "--preflight" in argv:
+            return dict(self.est)
+        ctx = int(argv[2])
+        return {"context": ctx, "mem_gb": self.intercept + self.slope * (ctx / 1000)}
+
+
+_EST = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
+        "max_context": 4000, "ref_baseline_gb": 0.0}
+
+
+def test_characterize_progress_true_passes_stream_true_to_run_worker(monkeypatch):
+    """cpu.characterize(progress=True) passes stream=True to run_worker for both preflight + measure.
+
+    Slug: 2026-06-24-download-progress
+    """
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    fake = _StreamCaptureFakeEngine(_EST)
+    monkeypatch.setattr(cpu, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(cpu, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    cpu.characterize("org/model", progress=True)
+    # Every call (preflight + at least one measure) must have stream=True
+    assert len(fake.stream_kwargs) >= 2
+    assert all(s is True for s in fake.stream_kwargs)
+
+
+def test_characterize_progress_false_passes_stream_false_to_run_worker(monkeypatch):
+    """cpu.characterize(progress=False) passes stream=False to run_worker (default behaviour).
+
+    Slug: 2026-06-24-download-progress
+    """
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    fake = _StreamCaptureFakeEngine(_EST)
+    monkeypatch.setattr(cpu, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(cpu, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    cpu.characterize("org/model", progress=False)
+    assert len(fake.stream_kwargs) >= 2
+    assert all(s is False for s in fake.stream_kwargs)
 
 
 def test_characterize_drives_shared_driver_over_cpu_env(monkeypatch):
@@ -119,6 +171,15 @@ def test_calibration_model_cached_is_always_true():
 
 def test_download_calibration_model_is_noop():
     assert cpu.download_calibration_model() is None
+
+
+def test_download_calibration_model_accepts_progress_and_is_noop(monkeypatch):
+    """cpu download_calibration_model is a no-op regardless of progress flag.
+
+    Slug: 2026-06-24-download-progress
+    """
+    assert cpu.download_calibration_model(progress=True) is None
+    assert cpu.download_calibration_model(progress=False) is None
 
 
 def test_calibrate_attaches_characterization(monkeypatch):

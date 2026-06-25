@@ -905,6 +905,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     bk = get_backend(sel.backend)
+    progress = (not as_json) and sys.stderr.isatty()
     # Pre-fetch: ensure weights are in the HF cache before the engine's preflight runs.
     # Without this, the worker's blobs/ scan yields weights_gb≈0 for uncached transformers
     # models, so the a-priori safety gates (L1/L4) under-predict memory on the first rung.
@@ -923,7 +924,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             return 1
         c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
         try:
-            bk.download_calibration_model(model)
+            bk.download_calibration_model(model, progress=progress)
         except Exception as exc:
             reason = acquire.classify_repo_error(exc)
             msg = _fetch_error_msg(model, reason)
@@ -963,7 +964,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     try:
-        result = bk.characterize(model)
+        result = bk.characterize(model, progress=progress)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
         c.emit(c.style("bad", f"  characterization failed: {exc}"))
         return 1

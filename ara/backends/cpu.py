@@ -63,8 +63,10 @@ def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
     return True
 
 
-def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
-    """No-op: GGUF acquisition is lazy inside the worker (it pulls only the smallest quant)."""
+def download_calibration_model(model: str = CALIBRATION_MODEL, *,
+                               progress: bool = False) -> None:
+    """No-op: GGUF acquisition is lazy inside the worker (it pulls only the smallest quant).
+    ``progress`` is accepted for interface symmetry but ignored."""
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
@@ -106,7 +108,7 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
-def characterize(model: str) -> dict:
+def characterize(model: str, *, progress: bool = False) -> dict:
     """Measure *model*'s safe context ceiling on CPU — the thin path, same driver as Apple.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this
@@ -114,14 +116,19 @@ def characterize(model: str) -> dict:
     ``cpu_llama`` worker, budget params, and the schedule. Crash-safety is layered: the driver
     gates each rung (L1 + L2), and the worker refuses-before-load (L4) / aborts mid-probe (L5).
     Returns ``{model, safe_context, points}``.
+
+    ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible
+    during the GGUF fetch that the CPU worker handles in-process.
     """
     margin, overhead = _budget_params()
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
-            ENV_NAME, _worker_argv(m, 0, margin, overhead, preflight=True)),
+            ENV_NAME, _worker_argv(m, 0, margin, overhead, preflight=True),
+            stream=progress),
         measure=lambda m, ctx: engine_env.run_worker(
-            ENV_NAME, _worker_argv(m, ctx, margin, overhead)),
+            ENV_NAME, _worker_argv(m, ctx, margin, overhead),
+            stream=progress),
         schedule=RAMP_SCHEDULE,
     )
 

@@ -110,6 +110,97 @@ def test_download_restores_bars_even_on_error(monkeypatch):
     assert enabled == [True]  # finally-block restored bars despite the error
 
 
+# 2026-06-24-download-progress: progress=True enables bars; prior state always restored.
+def test_download_progress_true_enables_bars_when_previously_disabled(monkeypatch):
+    """progress=True: bars enabled during download; prior disabled state restored after.
+
+    Slug: 2026-06-24-download-progress
+    """
+    order = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)  # bars were off
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+
+    acquire.download("org/repo", progress=True)
+
+    # enable for the call, then restore (was_disabled=True → disable in finally)
+    assert order == ["enable", "disable"]
+
+
+def test_download_progress_true_enables_bars_when_previously_enabled(monkeypatch):
+    """progress=True: bars enabled during download; prior enabled state restored after.
+
+    Slug: 2026-06-24-download-progress
+    """
+    order = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)  # bars were on
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+
+    acquire.download("org/repo", progress=True)
+
+    # enable for the call, restore (was_disabled=False → enable in finally)
+    assert order == ["enable", "enable"]
+
+
+def test_download_progress_false_disables_bars_when_previously_enabled(monkeypatch):
+    """progress=False (default): bars disabled during download; prior enabled state restored.
+
+    Slug: 2026-06-24-download-progress
+    """
+    order = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)  # bars were on
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+
+    acquire.download("org/repo", progress=False)
+
+    # disable for the call, restore (was_disabled=False → enable in finally)
+    assert order == ["disable", "enable"]
+
+
+def test_download_progress_false_restores_disabled_state(monkeypatch):
+    """progress=False: bars disabled during download; prior disabled state kept after.
+
+    Slug: 2026-06-24-download-progress
+    """
+    order = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)  # bars were off
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+
+    acquire.download("org/repo", progress=False)
+
+    # disable for the call, restore (was_disabled=True → disable in finally)
+    assert order == ["disable", "disable"]
+
+
+def test_download_progress_true_restores_prior_state_even_on_error(monkeypatch):
+    """progress=True: prior disabled state restored even when snapshot_download raises.
+
+    Slug: 2026-06-24-download-progress
+    """
+    order = []
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)  # bars were off
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+
+    def boom(repo_id):
+        raise RuntimeError("network died")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", boom)
+
+    try:
+        acquire.download("org/repo", progress=True)
+    except RuntimeError:
+        pass
+    # enable called at start; finally restores was_disabled=True → disable called
+    assert order == ["enable", "disable"]
+
+
 def test_valid_model_id_accepts_well_formed_repo_ids():
     # org/name and bare name, with the chars HF allows in a segment.
     for ok in ("mlx-community/Qwen3-0.6B-4bit", "meta-llama/Llama-3.2-1B",

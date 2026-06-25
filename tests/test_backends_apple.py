@@ -68,9 +68,58 @@ def test_calibration_model_cached_false_on_error(monkeypatch):
 
 def test_download_calibration_model_delegates_to_acquire(monkeypatch):
     calls = []
-    monkeypatch.setattr(acquire, "download", lambda repo_id: calls.append(repo_id))
+    monkeypatch.setattr(acquire, "download", lambda repo_id, *, progress=False: calls.append(repo_id))
     apple.download_calibration_model("org/calib-model")
     assert calls == ["org/calib-model"]
+
+
+def test_download_calibration_model_passes_progress_to_acquire(monkeypatch):
+    """download_calibration_model(progress=True) passes progress=True to acquire.download.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+    monkeypatch.setattr(acquire, "download",
+                        lambda repo_id, *, progress=False: captured.update(progress=progress))
+    apple.download_calibration_model("org/m", progress=True)
+    assert captured["progress"] is True
+
+
+def test_download_calibration_model_default_progress_false(monkeypatch):
+    """download_calibration_model() default passes progress=False to acquire.download.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+    monkeypatch.setattr(acquire, "download",
+                        lambda repo_id, *, progress=False: captured.update(progress=progress))
+    apple.download_calibration_model("org/m")
+    assert captured["progress"] is False
+
+
+def test_characterize_accepts_progress_and_does_not_stream(monkeypatch):
+    """apple.characterize(progress=True) accepts progress for symmetry but does NOT pass stream
+    to run_worker — bars already ran in-process during the pre-fetch step.
+
+    Slug: 2026-06-24-download-progress
+    """
+    stream_kwargs = []
+
+    def worker(name, argv, **kwargs):
+        stream_kwargs.append(kwargs.get("stream", False))
+        model = argv[2]
+        ctx = int(argv[3])
+        if "--preflight" in argv:
+            return {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
+                    "max_context": 4000, "ref_baseline_gb": 0.0}
+        return {"context": ctx, "mem_gb": 5.0 + (ctx / 1000)}
+
+    monkeypatch.setattr(apple, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.characterize("org/m", progress=True)
+    # stream must never be True for apple — bars ran in-process during pre-fetch
+    assert all(s is False for s in stream_kwargs)
 
 
 def _calibrate_worker(monkeypatch, calibration, calls=None):

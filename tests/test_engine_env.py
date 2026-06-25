@@ -32,7 +32,7 @@ class RunSpy:
         self.responses.append((match, (rc, out, err)))
         return self
 
-    def __call__(self, cmd, *, input=None):
+    def __call__(self, cmd, *, input=None, stream=False):
         self.calls.append(cmd)
         self.inputs.append(input)
         joined = " ".join(cmd)
@@ -80,6 +80,47 @@ def test_run_coerces_none_streams_to_empty(monkeypatch):
 
     monkeypatch.setattr(engine_env.subprocess, "run", lambda *a, **k: P())
     assert engine_env._run(["x"]) == (0, "", "")
+
+
+def test_run_stream_true_uses_pipe_stdout_and_inherit_stderr(monkeypatch):
+    """stream=True: subprocess called with stdout=PIPE, stderr=None (inherits terminal).
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+
+    class P:
+        returncode = 0
+        stdout = '{"ok": true}\n'
+
+    def fake_run(cmd, *, stdout, stderr, text, input):
+        captured["stdout"] = stdout
+        captured["stderr"] = stderr
+        captured["input"] = input
+        return P()
+
+    monkeypatch.setattr(engine_env.subprocess, "run", fake_run)
+    rc, out, err = engine_env._run(["python", "worker.py"], stream=True)
+    assert captured["stdout"] == engine_env.subprocess.PIPE
+    assert captured["stderr"] is None       # passes through live — not captured
+    assert captured["input"] is None
+    assert rc == 0
+    assert out == '{"ok": true}\n'
+    assert err == ""                        # always empty on the stream path
+
+
+def test_run_stream_true_returns_empty_err(monkeypatch):
+    """stream=True always returns empty string for err (stderr not captured).
+
+    Slug: 2026-06-24-download-progress
+    """
+    class P:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(engine_env.subprocess, "run", lambda *a, **k: P())
+    rc, out, err = engine_env._run(["x"], stream=True)
+    assert err == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -248,3 +289,71 @@ def test_run_worker_raises_when_no_json(engines_root, run_spy):
     run_spy.add("python", 0, out="just logs, no json here")
     with pytest.raises(engine_env.EngineEnvError, match="no JSON"):
         engine_env.run_worker("apple", ["-c", "x"])
+
+
+# --------------------------------------------------------------------------- #
+# run_worker stream=True (2026-06-24-download-progress)
+# --------------------------------------------------------------------------- #
+def test_run_worker_stream_true_passes_stream_to_run(engines_root, monkeypatch):
+    """stream=True propagated to _run; stdout JSON still parsed correctly.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+
+    def fake_run(cmd, *, input=None, stream=False):
+        captured["stream"] = stream
+        return (0, '{"result": 42}\n', "")
+
+    monkeypatch.setattr(engine_env, "_run", fake_run)
+    result = engine_env.run_worker("apple", ["-m", "worker"], stream=True)
+    assert captured["stream"] is True
+    assert result == {"result": 42}
+
+
+def test_run_worker_stream_false_passes_stream_to_run(engines_root, monkeypatch):
+    """stream=False (default) propagated to _run.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+
+    def fake_run(cmd, *, input=None, stream=False):
+        captured["stream"] = stream
+        return (0, '{"ok": true}\n', "")
+
+    monkeypatch.setattr(engine_env, "_run", fake_run)
+    engine_env.run_worker("apple", ["-m", "worker"])
+    assert captured["stream"] is False
+
+
+def test_run_worker_stream_true_error_message_says_see_output_above(engines_root, monkeypatch):
+    """stream=True nonzero rc: error says 'see output above' (stderr wasn't captured).
+
+    Slug: 2026-06-24-download-progress
+    """
+    monkeypatch.setattr(engine_env, "_run", lambda cmd, *, input=None, stream=False: (2, "", ""))
+    with pytest.raises(engine_env.EngineEnvError, match="see output above"):
+        engine_env.run_worker("apple", ["-c", "x"], stream=True)
+
+
+def test_run_worker_stream_false_error_message_embeds_stderr(engines_root, monkeypatch):
+    """stream=False nonzero rc: error message includes the captured stderr text.
+
+    Slug: 2026-06-24-download-progress
+    """
+    monkeypatch.setattr(engine_env, "_run",
+                        lambda cmd, *, input=None, stream=False: (3, "", "traceback here"))
+    with pytest.raises(engine_env.EngineEnvError, match="traceback here"):
+        engine_env.run_worker("apple", ["-c", "x"], stream=False)
+
+
+def test_run_worker_stream_true_no_json_still_raises(engines_root, monkeypatch):
+    """stream=True with no JSON line in stdout: EngineEnvError 'no JSON' unchanged.
+
+    Slug: 2026-06-24-download-progress
+    """
+    monkeypatch.setattr(engine_env, "_run",
+                        lambda cmd, *, input=None, stream=False: (0, "logs only, no json", ""))
+    with pytest.raises(engine_env.EngineEnvError, match="no JSON"):
+        engine_env.run_worker("apple", ["-m", "w"], stream=True)

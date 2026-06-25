@@ -416,7 +416,7 @@ class FakeBackend:
     def calibration_model_cached(self, model):
         return self._cached
 
-    def download_calibration_model(self, model):
+    def download_calibration_model(self, model, *, progress=False):
         self.downloaded.append(model)
 
     def calibrate(self, model=None):   # real backends default model=CALIBRATION_MODEL
@@ -2043,11 +2043,15 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     if characterize is not None:
+        # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
+        _char = characterize
+        def _char_wrapper(m, *, progress=False):
+            return _char(m)
         monkeypatch.setattr(cli, "get_backend",
                             lambda b=None: types.SimpleNamespace(
-                                characterize=characterize,
+                                characterize=_char_wrapper,
                                 calibration_model_cached=lambda m: True,   # skip pre-fetch
-                                download_calibration_model=lambda m: None,
+                                download_calibration_model=lambda m, *, progress=False: None,
                             ))
 
 
@@ -2072,9 +2076,9 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7,
                                                     "wall_gb": 41.3, "safe_budget_gb": 39.3}),
     ))
@@ -2096,9 +2100,9 @@ def test_characterize_warns_when_calibration_unavailable(make_console, store, mo
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"calibrated": False, "overhead_gb": None, "wall_gb": None,
                            "calibration_error": "calibration unavailable for 'x': boom"},
     ))
@@ -2120,9 +2124,9 @@ def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": 15.2},
     ))
     c, buf = make_console()
@@ -2141,9 +2145,9 @@ def test_characterize_wall_line_without_budget(make_console, store, monkeypatch)
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": None},
     ))
     c, buf = make_console()
@@ -2162,9 +2166,9 @@ def test_characterize_omits_wall_line_when_wall_none(make_console, store, monkey
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": None, "safe_budget_gb": None},
     ))
     c, buf = make_console()
@@ -2182,9 +2186,9 @@ def test_characterize_persists_measured_wall_when_overhead_none(make_console, st
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": None, "wall_gb": 30.0, "safe_budget_gb": 28.0},
     ))
     c, _ = make_console()
@@ -2204,9 +2208,9 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=2.0)   # already calibrated
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m: {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
+        characterize=lambda m, *, progress=False: {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
-        download_calibration_model=lambda m: None,
+        download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 9.9}),
     ))
     c, _ = make_console()
@@ -2265,9 +2269,9 @@ def test_render_characterize_engine_flag_overrides_detected_backend(make_console
     def fake_get_backend(b=None):
         seen["backend"] = b
         return types.SimpleNamespace(
-            characterize=lambda m: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
+            characterize=lambda m, *, progress=False: {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
             calibration_model_cached=lambda m: True,   # skip pre-fetch in this test
-            download_calibration_model=lambda m: None,
+            download_calibration_model=lambda m, *, progress=False: None,
         )
 
     monkeypatch.setattr(cli, "get_backend", fake_get_backend)
@@ -2285,7 +2289,7 @@ def test_render_characterize_unknown_engine_errors(make_console, monkeypatch):
     assert "unknown engine" in buf.getvalue().lower()
 
 
-def _error_characterize(model):
+def _error_characterize(model, *, progress=False):
     # the driver shape when an engine couldn't even LOAD the model (preflight error)
     return {"model": model, "safe_context": None, "points": [], "error": "no transformers config"}
 
@@ -2352,7 +2356,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: free_gb)
 
 
-def _fake_bk_characterize(model):
+def _fake_bk_characterize(model, *, progress=False):
     return {"model": model, "safe_context": 16000, "decode_context": None, "points": [[1024, 1.2]]}
 
 
@@ -2426,7 +2430,7 @@ def _bk_download_raises(exc):
     bk = FakeBackend(_limits(), cached=False)
     bk.characterize = _fake_bk_characterize
 
-    def _boom(model):
+    def _boom(model, *, progress=False):
         raise exc
     bk.download_calibration_model = _boom
     return bk
@@ -2517,6 +2521,92 @@ def test_render_characterize_unknown_download_error(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "org/model") == 1
     assert "couldn't fetch" in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# render_characterize — progress flag threading (2026-06-24-download-progress)
+# --------------------------------------------------------------------------- #
+def _wire_characterize_progress(monkeypatch, *, backend="apple", cached=True):
+    """Wire render_characterize with a backend that captures progress kwarg on both calls.
+    Returns the capture dict: {download_progress: bool|None, characterize_progress: bool|None}.
+    """
+    captured = {}
+
+    def _download(model, *, progress=False):
+        captured["download_progress"] = progress
+
+    def _characterize(model, *, progress=False):
+        captured["characterize_progress"] = progress
+        return {"model": model, "safe_context": 8000, "decode_context": None, "points": []}
+
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=_characterize,
+        calibration_model_cached=lambda m: cached,
+        download_calibration_model=_download,
+    ))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 1.0)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 50.0)
+    return captured
+
+
+def test_render_characterize_progress_true_when_tty_and_not_json(make_console, store, monkeypatch):
+    """progress=True when stderr is a TTY and --json is not set.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = _wire_characterize_progress(monkeypatch, cached=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert captured["download_progress"] is True
+    assert captured["characterize_progress"] is True
+
+
+def test_render_characterize_progress_false_when_not_tty(make_console, store, monkeypatch):
+    """progress=False when stderr is not a TTY (piped/CI).
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = _wire_characterize_progress(monkeypatch, cached=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert captured["download_progress"] is False
+    assert captured["characterize_progress"] is False
+
+
+def test_render_characterize_progress_false_when_as_json(make_console, store, monkeypatch,
+                                                          capsys):
+    """progress=False when --json is set, even if stderr is a TTY.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = _wire_characterize_progress(monkeypatch, cached=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/M", as_json=True) == 0
+    capsys.readouterr()  # consume stdout
+    assert captured["download_progress"] is False
+    assert captured["characterize_progress"] is False
+
+
+def test_render_characterize_progress_not_passed_to_download_when_already_cached(
+        make_console, store, monkeypatch):
+    """When model is already cached, download_calibration_model is not called at all.
+    characterize still receives the correct progress value.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = _wire_characterize_progress(monkeypatch, cached=True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert "download_progress" not in captured   # download never called
+    assert captured["characterize_progress"] is True
 
 
 # --------------------------------------------------------------------------- #

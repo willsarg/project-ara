@@ -35,7 +35,7 @@ def _machine() -> Machine:
 class _FakeBackend:
     CALIBRATION_MODEL = "org/calib"
 
-    def characterize(self, model):
+    def characterize(self, model, *, progress=False):
         return {"model": model, "safe_context": 8192, "decode_context": None,
                 "binding": "context_window",
                 "points": [{"context": 512, "mem_gb": 1.2}]}   # real dict-point shape
@@ -49,7 +49,7 @@ class _FakeBackend:
     def calibration_model_cached(self, model=CALIBRATION_MODEL):
         return True
 
-    def download_calibration_model(self, model=CALIBRATION_MODEL):
+    def download_calibration_model(self, model=CALIBRATION_MODEL, *, progress=False):
         pass
 
     def calibrate(self, model=CALIBRATION_MODEL):

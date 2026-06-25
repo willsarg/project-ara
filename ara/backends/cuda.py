@@ -59,11 +59,12 @@ def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
         return False
 
 
-def download_calibration_model(model: str = CALIBRATION_MODEL) -> None:
+def download_calibration_model(model: str = CALIBRATION_MODEL, *,
+                               progress: bool = False) -> None:
     """Fetch the calibration model into the HF cache. Network + disk only."""
     from ara import acquire
 
-    acquire.download(model)
+    acquire.download(model, progress=progress)
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
@@ -124,7 +125,7 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
-def characterize(model: str) -> dict:
+def characterize(model: str, *, progress: bool = False) -> dict:
     """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
@@ -133,6 +134,9 @@ def characterize(model: str) -> dict:
     layered: the driver gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine
     refuses-before-load (L4) and a VRAM watchdog aborts mid-probe (L5). Returns
     ``{model, safe_context, points}``.
+
+    ``progress`` is accepted for interface symmetry with the cpu backend but has no effect
+    here: the HF download bar already ran in-process during the pre-fetch step.
     """
     margin, overhead = _budget_params()
     return driver.characterize(

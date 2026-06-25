@@ -47,7 +47,7 @@ def _seam_apple(monkeypatch):
 
 
 def _seam_cpu(monkeypatch):
-    def worker(name, argv):
+    def worker(name, argv, *, stream=False):
         if "--limits" in argv:
             return dict(_FACTS)
         if "--preflight" in argv:

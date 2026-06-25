@@ -80,9 +80,57 @@ def test_calibration_model_cached_false_on_error(monkeypatch):
 
 def test_download_calibration_model_delegates_to_acquire(monkeypatch):
     calls = []
-    monkeypatch.setattr(acquire, "download", lambda repo_id: calls.append(repo_id))
+    monkeypatch.setattr(acquire, "download", lambda repo_id, *, progress=False: calls.append(repo_id))
     cuda.download_calibration_model("org/calib-model")
     assert calls == ["org/calib-model"]
+
+
+def test_download_calibration_model_passes_progress_to_acquire(monkeypatch):
+    """download_calibration_model(progress=True) passes progress=True to acquire.download.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+    monkeypatch.setattr(acquire, "download",
+                        lambda repo_id, *, progress=False: captured.update(progress=progress))
+    cuda.download_calibration_model("org/m", progress=True)
+    assert captured["progress"] is True
+
+
+def test_download_calibration_model_default_progress_false(monkeypatch):
+    """download_calibration_model() default passes progress=False to acquire.download.
+
+    Slug: 2026-06-24-download-progress
+    """
+    captured = {}
+    monkeypatch.setattr(acquire, "download",
+                        lambda repo_id, *, progress=False: captured.update(progress=progress))
+    cuda.download_calibration_model("org/m")
+    assert captured["progress"] is False
+
+
+def test_characterize_accepts_progress_and_does_not_stream(monkeypatch):
+    """cuda.characterize(progress=True) accepts progress for symmetry but does NOT pass stream
+    to run_worker — bars already ran in-process during the pre-fetch step.
+
+    Slug: 2026-06-24-download-progress
+    """
+    stream_kwargs = []
+
+    def worker(name, argv, **kwargs):
+        stream_kwargs.append(kwargs.get("stream", False))
+        ctx = int(argv[3])
+        if "--preflight" in argv:
+            return {"base_gb": 1.0, "slope_gb_per_k": 0.2, "budget_gb": 7.0,
+                    "max_context": 4000, "ref_baseline_gb": 0.0}
+        return {"context": ctx, "mem_gb": 1.0 + 0.2 * (ctx / 1000)}
+
+    monkeypatch.setattr(cuda, "_budget_params", lambda: (1.0, 0.6))
+    monkeypatch.setattr(cuda, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    cuda.characterize("org/m", progress=True)
+    # stream must never be True for cuda — bars ran in-process during pre-fetch
+    assert all(s is False for s in stream_kwargs)
 
 
 def _calibrate_worker(monkeypatch, calibration, calls=None):

@@ -40,8 +40,17 @@ class EngineEnvError(RuntimeError):
     """An engine env operation (create / worker call) failed."""
 
 
-def _run(cmd: list[str], *, input: str | None = None) -> tuple[int, str, str]:
-    """Run a command, return (returncode, stdout, stderr). The one external boundary."""
+def _run(cmd: list[str], *, input: str | None = None,
+         stream: bool = False) -> tuple[int, str, str]:
+    """Run a command, return (returncode, stdout, stderr). The one external boundary.
+
+    ``stream=False`` (default): capture both stdout and stderr, return all three.
+    ``stream=True``: capture stdout only; stderr passes through live to the terminal
+    (so HF download bars show). Returns ``(rc, stdout, "")``.
+    """
+    if stream:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True, input=input)
+        return proc.returncode, proc.stdout or "", ""
     proc = subprocess.run(cmd, capture_output=True, text=True, input=input)
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
@@ -118,16 +127,24 @@ def remove(name: str) -> bool:
     return True
 
 
-def run_worker(name: str, args: list[str], *, input: str | None = None) -> dict:
+def run_worker(name: str, args: list[str], *, input: str | None = None,
+               stream: bool = False) -> dict:
     """Spawn engine *name*'s python with *args*, return the single JSON object it emits.
 
     The worker prints one ``{...}`` line to stdout (other lines are ignored as logs),
     mirroring ``wmx_suite.probe_worker``. Raises :class:`EngineEnvError` on a non-zero
     exit or if no JSON line is found.
+
+    ``stream=False`` (default): stderr is captured and included in error messages.
+    ``stream=True``: stderr passes through live to the terminal (e.g. so HF download
+    bars show during the CPU worker's GGUF fetch); error messages say to check output
+    above since stderr wasn't captured.
     """
     cmd = [str(python_path(name)), *args]
-    rc, out, err = _run(cmd, input=input)
+    rc, out, err = _run(cmd, input=input, stream=stream)
     if rc != 0:
+        if stream:
+            raise EngineEnvError(f"worker {name!r} exited {rc} (see output above)")
         raise EngineEnvError(f"worker {name!r} exited {rc}: {err.strip()}")
     line = next((ln for ln in out.splitlines() if ln.lstrip().startswith("{")), None)
     if line is None:
