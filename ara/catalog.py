@@ -92,8 +92,13 @@ def _quant_from_filename(path: str) -> str | None:
 
 
 def _describe_gguf(model_id: str) -> dict | None:
-    """Architecture metadata from a cached GGUF file header, or None if unavailable."""
-    path = _cached_gguf_path(model_id)
+    """Architecture metadata from a GGUF file header, or None if unavailable.
+
+    *model_id* may be a local ``.gguf`` path (read directly — a loose file on disk, e.g. a local
+    model library) or an HF repo id (located in the cache). (Slug: 2026-06-25-local-gguf-cli-support)
+    """
+    path = (model_id if (model_id.endswith(".gguf") and os.path.isfile(model_id))
+            else _cached_gguf_path(model_id))
     if path is None:
         return None
     try:

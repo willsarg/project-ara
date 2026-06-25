@@ -3523,7 +3523,21 @@ def test_run_rejects_malformed_model_id(make_console, monkeypatch):
     _wire_run(monkeypatch, characterization=_CHAR)
     c, buf = make_console()
     assert cli.render_run(c, "--oops", prompt="hi") == 1
-    assert "invalid model id" in buf.getvalue()
+    assert "invalid model" in buf.getvalue()
+
+
+def test_run_accepts_local_gguf_path(make_console, monkeypatch, tmp_path):
+    # A local .gguf path passes the guard (the worker resolves it); uncharacterized here, so it
+    # reaches the 'not characterized' message — proving the guard accepted the path.
+    # Slug: 2026-06-25-local-gguf-cli-support
+    f = tmp_path / "Local-Q4_K_M.gguf"
+    f.write_bytes(b"\x00")
+    _wire_run(monkeypatch, characterization=None)
+    c, buf = make_console()
+    assert cli.render_run(c, str(f), prompt="hi") == 1
+    out = buf.getvalue()
+    assert "invalid model" not in out          # guard accepted the local path
+    assert "isn't characterized" in out
 
 
 def test_characterize_rejects_malformed_model_id(make_console, monkeypatch):
@@ -3531,7 +3545,21 @@ def test_characterize_rejects_malformed_model_id(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
     c, buf = make_console()
     assert cli.render_characterize(c, "bad=id") == 1
-    assert "invalid model id" in buf.getvalue()
+    assert "invalid model" in buf.getvalue()
+
+
+def test_characterize_accepts_local_gguf_path(make_console, store, monkeypatch, tmp_path):
+    # A local .gguf path passes the guard and flows through to a measured ceiling.
+    # Slug: 2026-06-25-local-gguf-cli-support
+    f = tmp_path / "Local-Q4_K_M.gguf"
+    f.write_bytes(b"\x00")
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 12345,
+                                               "decode_context": None, "points": [[512, 1.0]]})
+    c, buf = make_console()
+    assert cli.render_characterize(c, str(f)) == 0
+    assert "12345" in buf.getvalue()
+    assert "invalid model" not in buf.getvalue()
 
 
 # =========================================================================== #

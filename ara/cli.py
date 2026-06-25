@@ -892,8 +892,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    if not acquire.valid_model_id(model):
-        msg = f"invalid model id {model!r} — expected a Hugging Face repo id (org/name)"
+    if not acquire.valid_model_ref(model):
+        msg = (f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
+               f"or a local .gguf file path")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
     engine_ok, engine_pkg = engine_status(sel.backend)
@@ -1171,8 +1172,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}")
     if not prompt:
         return err("usage: ara run <model> <prompt>")
-    if not acquire.valid_model_id(model):
-        return err(f"invalid model id {model!r} — expected a Hugging Face repo id (org/name)")
+    if not acquire.valid_model_ref(model):
+        return err(f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
+                   f"or a local .gguf file path")
 
     con = db.connect()
     mk = profile.machine_key()

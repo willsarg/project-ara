@@ -11,6 +11,7 @@ HUGGING_FACE_HUB_TOKEN for gated ones, or HF_ENDPOINT for a mirror.
 """
 from __future__ import annotations
 
+import os
 import re
 
 # Headroom we insist on beyond the raw download, so a fetch never fills the disk
@@ -29,6 +30,23 @@ def valid_model_id(model: str) -> bool:
     """True if *model* is a well-formed HF repo id (``org/name`` or ``name``), safe to pass as a
     worker argv positional. Rejects flag-like / traversal / malformed values."""
     return isinstance(model, str) and _MODEL_ID_RE.match(model) is not None
+
+
+def is_local_gguf(model: str) -> bool:
+    """True if *model* points at an existing local ``.gguf`` file that's safe as a worker argv
+    positional (never flag-like). The engine workers already resolve a ``.gguf`` path directly, so
+    this lets the CLI accept loose GGUF files on disk (e.g. a local model library) without
+    weakening the repo-id guard. The leading-``-`` ban preserves the argv-injection guarantee — a
+    real file path is a safe positional. (Slug: 2026-06-25-local-gguf-cli-support)"""
+    return (isinstance(model, str) and model.endswith(".gguf")
+            and not model.startswith("-") and os.path.isfile(model))
+
+
+def valid_model_ref(model: str) -> bool:
+    """True if *model* is a usable model reference safe to pass to an engine worker: a well-formed
+    HF repo id, or a local ``.gguf`` file path. The single guard the CLI applies before a model
+    becomes worker argv. (Slug: 2026-06-25-local-gguf-cli-support)"""
+    return valid_model_id(model) or is_local_gguf(model)
 
 
 _REASON_GATED = "gated"

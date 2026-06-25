@@ -218,6 +218,37 @@ def test_valid_model_id_rejects_flag_like_and_malformed():
 
 
 # --------------------------------------------------------------------------- #
+# is_local_gguf / valid_model_ref — accept loose local GGUF files (the local model library)
+# Slug: 2026-06-25-local-gguf-cli-support
+# --------------------------------------------------------------------------- #
+def test_is_local_gguf_accepts_existing_gguf_file(tmp_path):
+    f = tmp_path / "Model-Q4_K_M.gguf"
+    f.write_bytes(b"\x00")
+    assert acquire.is_local_gguf(str(f)) is True
+
+
+def test_is_local_gguf_rejects_missing_non_gguf_flaglike_and_nonstr(tmp_path):
+    txt = tmp_path / "model.txt"
+    txt.write_bytes(b"\x00")
+    assert acquire.is_local_gguf(str(tmp_path / "nope.gguf")) is False   # doesn't exist
+    assert acquire.is_local_gguf(str(txt)) is False                       # not .gguf
+    assert acquire.is_local_gguf("-evil.gguf") is False                   # flag-like (leading dash)
+    assert acquire.is_local_gguf(12345) is False                          # not a str
+
+
+def test_valid_model_ref_accepts_repo_id_and_local_gguf(tmp_path):
+    f = tmp_path / "Model-Q4_K_M.gguf"
+    f.write_bytes(b"\x00")
+    assert acquire.valid_model_ref("org/name") is True       # repo id
+    assert acquire.valid_model_ref(str(f)) is True           # local .gguf file
+
+
+def test_valid_model_ref_rejects_flag_like_and_malformed():
+    for bad in ("--evil", "a=b", "a b", "-rf"):
+        assert acquire.valid_model_ref(bad) is False
+
+
+# --------------------------------------------------------------------------- #
 # classify_repo_error — maps HF exceptions to a small set of honest reasons
 # --------------------------------------------------------------------------- #
 def _fake_response(status_code=500):

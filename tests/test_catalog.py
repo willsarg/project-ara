@@ -134,6 +134,21 @@ def test_describe_gguf_full_mapping(monkeypatch):
     assert d["quant"] == "Q4_K_M"
 
 
+def test_describe_gguf_reads_a_local_path_directly(tmp_path, monkeypatch):
+    # A loose local .gguf file is read directly, NOT via the HF cache — the local-model-library
+    # path. Slug: 2026-06-25-local-gguf-cli-support
+    f = tmp_path / "MyModel-Q4_K_M.gguf"
+    f.write_bytes(b"\x00")
+
+    def _no_cache(m):
+        raise AssertionError("a local .gguf path must not consult the HF cache")
+
+    monkeypatch.setattr(catalog, "_cached_gguf_path", _no_cache)
+    monkeypatch.setattr(catalog, "_gguf_fields", lambda p: _gguf_fields_fake(include_kv=True))
+    d = catalog._describe_gguf(str(f))
+    assert d["n_layers"] == 30 and d["quant"] == "Q4_K_M"
+
+
 def test_describe_gguf_kv_heads_falls_back_to_head_count(monkeypatch):
     monkeypatch.setattr(catalog, "_cached_gguf_path", lambda m: "org/repo-Q4_K_M.gguf")
     monkeypatch.setattr(catalog, "_gguf_fields", lambda p: _gguf_fields_fake(include_kv=False))
