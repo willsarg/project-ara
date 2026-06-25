@@ -144,3 +144,17 @@ def test_generate_returns_completion_when_safe(monkeypatch):
     out = w.generate("org/m", 4000, "meaning?", margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
     assert out == {"context": 4000, "completion": " 42"}
     assert seen == {"n_ctx": 4000, "prompt": "meaning?", "max_tokens": 8}   # KV capped at ceiling
+
+
+def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
+    """Rule #1 (Safety): the ambient baseline must take the MAX of repeated reads, never the
+    min — an under-reported baseline over-states headroom, a crash-wall trap. base_gb =
+    used_gb + model_base is checked >= budget to refuse, so under-counting `used` is unsafe."""
+    import types
+
+    import psutil
+
+    reads = iter([1.0 * w.GIB, 3.0 * w.GIB, 2.0 * w.GIB])
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: types.SimpleNamespace(used=next(reads)))
+    assert w._used_gb() == pytest.approx(3.0)   # max(1,3,2) GiB, not min (1.0)

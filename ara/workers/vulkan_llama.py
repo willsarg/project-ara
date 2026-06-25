@@ -169,10 +169,15 @@ def offload_ok(device: dict | None, offloaded: tuple[int, int] | None) -> str | 
 # Engine-touching helpers (import llama_cpp / psutil / huggingface_hub inside).
 # --------------------------------------------------------------------------- #
 def _used_gb() -> float:
-    """Live system RAM in use right now (GB) — the ambient baseline (GTT counts here too)."""
+    """Live system RAM in use right now (GB) — the ambient baseline (GTT counts here too).
+
+    Takes the MAX of a few reads (Rule #1): the baseline is added to the model footprint and
+    checked against the safe budget, so under-reporting it over-states headroom — a crash-wall
+    trap. The conservative read is the highest sample, never the lowest.
+    """
     import psutil
 
-    return min(psutil.virtual_memory().used for _ in range(3)) / GIB
+    return max(psutil.virtual_memory().used for _ in range(3)) / GIB
 
 
 def _total_gb() -> float:

@@ -12,6 +12,8 @@ Slug: 2026-06-25-vulkan-amd-engine-lane
 """
 from __future__ import annotations
 
+import pytest
+
 from ara.workers import vulkan_llama as w
 
 
@@ -176,3 +178,16 @@ def test_limits_from_reports_shared_ram_wall():
                       margin_gb=1.1)
     assert d["wall_gb"] == 11.0 and d["safe_budget_gb"] == 9.9
     assert d["device"] == "GPU (Vulkan)"
+
+
+def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
+    """Rule #1 (Safety): the ambient baseline must take the MAX of repeated reads, never the
+    min — an under-reported baseline over-states headroom, a crash-wall trap."""
+    import types
+
+    import psutil
+
+    reads = iter([1.0 * w.GIB, 3.0 * w.GIB, 2.0 * w.GIB])
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: types.SimpleNamespace(used=next(reads)))
+    assert w._used_gb() == pytest.approx(3.0)   # max(1,3,2) GiB, not min (1.0)
