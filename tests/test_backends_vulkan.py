@@ -101,6 +101,66 @@ def test_characterize_progress_false_passes_stream_false_to_run_worker(monkeypat
     assert all(s is False for s in fake.stream_kwargs)
 
 
+# --------------------------------------------------------------------------- #
+# flash-attention plumbing (on by default; --no-flash-attn disables it)
+# Slug: 2026-06-25-vulkan-flash-attention
+# --------------------------------------------------------------------------- #
+def test_worker_argv_omits_flag_by_default_and_adds_it_when_disabled():
+    assert "--no-flash-attn" not in vulkan._worker_argv("m", 100, 2.0, 1.0)
+    assert "--no-flash-attn" in vulkan._worker_argv("m", 100, 2.0, 1.0, flash_attn=False)
+
+
+def test_characterize_threads_no_flash_attn_to_every_worker_call(monkeypatch):
+    seen = []
+
+    def fake(name, argv, *, stream=False):
+        seen.append(argv)
+        if "--preflight" in argv:
+            return dict(_EST)
+        return {"context": int(argv[2]), "mem_gb": 5.0 + int(argv[2]) / 1000}
+
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    vulkan.characterize("org/model", flash_attn=False)
+    assert seen and all("--no-flash-attn" in a for a in seen)
+
+
+def test_characterize_default_has_flash_attn_on(monkeypatch):
+    seen = []
+
+    def fake(name, argv, *, stream=False):
+        seen.append(argv)
+        if "--preflight" in argv:
+            return dict(_EST)
+        return {"context": int(argv[2]), "mem_gb": 5.0 + int(argv[2]) / 1000}
+
+    monkeypatch.setattr(catalog, "describe", lambda m: None)
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(fake)}))
+    vulkan.characterize("org/model")
+    assert seen and not any("--no-flash-attn" in a for a in seen)
+
+
+def test_generate_adds_no_flash_attn_when_disabled(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 8192, "completion": "x"}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    vulkan.generate("org/model", "hi", max_context=8192, flash_attn=False)
+    assert "--no-flash-attn" in seen["argv"]
+    # default keeps FA on (no flag)
+    vulkan.generate("org/model", "hi", max_context=8192)
+    assert "--no-flash-attn" not in seen["argv"]
+
+
 def test_characterize_drives_shared_driver_over_vulkan_env(monkeypatch):
     est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
            "max_context": 16000, "ref_baseline_gb": 0.0}

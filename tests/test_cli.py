@@ -87,8 +87,9 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
-                        lambda c, m, engine=None, as_json=False:
-                        (rec.update(characterize=m, characterize_engine=engine) or 0))
+                        lambda c, m, engine=None, as_json=False, flash_attn=True:
+                        (rec.update(characterize=m, characterize_engine=engine,
+                                    characterize_fa=flash_attn) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
@@ -136,6 +137,33 @@ def test_main_status(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["status"])
     assert rec["status"] is False
+
+
+# --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention
+def test_main_run_flash_attn_on_by_default(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["run", "org/m", "hello"])
+    assert rec["run"]["flash_attn"] is True
+    assert rec["run"]["model"] == "org/m"
+
+
+def test_main_run_no_flash_attn_disables_and_is_not_in_prompt(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["run", "org/m", "hello", "--no-flash-attn"])
+    assert rec["run"]["flash_attn"] is False
+    assert rec["run"]["prompt"] == "hello"   # the flag is filtered out of the positional prompt
+
+
+def test_main_characterize_no_flash_attn(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/m", "--no-flash-attn"])
+    assert rec["characterize_fa"] is False
+
+
+def test_main_characterize_flash_attn_on_by_default(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/m"])
+    assert rec["characterize_fa"] is True
 
 
 def test_main_profile_model_separate_value(monkeypatch):
@@ -3560,6 +3588,47 @@ def test_characterize_accepts_local_gguf_path(make_console, store, monkeypatch, 
     assert cli.render_characterize(c, str(f)) == 0
     assert "12345" in buf.getvalue()
     assert "invalid model" not in buf.getvalue()
+
+
+def test_characterize_threads_flash_attn_to_vulkan_backend(make_console, store, monkeypatch):
+    # flash-attention is a vulkan-only kwarg; render_characterize passes it only on that engine.
+    # Slug: 2026-06-25-vulkan-flash-attention
+    seen = {}
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "llama.cpp (Vulkan)"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+
+    def char(m, *, progress=False, flash_attn=True):
+        seen["flash_attn"] = flash_attn
+        return {"model": m, "safe_context": 9000, "decode_context": None, "points": [[512, 1.0]]}
+
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=char, calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m, *, progress=False: None))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/m", engine="vulkan", flash_attn=False) == 0
+    assert seen["flash_attn"] is False
+
+
+def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
+    # Slug: 2026-06-25-vulkan-flash-attention
+    seen = {}
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "llama.cpp (Vulkan)"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": 8000})
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+
+    def gen(model, prompt, *, max_context, max_tokens, flash_attn=True):
+        seen["flash_attn"] = flash_attn
+        return {"context": max_context, "completion": "hi"}
+
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(generate=gen))
+    c, _ = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="vulkan", flash_attn=False) == 0
+    assert seen["flash_attn"] is False
 
 
 # =========================================================================== #

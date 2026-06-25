@@ -212,7 +212,7 @@ def _read_meta(gguf_path: str) -> dict:
     return dict(llm.metadata)
 
 
-def _probe(gguf_path: str, ctx: int, abort_gb: float) -> dict:
+def _probe(gguf_path: str, ctx: int, abort_gb: float, flash_attn: bool = True) -> dict:
     """Load *gguf_path* at *ctx* fully offloaded to the GPU; return its footprint.
 
     Footprint = Δ(GPU used, from GTT/VRAM sysfs) + Δ(process RSS) — the total system memory the
@@ -242,7 +242,8 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float) -> dict:
     try:
         from llama_cpp import Llama
 
-        llm = Llama(model_path=gguf_path, n_ctx=ctx, n_gpu_layers=-1, verbose=True)
+        llm = Llama(model_path=gguf_path, n_ctx=ctx, n_gpu_layers=-1,
+                    flash_attn=flash_attn, verbose=True)
         llm.eval([llm.token_bos()])         # fault weights resident + touch the KV cache
         gpu_delta = max(0.0, _gpu_used_gb() - gpu0)
         rss_delta = max(0.0, proc.memory_info().rss / GIB - rss0)
@@ -254,7 +255,8 @@ def _probe(gguf_path: str, ctx: int, abort_gb: float) -> dict:
         stop.set()
 
 
-def _run_probe_child(gguf_path: str, ctx: int, abort_gb: float) -> dict:
+def _run_probe_child(gguf_path: str, ctx: int, abort_gb: float,
+                     flash_attn: bool = True) -> dict:
     """Run one ``--probe`` child (clean baseline per repeat) and capture its stderr.
 
     The child's stderr carries llama.cpp's device + offload logs (C-level fd-2 writes, captured
@@ -262,6 +264,8 @@ def _run_probe_child(gguf_path: str, ctx: int, abort_gb: float) -> dict:
     happen, attaching the observed Vulkan device fact (Rule #3)."""
     cmd = [sys.executable, os.path.abspath(__file__), "--probe", gguf_path, str(ctx),
            "--abort-gb", str(abort_gb)]
+    if not flash_attn:
+        cmd.append("--no-flash-attn")
     out = subprocess.run(cmd, capture_output=True, text=True)
     line = next((ln for ln in out.stdout.splitlines() if ln.lstrip().startswith("{")), None)
     if line is None:
@@ -330,7 +334,7 @@ def _refused(ctx: int, reason: str) -> dict:
 
 
 def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
-        repeats: int = DEFAULT_REPEATS) -> dict:
+        flash_attn: bool = True, repeats: int = DEFAULT_REPEATS) -> dict:
     """Gate (L4) then, if safe, measure the GPU+CPU footprint at *ctx* (median of repeats)."""
     try:
         gguf = _resolve_gguf(model)
@@ -346,7 +350,7 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
         return _refused(ctx, reason)
     deltas = []
     for _ in range(max(1, repeats)):
-        raw = _run_probe_child(gguf, ctx, budget)
+        raw = _run_probe_child(gguf, ctx, budget, flash_attn)
         if raw.get("status") != "ok":
             return _refused(ctx, f"probe failed: {raw.get('note', 'no output')}")
         deltas.append(raw["delta_gb"])
@@ -354,7 +358,7 @@ def run(model: str, ctx: int, *, margin_gb: float, overhead_gb: float,
 
 
 def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb: float,
-             max_tokens: int) -> dict:
+             max_tokens: int, flash_attn: bool = True) -> dict:
     """Gate (L4) then, if safe, load fully offloaded with the KV cache capped at *ctx* (the
     governed safe ceiling) and return a one-shot completion. ``ctx`` is ARA's characterized
     ceiling, so generation never allocates past it."""
@@ -372,7 +376,8 @@ def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb
         return _refused(ctx, reason)
     from llama_cpp import Llama
 
-    llm = Llama(model_path=gguf, n_ctx=ctx, n_gpu_layers=-1, verbose=False)
+    llm = Llama(model_path=gguf, n_ctx=ctx, n_gpu_layers=-1,
+                flash_attn=flash_attn, verbose=False)
     out = llm.create_completion(prompt, max_tokens=max_tokens)
     return {"context": ctx, "completion": out["choices"][0]["text"]}
 
@@ -395,21 +400,25 @@ def main(argv=None) -> None:
     ap.add_argument("--generate", action="store_true",
                     help="one-shot completion at <ctx> (the governed ceiling); prompt on stdin")
     ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--no-flash-attn", action="store_true",
+                    help="disable Vulkan flash-attention (on by default; FA ~doubles the context "
+                         "ceiling at a small prefill cost). Off favours prompt-processing speed.")
     args = ap.parse_args(argv)
+    flash_attn = not args.no_flash_attn
 
     if args.limits:
         result = limits(margin_gb=args.margin)
     elif args.probe:
-        result = _probe(args.model, args.ctx, args.abort_gb)
+        result = _probe(args.model, args.ctx, args.abort_gb, flash_attn)
     elif args.preflight:
         result = preflight(args.model, margin_gb=args.margin, overhead_gb=args.overhead)
     elif args.generate:
         result = generate(args.model, args.ctx, sys.stdin.read(),
                           margin_gb=args.margin, overhead_gb=args.overhead,
-                          max_tokens=args.max_tokens)
+                          max_tokens=args.max_tokens, flash_attn=flash_attn)
     else:
         result = run(args.model, args.ctx, margin_gb=args.margin,
-                     overhead_gb=args.overhead, repeats=args.repeats)
+                     overhead_gb=args.overhead, flash_attn=flash_attn, repeats=args.repeats)
     print(json.dumps(result), flush=True)
 
 

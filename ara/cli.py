@@ -880,7 +880,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
 
 
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
-                        as_json: bool = False) -> int:
+                        as_json: bool = False, flash_attn: bool = True) -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
@@ -964,8 +964,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+    # flash-attention is a vulkan-only lever (FA ~doubles the context ceiling on an AMD iGPU);
+    # other engines don't accept the kwarg, so only pass it through when it applies.
+    fa_kw = {"flash_attn": flash_attn} if sel.backend == "vulkan" else {}
     try:
-        result = bk.characterize(model, progress=progress)
+        result = bk.characterize(model, progress=progress, **fa_kw)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
         c.emit(c.style("bad", f"  characterization failed: {exc}"))
         return 1
@@ -1157,7 +1160,7 @@ RUN_MAX_TOKENS = 256
 
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
                assume_yes: bool = False, as_json: bool = False,
-               max_tokens: int = RUN_MAX_TOKENS) -> int:
+               max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True) -> int:
     """Governed one-shot inference: generate a completion for *model*, capped at its characterized
     safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
     the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
@@ -1240,8 +1243,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
+    # flash-attention is a vulkan-only lever; pass it through only when running on that engine.
+    fa_kw = {"flash_attn": flash_attn} if backend == "vulkan" else {}
     try:
-        result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens)
+        result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if result.get("refused"):
@@ -1529,6 +1534,7 @@ def main() -> int:
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
+    flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
 
     # --model / --engine / --token / --include / --exclude take values; pull them out first.
     model: str | None = None
@@ -1574,7 +1580,7 @@ def main() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y"):
+        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
@@ -1623,7 +1629,8 @@ def main() -> int:
         if len(rest) < 2:
             c.emit(c.style("warn", "  usage: ara characterize <model>"))
             return 1
-        return render_characterize(c, rest[1], engine=engine, as_json=as_json)
+        return render_characterize(c, rest[1], engine=engine, as_json=as_json,
+                                   flash_attn=flash_attn)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -1636,7 +1643,8 @@ def main() -> int:
             c.emit(c.style("warn", "  usage: ara run <model> <prompt>"))
             return 1
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
-                          engine=engine, assume_yes=assume_yes, as_json=as_json)
+                          engine=engine, assume_yes=assume_yes, as_json=as_json,
+                          flash_attn=flash_attn)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)
