@@ -887,6 +887,29 @@ def _kv_quant_error(kv_quant: str) -> str:
     return (f"invalid --kv-quant {kv_quant!r} — choose one of: {', '.join(_KV_QUANT_CHOICES)}")
 
 
+# Which context levers each engine actually honors at the ARA level. Rule #3: a lever the engine
+# can't honor is REJECTED with a clear message, never silently dropped. Mirrors _kv_fa_kwargs.
+_ENGINE_LEVERS = {
+    "vulkan": {"kv_quant", "flash_attn"},
+    "cuda": {"kv_quant", "flash_attn"},
+    "apple": {"kv_quant"},        # MLX's SDPA is always fused — no flash-attn knob
+    "cpu": set(),                  # llama.cpp cache-type / flash aren't wired at the ARA level yet
+}
+
+
+def _unsupported_lever_error(backend: str, *, kv_quant: str, flash_attn: bool,
+                             flash_attn_optin: bool) -> str | None:
+    """A clear message when the user EXPLICITLY set a context lever the selected engine can't honor
+    — else None. Honesty (Rule #3): reject rather than silently ignore the flag. A flash flag is
+    'explicit' when --no-flash-attn turned the default off, or --flash-attn opted in."""
+    levers = _ENGINE_LEVERS.get(backend, set())
+    if kv_quant != "f16" and "kv_quant" not in levers:
+        return f"--kv-quant isn't supported on the {backend} engine (it runs an fp16 KV cache)"
+    if ((not flash_attn) or flash_attn_optin) and "flash_attn" not in levers:
+        return f"flash-attention isn't a tunable setting on the {backend} engine"
+    return None
+
+
 def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
                  kv_quant: str) -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
@@ -935,6 +958,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if kv_quant not in _KV_QUANT_CHOICES:
         msg = _kv_quant_error(kv_quant)
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant,
+                                         flash_attn=flash_attn, flash_attn_optin=flash_attn_optin)
+    if lever_err is not None:
+        print(json.dumps({"error": lever_err})) if as_json else c.emit(c.style("bad", f"  {lever_err}"))
         return 1
     engine_ok, engine_pkg = engine_status(sel.backend)
     if not engine_ok:
@@ -1275,6 +1303,11 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
         engine_key = max(runnable, key=lambda k: runnable[k][0])
         safe, backend, _ = runnable[engine_key]
+
+    lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant,
+                                         flash_attn=flash_attn, flash_attn_optin=flash_attn_optin)
+    if lever_err is not None:
+        return err(lever_err)
 
     engine_ok, engine_pkg = engine_status(backend)
     if not engine_ok:

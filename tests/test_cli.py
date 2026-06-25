@@ -2022,6 +2022,47 @@ def test_kv_fa_kwargs_per_backend():
     assert cli._kv_fa_kwargs("cpu", flash_attn=True, flash_attn_optin=True, kv_quant="f16") == {}
 
 
+def test_unsupported_lever_error():
+    # kv-quant on an fp16-only engine → rejected; flash on apple (SDPA fused) → rejected
+    assert "kv-quant" in cli._unsupported_lever_error(
+        "cpu", kv_quant="q4_0", flash_attn=True, flash_attn_optin=False)
+    assert "flash" in cli._unsupported_lever_error(
+        "apple", kv_quant="f16", flash_attn=True, flash_attn_optin=True)     # --flash-attn
+    assert "flash" in cli._unsupported_lever_error(
+        "apple", kv_quant="f16", flash_attn=False, flash_attn_optin=False)   # --no-flash-attn
+    # supported combos and bare defaults → no error
+    assert cli._unsupported_lever_error(
+        "cuda", kv_quant="q4_0", flash_attn=True, flash_attn_optin=True) is None
+    assert cli._unsupported_lever_error(
+        "apple", kv_quant="q8_0", flash_attn=True, flash_attn_optin=False) is None
+    assert cli._unsupported_lever_error(
+        "cpu", kv_quant="f16", flash_attn=True, flash_attn_optin=False) is None
+
+
+def test_render_characterize_rejects_unsupported_lever(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cpu")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M", kv_quant="q4_0") == 1
+    assert "kv-quant" in buf.getvalue() and "cpu" in buf.getvalue()
+
+
+def test_render_characterize_rejects_unsupported_lever_json(monkeypatch, capsys):
+    _wire_characterize(monkeypatch, backend="cpu")
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "org/M", kv_quant="q4_0", as_json=True) == 1
+    assert "kv-quant" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_render_run_rejects_unsupported_lever(monkeypatch, capsys):
+    _wire_run_cross(monkeypatch, detected="cpu",
+                    chars={"cpu": {"model_id": "org/m", "safe_context": 4096}},
+                    supports={"cpu": True})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True,
+                          kv_quant="q4_0") == 1
+    assert "kv-quant" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_flash_sdpa_note_warns_when_cuda_incapable(make_console):
     c, buf = make_console()
     bk = types.SimpleNamespace(flash_attn_capable=lambda: False)
