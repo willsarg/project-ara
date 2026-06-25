@@ -268,10 +268,19 @@ def test_run_none_when_fewer_than_two_points():
 # analytic_kv_slope_gb_per_k — decode slope from model metadata
 # --------------------------------------------------------------------------- #
 def test_analytic_kv_slope_known_numbers():
-    # 2 * 32 layers * 8 kv_heads * 128 head_dim * 2 bytes / 1e9 * 1000 = ~0.13107 GB/1k
+    # 2 * 32 layers * 8 kv_heads * 128 head_dim * 2 bytes per token, in BINARY GiB/1k tokens —
+    # the same unit as budget/baseline/intercept everywhere else (Rule #1/#3: one unit per solve).
     slope = ramp.analytic_kv_slope_gb_per_k(32, 8, 128)
-    expected = 2 * 32 * 8 * 128 * 2 / 1e9 * 1000
+    expected = 2 * 32 * 8 * 128 * 2 / (1024 ** 3) * 1000
     assert slope == pytest.approx(expected)
+
+
+def test_analytic_kv_slope_uses_binary_gib_not_decimal_gb():
+    # Guard the unit explicitly: the GiB result is ~7.37% smaller than the old decimal-GB bug.
+    slope = ramp.analytic_kv_slope_gb_per_k(32, 8, 128)
+    decimal_gb = 2 * 32 * 8 * 128 * 2 / 1e9 * 1000
+    assert slope == pytest.approx(decimal_gb * 1e9 / (1024 ** 3))
+    assert slope < decimal_gb
 
 
 def test_analytic_kv_slope_none_when_n_layers_is_none():

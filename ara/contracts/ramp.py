@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Memory is binary GiB everywhere in ARA (detect/workers/fits all divide bytes by 1024**3 and
+# call it "gb"). The analytic KV slope must use the SAME unit, or the ceiling solve mixes a GiB
+# budget/baseline with a decimal-GB slope — a ~7.37% dimensional error (Rule #1/#3).
+GIB = 1024 ** 3
+
 
 class RampError(ValueError):
     """The measured points can't support a fit (too few, or no distinct contexts)."""
@@ -208,10 +213,12 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
     if any dimension is missing or zero (can't estimate). Uses TOTAL n_layers (over-counts KV for
     sliding-window models → conservative) and fp16 KV by default (engines that quantize KV get
     more headroom → conservative). This is an estimate, not a measurement.
+
+    In binary GiB per 1000 tokens (``GIB``), matching budget/baseline/intercept — see the GIB note.
     """
     if not (n_layers and kv_heads and head_dim):
         return None
-    return 2 * n_layers * kv_heads * head_dim * kv_dtype_bytes / 1e9 * 1000
+    return 2 * n_layers * kv_heads * head_dim * kv_dtype_bytes / GIB * 1000
 
 
 def decode_ceiling(intercept_gb, kv_slope_gb_per_k, budget_gb, ref_baseline_gb=0.0,
