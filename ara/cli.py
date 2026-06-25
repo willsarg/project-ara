@@ -887,21 +887,35 @@ def _kv_quant_error(kv_quant: str) -> str:
     return (f"invalid --kv-quant {kv_quant!r} — choose one of: {', '.join(_KV_QUANT_CHOICES)}")
 
 
-def _kv_fa_kwargs(backend: str, *, flash_attn: bool, kv_quant: str) -> dict:
+def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
+                 kv_quant: str) -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
-    on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes; flash-attention is a
-    vulkan-only knob here (MLX's SDPA is always fused; CUDA's attention selector is a later slice).
-    Other engines accept neither."""
+    on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes. Flash-attention has
+    OPPOSITE defaults per engine: vulkan's llama.cpp FA is on-by-default (``flash_attn``, the
+    ``--no-flash-attn`` opt-out), while CUDA defaults to SDPA with FA2 an availability-gated opt-in
+    (``flash_attn_optin``, the ``--flash-attn`` flag). MLX's SDPA is always fused (no knob)."""
     if backend == "vulkan":
         return {"flash_attn": flash_attn, "kv_quant": kv_quant}
-    if backend in ("apple", "cuda"):
+    if backend == "cuda":
+        return {"kv_quant": kv_quant, "flash_attn": flash_attn_optin}
+    if backend == "apple":
         return {"kv_quant": kv_quant}
     return {}
 
 
+def _flash_sdpa_note(c: Console, bk, backend: str, flash_attn_optin: bool,
+                     as_json: bool) -> None:
+    """Honesty (Rule #3): when the user opts into --flash-attn but this GPU can't run FA2, say so
+    — the run silently uses SDPA otherwise. Only the CUDA backend exposes the capability check.
+    Skipped under --json (a styled line would corrupt the parse)."""
+    if (not as_json and flash_attn_optin and backend == "cuda"
+            and hasattr(bk, "flash_attn_capable") and not bk.flash_attn_capable()):
+        c.emit(c.style("dim", "  flash-attn (FA2) needs an Ampere+ GPU — using SDPA"))
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
-                        kv_quant: str = "f16") -> int:
+                        flash_attn_optin: bool = False, kv_quant: str = "f16") -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
@@ -989,7 +1003,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, kv_quant=kv_quant)
+    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn,
+                          flash_attn_optin=flash_attn_optin, kv_quant=kv_quant)
+    _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
     except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
@@ -1191,7 +1207,7 @@ RUN_MAX_TOKENS = 256
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
                assume_yes: bool = False, as_json: bool = False,
                max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
-               kv_quant: str = "f16") -> int:
+               flash_attn_optin: bool = False, kv_quant: str = "f16") -> int:
     """Governed one-shot inference: generate a completion for *model*, capped at its characterized
     safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
     the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
@@ -1276,7 +1292,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
-    fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, kv_quant=kv_quant)
+    fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn,
+                          flash_attn_optin=flash_attn_optin, kv_quant=kv_quant)
+    _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
         result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
@@ -1581,6 +1599,7 @@ def _main_impl() -> int:
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
+    flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
 
     # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
     model: str | None = None
@@ -1634,7 +1653,7 @@ def _main_impl() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn"):
+        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn", "--flash-attn"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
@@ -1688,7 +1707,8 @@ def _main_impl() -> int:
         if len(rest) < 2:
             return _arg_err("usage: ara characterize <model>")
         return render_characterize(c, rest[1], engine=engine, as_json=as_json,
-                                   flash_attn=flash_attn, kv_quant=kv_quant)
+                                   flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                                   kv_quant=kv_quant)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -1701,7 +1721,8 @@ def _main_impl() -> int:
             return _arg_err("usage: ara run <model> <prompt>")
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
                           engine=engine, assume_yes=assume_yes, as_json=as_json,
-                          flash_attn=flash_attn, kv_quant=kv_quant)
+                          flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                          kv_quant=kv_quant)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)

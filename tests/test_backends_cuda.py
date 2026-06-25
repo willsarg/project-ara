@@ -361,3 +361,34 @@ def test_generate_appends_kv_bits_for_quant(monkeypatch):
         lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 8192, "completion": "x"})}))
     cuda.generate("org/m", "hi", max_context=8192, max_tokens=64, kv_quant="q8_0")
     assert seen["argv"][seen["argv"].index("--kv-bits") + 1] == "8"
+
+
+# --------------------------------------------------------------------------- #
+# Flash-attention: SDPA default, FA2 opt-in (--flash-attn), availability-gated
+# --------------------------------------------------------------------------- #
+def test_worker_argv_appends_flash_attn_when_opted_in():
+    assert "--flash-attn" in cuda._worker_argv("org/m", 2000, 1.0, 0.6, flash_attn=True)
+    assert "--flash-attn" not in cuda._worker_argv("org/m", 2000, 1.0, 0.6)   # SDPA default
+
+
+def test_generate_appends_flash_attn_when_opted_in(monkeypatch):
+    seen = {}
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 8192, "completion": "x"})}))
+    cuda.generate("org/m", "hi", max_context=8192, max_tokens=64, flash_attn=True)
+    assert "--flash-attn" in seen["argv"]
+
+
+def test_flash_attn_capable_reads_device_worker(monkeypatch):
+    monkeypatch.setattr(cuda, "safe_limits", lambda: {"flash_attn_capable": True})
+    assert cuda.flash_attn_capable() is True
+    monkeypatch.setattr(cuda, "safe_limits", lambda: {"flash_attn_capable": False})
+    assert cuda.flash_attn_capable() is False
+
+
+def test_flash_attn_capable_false_when_worker_errors(monkeypatch):
+    def boom():
+        raise RuntimeError("no GPU")
+    monkeypatch.setattr(cuda, "safe_limits", boom)
+    assert cuda.flash_attn_capable() is False

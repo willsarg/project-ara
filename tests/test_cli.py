@@ -87,9 +87,11 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
-                        lambda c, m, engine=None, as_json=False, flash_attn=True, kv_quant="f16":
+                        lambda c, m, engine=None, as_json=False, flash_attn=True,
+                        flash_attn_optin=False, kv_quant="f16":
                         (rec.update(characterize=m, characterize_engine=engine,
-                                    characterize_fa=flash_attn, characterize_kv=kv_quant) or 0))
+                                    characterize_fa=flash_attn, characterize_fa_optin=flash_attn_optin,
+                                    characterize_kv=kv_quant) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
@@ -1851,7 +1853,7 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
     def backend(b=None):
         bk = types.SimpleNamespace()
         if supports.get(b):
-            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16": {
+            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False: {
                 "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
         return bk
     monkeypatch.setattr(cli, "get_backend", backend)
@@ -2004,6 +2006,60 @@ def test_main_search_dispatch(monkeypatch):
 def test_main_search_no_query(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["search"]) == 1
     assert "usage: ara search" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Context-lever kwargs + flash-attention (SDPA default, FA2 opt-in on CUDA)
+# --------------------------------------------------------------------------- #
+def test_kv_fa_kwargs_per_backend():
+    assert cli._kv_fa_kwargs("vulkan", flash_attn=True, flash_attn_optin=False,
+                             kv_quant="q4_0") == {"flash_attn": True, "kv_quant": "q4_0"}
+    # cuda: flash is the OPT-IN (default off → SDPA), kv-quant carried
+    assert cli._kv_fa_kwargs("cuda", flash_attn=True, flash_attn_optin=True,
+                             kv_quant="q8_0") == {"kv_quant": "q8_0", "flash_attn": True}
+    assert cli._kv_fa_kwargs("apple", flash_attn=True, flash_attn_optin=True,
+                             kv_quant="f16") == {"kv_quant": "f16"}
+    assert cli._kv_fa_kwargs("cpu", flash_attn=True, flash_attn_optin=True, kv_quant="f16") == {}
+
+
+def test_flash_sdpa_note_warns_when_cuda_incapable(make_console):
+    c, buf = make_console()
+    bk = types.SimpleNamespace(flash_attn_capable=lambda: False)
+    cli._flash_sdpa_note(c, bk, "cuda", True, False)
+    assert "SDPA" in buf.getvalue()
+
+
+def test_flash_sdpa_note_silent_when_capable(make_console):
+    c, buf = make_console()
+    bk = types.SimpleNamespace(flash_attn_capable=lambda: True)
+    cli._flash_sdpa_note(c, bk, "cuda", True, False)
+    assert buf.getvalue() == ""
+
+
+def test_flash_sdpa_note_skipped_under_json(make_console):
+    c, buf = make_console()
+    bk = types.SimpleNamespace(flash_attn_capable=lambda: False)
+    cli._flash_sdpa_note(c, bk, "cuda", True, True)        # as_json → no styled line
+    assert buf.getvalue() == ""
+
+
+def test_flash_sdpa_note_silent_without_optin(make_console):
+    c, buf = make_console()
+    bk = types.SimpleNamespace(flash_attn_capable=lambda: False)
+    cli._flash_sdpa_note(c, bk, "cuda", False, False)      # no opt-in → nothing to say
+    assert buf.getvalue() == ""
+
+
+def test_main_characterize_flash_attn_optin(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--flash-attn"])
+    assert rec["characterize_fa_optin"] is True
+
+
+def test_main_characterize_flash_attn_optin_default_false(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M"])
+    assert rec["characterize_fa_optin"] is False
 
 
 # --------------------------------------------------------------------------- #
