@@ -987,6 +987,20 @@ def test_resolve_want_command_without_sections_warns(make_console):
     assert "don't apply to 'profile'" in buf.getvalue()
 
 
+def test_resolve_want_suppresses_advisory_warnings_under_json(make_console):
+    # Rule #3 (Honesty): advisory --include/--exclude warnings are styled text; under --json they
+    # would corrupt the parse, so they're suppressed. The section filter still applies.
+    c, buf = make_console()
+    pred = cli._resolve_want("detect", ["bogus"], [], c, as_json=True)
+    assert buf.getvalue() == "" and pred is not None
+
+
+def test_resolve_want_command_without_sections_quiet_under_json(make_console):
+    c, buf = make_console()
+    assert cli._resolve_want("profile", ["x"], [], c, as_json=True) is None
+    assert buf.getvalue() == ""
+
+
 # =========================================================================== #
 # render_apps
 # =========================================================================== #
@@ -1971,6 +1985,14 @@ def test_render_search_json(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)[0]["id"] == "a"
 
 
+def test_render_search_failure_json(monkeypatch, capsys):
+    # Rule #3 (Honesty): a failed search under --json must emit {"error": ...}, not styled text.
+    monkeypatch.setattr(cli.hub, "search", lambda q: None)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_search(c, "x", as_json=True) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
 def test_main_search_dispatch(monkeypatch):
     seen = {}
     monkeypatch.setattr(cli, "render_search",
@@ -1982,6 +2004,42 @@ def test_main_search_dispatch(monkeypatch):
 def test_main_search_no_query(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["search"]) == 1
     assert "usage: ara search" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# --json honesty (Rule #3): usage errors, unknown commands, and uncaught
+# exceptions must all emit {"error": ...} under --json, never styled text or a
+# traceback that breaks a JSON consumer.
+# --------------------------------------------------------------------------- #
+def test_main_usage_errors_json(monkeypatch, capsys):
+    for argv in (["search"], ["characterize"], ["run"]):
+        assert _run_main(monkeypatch, [*argv, "--json"]) == 1
+        assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_main_unknown_command_json(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["bogus", "--json"]) == 1
+    assert "isn't built yet" in json.loads(capsys.readouterr().out)["error"]
+
+
+def _raise_engine_env(*a, **k):
+    raise RuntimeError("worker crashed")
+
+
+def test_main_uncaught_exception_json_emits_error(monkeypatch, capsys):
+    # The front-door guard: an exception bubbling out of a renderer (e.g. EngineEnvError) under
+    # --json becomes a structured error, not a raw traceback.
+    monkeypatch.setattr(cli, "render_detect", _raise_engine_env)
+    assert _run_main(monkeypatch, ["detect", "--json"]) == 1
+    assert "worker crashed" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_uncaught_exception_without_json_propagates(monkeypatch):
+    # Without --json, behaviour is unchanged: the exception propagates (the friendly-diagnostics
+    # work is a separate backlog item; this guard is scoped to --json honesty only).
+    monkeypatch.setattr(cli, "render_detect", _raise_engine_env)
+    with pytest.raises(RuntimeError, match="worker crashed"):
+        _run_main(monkeypatch, ["detect"])
 
 
 # --------------------------------------------------------------------------- #

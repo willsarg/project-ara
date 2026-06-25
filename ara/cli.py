@@ -89,12 +89,15 @@ def _section_filter(include, exclude):
     return (lambda k: k in inc) if inc else (lambda k: k not in exc)
 
 
-def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console):
+def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console, *,
+                  as_json: bool = False):
     """Build the section predicate for *cmd*, normalizing aliases and warning on unknowns.
-    Returns None when the command has no sections to filter."""
+    Returns None when the command has no sections to filter. The advisory warnings are styled
+    text, so they're suppressed under --json (Rule #3) — they'd corrupt the JSON parse; the
+    filter still applies."""
     valid = _RECON_SECTIONS.get(cmd)
     if valid is None:
-        if include or exclude:
+        if (include or exclude) and not as_json:
             c.emit(c.style("warn", f"  --include/--exclude don't apply to '{cmd}'"))
             c.emit()
         return None
@@ -104,7 +107,7 @@ def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console):
 
     inc, exc = norm(include), norm(exclude)
     unknown = [s for s in (*inc, *exc) if s not in valid]
-    if unknown:
+    if unknown and not as_json:
         c.emit(c.style("warn", f"  unknown section(s) for {cmd}: {', '.join(dict.fromkeys(unknown))}"))
         c.emit(c.style("dim", f"  valid: {', '.join(valid)}"))
         c.emit()
@@ -1036,8 +1039,12 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     """Search the Hugging Face Hub for models (engine-agnostic)."""
     results = hub.search(query)
     if results is None:
-        c.emit(c.style("warn", "  couldn't search — is the hf CLI installed? ")
-               + c.style("accent", "pip install huggingface_hub"))
+        if as_json:
+            print(json.dumps({"error": "couldn't search — is the hf CLI installed? "
+                                       "(pip install huggingface_hub)"}))
+        else:
+            c.emit(c.style("warn", "  couldn't search — is the hf CLI installed? ")
+                   + c.style("accent", "pip install huggingface_hub"))
         return 1
     if as_json:
         print(json.dumps(results, indent=2))
@@ -1554,6 +1561,20 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
 # entry
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
+    ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
+    can't parse. Without ``--json`` the exception propagates unchanged (friendlier front-door
+    diagnostics are a separate backlog item). KeyboardInterrupt / SystemExit are not caught."""
+    try:
+        return _main_impl()
+    except Exception as exc:   # noqa: BLE001 — deliberate front-door --json honesty guard
+        if "--json" in sys.argv[1:]:
+            print(json.dumps({"error": f"ara failed: {exc}"}))
+            return 1
+        raise
+
+
+def _main_impl() -> int:
     argv = sys.argv[1:]
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
@@ -1617,13 +1638,19 @@ def main() -> int:
         rest.append(a)
     c = Console.from_env(verbose=verbose)
 
+    def _arg_err(msg: str) -> int:
+        """Usage / dispatch error: structured JSON under --json, styled warn otherwise (Rule #3)."""
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("warn", f"  {msg}"))
+        return 1
+
     if not rest or rest[0] in ("-h", "--help"):
         render_landing(c)
         return 0
 
     cmd = rest[0]
     # Section filtering is shared across the recon commands; build the predicate once.
-    want = _resolve_want(cmd, include, exclude, c) if (include or exclude) else None
+    want = (_resolve_want(cmd, include, exclude, c, as_json=as_json)
+            if (include or exclude) else None)
 
     if cmd == "detect":
         render_detect(c, as_json=as_json, want=want)
@@ -1653,14 +1680,12 @@ def main() -> int:
 
     if cmd == "search":
         if len(rest) < 2:
-            c.emit(c.style("warn", "  usage: ara search <query>"))
-            return 1
+            return _arg_err("usage: ara search <query>")
         return render_search(c, " ".join(rest[1:]), as_json=as_json)
 
     if cmd == "characterize":
         if len(rest) < 2:
-            c.emit(c.style("warn", "  usage: ara characterize <model>"))
-            return 1
+            return _arg_err("usage: ara characterize <model>")
         return render_characterize(c, rest[1], engine=engine, as_json=as_json,
                                    flash_attn=flash_attn, kv_quant=kv_quant)
 
@@ -1672,8 +1697,7 @@ def main() -> int:
 
     if cmd == "run":
         if len(rest) < 2:
-            c.emit(c.style("warn", "  usage: ara run <model> <prompt>"))
-            return 1
+            return _arg_err("usage: ara run <model> <prompt>")
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
                           engine=engine, assume_yes=assume_yes, as_json=as_json,
                           flash_attn=flash_attn, kv_quant=kv_quant)
@@ -1687,6 +1711,8 @@ def main() -> int:
     if cmd == "hf":
         return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
 
+    if as_json:
+        return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
     c.emit(
         c.style("dim", "  run ") + c.style("accent", "ara")
