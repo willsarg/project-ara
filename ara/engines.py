@@ -74,6 +74,30 @@ ENGINES: dict[str, dict] = {
                 "max_version": "0.3.19",
             },
         },
+        "wheel_platforms": ("Windows",),   # the abetlen CPU index serves only Windows wheels
+        "python": "3.12",
+    },
+    "vulkan": {
+        "backend": "vulkan",
+        "package": "llama.cpp (Vulkan)",
+        "available": True,
+        "builtin": True,           # worker ships in ARA; only its deps install into the env
+        "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
+        "model_kinds": ("gguf",),
+        # GPU-offload GGUF via llama.cpp's Vulkan backend (opt-in, --engine vulkan). Prebuilt
+        # Vulkan wheels exist for x86_64 Linux + Windows on the project's own index (default PyPI
+        # ships no llama-cpp-python wheel at all). We MUST force the prebuilt Vulkan wheel from
+        # that index: a plain `llama-cpp-python` install hands back the `cpu` engine's CPU-only
+        # wheel from uv's cache (same version, no GGML_VULKAN) — verified. `--only-binary` (added
+        # in _builtin_targets) makes it deterministic (no silent source-build fallback); pinned to
+        # the newest Vulkan wheel. Kept AFTER `cpu` so engine_for_model's GGUF default stays `cpu`.
+        "wheel_only": {
+            "llama-cpp-python": {
+                "index": "https://abetlen.github.io/llama-cpp-python/whl/vulkan",
+                "max_version": "0.3.31",
+            },
+        },
+        "wheel_platforms": ("Linux", "Windows"),
         "python": "3.12",
     },
 }
@@ -130,9 +154,9 @@ class InstallResult:
     detail: str = ""
 
 
-def _cap_for_windows(req: str, wheels: dict) -> str:
+def _cap_to_wheel_max(req: str, wheels: dict) -> str:
     """Append a wheel-compatible version ceiling to requirement *req* if it's a ``wheel_only``
-    package with a ``max_version`` (the newest prebuilt wheel that runs on a baseline CPU).
+    package with a ``max_version`` (the newest prebuilt wheel on the engine's index).
     Leaves the requirement's own floor intact (``llama-cpp-python>=0.3`` → ``…>=0.3,<=0.3.19``).
     """
     name = re.match(r"[A-Za-z0-9._-]+", req).group(0)
@@ -143,26 +167,28 @@ def _cap_for_windows(req: str, wheels: dict) -> str:
 
 
 def _builtin_targets(engine: dict) -> list[str]:
-    """uv-pip args for a builtin engine: its package list, with Windows wheel handling.
+    """uv-pip args for a builtin engine: its package list, with prebuilt-wheel handling.
 
-    On Windows, every ``wheel_only`` package (no PyPI wheel, can't build without MSVC) is
+    On the platforms an engine lists in ``wheel_platforms``, every ``wheel_only`` package is
     forced to a prebuilt wheel from its index (``--only-binary`` makes that deterministic — no
-    silent source-build fallback) and capped at its ``max_version``. Off Windows the source
-    build picks the host's own ISA, so the list passes through untouched.
+    silent source-build fallback) and capped at its ``max_version``. This covers two cases: the
+    ``cpu`` engine on Windows (no MSVC → can't source-build), and the ``vulkan`` engine on
+    x86_64 Linux/Windows (a plain install would resolve to the CPU-only wheel from cache). On any
+    other platform the source build picks the host's own ISA, so the list passes through untouched.
     """
     wheels = engine.get("wheel_only") or {}
-    if not wheels or platform.system() != "Windows":
+    if not wheels or platform.system() not in engine.get("wheel_platforms", ()):
         return list(engine["packages"])
     flags: list[str] = []
     for pkg, spec in wheels.items():
         flags += ["--only-binary", pkg, "--extra-index-url", spec["index"]]
-    return [*flags, *(_cap_for_windows(req, wheels) for req in engine["packages"])]
+    return [*flags, *(_cap_to_wheel_max(req, wheels) for req in engine["packages"])]
 
 
 def _install_targets(key: str) -> list[str]:
     """The trailing ``uv pip install`` args (pip flags + targets) for engine *key*'s env.
 
-    Built-in engines install a plain package list (with Windows prebuilt-wheel handling — see
+    Built-in engines install a plain package list (with per-platform prebuilt-wheel handling — see
     :func:`_builtin_targets`). External suites install their source: a git/remote ``spec``
     (folding in an ``extras`` group via a PEP 508 direct reference) or a local path installed
     editable (``-e``) for dev. Any ``pip_args`` (e.g. ``--torch-backend=auto`` to fetch the

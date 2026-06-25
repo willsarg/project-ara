@@ -163,8 +163,16 @@ def test_cpu_features_arm_with_bf16(set_platform, run_stub):
 
 
 def test_cpu_features_x86_flags(set_platform, run_stub, monkeypatch):
-    # Intel Mac: no /proc/cpuinfo, so flags come from sysctl (via the run_stub).
+    # Intel Mac (any host without /proc/cpuinfo): flags come from sysctl. Force the except branch
+    # deterministically — on a real Linux host /proc/cpuinfo reads fine, so without this the test
+    # silently exercises the proc branch instead and leaves the sysctl fallback uncovered (caught
+    # on rog-ubuntu, where the Z1's real cpuinfo happens to contain the same flags).
     set_platform("Darwin", "x86_64")
+
+    def _no_proc(self):
+        raise FileNotFoundError("/proc/cpuinfo")
+
+    monkeypatch.setattr(detect.Path, "read_text", _no_proc)
     run_stub.add("machdep.cpu", "fpu avx2 avx avx512f sse4_2 bmi1")
     feats = detect._cpu_features()
     assert feats == ["AVX-512", "AVX2", "AVX", "SSE4.2"]

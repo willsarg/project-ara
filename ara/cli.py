@@ -260,7 +260,7 @@ def _det_memory_detail(c: Console, m) -> None:
         c.emit(c.field("  modules", "(not reported on this system)"))
 
 
-_ARA_ENGINE_BACKENDS = {"cuda", "mlx"}   # backends ARA can actually run today
+_ARA_ENGINE_BACKENDS = {"cuda", "mlx", "vulkan"}   # backends ARA can actually run today
 _RUNTIME_LABEL = {"vulkan": "Vulkan", "cuda": "CUDA", "mlx": "MLX", "rocm": "ROCm"}
 
 

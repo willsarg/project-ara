@@ -37,6 +37,7 @@ def test_resolve_passes_through_explicit_engine():
     assert engines.resolve("wmx") == "wmx"
     assert engines.resolve("wcx") == "wcx"
     assert engines.resolve("cpu") == "cpu"
+    assert engines.resolve("vulkan") == "vulkan"
 
 
 def test_resolve_auto_uses_hardware_pick(monkeypatch):
@@ -57,6 +58,7 @@ def test_for_backend_maps_backend_to_engine():
     assert engines.for_backend("apple") == "wmx"
     assert engines.for_backend("cuda") == "wcx"
     assert engines.for_backend("cpu") == "cpu"
+    assert engines.for_backend("vulkan") == "vulkan"
     assert engines.for_backend("unsupported") is None
 
 
@@ -113,6 +115,37 @@ def test_install_targets_cpu_forces_prebuilt_wheel_on_windows(monkeypatch):
     # abetlen wheels are AVX-512-only and fault on CPUs without it); other deps pass through.
     assert targets[4:] == [
         f"llama-cpp-python>=0.3,<={spec['max_version']}", "psutil", "huggingface_hub"]
+
+
+def test_install_targets_vulkan_forces_prebuilt_wheel_on_linux(monkeypatch):
+    # The Vulkan engine MUST pull the prebuilt Vulkan wheel from the project's own index on
+    # x86_64 Linux: a plain install would resolve llama-cpp-python to the `cpu` engine's
+    # CPU-only wheel from uv's cache (same version, no GGML_VULKAN). `--only-binary` makes it
+    # deterministic. (Slug: 2026-06-25-vulkan-amd-engine-lane)
+    monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
+    targets = engines._install_targets("vulkan")
+    spec = engines.ENGINES["vulkan"]["wheel_only"]["llama-cpp-python"]
+    assert spec["index"].endswith("/whl/vulkan")
+    assert targets[:4] == [
+        "--only-binary", "llama-cpp-python", "--extra-index-url", spec["index"]]
+    assert targets[4:] == [
+        f"llama-cpp-python>=0.3,<={spec['max_version']}", "psutil", "huggingface_hub"]
+
+
+def test_install_targets_vulkan_forces_prebuilt_wheel_on_windows(monkeypatch):
+    # Windows also has prebuilt Vulkan wheels on the index → same forced-wheel path.
+    monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
+    targets = engines._install_targets("vulkan")
+    spec = engines.ENGINES["vulkan"]["wheel_only"]["llama-cpp-python"]
+    assert targets[:4] == [
+        "--only-binary", "llama-cpp-python", "--extra-index-url", spec["index"]]
+
+
+def test_install_targets_vulkan_plain_on_macos(monkeypatch):
+    # macOS isn't in vulkan's wheel_platforms (no Vulkan there — it's Metal/MLX country), so the
+    # package list passes through untouched rather than forcing a non-existent wheel.
+    monkeypatch.setattr(engines.platform, "system", lambda: "Darwin")
+    assert engines._install_targets("vulkan") == engines.ENGINES["vulkan"]["packages"]
 
 
 def test_install_targets_external_git_spec(monkeypatch):
@@ -254,8 +287,15 @@ def test_uninstall_removes_the_env(monkeypatch):
 # model_kinds — every shipping engine declares which model formats it accepts
 # --------------------------------------------------------------------------- #
 def test_every_shipping_engine_has_model_kinds():
-    for key in ("wmx", "wcx", "cpu"):
+    for key in ("wmx", "wcx", "cpu", "vulkan"):
         assert "model_kinds" in engines.ENGINES[key], f"{key!r} missing model_kinds"
+
+
+def test_vulkan_is_gguf_capable_but_cpu_stays_the_gguf_default():
+    # vulkan also accepts GGUF, but it's ordered AFTER cpu so the cheap classifier still defaults
+    # a bare .gguf to the CPU engine (vulkan is opt-in via --engine). (2026-06-25-vulkan-amd-engine-lane)
+    assert "gguf" in engines.ENGINES["vulkan"]["model_kinds"]
+    assert engines.engine_for_model("model-Q4_K_M.gguf") == "cpu"
 
 
 # --------------------------------------------------------------------------- #

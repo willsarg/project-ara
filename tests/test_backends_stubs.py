@@ -16,7 +16,7 @@ import pytest
 
 # (module, expected contract class named in the docstring)
 _STUBS = [
-    ("ara.backends.rocm", "ramp"),        # AMD GPU (Radeon + APU/Strix)
+    # AMD GPU (Radeon + APU) now ships as the real `vulkan` backend — no longer a stub.
     ("ara.backends.oneapi", "ramp"),      # Intel Arc / iGPU
     ("ara.backends.ane", "graph-fit"),    # Apple Neural Engine
     ("ara.backends.xdna", "graph-fit"),   # AMD Ryzen AI NPU

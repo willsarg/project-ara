@@ -3337,8 +3337,9 @@ def _fake_machine(**over):
     return _machine(**over)
 
 
-def test_accelerator_amd_vulkan_present_not_usable(make_console):
-    # accel.kind none, but a Vulkan-usable AMD iGPU present → reported, engine-coming hint
+def test_accelerator_amd_vulkan_present_usable(make_console):
+    # accel.kind none, but a Vulkan-usable AMD iGPU present → reported as usable (the `vulkan`
+    # engine ships now: `ara ... --engine vulkan`), no engine-coming hint.
     from ara import detect
     c, out = make_console(verbose=True)
     m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
@@ -3350,8 +3351,27 @@ def test_accelerator_amd_vulkan_present_not_usable(make_console):
     s = out.getvalue()
     assert "AMD Radeon 780M" in s
     assert "Vulkan 1.4.318 · radv · coopmat" in s
-    assert "engine coming" in s
+    assert "usable" in s
+    assert "engine coming" not in s
     assert "no GPU detected" not in s
+
+
+def test_accelerator_detected_backend_without_shipped_engine_shows_coming(make_console):
+    # The forward-looking seam: a usable_backend that detection knows but ARA doesn't yet run
+    # (not in _ARA_ENGINE_BACKENDS) renders the honest "engine coming (not yet runnable)" hint.
+    # `vulkan` graduated out of this branch; the next backend (e.g. a discrete-Radeon ROCm lane)
+    # would land here until its engine ships.
+    from ara import detect
+    c, out = make_console(verbose=True)
+    m = _fake_machine(accel=detect.Accelerator("none", "none detected", None, None),
+                      gpus=[GpuInfo(vendor="amd", name="Radeon RX 7900 XTX",
+                            vram_gb=24.0, integrated=False,
+                            compute_runtime="ROCm 6.1",
+                            usable_backend="rocm")])
+    cli._det_accelerator(c, m)
+    s = out.getvalue()
+    assert "Radeon RX 7900 XTX" in s
+    assert "engine coming (not yet runnable)" in s
 
 
 def test_accelerator_empty_still_says_none(make_console):
