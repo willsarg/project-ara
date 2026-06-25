@@ -781,7 +781,7 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# profile (measures — crosses the seam into the engine)
+# characterize (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
     # The tag must match the data source: a measured wall reads as measured; without one it's

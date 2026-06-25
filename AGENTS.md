@@ -8,7 +8,7 @@ workflow (setup, landing a change); this covers the **why** and the **rules**.
 
 **Project ARA — "AI Runs Anywhere."** A tool you reach for to **honestly assess any machine
 with a Python runtime for AI workloads**, then run local models safely on whatever hardware
-is present. Apple Silicon is the first running backend; recon works everywhere.
+is present. Apple Silicon (MLX), NVIDIA (CUDA), and any CPU all run models today; recon works everywhere.
 
 ### The three rules (the invariant core)
 
@@ -17,7 +17,7 @@ workloads on any infrastructure"* — **is** three numbered rules. Every change,
 system, answers to all three. Canonical statement: the private vault's `ARA - Product` note.
 
 1. **Safety** — *don't crash the system.* Never exceed the memory wall; run right up to the safe
-   edge and no further. In ARA's core this means **recon is read-only** and **`profile` is
+   edge and no further. In ARA's core this means **recon is read-only** and **`characterize` is
    consent-gated** (see Hard rules); the engines (wmx/wcx) enforce the wall when they measure and
    launch.
 2. **Reliability** — *every component is properly tested.* `fail_under = 100` (statement + branch);
@@ -36,9 +36,13 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
   - `python` — every interpreter + its AI libraries + install cautions.
   - `apps` — installed AI/ML apps, versions, source, and Homebrew drift.
   - `mlx` — the MLX ecosystem + Apple readiness.
-  - `profile` — **the only command that measures**; opt-in and consent-gated; crosses the
-    seam into the engine.
-  - `recommend` / `run` — *planned* (curated catalog × measured wall; safe launch).
+  - `profile` — **engine-free** analytic capability assessment: estimates the safe memory
+    budget from recon facts; never loads an engine or a model.
+  - `characterize` — **the command that measures**: opt-in; crosses the seam into the engine to
+    find a model's real safe context ceiling (refusing before it risks the memory wall).
+  - `recommend` — ranks cached models that fit this machine's budget, by estimated usable context.
+  - `run` — governed one-shot inference, capped under the measured safe ceiling (CPU · MLX · CUDA).
+  - `models` / `search` — catalog cached models (with measured ceilings) / search the HF Hub.
 - **Broad compatibility.** Cover the open-source AI ecosystem widely — engines (MLX,
   llama.cpp, Ollama, LM Studio, vLLM), model stores (HF, Ollama, LM Studio, Jan, GPT4All),
   frameworks (PyTorch, transformers, TensorFlow), and apps — not one vendor's corner.
@@ -55,7 +59,7 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
   `pyproject.toml`. ARA probes the machine and installs the matched suite at runtime via
   `ara install` (`ara/engines.py` is the catalog + `uv pip install git+<spec>` logic). This
   keeps the core universal, the lock engine-free, and `uv sync` identical on every OS — and
-  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|auto}` is the consent surface
+  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|cpu|auto}` is the consent surface
   (the flag itself authorizes the install, so it stays scriptable).
 
 ## Hard rules
@@ -64,8 +68,9 @@ These are how **Rule #1 (Safety)** and **Rule #3 (Accuracy)** are enforced in th
 
 - **Recon is read-only.** Nothing under `detect`/`status`/`python`/`apps`/`mlx` may stress
   the machine, load a model, or mutate state.
-- **`profile` is consent-gated.** It only measures (and only downloads a calibration model)
-  with explicit user opt-in.
+- **Measuring is consent-gated.** `characterize` is the only command that loads an engine and a
+  model (downloading weights on demand) — it runs only with explicit user opt-in. `profile` stays
+  engine-free and read-only.
 - **Advisory, never destructive.** ARA surfaces facts and considerations. It does **not**
   run or prescribe state-mutating commands on the user's behalf. (A flag may *describe* a
   fix; it must not tell the user to run something that silently destroys state.)
@@ -84,8 +89,10 @@ These are how **Rule #1 (Safety)** and **Rule #3 (Accuracy)** are enforced in th
 - **Write portable; claim only what's tested.** Shared layers (the engine env, worker IPC,
   paths) must be OS-agnostic — use `pathlib`/`os.path`, branch interpreter/venv layout on
   `os.name` (`Scripts\python.exe` vs `bin/python`), keep OS-specific recon (sysctl, Homebrew
-  paths) behind a platform guard. But ARA is developed and tested on macOS (Apple Silicon),
-  with Linux supported; **make no Windows support claims until it's actually been run there.**
+  paths) behind a platform guard. ARA is developed on macOS (Apple Silicon) and tested green on
+  macOS (CPU + MLX), Windows (CPU + CUDA, RTX 2070), and Linux (CPU); **claim a platform only once
+  the suite is green there** — CUDA-on-Linux shares the Windows code path but isn't claimed yet
+  (no NVIDIA-on-Linux box has run it).
 
 ## License & AI agents (Apache 2.0)
 

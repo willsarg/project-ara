@@ -17,8 +17,8 @@
 > ARA is the tool you reach for to **honestly assess any machine with a Python runtime for
 > AI work** — what hardware it has, what's installed, where your models and interpreters
 > actually live — and then run local models right up to the hardware's safe edge, never
-> over. Recon is read-only and runs anywhere; running models is backend-specific (Apple
-> Silicon today, more later).
+> over. Recon is read-only and runs anywhere; running models works today on CPU, Apple
+> Silicon (MLX), and NVIDIA (CUDA).
 
 ---
 
@@ -36,7 +36,7 @@ knows your machine's real limits. The design values, in order:
 - **Honesty** — report your *real* environment, never ARA's own internals; never claim
   something it didn't observe.
 - **Well-scoped tools** — each command does one clear job (`detect` observes, `status`
-  watches, `profile` measures), so the output is predictable.
+  watches, `characterize` measures), so the output is predictable.
 - **Broad compatibility** — across the open-source AI ecosystem (engines, model stores,
   frameworks, apps), not one vendor's corner of it.
 
@@ -45,10 +45,12 @@ knows your machine's real limits. The design values, in order:
 ## 🚀 Quick start
 
 ```bash
-uv sync                # install the pure-Python core into .venv (works on any OS)
-uv run ara             # the landing screen + getting-started path
-uv run ara detect      # read-only recon of this machine
-uv run ara install     # add the engine matched to this machine (Apple Silicon today)
+uv sync                          # install the pure-Python core into .venv (works on any OS)
+uv run ara                       # the landing screen + getting-started path
+uv run ara detect                # read-only recon of this machine
+uv run ara install               # add the engine matched to this machine (MLX / CUDA / CPU)
+uv run ara characterize <model>  # measure that model's safe context ceiling on this machine
+uv run ara run <model> "..."     # one-shot inference, governed under the measured ceiling
 ```
 
 No arguments shows what ARA can do for this machine. Everything below is a subcommand.
@@ -66,10 +68,13 @@ stays lean and works the same on every platform.
 | `ara python` | Every Python interpreter on the system (macOS / Homebrew / python.org / pyenv / conda / uv / asdf), which has which AI libraries, and which you shouldn't `pip install` into. |
 | `ara apps` | Full inventory of installed AI/ML apps with versions and install source (App / Homebrew cask / formula), flagging real duplicates and self-update-vs-Homebrew drift. |
 | `ara mlx` | The MLX ecosystem (Apple Silicon): libraries by modality + readiness (Metal GPU, cached `mlx-community` models, LM Studio's MLX runtime). |
-| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {wmx\|wcx\|auto}` picks it (`auto` = whatever fits this hardware); the flag is the consent, so it's scriptable. Today: `wmx` ([`wmx-suite`](https://github.com/willsarg/wmx-suite), Apple Silicon); `wcx` (CUDA) is coming. |
-| `ara profile` | Measure this machine's **safe memory limits** — opt-in calibration against a tiny model, crossing into the engine. Installs the engine first if you pass `--engine`. |
-| `ara recommend` | *(planned)* Best model per modality that fits this machine — curated catalog × measured wall. |
-| `ara run <model>` | *(planned)* Launch a model safely — right up to the edge, never over. |
+| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {wmx\|wcx\|cpu\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `wmx` on Apple Silicon, `wcx` when an NVIDIA GPU is present; pass `--engine cpu` explicitly for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `wmx` ([`wmx-suite`](https://github.com/willsarg/wmx-suite), Apple Silicon/MLX), `wcx` ([`wcx-suite`](https://github.com/willsarg/wcx-suite), NVIDIA/CUDA), and the built-in `cpu` (llama.cpp) fallback. |
+| `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
+| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under the engine that refuses before it risks the memory wall, then stores the ceiling for `recommend` / `run`. The command that crosses into the engine. |
+| `ara recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
+| `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on CPU, MLX, and CUDA. |
+| `ara models [<model>]` | Catalog the models in your HF cache with each one's best measured safe-context ceiling; pass a model id for its architecture + per-engine ceiling detail. |
+| `ara search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 
 Recon commands share `--json` (machine-readable) and `--include` / `--exclude` (show only
 or hide specific sections, e.g. `ara detect --exclude models`).
@@ -93,21 +98,31 @@ its **own isolated environment** on demand (`ara install`) — so the core stays
 The catalog of engines and the install logic live in [`ara/engines.py`](./ara/engines.py). See
 [AGENTS.md](./AGENTS.md) for the design boundary and conventions.
 
-**Platform support.** Developed and tested on **macOS (Apple Silicon)**. Linux (CPU, and CUDA
-once `wcx-suite` lands) is supported and recon runs there. Windows code is written to be
-portable (interpreter/venv paths, the worker IPC), but is **not yet tested** — no Windows
-claims until it is.
+**Platform support.** Recon is OS-agnostic and runs anywhere. Running models is verified live on:
+
+| OS | Engines verified |
+|---|---|
+| **macOS (Apple Silicon)** | CPU + MLX — the primary development machine |
+| **Windows** | CPU + CUDA — full test suite green and CUDA inference verified on an RTX 2070 |
+| **Linux** | CPU — full suite + integration tests green |
+
+CUDA on Linux shares the same [`wcx-suite`](https://github.com/willsarg/wcx-suite) engine path as
+Windows, but hasn't yet been exercised on an NVIDIA-on-Linux box, so it isn't claimed here until it
+has been.
 
 ---
 
 ## 🛟 Safety
 
-`ara detect` and the other recon commands are **strictly read-only** — they observe, never
-stress, profile, or load a model. The only command that measures the machine, `ara profile`,
-is **opt-in and consent-gated**, and the safe limits come from `wmx-suite`, which predicts
-the hardware wall and stays under it rather than probing into the danger zone. ARA stays
-**advisory** — it surfaces what's true and what to consider; it never runs destructive or
-system-mutating commands on your behalf.
+`ara detect` and the other recon commands (`status` / `python` / `apps` / `mlx`) are **strictly
+read-only** — they observe, never stress, benchmark, or load a model. Measuring is opt-in:
+`ara characterize` is the command that crosses into the engine, and it finds a model's safe
+context ceiling by **refusing before it ever loads past the memory wall** and aborting a probe
+the moment usage approaches the limit. Each engine governs against the right wall — physical RAM
+(CPU; swap is reported but never counted), the MLX unified-memory wall (Apple), or VRAM (CUDA) —
+and `ara run` stays capped under that measured ceiling. Model ids are validated before they're
+ever passed to an engine subprocess. ARA stays **advisory** — it surfaces what's true and what to
+consider; it never runs destructive or system-mutating commands on your behalf.
 
 ---
 
