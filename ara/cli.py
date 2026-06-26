@@ -12,12 +12,22 @@ import json
 import os
 import sys
 from dataclasses import asdict
+from importlib import metadata
 from pathlib import Path
 
 from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, hf_auth, mlx,
                  profile, calibration, pythons, serialize, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
+
+
+def _ara_version() -> str:
+    """The installed project-ara version (for ``ara --version``), or a sentinel when running from an
+    un-installed source tree that has no distribution metadata."""
+    try:
+        return metadata.version("project-ara")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"
 
 _CMD_W = 16
 
@@ -1675,6 +1685,9 @@ def main() -> int:
 
 def _main_impl() -> int:
     argv = sys.argv[1:]
+    if "--version" in argv:
+        print(_ara_version())
+        return 0
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv

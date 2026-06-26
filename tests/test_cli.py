@@ -228,6 +228,19 @@ def test_main_unknown_command_returns_1(monkeypatch, capsys):
     assert "isn't built yet" in capsys.readouterr().out
 
 
+def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
+    from importlib.metadata import version
+    assert _run_main(monkeypatch, ["--version"]) == 0
+    assert capsys.readouterr().out.strip() == version("project-ara")
+
+
+def test_ara_version_falls_back_when_not_installed(monkeypatch):
+    def _missing(name):
+        raise cli.metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(cli.metadata, "version", _missing)
+    assert cli._ara_version() == "0+unknown"
+
+
 def test_main_verbose_flag_sets_console(monkeypatch):
     captured = {}
     monkeypatch.setattr(cli, "render_detect",
