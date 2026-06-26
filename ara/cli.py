@@ -125,6 +125,42 @@ def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console, 
 
 
 # --------------------------------------------------------------------------- #
+# help (per-subcommand usage for `ara <cmd> --help` / `-h`)
+# --------------------------------------------------------------------------- #
+_COMMAND_HELP = {
+    "detect": "ara detect [--json] [--include S] [--exclude S] — read-only machine recon",
+    "status": "ara status [--json] — AI/ML processes running right now",
+    "python": "ara python [--json] — interpreters + their AI libraries",
+    "apps": "ara apps [--json] — installed AI/ML apps",
+    "mlx": "ara mlx [--json] — MLX ecosystem readiness",
+    "search": "ara search <query> [--json] — find models on the Hugging Face Hub",
+    "models": "ara models [<model-id>] [--json] — model catalog + safe ceilings",
+    "characterize": ("ara characterize <model> [--engine E] [--kv-quant f16|q8_0|q4_0] "
+                     "[--weight-quant none|int8|int4|fp8] [--chunked-prefill] [--json]"),
+    "install": "ara install [<engine>] [--engine E] — install an engine (default: matched to this machine)",
+    "uninstall": "ara uninstall [<engine>] [--engine E] — remove an engine",
+    "profile": "ara profile [--model M] [--engine E] [--json] — analytic capability estimate",
+    "recommend": "ara recommend [--json] — models that fit here, ranked by usable context",
+    "run": ("ara run <model> <prompt> [--engine E] [--kv-quant ...] [--weight-quant ...] "
+            "[--chunked-prefill] [--json]"),
+    "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
+}
+
+
+def render_help(c: Console, cmd: str | None, *, as_json: bool = False) -> int:
+    """`ara <cmd> --help` — print *cmd*'s usage. No/unknown command → the full landing catalog."""
+    usage = _COMMAND_HELP.get(cmd) if cmd else None
+    if usage is None:
+        render_landing(c)
+        return 0
+    if as_json:
+        print(json.dumps({"command": cmd, "usage": usage}))
+    else:
+        c.emit(c.style("dim", f"  usage: {usage}"))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # landing
 # --------------------------------------------------------------------------- #
 def render_landing(c: Console) -> None:
@@ -1688,6 +1724,7 @@ def _main_impl() -> int:
     if "--version" in argv:
         print(_ara_version())
         return 0
+    wants_help = "-h" in argv or "--help" in argv
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
@@ -1764,7 +1801,7 @@ def _main_impl() -> int:
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
         if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn", "--flash-attn",
-                 "--chunked-prefill"):
+                 "--chunked-prefill", "-h", "--help"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
@@ -1779,7 +1816,9 @@ def _main_impl() -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("warn", f"  {msg}"))
         return 1
 
-    if not rest or rest[0] in ("-h", "--help"):
+    if wants_help:                          # `ara <cmd> --help` / `-h` → that command's usage
+        return render_help(c, rest[0] if rest else None, as_json=as_json)
+    if not rest:
         render_landing(c)
         return 0
 
@@ -1843,10 +1882,13 @@ def _main_impl() -> int:
                           prefill_chunk=prefill_chunk)
 
     if cmd == "install":
-        return render_install(c, engine=engine or "auto", as_json=as_json)
+        # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
+        return render_install(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+                              as_json=as_json)
 
     if cmd == "uninstall":
-        return render_uninstall(c, engine=engine or "auto", as_json=as_json)
+        return render_uninstall(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+                                as_json=as_json)
 
     if cmd == "hf":
         return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)

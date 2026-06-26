@@ -80,6 +80,8 @@ def _capture_dispatch(monkeypatch):
     """Replace the render_* entry points with recorders; return the record dict."""
     rec = {}
     monkeypatch.setattr(cli, "render_landing", lambda c: rec.update(landing=True))
+    monkeypatch.setattr(cli, "render_help",
+                        lambda c, cmd, as_json=False: rec.update(help=cmd, help_called=True) or 0)
     monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False, want=None: rec.update(detect=as_json, detect_want=want))
     monkeypatch.setattr(cli, "render_status", lambda c, as_json=False, want=None: rec.update(status=as_json))
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
@@ -120,9 +122,10 @@ def test_main_no_args_shows_landing(monkeypatch):
 
 
 def test_main_help_shows_landing(monkeypatch):
+    # bare -h (no command) routes through render_help with no command → the landing catalog.
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["-h"]) == 0
-    assert rec.get("landing") is True
+    assert rec.get("help_called") and rec["help"] is None
 
 
 def test_main_detect(monkeypatch):
@@ -239,6 +242,74 @@ def test_ara_version_falls_back_when_not_installed(monkeypatch):
         raise cli.metadata.PackageNotFoundError(name)
     monkeypatch.setattr(cli.metadata, "version", _missing)
     assert cli._ara_version() == "0+unknown"
+
+
+# ---- --help / -h routing (per subcommand, no side effects) --------------------------------
+def test_main_subcommand_help_routes_to_help_not_action(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["install", "--help"]) == 0
+    assert rec.get("help_called") and rec["help"] == "install"
+    assert "install" not in rec                 # the install action never ran (no side effect)
+
+
+def test_main_dash_h_after_command_routes_to_help(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["characterize", "-h"]) == 0
+    assert rec["help"] == "characterize" and "characterize" not in rec
+
+
+def test_main_bare_help_routes_to_help_with_no_command(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["--help"]) == 0
+    assert rec.get("help_called") and rec["help"] is None
+
+
+def test_render_help_known_command_prints_usage(make_console):
+    c, buf = make_console()
+    assert cli.render_help(c, "install") == 0
+    out = buf.getvalue()
+    assert "usage" in out and "ara install" in out
+
+
+def test_render_help_no_or_unknown_command_falls_back_to_landing(monkeypatch, make_console):
+    c, _ = make_console()
+    seen = {}
+    monkeypatch.setattr(cli, "render_landing", lambda c: seen.update(landing=True))
+    assert cli.render_help(c, None) == 0 and seen.get("landing")
+    seen.clear()
+    assert cli.render_help(c, "frobnicate") == 0 and seen.get("landing")
+
+
+def test_render_help_json(capsys):
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_help(c, "install", as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["command"] == "install" and "ara install" in out["usage"]
+
+
+# ---- install / uninstall take a positional engine (not just --engine) ---------------------
+def test_main_install_honors_positional_engine(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install", "wmx"])
+    assert rec["install"]["engine"] == "wmx"
+
+
+def test_main_install_defaults_to_auto(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install"])
+    assert rec["install"]["engine"] == "auto"
+
+
+def test_main_install_engine_flag_still_works(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install", "--engine", "cpu"])
+    assert rec["install"]["engine"] == "cpu"
+
+
+def test_main_uninstall_honors_positional_engine(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["uninstall", "vulkan"])
+    assert rec["uninstall"]["engine"] == "vulkan"
 
 
 def test_main_verbose_flag_sets_console(monkeypatch):
