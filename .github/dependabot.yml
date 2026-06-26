@@ -1,6 +1,7 @@
-# Keeps the SHA-pinned GitHub Actions fresh (the one downside of pinning: pins go stale and miss
-# upstream security fixes). Dependabot opens a weekly PR bumping the pins — grouped into one PR to
-# stay low-noise. https://docs.github.com/code-security/dependabot
+# Weekly Dependabot updates, each grouped into a single low-noise PR:
+#   - github-actions: keep the SHA-pinned actions fresh (pins otherwise go stale + miss security fixes)
+#   - uv: keep the Python deps (pyproject.toml + uv.lock) current
+# https://docs.github.com/code-security/dependabot
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -10,3 +11,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]      # one combined PR for all action bumps
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]      # one combined PR for all Python dep bumps
