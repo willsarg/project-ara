@@ -41,3 +41,12 @@ def test_profile_record_excludes_live_transient_fields():
                 "hf_token", "hf_cli", "hf_cli_version", "python_version",
                 "framework_python", "memory", "storage"):
         assert key not in rec, f"live/transient field leaked into projection: {key}"
+
+
+def test_profile_record_drops_volatile_serving_from_runtimes():
+    """A runtime's `serving` state (e.g. ollama up/down) is LIVE — it must not enter the durable
+    projection, or starting/stopping ollama would trip false drift. Spec 2026-06-26-detect-ollama-liveness."""
+    m = detect.machine()
+    rec = serialize.profile_record(m)
+    for r in rec["runtimes"]:
+        assert "serving" not in r, "live `serving` leaked into the durable runtime projection"

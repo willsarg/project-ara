@@ -50,5 +50,9 @@ def profile_record(m: detect.Machine) -> dict:
     rec["accel"] = dataclasses.asdict(m.accel)
     rec["gpus"] = [dataclasses.asdict(g) for g in m.gpus]
     rec["board"] = dataclasses.asdict(m.board)
-    rec["runtimes"] = [dataclasses.asdict(r) for r in m.runtimes]
+    # `serving` is LIVE (a server runtime is up or down right now) — drop it from the durable
+    # projection or ollama starting/stopping would trip false drift. The rest of a Runtime
+    # (name/present/version/kind/accels/usable) is durable capability.
+    rec["runtimes"] = [{k: v for k, v in dataclasses.asdict(r).items() if k != "serving"}
+                       for r in m.runtimes]
     return rec
