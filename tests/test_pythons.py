@@ -262,6 +262,28 @@ def test_known_patterns_dispatches_to_windows(monkeypatch):
     assert pats and all(p.endswith("python.exe") for p in pats)
 
 
+def test_known_patterns_dispatches_to_posix(monkeypatch):
+    # Mirror of the windows-dispatch test: force the non-nt branch regardless of host so the POSIX
+    # return (pythons.py:142) is covered when the suite runs ON Windows too, not only on a POSIX box.
+    monkeypatch.setattr(pythons.os, "name", "posix")
+    monkeypatch.setattr(pythons, "Path",
+                        types.SimpleNamespace(home=lambda: "/home/dev"))
+    pats = pythons._known_patterns()
+    assert "/usr/bin/python3" in pats
+    assert any("/.pyenv/" in p for p in pats)
+
+
+def test_candidates_skips_a_candidate_that_errors(monkeypatch):
+    # A candidate that blows up mid-inspection must be skipped, not crash discovery — covers the
+    # per-candidate except (pythons.py:241-242) deterministically on every OS, rather than relying
+    # on the host filesystem happening to raise.
+    monkeypatch.setenv("PATH", "/fakebin")
+    monkeypatch.setattr(pythons.os, "listdir", lambda d: ["python3"])   # one candidate enters
+    monkeypatch.setattr(pythons, "_known_patterns", lambda: [])         # no glob candidates
+    monkeypatch.setattr(pythons.os.path, "basename", _raise())          # inspecting it raises
+    assert pythons._candidates() == {}                                  # swallowed → empty, no crash
+
+
 # --------------------------------------------------------------------------- #
 # _is_executable — Windows PATHEXT gate vs. POSIX exec-bit
 # --------------------------------------------------------------------------- #
