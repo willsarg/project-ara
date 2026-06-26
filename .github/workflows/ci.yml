@@ -1,0 +1,34 @@
+# Fast build/test feedback: runs the mocked unit suite + the 100% coverage gate (both baked into
+# the default `pytest` invocation in pyproject.toml) on every push to main and every PR.
+# Integration tests (`-m integration`) are hardware-gated and stay manual on the real boxes.
+#
+# Security hardening: least-privilege token (read-only), actions pinned to full commit SHAs
+# (mutable tags are a supply-chain risk), checkout credentials not persisted, locked deps, timeout.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read           # the only scope the test job needs
+
+concurrency:               # cancel superseded runs on rapid pushes to the same ref
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false      # don't leave the GITHUB_TOKEN in .git/config
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev  # install exactly the locked deps (no resolution drift)
+      - run: uv run pytest                 # unit suite + 100% coverage gate

@@ -3,8 +3,11 @@
 # https://pypi.org/manage/account/publishing/ bound to: owner willsarg, repo project-ara,
 # workflow publish.yml, environment pypi. See https://docs.pypi.org/trusted-publishers/.
 #
-# NOTE: version is static in pyproject.toml — bump `version` to match the tag before tagging,
-# or PyPI will reject a duplicate/mismatched version.
+# NOTE: version is static in pyproject.toml — the first build step fails if the tag doesn't match it.
+#
+# Security hardening: deny-all token by default (each job opts into the minimum), actions pinned to
+# full commit SHAs (mutable tags are a supply-chain risk), checkout credentials not persisted,
+# id-token:write scoped to the publish job alone, environment binding, per-job timeouts.
 name: Publish to PyPI
 
 on:
@@ -12,15 +15,18 @@ on:
     tags:
       - "v*"
 
-permissions: {}          # deny-all at the top; each job opts into only what it needs
+permissions: {}            # deny-all at the top; each job opts into only what it needs
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: read     # checkout only
+      contents: read       # checkout only
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Verify tag matches pyproject version
         env:
           TAG: ${{ github.ref_name }}          # e.g. v0.0.2 — via env, never inlined into the script
@@ -33,13 +39,13 @@ jobs:
             exit 1
           fi
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.12"
       - name: Build sdist + wheel
         run: uv build                       # uses the declared hatchling backend
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
@@ -47,14 +53,15 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: pypi      # bind to the GitHub Environment the PyPI publisher trusts
     permissions:
       id-token: write      # OIDC token for Trusted Publishing — the ONLY elevated scope
     steps:
       - name: Download dist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist/
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
