@@ -1,5 +1,7 @@
-# Fast build/test feedback: runs the mocked unit suite + the 100% coverage gate (both baked into
-# the default `pytest` invocation in pyproject.toml) on every push to main and every PR.
+# On-demand test run: the mocked unit suite + 100% coverage gate (both baked into the default
+# `pytest` invocation in pyproject.toml). Manual only for now — the release pipeline (publish.yml)
+# already gates v* tags on these same tests, so per-push CI is off. Re-add a `push:`/`pull_request:`
+# trigger here when you want per-commit feedback again.
 # Integration tests (`-m integration`) are hardware-gated and stay manual on the real boxes.
 #
 # Security hardening: least-privilege token (read-only), actions pinned to full commit SHAs
@@ -7,16 +9,10 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:       # run manually from the Actions tab on demand
 
 permissions:
   contents: read           # the only scope the test job needs
-
-concurrency:               # cancel superseded runs on rapid pushes to the same ref
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   test:
