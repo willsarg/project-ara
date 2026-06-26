@@ -35,6 +35,11 @@ ENGINES: dict[str, dict] = {
         "package": "wmx-suite",
         "available": True,
         "spec": "git+https://github.com/willsarg/wmx-suite",
+        # Pinned engine commit this ARA release ships — a SHA is immutable, so a given ARA version
+        # always installs the exact engine code it was tested against (reproducible releases). Bump
+        # via scripts/pin_engines.py before tagging an ARA release. The ARA_WMX_SOURCE dev override
+        # bypasses this entirely (local checkout).
+        "ref": "b942887e90edccbd084a25f03368e3f69de29ba4",
         "python": "3.12",          # wmx-suite requires >=3.12
         "model_kinds": ("transformers",),
     },
@@ -45,6 +50,7 @@ ENGINES: dict[str, dict] = {
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
         "spec": "git+https://github.com/willsarg/wcx-suite",
+        "ref": "205b8ecb333e7832f2b02a4c4a418afcbf003836",   # pinned engine commit (see wmx note)
         "extras": "cuda",                        # pulls torch + transformers
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default
         # PyPI torch on Windows/Linux is CPU-only).
@@ -138,12 +144,19 @@ def is_installed(key: str) -> bool:
 
 
 def source_for(key: str) -> str:
-    """The install source for an external engine *key*: its git spec, or a dev override.
+    """The install source for an external engine *key*: its git spec pinned to a commit, or a
+    dev override.
 
-    Setting ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) replaces the
-    git URL — lets a developer install from a local checkout instead of cloning."""
+    Default is ``spec@ref`` — the git URL pinned to the engine's recorded commit SHA, so a given
+    ARA release always installs the exact engine code it shipped with (reproducible). Setting
+    ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) replaces it with a local checkout
+    for development — used verbatim, with no pin appended."""
     override = os.environ.get(f"ARA_{key.upper()}_SOURCE")
-    return override or ENGINES[key]["spec"]
+    if override:
+        return override
+    engine = ENGINES[key]
+    ref = engine.get("ref")
+    return f"{engine['spec']}@{ref}" if ref else engine["spec"]
 
 
 @dataclass(frozen=True)

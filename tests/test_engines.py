@@ -3,6 +3,8 @@
 """engines.py — the engine catalog + isolated-env install lifecycle (`ara install`)."""
 from __future__ import annotations
 
+import re
+
 import ara.engines as engines
 
 
@@ -82,12 +84,16 @@ def test_is_installed_false_for_unknown_engine():
 # --------------------------------------------------------------------------- #
 # source_for() — the install source, with a dev env-var override (external suites)
 # --------------------------------------------------------------------------- #
-def test_source_for_defaults_to_git_spec(monkeypatch):
+def test_source_for_pins_default_to_ref_sha(monkeypatch):
+    # Default install pins the git spec to the engine's recorded commit SHA → reproducible releases.
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    assert engines.source_for("wmx") == "git+https://github.com/willsarg/wmx-suite"
+    e = engines.ENGINES["wmx"]
+    assert re.fullmatch(r"[0-9a-f]{40}", e["ref"])         # a full commit SHA is pinned
+    assert engines.source_for("wmx") == f"{e['spec']}@{e['ref']}"
 
 
 def test_source_for_uses_env_override(monkeypatch):
+    # The dev override is a local checkout — used verbatim, with no SHA pin appended.
     monkeypatch.setenv("ARA_WMX_SOURCE", "../wmx-suite")
     assert engines.source_for("wmx") == "../wmx-suite"
 
@@ -150,7 +156,8 @@ def test_install_targets_vulkan_plain_on_macos(monkeypatch):
 
 def test_install_targets_external_git_spec(monkeypatch):
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    assert engines._install_targets("wmx") == ["git+https://github.com/willsarg/wmx-suite"]
+    ref = engines.ENGINES["wmx"]["ref"]
+    assert engines._install_targets("wmx") == [f"git+https://github.com/willsarg/wmx-suite@{ref}"]
 
 
 def test_install_targets_external_local_is_editable(monkeypatch):
@@ -160,9 +167,10 @@ def test_install_targets_external_local_is_editable(monkeypatch):
 
 def test_install_targets_wcx_folds_extra_and_torch_backend(monkeypatch):
     monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    ref = engines.ENGINES["wcx"]["ref"]
     assert engines._install_targets("wcx") == [
         "--torch-backend=auto",
-        "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
+        f"wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite@{ref}"]
 
 
 def test_install_targets_wcx_local_is_editable_with_extra(monkeypatch):
@@ -188,9 +196,10 @@ def test_wcx_is_available_and_installs_into_its_cuda_env(monkeypatch):
     assert engines.ENGINES["wcx"]["available"] is True
     assert engines.install("wcx").status == "installed"
     assert seen["name"] == "cuda" and seen["python"] == "3.12"
+    ref = engines.ENGINES["wcx"]["ref"]
     assert seen["packages"] == [
         "--torch-backend=auto",
-        "wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite"]
+        f"wcx-suite[cuda] @ git+https://github.com/willsarg/wcx-suite@{ref}"]
 
 
 def test_install_unknown_engine_reports_unknown():
@@ -227,8 +236,9 @@ def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "create", fake_create)
     r = engines.install("wmx")
     assert r.status == "installed"
+    ref = engines.ENGINES["wmx"]["ref"]
     assert seen == {"name": "apple",
-                    "packages": ["git+https://github.com/willsarg/wmx-suite"],
+                    "packages": [f"git+https://github.com/willsarg/wmx-suite@{ref}"],
                     "python": "3.12"}
 
 
