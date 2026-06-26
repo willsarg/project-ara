@@ -124,6 +124,24 @@ def test_env_token_absent(monkeypatch):
     assert hf_auth._env_token_present() is False
 
 
+def test_has_token_true_when_available(monkeypatch):
+    monkeypatch.setattr(hf_auth, "_get_token", lambda: "hf_xyz")
+    assert hf_auth.has_token() is True
+
+
+def test_has_token_false_when_none(monkeypatch):
+    monkeypatch.setattr(hf_auth, "_get_token", lambda: None)
+    assert hf_auth.has_token() is False
+
+
+def test_quiet_hub_warnings_raises_hf_logger_to_error():
+    import logging
+    log = logging.getLogger("huggingface_hub")
+    log.setLevel(logging.WARNING)
+    hf_auth.quiet_hub_warnings()
+    assert log.level == logging.ERROR
+
+
 # --------------------------------------------------------------------------- #
 # set_token
 # --------------------------------------------------------------------------- #

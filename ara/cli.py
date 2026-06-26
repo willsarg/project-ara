@@ -21,6 +21,15 @@ from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engi
 from ara.ui import Console
 
 
+def _hf_hint(c: Console, as_json: bool) -> None:
+    """A one-line nudge toward `ara hf login` when a Hub op runs unauthenticated (higher rate limits
+    + faster downloads). Skipped under --json (would corrupt the parse) and when already
+    authenticated. Pairs with hf_auth.quiet_hub_warnings(), which mutes HF's own generic warning."""
+    if not as_json and not hf_auth.has_token():
+        c.emit(c.style("dim", "  tip: run ") + c.style("accent", "ara hf login")
+               + c.style("dim", " for higher rate limits + faster downloads"))
+
+
 def _ara_version() -> str:
     """The installed project-ara version (for ``ara --version``), or a sentinel when running from an
     un-installed source tree that has no distribution metadata."""
@@ -1186,6 +1195,7 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
                + c.style("dim", f"  ↓{r['downloads']} · ♥{r['likes']}"))
     if not results:
         c.emit(c.style("dim", "  no models found"))
+    _hf_hint(c, as_json)
     c.emit()
     return 0
 
@@ -1720,6 +1730,7 @@ def main() -> int:
 
 
 def _main_impl() -> int:
+    hf_auth.quiet_hub_warnings()         # mute HF's generic 'unauthenticated' chatter (we nudge ourselves)
     argv = sys.argv[1:]
     if "--version" in argv:
         print(_ara_version())

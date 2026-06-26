@@ -312,6 +312,44 @@ def test_main_uninstall_honors_positional_engine(monkeypatch):
     assert rec["uninstall"]["engine"] == "vulkan"
 
 
+# ---- HF auth polish: quiet the generic warning, nudge toward `ara hf login` ----------------
+def test_hf_hint_nudges_when_unauthenticated(monkeypatch, make_console):
+    monkeypatch.setattr(cli.hf_auth, "has_token", lambda: False)
+    c, buf = make_console()
+    cli._hf_hint(c, as_json=False)
+    assert "ara hf login" in buf.getvalue()
+
+
+def test_hf_hint_silent_when_authenticated(monkeypatch, make_console):
+    monkeypatch.setattr(cli.hf_auth, "has_token", lambda: True)
+    c, buf = make_console()
+    cli._hf_hint(c, as_json=False)
+    assert buf.getvalue() == ""
+
+
+def test_hf_hint_silent_under_json(monkeypatch, make_console):
+    monkeypatch.setattr(cli.hf_auth, "has_token", lambda: False)
+    c, buf = make_console()
+    cli._hf_hint(c, as_json=True)
+    assert buf.getvalue() == ""
+
+
+def test_render_search_nudges_to_login_when_unauthenticated(monkeypatch, make_console):
+    monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m", "downloads": 1, "likes": 2}])
+    monkeypatch.setattr(cli.hf_auth, "has_token", lambda: False)
+    c, buf = make_console()
+    assert cli.render_search(c, "llama") == 0
+    assert "ara hf login" in buf.getvalue()
+
+
+def test_main_quiets_hub_warnings(monkeypatch):
+    _capture_dispatch(monkeypatch)
+    called = {}
+    monkeypatch.setattr(cli.hf_auth, "quiet_hub_warnings", lambda: called.setdefault("q", True))
+    _run_main(monkeypatch, ["detect"])
+    assert called.get("q")
+
+
 def test_main_verbose_flag_sets_console(monkeypatch):
     captured = {}
     monkeypatch.setattr(cli, "render_detect",

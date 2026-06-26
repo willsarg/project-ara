@@ -51,6 +51,20 @@ def _env_token_present() -> bool:
     return "HF_TOKEN" in os.environ or "HUGGING_FACE_HUB_TOKEN" in os.environ
 
 
+def has_token() -> bool:
+    """True if any HF token is available — env or the standard token store (what `ara hf login`
+    writes). Lets the CLI nudge toward authenticating only when it'd actually help."""
+    return _get_token() is not None
+
+
+def quiet_hub_warnings() -> None:
+    """Silence huggingface_hub's WARNING chatter (e.g. its generic 'unauthenticated requests …
+    set a HF_TOKEN' nudge) so ARA can surface its own guidance (`ara hf login`) instead. Idempotent;
+    leaves ERROR-level messages visible."""
+    import logging
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+
 def _write_token(path: Path, token: str) -> None:
     """Write *token* to *path* with owner-only permissions — a token is a credential, never
     leave it world-readable. Creates the dir 0o700 and the file 0o600 (atomically at create via
