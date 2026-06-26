@@ -7,8 +7,11 @@ import os
 import sys
 import types
 
+import pytest
+
 import ara.detect as detect
 import ara.hardware as hardware
+from ara import ollama
 from ara.detect import (
     Accelerator,
     Machine,
@@ -16,6 +19,13 @@ from ara.detect import (
     accelerator,
     backend_name,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ollama_probe(monkeypatch):
+    """Keep detect tests off the network: default the ollama liveness probe to 'not serving'.
+    Individual tests override this. Spec 2026-06-26-detect-ollama-liveness."""
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: None)
 from ara.hardware import (
     BoardInfo,
     CpuInfo,
@@ -345,6 +355,50 @@ def test_runtime_requires_property():
     assert Runtime("vLLM", True, usable=False, accels=("nvidia",)).requires == "needs CUDA"
     assert Runtime("MLX", True, usable=True, accels=("apple",)).requires is None
     assert Runtime("PyTorch", True, usable=None).requires is None
+
+
+# --------------------------------------------------------------------------- #
+# ollama liveness — installed vs serving (2026-06-26-detect-ollama-liveness)
+# --------------------------------------------------------------------------- #
+def test_ollama_liveness_not_installed_skips_probe(monkeypatch):
+    """Not installed → serving stays None and NO network probe fires."""
+    called = []
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: called.append(1) or "x")
+    rt = Runtime("Ollama", present=False, version=None)
+    out = detect._with_ollama_liveness(rt)
+    assert out.serving is None
+    assert out is rt          # returned unchanged
+    assert called == []       # never probed when not installed
+
+
+def test_ollama_liveness_serving_prefers_api_version(monkeypatch):
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: "0.30.10")
+    rt = Runtime("Ollama", present=True, version="0.30.9-brew")
+    out = detect._with_ollama_liveness(rt)
+    assert out.serving is True
+    assert out.version == "0.30.10"      # running version wins over the brew receipt
+
+
+def test_ollama_liveness_installed_not_serving_keeps_brew_version(monkeypatch):
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: None)
+    rt = Runtime("Ollama", present=True, version="0.30.9-brew")
+    out = detect._with_ollama_liveness(rt)
+    assert out.serving is False
+    assert out.version == "0.30.9-brew"
+
+
+def test_runtimes_applies_ollama_liveness_only_to_ollama(monkeypatch, fake_home):
+    monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
+    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
+    monkeypatch.setattr("shutil.which", lambda n, path=None: "/x/ollama" if n == "ollama" else None)
+    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: "0.30.10")
+
+    rts = {rt.name: rt for rt in detect.runtimes("apple")}
+    assert rts["Ollama"].present is True
+    assert rts["Ollama"].serving is True
+    assert rts["Ollama"].version == "0.30.10"
+    assert rts["llama.cpp"].serving is None      # other engines carry no serving state
     assert Runtime("x", True, usable=False, accels=("nvidia", "apple")).requires == (
         "needs CUDA / Apple Silicon"
     )

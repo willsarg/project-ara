@@ -460,6 +460,11 @@ def _det_engines(c: Console, m) -> None:
             val = f"{rt.name} {rt.version}" if rt.version else rt.name
             if rt.requires:  # installed, but can't accelerate on this hardware
                 c.emit(c.field("·", val, f"installed · {rt.requires}", value_role="warn"))
+            elif rt.serving is False:  # a server runtime that's installed but not up
+                c.emit(c.field("·", val, "installed · not serving — run `ollama serve`",
+                               value_role="warn"))
+            elif rt.serving is True:
+                c.emit(c.field("·", val, "serving", value_role="good"))
             else:
                 c.emit(c.field("·", val, "found", value_role="good"))
         elif c.verbose:

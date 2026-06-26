@@ -437,6 +437,34 @@ def test_render_detect_text(make_console, monkeypatch, stub_pythons):
     assert "3 models" in out
 
 
+# ollama liveness in the ENGINES section (2026-06-26-detect-ollama-liveness)
+def test_det_engines_serving(make_console):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime("Ollama", True, "0.30.10", kind="engine", serving=True)])
+    cli._det_engines(c, m)
+    out = buf.getvalue()
+    assert "Ollama 0.30.10" in out
+    assert "serving" in out
+
+
+def test_det_engines_installed_not_serving_guides_serve(make_console):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime("Ollama", True, "0.30.10", kind="engine", serving=False)])
+    cli._det_engines(c, m)
+    out = buf.getvalue()
+    assert "not serving" in out
+    assert "ollama serve" in out         # actionable guidance, not suppression
+
+
+def test_det_engines_serving_none_renders_found(make_console):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime("llama.cpp", True, "9780", kind="engine")])
+    cli._det_engines(c, m)
+    out = buf.getvalue()
+    assert "found" in out
+    assert "serving" not in out          # non-server engines carry no serving state
+
+
 def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     stub_pythons(count=1)
     m = _machine(accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1,

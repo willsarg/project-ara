@@ -16,13 +16,19 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
 from pathlib import Path
 
 import psutil
 
-from ara import apps as _apps, engines as _engines, hardware as _hardware, versions as _versions
+from ara import (
+    apps as _apps,
+    engines as _engines,
+    hardware as _hardware,
+    ollama,
+    versions as _versions,
+)
 
 GB = 1024 ** 3
 
@@ -290,6 +296,7 @@ class Runtime:
     kind: str = "engine"             # "engine" (launch target) | "framework" (library)
     accels: tuple[str, ...] = ()     # accelerator kinds it's built for; () = cross-platform
     usable: bool | None = None       # resolved against this machine; None = not gated
+    serving: bool | None = None      # server runtimes only: True=reachable, False=installed-but-down
 
     @property
     def requires(self) -> str | None:
@@ -343,7 +350,17 @@ def runtimes(accel_kind: str = "none", user_py: str | None = None) -> list[Runti
     for name, present, version, kind, accels in specs:
         usable = None if not accels else (accel_kind in accels)
         out.append(Runtime(name, present, version, kind=kind, accels=accels, usable=usable))
-    return out
+    return [_with_ollama_liveness(rt) if rt.name == "Ollama" else rt for rt in out]
+
+
+def _with_ollama_liveness(rt: Runtime) -> Runtime:
+    """Enrich the Ollama runtime with liveness. Ollama is a *server* — "installed" (which/`~/.ollama`)
+    isn't "serving", so probe the local API only when it's installed (no pointless call otherwise).
+    When serving, prefer the running version over the brew receipt. Spec 2026-06-26-detect-ollama-liveness."""
+    if not rt.present:
+        return rt
+    api_version = ollama.version()
+    return replace(rt, version=api_version or rt.version, serving=api_version is not None)
 
 
 # --------------------------------------------------------------------------- #
