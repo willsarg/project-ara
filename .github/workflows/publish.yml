@@ -1,0 +1,49 @@
+# Publish project-ara to PyPI via Trusted Publishing (OIDC) — no API token stored.
+# Fires when a version tag (v*) is pushed. The PyPI side is a "trusted publisher" registered at
+# https://pypi.org/manage/account/publishing/ bound to: owner willsarg, repo project-ara,
+# workflow publish.yml, environment pypi. See https://docs.pypi.org/trusted-publishers/.
+#
+# NOTE: version is static in pyproject.toml — bump `version` to match the tag before tagging,
+# or PyPI will reject a duplicate/mismatched version.
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}          # deny-all at the top; each job opts into only what it needs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read     # checkout only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: uv build                       # uses the declared hatchling backend
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi      # bind to the GitHub Environment the PyPI publisher trusts
+    permissions:
+      id-token: write      # OIDC token for Trusted Publishing — the ONLY elevated scope
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
