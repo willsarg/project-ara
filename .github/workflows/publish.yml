@@ -18,25 +18,15 @@ on:
 permissions: {}            # deny-all at the top; each job opts into only what it needs
 
 jobs:
-  # Tests gate the release: build/publish only run if the unit suite + 100% coverage pass.
+  # Tests gate the release (test → build → publish): a v* tag runs the cross-OS suite first via the
+  # shared test.yml, and build/publish only proceed if every OS passes.
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    uses: ./.github/workflows/test.yml
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          python-version: "3.12"
-          enable-cache: true
-      - run: uv sync --frozen --group dev
-      - run: uv run pytest                 # unit suite + 100% coverage gate
 
   build:
-    needs: test            # no build unless tests pass
+    needs: test            # no build unless tests pass on all OSes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

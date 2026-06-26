@@ -1,0 +1,39 @@
+# The test suite, run on all three OSes — primarily to catch POSIX/path/filesystem differences
+# (the project has Windows-specific code paths). Runs the mocked unit suite + 100% coverage gate
+# (both baked into the default `pytest` in pyproject.toml). Integration tests (`-m integration`) are
+# hardware-gated and stay manual on the real boxes.
+#
+# Two entry points:
+#   - workflow_call: the release pipeline (publish.yml) calls this so a v* tag is gated on tests.
+#   - workflow_dispatch: run it by hand from the Actions tab for on-demand cross-platform feedback.
+#
+# Hardening: read-only token, actions pinned to commit SHAs, checkout creds not persisted, locked
+# deps, per-job timeout. The run steps are single uv commands, so they work in bash (Linux/macOS)
+# and PowerShell (Windows) unchanged — no shell-specific syntax.
+name: Test
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false           # show every OS's result, not just the first failure
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run pytest         # unit suite + 100% coverage gate
