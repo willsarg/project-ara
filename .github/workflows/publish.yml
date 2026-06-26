@@ -21,6 +21,17 @@ jobs:
       contents: read     # checkout only
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tag matches pyproject version
+        env:
+          TAG: ${{ github.ref_name }}          # e.g. v0.0.2 — via env, never inlined into the script
+        run: |
+          file_version="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          tag_version="${TAG#v}"               # strip the leading v
+          echo "tag=$TAG (->$tag_version)  pyproject=$file_version"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::tag $TAG does not match pyproject.toml version $file_version — bump the version (or fix the tag) so they line up, then re-tag."
+            exit 1
+          fi
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
