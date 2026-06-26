@@ -412,6 +412,37 @@ def test_generate_appends_weight_quant(monkeypatch):
     assert seen["argv"][-2:] == ["--weight-quant", "int8"]
 
 
+# --------------------------------------------------------------------------- #
+# Chunked prefill lever (--prefill-chunk N) → wcx --prefill-chunk N
+# --------------------------------------------------------------------------- #
+def test_worker_argv_appends_prefill_chunk():
+    argv = cuda._worker_argv("org/m", 2000, 1.0, 0.6, prefill_chunk=256)
+    assert argv[-2:] == ["--prefill-chunk", "256"]
+    assert "--prefill-chunk" not in cuda._worker_argv("org/m", 2000, 1.0, 0.6)   # off by default
+
+
+def test_characterize_threads_prefill_chunk_to_measure(monkeypatch):
+    # The certified ceiling must be measured with the same chunking run will use.
+    _patch_budget(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(cuda.driver, "characterize",
+                        lambda model, measure=None, **kw: seen.update(
+                            argv=measure(model, 2000)) or {"model": model})
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: argv)}))
+    cuda.characterize("org/m", prefill_chunk=256)
+    assert seen["argv"][-2:] == ["--prefill-chunk", "256"]
+
+
+def test_generate_appends_prefill_chunk(monkeypatch):
+    seen = {}
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 8192, "completion": "x"})}))
+    cuda.generate("org/m", "hi", max_context=8192, max_tokens=64, prefill_chunk=256)
+    assert seen["argv"][-2:] == ["--prefill-chunk", "256"]
+
+
 def test_fp8_capable_reads_device_worker(monkeypatch):
     monkeypatch.setattr(cuda, "safe_limits", lambda: {"fp8_capable": True})
     assert cuda.fp8_capable() is True

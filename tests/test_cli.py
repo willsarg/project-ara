@@ -88,10 +88,12 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
                         lambda c, m, engine=None, as_json=False, flash_attn=True,
-                        flash_attn_optin=False, kv_quant="f16", weight_quant="none":
+                        flash_attn_optin=False, kv_quant="f16", weight_quant="none",
+                        prefill_chunk=None:
                         (rec.update(characterize=m, characterize_engine=engine,
                                     characterize_fa=flash_attn, characterize_fa_optin=flash_attn_optin,
-                                    characterize_kv=kv_quant, characterize_wq=weight_quant) or 0))
+                                    characterize_kv=kv_quant, characterize_wq=weight_quant,
+                                    characterize_chunk=prefill_chunk) or 0))
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
@@ -1853,7 +1855,7 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
     def backend(b=None):
         bk = types.SimpleNamespace()
         if supports.get(b):
-            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False, weight_quant="none": {
+            bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False, weight_quant="none", prefill_chunk=None: {
                 "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
         return bk
     monkeypatch.setattr(cli, "get_backend", backend)
@@ -2014,10 +2016,10 @@ def test_main_search_no_query(monkeypatch, capsys):
 def test_kv_fa_kwargs_per_backend():
     assert cli._kv_fa_kwargs("vulkan", flash_attn=True, flash_attn_optin=False,
                              kv_quant="q4_0") == {"flash_attn": True, "kv_quant": "q4_0"}
-    # cuda: flash is the OPT-IN (default off → SDPA); kv-quant + weight-quant carried
+    # cuda: flash is the OPT-IN (default off → SDPA); kv-quant + weight-quant + prefill-chunk carried
     assert cli._kv_fa_kwargs("cuda", flash_attn=True, flash_attn_optin=True, kv_quant="q8_0",
                              weight_quant="int4") == {"kv_quant": "q8_0", "flash_attn": True,
-                                                      "weight_quant": "int4"}
+                                                      "weight_quant": "int4", "prefill_chunk": None}
     assert cli._kv_fa_kwargs("apple", flash_attn=True, flash_attn_optin=True,
                              kv_quant="f16") == {"kv_quant": "f16"}
     assert cli._kv_fa_kwargs("cpu", flash_attn=True, flash_attn_optin=True, kv_quant="f16") == {}
@@ -2107,6 +2109,69 @@ def test_main_characterize_threads_weight_quant(monkeypatch):
     rec2 = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["characterize", "org/M", "--weight-quant=int8"])   # = form
     assert rec2["characterize_wq"] == "int8"
+
+
+def test_kv_fa_kwargs_includes_prefill_chunk_for_cuda():
+    kw = cli._kv_fa_kwargs("cuda", flash_attn=True, flash_attn_optin=False, kv_quant="f16",
+                           weight_quant="none", prefill_chunk=256)
+    assert kw["prefill_chunk"] == 256
+    # engines with no chunked-prefill path never carry the kwarg
+    assert "prefill_chunk" not in cli._kv_fa_kwargs(
+        "vulkan", flash_attn=True, flash_attn_optin=False, kv_quant="f16", prefill_chunk=256)
+
+
+def test_unsupported_lever_error_prefill_chunk():
+    # chunked prefill is cuda-only; rejected (explicitly) on the others
+    assert "chunked prefill" in cli._unsupported_lever_error(
+        "cpu", kv_quant="f16", flash_attn=True, flash_attn_optin=False, prefill_chunk=256)
+    assert cli._unsupported_lever_error(
+        "cuda", kv_quant="f16", flash_attn=True, flash_attn_optin=False, prefill_chunk=256) is None
+    assert cli._unsupported_lever_error(            # not requested → no error anywhere
+        "cpu", kv_quant="f16", flash_attn=True, flash_attn_optin=False, prefill_chunk=None) is None
+
+
+def test_main_characterize_threads_prefill_chunk(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "256"])
+    assert rec["characterize_chunk"] == 256
+    rec2 = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--chunked-prefill"])   # bare → default 512
+    assert rec2["characterize_chunk"] == 512
+    rec3 = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M"])                        # off by default
+    assert rec3["characterize_chunk"] is None
+
+
+def test_main_run_threads_prefill_chunk(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["run", "org/M", "hello", "--prefill-chunk", "128"])
+    assert rec["run"]["prefill_chunk"] == 128
+
+
+def test_main_characterize_prefill_chunk_eq_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk=384"])   # = form
+    assert rec["characterize_chunk"] == 384
+
+
+def test_main_prefill_chunk_non_integer_disables_lever(monkeypatch):
+    # A non-integer value parses to None (off) rather than crashing the CLI (Rule #1 fail-safe).
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"])
+    assert rec["characterize_chunk"] is None
+
+
+def test_int_or_none_parses_and_rejects():
+    assert cli._int_or_none("512") == 512
+    assert cli._int_or_none("nope") is None
+    assert cli._int_or_none("") is None
+
+
+def test_render_characterize_rejects_unsupported_chunked_prefill(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cpu")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M", prefill_chunk=256) == 1
+    assert "chunked prefill" in buf.getvalue() and "cpu" in buf.getvalue()
 
 
 def test_render_characterize_rejects_unsupported_lever(make_console, monkeypatch):

@@ -266,7 +266,17 @@ def _det_memory_detail(c: Console, m) -> None:
 _ARA_ENGINE_BACKENDS = {"cuda", "mlx", "vulkan"}   # backends ARA can actually run today
 _KV_QUANT_CHOICES = ("f16", "q8_0", "q4_0")        # vulkan KV-cache quant (symmetric K=V)
 _WEIGHT_QUANT_CHOICES = ("none", "int8", "int4", "fp8")   # CUDA runtime weight quant (bitsandbytes/FP8)
+_DEFAULT_PREFILL_CHUNK = 512   # chunk size a bare --chunked-prefill uses (cuda); tunable via --prefill-chunk
 _RUNTIME_LABEL = {"vulkan": "Vulkan", "cuda": "CUDA", "mlx": "MLX", "rocm": "ROCm"}
+
+
+def _int_or_none(s: str) -> int | None:
+    """Parse a CLI integer value, or None if it's empty/not an int (so a bad value disables the
+    lever rather than crashing — the engine-level reject/validation still applies downstream)."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
 
 
 def _gpu_line(c: Console, g) -> None:
@@ -892,14 +902,16 @@ def _kv_quant_error(kv_quant: str) -> str:
 # can't honor is REJECTED with a clear message, never silently dropped. Mirrors _kv_fa_kwargs.
 _ENGINE_LEVERS = {
     "vulkan": {"kv_quant", "flash_attn"},
-    "cuda": {"kv_quant", "flash_attn", "weight_quant"},   # NVIDIA-native runtime weight quant
+    # NVIDIA-native runtime weight quant + chunked prefill (long-context unlock on Turing/no-FA cards)
+    "cuda": {"kv_quant", "flash_attn", "weight_quant", "prefill_chunk"},
     "apple": {"kv_quant"},        # MLX's SDPA is always fused — no flash-attn knob
     "cpu": set(),                  # llama.cpp cache-type / flash aren't wired at the ARA level yet
 }
 
 
 def _unsupported_lever_error(backend: str, *, kv_quant: str, flash_attn: bool,
-                             flash_attn_optin: bool, weight_quant: str = "none") -> str | None:
+                             flash_attn_optin: bool, weight_quant: str = "none",
+                             prefill_chunk: int | None = None) -> str | None:
     """A clear message when the user EXPLICITLY set a context lever the selected engine can't honor
     — else None. Honesty (Rule #3): reject rather than silently ignore the flag. A flash flag is
     'explicit' when --no-flash-attn turned the default off, or --flash-attn opted in."""
@@ -910,11 +922,14 @@ def _unsupported_lever_error(backend: str, *, kv_quant: str, flash_attn: bool,
         return f"flash-attention isn't a tunable setting on the {backend} engine"
     if weight_quant != "none" and "weight_quant" not in levers:
         return f"--weight-quant is only supported on the cuda engine (not {backend})"
+    if prefill_chunk is not None and "prefill_chunk" not in levers:
+        return f"chunked prefill is only supported on the cuda engine (not {backend})"
     return None
 
 
 def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
-                 kv_quant: str, weight_quant: str = "none") -> dict:
+                 kv_quant: str, weight_quant: str = "none",
+                 prefill_chunk: int | None = None) -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
     on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes. Flash-attention has
     OPPOSITE defaults per engine: vulkan's llama.cpp FA is on-by-default (``flash_attn``, the
@@ -924,7 +939,8 @@ def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
     if backend == "vulkan":
         return {"flash_attn": flash_attn, "kv_quant": kv_quant}
     if backend == "cuda":
-        return {"kv_quant": kv_quant, "flash_attn": flash_attn_optin, "weight_quant": weight_quant}
+        return {"kv_quant": kv_quant, "flash_attn": flash_attn_optin, "weight_quant": weight_quant,
+                "prefill_chunk": prefill_chunk}
     if backend == "apple":
         return {"kv_quant": kv_quant}
     return {}
@@ -952,7 +968,7 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
                         flash_attn_optin: bool = False, kv_quant: str = "f16",
-                        weight_quant: str = "none") -> int:
+                        weight_quant: str = "none", prefill_chunk: int | None = None) -> int:
     """Measure a model's safe context ceiling on an engine, and store it.
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
@@ -978,7 +994,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
     lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant, flash_attn=flash_attn,
-                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant)
+                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                                         prefill_chunk=prefill_chunk)
     if lever_err is not None:
         print(json.dumps({"error": lever_err})) if as_json else c.emit(c.style("bad", f"  {lever_err}"))
         return 1
@@ -1054,7 +1071,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant)
+                          kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
     try:
         result = bk.characterize(model, progress=progress, **fa_kw)
@@ -1258,7 +1275,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                assume_yes: bool = False, as_json: bool = False,
                max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
                flash_attn_optin: bool = False, kv_quant: str = "f16",
-               weight_quant: str = "none") -> int:
+               weight_quant: str = "none", prefill_chunk: int | None = None) -> int:
     """Governed one-shot inference: generate a completion for *model*, capped at its characterized
     safe context ceiling (launch under the wall, never over). Requires a *measured* ceiling — if
     the model isn't characterized here, it refuses and points at ``ara characterize``. Loads the
@@ -1331,7 +1348,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         safe, backend, _ = runnable[engine_key]
 
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
-                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant)
+                                         flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                                         prefill_chunk=prefill_chunk)
     if lever_err is not None:
         return err(lever_err)
 
@@ -1355,7 +1373,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if not as_json:
         c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
     fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant)
+                          kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
         result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
@@ -1662,6 +1680,7 @@ def _main_impl() -> int:
     assume_yes = "--yes" in argv or "-y" in argv
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
+    chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
 
     # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
     model: str | None = None
@@ -1669,6 +1688,7 @@ def _main_impl() -> int:
     token: str | None = None
     kv_quant: str = "f16"
     weight_quant: str = "none"
+    prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1712,6 +1732,13 @@ def _main_impl() -> int:
         if a.startswith("--weight-quant="):
             weight_quant = a.split("=", 1)[1]
             continue
+        if a == "--prefill-chunk":
+            prefill_chunk_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
+            skip = True
+            continue
+        if a.startswith("--prefill-chunk="):
+            prefill_chunk_val = _int_or_none(a.split("=", 1)[1])
+            continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
                 _csv(argv[i + 1] if i + 1 < len(argv) else ""))
@@ -1723,10 +1750,16 @@ def _main_impl() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn", "--flash-attn"):
+        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn", "--flash-attn",
+                 "--chunked-prefill"):
             continue
         rest.append(a)
     c = Console.from_env(verbose=verbose)
+
+    # Resolve the chunked-prefill lever: an explicit size wins; a bare --chunked-prefill uses the
+    # default; neither → off (single-shot). One source of truth passed down to the cuda worker.
+    prefill_chunk = prefill_chunk_val if prefill_chunk_val is not None else (
+        _DEFAULT_PREFILL_CHUNK if chunked_prefill else None)
 
     def _arg_err(msg: str) -> int:
         """Usage / dispatch error: structured JSON under --json, styled warn otherwise (Rule #3)."""
@@ -1778,7 +1811,8 @@ def _main_impl() -> int:
             return _arg_err("usage: ara characterize <model>")
         return render_characterize(c, rest[1], engine=engine, as_json=as_json,
                                    flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                                   kv_quant=kv_quant, weight_quant=weight_quant)
+                                   kv_quant=kv_quant, weight_quant=weight_quant,
+                                   prefill_chunk=prefill_chunk)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -1792,7 +1826,8 @@ def _main_impl() -> int:
         return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
                           engine=engine, assume_yes=assume_yes, as_json=as_json,
                           flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant)
+                          kv_quant=kv_quant, weight_quant=weight_quant,
+                          prefill_chunk=prefill_chunk)
 
     if cmd == "install":
         return render_install(c, engine=engine or "auto", as_json=as_json)
