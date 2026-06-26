@@ -1,6 +1,6 @@
 [project]
 name = "project-ara"
-version = "0.0.2"
+version = "0.0.3"
 description = "AI Runs Anywhere — backend-agnostic local inference that fits any hardware safely."
 readme = "README.md"
 license = "Apache-2.0"
