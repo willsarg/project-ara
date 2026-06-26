@@ -1084,6 +1084,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             else:
                 c.emit(c.style("bad", f"  {msg}"))
             return 1
+        _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
         c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
         try:
             bk.download_calibration_model(model, progress=progress)
@@ -1730,7 +1731,6 @@ def main() -> int:
 
 
 def _main_impl() -> int:
-    hf_auth.quiet_hub_warnings()         # mute HF's generic 'unauthenticated' chatter (we nudge ourselves)
     argv = sys.argv[1:]
     if "--version" in argv:
         print(_ara_version())

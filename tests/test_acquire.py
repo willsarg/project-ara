@@ -81,22 +81,6 @@ def test_download_calls_snapshot_and_restores_bars(monkeypatch):
     assert order == ["disable", "enable"]  # disabled for the download, then restored
 
 
-def test_download_suppresses_hf_unauthenticated_warning(monkeypatch):
-    import warnings
-
-    def warns_then_ok(repo_id):
-        warnings.warn("You are sending unauthenticated requests to the HF Hub")
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", warns_then_ok)
-    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)
-    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
-    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: None)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        acquire.download("org/repo")
-    assert not any("unauthenticated" in str(w.message) for w in caught)   # muted by download()
-
-
 def test_download_leaves_bars_disabled_if_already_disabled(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
     monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)

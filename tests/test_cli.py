@@ -342,12 +342,6 @@ def test_render_search_nudges_to_login_when_unauthenticated(monkeypatch, make_co
     assert "ara hf login" in buf.getvalue()
 
 
-def test_main_quiets_hub_warnings(monkeypatch):
-    _capture_dispatch(monkeypatch)
-    called = {}
-    monkeypatch.setattr(cli.hf_auth, "quiet_hub_warnings", lambda: called.setdefault("q", True))
-    _run_main(monkeypatch, ["detect"])
-    assert called.get("q")
 
 
 def test_main_verbose_flag_sets_console(monkeypatch):

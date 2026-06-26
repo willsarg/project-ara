@@ -134,14 +134,6 @@ def test_has_token_false_when_none(monkeypatch):
     assert hf_auth.has_token() is False
 
 
-def test_quiet_hub_warnings_raises_hf_logger_to_error():
-    import logging
-    log = logging.getLogger("huggingface_hub")
-    log.setLevel(logging.WARNING)
-    hf_auth.quiet_hub_warnings()
-    assert log.level == logging.ERROR
-
-
 # --------------------------------------------------------------------------- #
 # set_token
 # --------------------------------------------------------------------------- #

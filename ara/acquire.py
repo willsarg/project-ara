@@ -125,8 +125,6 @@ def download(repo_id: str, *, progress: bool = False) -> None:
     The prior bar state is always restored in ``finally`` regardless of which path
     ran or whether the download succeeded.
     """
-    import warnings
-
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
 
@@ -136,11 +134,7 @@ def download(repo_id: str, *, progress: bool = False) -> None:
     else:
         disable_progress_bars()
     try:
-        with warnings.catch_warnings():
-            # Mute HF's generic 'unauthenticated requests … set a HF_TOKEN' nudge during the fetch —
-            # ARA surfaces its own `ara hf login` guidance instead. Real errors still raise.
-            warnings.simplefilter("ignore")
-            snapshot_download(repo_id)
+        snapshot_download(repo_id)
     finally:
         if was_disabled:
             disable_progress_bars()
