@@ -2,11 +2,12 @@
 # Copyright 2026 Will Sarg
 """Thin, engine-free client for a local Ollama server.
 
-stdlib only (``urllib`` + ``json``), lazy, with a single patchable seam so ``detect``
-can probe liveness without depending on a running server. Tier 1 is liveness only
-(``version()``); richer endpoints (tags/ps/show) arrive with later tiers.
+stdlib only (``urllib`` + ``json``), lazy, with two patchable seams (``_get_json`` /
+``_post_json``) so callers can probe and drive a local server without depending on one
+running. Liveness (``version``) serves ``detect``; the ``serve`` tier adds inventory
+(``tags``/``ps``) and the governed-model lifecycle (``create``/``load``).
 
-See vault spec 2026-06-26-detect-ollama-liveness.
+See vault specs 2026-06-26-detect-ollama-liveness and 2026-06-26-ara-serve-governed-endpoint.
 """
 from __future__ import annotations
 
@@ -40,6 +41,21 @@ def _get_json(path: str, timeout: float) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _post_json(path: str, payload: dict, timeout: float) -> dict | None:
+    """POST a JSON ``payload`` to ``base_url() + path`` and parse a JSON object response.
+    Returns the dict, or ``None`` on any transport/parse failure. The POST counterpart to
+    ``_get_json`` — tests monkeypatch ``urllib.request.urlopen`` here (or patch this seam)."""
+    try:
+        req = urllib.request.Request(
+            base_url() + path, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def version(timeout: float = 0.5) -> str | None:
     """The running server's version via ``GET /api/version``, or ``None`` when the server
     isn't reachable/serving. ``None`` is the canonical 'not serving' signal."""
@@ -48,3 +64,49 @@ def version(timeout: float = 0.5) -> str | None:
         return None
     v = data.get("version")
     return v if isinstance(v, str) else None
+
+
+def tags(timeout: float = 2.0) -> list[str] | None:
+    """Installed model names via ``GET /api/tags`` (e.g. ``["qwen3:0.6b", ...]``), or ``None``
+    when the server is unreachable / the payload is malformed. Malformed entries are skipped."""
+    data = _get_json("/api/tags", timeout)
+    if not data:
+        return None
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None
+    return [m["name"] for m in models
+            if isinstance(m, dict) and isinstance(m.get("name"), str)]
+
+
+def ps(timeout: float = 2.0) -> list[dict] | None:
+    """Currently-loaded models via ``GET /api/ps`` — each dict carries ``name``,
+    ``context_length``, ``size`` and ``size_vram`` (``size_vram < size`` ⇒ partial offload /
+    spill). ``None`` when unreachable; non-dict entries are dropped."""
+    data = _get_json("/api/ps", timeout)
+    if not data:
+        return None
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None
+    return [m for m in models if isinstance(m, dict)]
+
+
+def create(name: str, from_model: str, num_ctx: int, timeout: float = 300.0) -> bool:
+    """Create a derived model ``name`` from ``from_model`` with ``num_ctx`` **baked in** as a
+    default parameter, via ``POST /api/create``. Baking the ceiling into the model is what makes
+    it hold under arbitrary consumers — a plain ``/v1`` request reloads the base model at its
+    default context, blowing past the safe wall (measured 2026-06-26). ``True`` on success."""
+    data = _post_json("/api/create",
+                      {"model": name, "from": from_model,
+                       "parameters": {"num_ctx": num_ctx}, "stream": False}, timeout)
+    return bool(data and data.get("status") == "success")
+
+
+def load(name: str, keep_alive: int = -1, timeout: float = 300.0) -> dict | None:
+    """Warm-load ``name`` into memory via an empty-prompt ``POST /api/generate`` (so it appears
+    in ``ps`` for verification) and hold it with ``keep_alive`` (``-1`` = until stopped).
+    Returns the response dict, or ``None`` on failure."""
+    return _post_json("/api/generate",
+                      {"model": name, "prompt": "", "stream": False,
+                       "keep_alive": keep_alive}, timeout)

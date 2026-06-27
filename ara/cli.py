@@ -16,7 +16,7 @@ from importlib import metadata
 from pathlib import Path
 
 from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, hf_auth, mlx,
-                 profile, calibration, pythons, serialize, status, versions)
+                 ollama, profile, calibration, pythons, serialize, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -152,6 +152,8 @@ _COMMAND_HELP = {
     "recommend": "ara recommend [--json] — models that fit here, ranked by usable context",
     "run": ("ara run <model> <prompt> [--engine E] [--kv-quant ...] [--weight-quant ...] "
             "[--chunked-prefill] [--json]"),
+    "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
+              "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
     "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
 }
 
@@ -210,6 +212,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "profile", "estimate this machine's capability (analytic — no engine)"))
     c.emit(_cmd(c, "recommend", "catalog models that fit, ranked by usable context"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
+    c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
@@ -1455,6 +1458,117 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# serve — stand a model up as a governed OpenAI-compatible endpoint on Ollama
+# (Decision 2026-06-26; spec 2026-06-26-ara-serve-governed-endpoint)
+# --------------------------------------------------------------------------- #
+# Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
+# engines transfers; the MLX (wmx) ceiling does NOT (different allocation model — the seam mismatch).
+_OLLAMA_CEILING_ENGINES = ("cpu", "vulkan")
+
+
+def _ollama_safe_ceiling(con, mk: str, model: str):
+    """The largest *measured* llama.cpp-class safe ceiling for *model* on this machine, as
+    ``(safe_context, "measured")``, or ``None`` if none is recorded."""
+    best = None
+    for key in _OLLAMA_CEILING_ENGINES:
+        row = db.get_characterization(con, mk, key, model)
+        if (row and row.get("safe_context") is not None
+                and (best is None or row["safe_context"] > best[0])):
+            best = (row["safe_context"], "measured")
+    return best
+
+
+def _governed_name(model: str) -> str:
+    """A valid derived Ollama model name carrying the governed ceiling — e.g.
+    ``qwen3:0.6b`` → ``qwen3-0.6b-ara``. Anything outside ``[a-z0-9._-]`` becomes ``-``."""
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in model.lower())
+    return safe + "-ara"
+
+
+def _find_loaded(entries: list[dict], served: str) -> dict | None:
+    """The ``/api/ps`` entry for our derived model (Ollama tags it ``:latest``), or ``None``."""
+    return next((m for m in entries if m.get("name") == served
+                 or m.get("name", "").startswith(served + ":")), None)
+
+
+def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | None = None,
+                 assume_yes: bool = False, as_json: bool = False) -> int:
+    """Stand *model* up as a **governed** OpenAI-compatible endpoint on a local Ollama, capped at a
+    safe context ceiling, and hand back the connection — then get out of the way (BYO consumer).
+
+    The ceiling is **baked into a derived model** (``<model>-ara``): a plain ``/v1`` request reloads
+    the base model at its *default* context, blowing past the safe wall (measured 2026-06-26), so
+    governing per-request isn't enough. The ceiling is *measured* (a llama.cpp-class
+    characterization) or *explicit* (``--ctx``) — never a silent guess (Rule #1/#3). After load it
+    verifies the ceiling actually took before returning an endpoint. Spec
+    2026-06-26-ara-serve-governed-endpoint."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    # 1. liveness — honest about a server that isn't there (Rule #3)
+    if ollama.version() is None:
+        return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
+
+    # 2. the base model must already be in Ollama's store (pull is a later slice)
+    names = ollama.tags()
+    if names is None:
+        return err("couldn't list Ollama models — is the server reachable?")
+    if model not in names:
+        return err(f"{model} isn't pulled in Ollama — run: ollama pull {model}")
+
+    # 3. resolve the safe ceiling — measured, or explicit; never guessed
+    if ctx is not None:
+        if ctx <= 0:
+            return err("--ctx must be a positive integer")
+        safe, source = ctx, "requested"
+    else:
+        found = _ollama_safe_ceiling(db.connect(), profile.machine_key(), model)
+        if found is None:
+            return err(f"no measured safe ceiling for {model} — pass --ctx N, or characterize it "
+                       f"first (Ollama runs llama.cpp; characterize on cpu/vulkan).")
+        safe, source = found
+
+    # consent — serve creates + holds a model in memory
+    if not as_json and not assume_yes and sys.stdin.isatty():
+        if not _confirm(f"Stand up {model} on Ollama, governed at ≤{safe} ctx?"):
+            c.emit(c.style("dim", "  skipped."))
+            return 0
+
+    # 4. bake the ceiling into a derived model
+    served = name or _governed_name(model)
+    if not ollama.create(served, model, safe):
+        return err(f"couldn't create the governed model {served!r} on Ollama.")
+
+    # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
+    ollama.load(served)
+    entry = _find_loaded(ollama.ps() or [], served)
+    if entry is None:
+        return err(f"{served} didn't load — Ollama may be out of memory.")
+    served_ctx = entry.get("context_length")
+    if served_ctx != safe:
+        return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
+    size, vram = entry.get("size"), entry.get("size_vram")
+    spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+
+    # 6. the handoff — connection info, then ARA exits (the model stays served)
+    endpoint = ollama.base_url() + "/v1"
+    if as_json:
+        print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
+                          "served_context": safe, "ceiling_source": source, "spilled": spilled,
+                          "openai_base_url": endpoint}, indent=2))
+        return 0
+    c.emit()
+    c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
+    c.emit(c.field("endpoint", f"{endpoint}  (OpenAI-compatible)"))
+    c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
+    if spilled:
+        c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
+    c.emit()
+    return 0
+
+
 def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
     """Install the matched engine. ``--engine`` is the consent; exit 0 once the
     engine is present (installed or already), nonzero otherwise."""
@@ -1755,6 +1869,8 @@ def _main_impl() -> int:
     kv_quant: str = "f16"
     weight_quant: str = "none"
     prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
+    serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
+    serve_name: str | None = None                # `serve --name X`: derived served-model name
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1804,6 +1920,20 @@ def _main_impl() -> int:
             continue
         if a.startswith("--prefill-chunk="):
             prefill_chunk_val = _int_or_none(a.split("=", 1)[1])
+            continue
+        if a == "--ctx":
+            serve_ctx = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
+            skip = True
+            continue
+        if a.startswith("--ctx="):
+            serve_ctx = _int_or_none(a.split("=", 1)[1])
+            continue
+        if a == "--name":
+            serve_name = argv[i + 1] if i + 1 < len(argv) else None
+            skip = True
+            continue
+        if a.startswith("--name="):
+            serve_name = a.split("=", 1)[1] or None
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -1896,6 +2026,12 @@ def _main_impl() -> int:
                           flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant,
                           prefill_chunk=prefill_chunk)
+
+    if cmd == "serve":
+        if len(rest) < 2:
+            return _arg_err("usage: ara serve <model> [--ctx N] [--name NAME]")
+        return render_serve(c, rest[1], ctx=serve_ctx, name=serve_name,
+                            assume_yes=assume_yes, as_json=as_json)
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.

@@ -4496,3 +4496,229 @@ def test_main_hf_no_sub_dispatches_none(monkeypatch):
                         lambda c, sub, token=None, as_json=False: rec.update(hf=sub) or 1)
     _run_main(monkeypatch, ["hf"])
     assert rec.get("hf") is None
+
+
+# --------------------------------------------------------------------------- #
+# serve — governed Ollama endpoint (spec 2026-06-26-ara-serve-governed-endpoint)
+# --------------------------------------------------------------------------- #
+# A loaded /api/ps entry for the default derived name at the requested 8192 ctx (no spill).
+_SERVE_LOADED = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+                  "size": 100, "size_vram": 100}]
+
+
+def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create_ok=True,
+                ps_rows=None, characterization=None, isatty=False):
+    """Wire render_serve's Ollama + db seams. ``names=None`` ⇒ tags() unreachable;
+    ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches)."""
+    monkeypatch.setattr(cli.ollama, "version", lambda timeout=0.5: version)
+    monkeypatch.setattr(cli.ollama, "tags",
+                        lambda timeout=2.0: (None if names is None else list(names)))
+    monkeypatch.setattr(cli.ollama, "create", lambda n, f, ctx, timeout=300.0: create_ok)
+    monkeypatch.setattr(cli.ollama, "load", lambda n, keep_alive=-1, timeout=300.0: {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda timeout=2.0: (ps_rows or []))
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(cli.db, "connect", lambda: object())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+
+
+def test_serve_refuses_when_not_serving(make_console, monkeypatch):
+    _wire_serve(monkeypatch, version=None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "isn't serving" in buf.getvalue()
+
+
+def test_serve_refuses_when_tags_unreachable(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't list Ollama models" in buf.getvalue()
+
+
+def test_serve_refuses_when_model_not_pulled(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    out = buf.getvalue()
+    assert "isn't pulled" in out and "ollama pull qwen3:0.6b" in out
+
+
+def test_serve_rejects_nonpositive_ctx(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=0) == 1
+    assert "positive integer" in buf.getvalue()
+
+
+def test_serve_refuses_without_measured_ceiling(make_console, monkeypatch):
+    _wire_serve(monkeypatch, characterization=None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 1          # no --ctx, nothing measured
+    assert "no measured safe ceiling" in buf.getvalue()
+
+
+def test_serve_uses_measured_ceiling(make_console, monkeypatch, capsys):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 4096,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096}, ps_rows=rows)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["served_context"] == 4096 and payload["ceiling_source"] == "measured"
+
+
+def test_serve_refuses_when_create_fails(make_console, monkeypatch):
+    _wire_serve(monkeypatch, create_ok=False)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't create" in buf.getvalue()
+
+
+def test_serve_refuses_when_model_does_not_load(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=[])                   # nothing in /api/ps
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "didn't load" in buf.getvalue()
+
+
+def test_serve_refuses_on_governance_mismatch(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 40960,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, ps_rows=rows)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "governance failed" in buf.getvalue()
+
+
+def test_serve_confirm_declined_skips(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, isatty=True)
+    monkeypatch.setattr(cli, "_confirm", lambda q: False)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert "skipped" in buf.getvalue()
+
+
+def test_serve_confirm_accepted_proceeds(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, isatty=True)
+    monkeypatch.setattr(cli, "_confirm", lambda q: True)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert "qwen3-0.6b-ara" in buf.getvalue()
+
+
+def test_serve_happy_text(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, isatty=False)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    out = buf.getvalue()
+    assert "qwen3-0.6b-ara" in out
+    assert "OPENAI_BASE_URL=http://127.0.0.1:11434/v1" in out
+
+
+def test_serve_happy_json(make_console, monkeypatch, capsys):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["model"] == "qwen3-0.6b-ara"
+    assert payload["base_model"] == "qwen3:0.6b"
+    assert payload["served_context"] == 8192
+    assert payload["endpoint"] == "http://127.0.0.1:11434/v1"
+    assert payload["ceiling_source"] == "requested"
+    assert payload["spilled"] is False
+
+
+def test_serve_custom_name_and_assume_yes(make_console, monkeypatch):
+    rows = [{"name": "mysrv:latest", "context_length": 8192, "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, ps_rows=rows, isatty=True)    # tty, but --yes bypasses consent
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, name="mysrv", assume_yes=True) == 0
+    assert "mysrv" in buf.getvalue()
+
+
+def test_serve_warns_on_spill(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 200, "size_vram": 100}]            # size_vram < size ⇒ partial offload
+    _wire_serve(monkeypatch, ps_rows=rows)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert "partially offloaded" in buf.getvalue()
+
+
+# serve helpers
+def test_governed_name_sanitizes():
+    assert cli._governed_name("qwen3:0.6b") == "qwen3-0.6b-ara"
+    assert cli._governed_name("Org/Repo-Name") == "org-repo-name-ara"
+
+
+def test_find_loaded_matches_exact_tagged_and_none():
+    assert cli._find_loaded([{"name": "srv"}], "srv") == {"name": "srv"}
+    assert cli._find_loaded([{"name": "srv:latest"}], "srv") == {"name": "srv:latest"}
+    assert cli._find_loaded([{"name": "other"}], "srv") is None
+
+
+def test_ollama_safe_ceiling_first_engine_largest(monkeypatch):
+    chars = {"cpu": {"safe_context": 8000}, "vulkan": {"safe_context": 5000}}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured")
+
+
+def test_ollama_safe_ceiling_second_engine_larger(monkeypatch):
+    chars = {"cpu": {"safe_context": 5000}, "vulkan": {"safe_context": 8000}}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured")
+
+
+def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
+    chars = {"cpu": None, "vulkan": {"safe_context": None}}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") is None
+
+
+# serve dispatch (main argv parsing)
+def test_main_serve_usage_without_model(monkeypatch):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["serve"]) == 1
+
+
+def test_main_serve_dispatches_with_ctx_and_name(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["serve", "qwen3:0.6b", "--ctx", "8192", "--name", "srv"])
+    assert rec["serve"] == {"model": "qwen3:0.6b", "ctx": 8192, "name": "srv",
+                            "assume_yes": False, "as_json": False}
+
+
+def test_main_serve_equals_forms(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve=kw) or 0)
+    _run_main(monkeypatch, ["serve", "m", "--ctx=4096", "--name=x"])
+    assert rec["serve"]["ctx"] == 4096 and rec["serve"]["name"] == "x"
+
+
+def test_main_serve_empty_name_is_none(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve=kw) or 0)
+    _run_main(monkeypatch, ["serve", "m", "--name=", "--ctx", "8"])
+    assert rec["serve"]["name"] is None and rec["serve"]["ctx"] == 8
+
+
+def test_main_serve_ctx_flag_at_end_is_none(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve=kw) or 0)
+    _run_main(monkeypatch, ["serve", "m", "--ctx"])
+    assert rec["serve"]["ctx"] is None
+
+
+def test_main_serve_name_flag_at_end_is_none(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve=kw) or 0)
+    _run_main(monkeypatch, ["serve", "m", "--name"])
+    assert rec["serve"]["name"] is None
