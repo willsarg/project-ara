@@ -1,0 +1,188 @@
+[
+  {
+    "context": "The company was founded in 2010 by Sarah Chen and Marcus Webb. It specializes in renewable energy storage solutions.",
+    "question": "Who founded the company?",
+    "answers": [
+      {
+        "text": "Sarah Chen and Marcus Webb"
+      }
+    ]
+  },
+  {
+    "context": "The annual report shows total revenue of $4.2 million for fiscal year 2024, up 18% from the previous year. Operating costs were $2.8 million.",
+    "question": "What was the total revenue in fiscal year 2024?",
+    "answers": [
+      {
+        "text": "$4.2 million"
+      }
+    ]
+  },
+  {
+    "context": "The clinical trial enrolled 342 participants across five hospital sites. The primary endpoint was reduction in systolic blood pressure after 12 weeks.",
+    "question": "How many participants were enrolled in the clinical trial?",
+    "answers": [
+      {
+        "text": "342"
+      }
+    ]
+  },
+  {
+    "context": "Package delivery is guaranteed within 3-5 business days for standard shipping. Express shipping guarantees next-day delivery for orders placed before 2 PM.",
+    "question": "What is the cutoff time for next-day delivery?",
+    "answers": [
+      {
+        "text": "2 PM"
+      }
+    ]
+  },
+  {
+    "context": "The server room maintains a temperature of 68\u00b0F and humidity between 40% and 60%. The cooling system uses liquid nitrogen as a secondary coolant.",
+    "question": "What temperature is maintained in the server room?",
+    "answers": [
+      {
+        "text": "68\u00b0F"
+      }
+    ]
+  },
+  {
+    "context": "Dr. Amara Osei presented findings from a three-year longitudinal study of 1,200 children. The study tracked cognitive development from ages 4 to 7.",
+    "question": "How long did the longitudinal study run?",
+    "answers": [
+      {
+        "text": "three years"
+      }
+    ]
+  },
+  {
+    "context": "The recipe requires 2 cups of almond flour, 3 eggs, and half a cup of honey. Bake at 350\u00b0F for 25 minutes.",
+    "question": "At what temperature should the dish be baked?",
+    "answers": [
+      {
+        "text": "350\u00b0F"
+      }
+    ]
+  },
+  {
+    "context": "The new transit line will connect the northern suburbs to downtown in approximately 22 minutes. Construction is expected to be completed by Q3 2027.",
+    "question": "When is construction expected to be completed?",
+    "answers": [
+      {
+        "text": "Q3 2027"
+      }
+    ]
+  },
+  {
+    "context": "Membership fees are $45 per month or $480 annually. Members receive unlimited access to all fitness classes and the swimming pool.",
+    "question": "What is the annual membership fee?",
+    "answers": [
+      {
+        "text": "$480"
+      }
+    ]
+  },
+  {
+    "context": "The policy covers medical expenses up to $500,000 per incident. There is a $1,000 deductible per calendar year.",
+    "question": "What is the deductible per calendar year?",
+    "answers": [
+      {
+        "text": "$1,000"
+      }
+    ]
+  },
+  {
+    "context": "The library holds 45,000 volumes and subscribes to 120 academic journals. Digital access includes over 200,000 e-books.",
+    "question": "How many e-books does the library provide digital access to?",
+    "answers": [
+      {
+        "text": "over 200,000"
+      },
+      {
+        "text": "200,000"
+      }
+    ]
+  },
+  {
+    "context": "Professor Liang's course meets on Tuesdays and Thursdays from 10:30 AM to 11:45 AM in building 7, room 203.",
+    "question": "Where does Professor Liang's course meet?",
+    "answers": [
+      {
+        "text": "building 7, room 203"
+      }
+    ]
+  },
+  {
+    "context": "The prototype battery achieves an energy density of 450 Wh/kg, nearly double the industry standard of 250 Wh/kg.",
+    "question": "What is the energy density of the prototype battery?",
+    "answers": [
+      {
+        "text": "450 Wh/kg"
+      }
+    ]
+  },
+  {
+    "context": "All refund requests must be submitted within 30 days of purchase. Refunds are processed within 5-7 business days.",
+    "question": "How long does a customer have to submit a refund request?",
+    "answers": [
+      {
+        "text": "30 days"
+      },
+      {
+        "text": "within 30 days of purchase"
+      }
+    ]
+  },
+  {
+    "context": "The summit was attended by representatives from 47 countries. A joint declaration on carbon neutrality was signed by 39 of those nations.",
+    "question": "How many countries signed the joint declaration?",
+    "answers": [
+      {
+        "text": "39"
+      }
+    ]
+  },
+  {
+    "context": "The software supports Python 3.9 and above, and requires at least 4 GB of RAM. GPU acceleration is optional but recommended.",
+    "question": "What is the minimum RAM requirement?",
+    "answers": [
+      {
+        "text": "4 GB"
+      }
+    ]
+  },
+  {
+    "context": "The bridge spans 1.2 kilometers across the river delta. It was designed by civil engineer Fatima Al-Rashid and opened in 2019.",
+    "question": "Who designed the bridge?",
+    "answers": [
+      {
+        "text": "Fatima Al-Rashid"
+      }
+    ]
+  },
+  {
+    "context": "Eligible applicants must be between 18 and 35 years old and hold a bachelor's degree. The fellowship provides a $25,000 stipend.",
+    "question": "What stipend does the fellowship provide?",
+    "answers": [
+      {
+        "text": "$25,000"
+      }
+    ]
+  },
+  {
+    "context": "The dataset contains 1.4 million labeled images across 80 categories. Images were collected from 12 countries over a period of 18 months.",
+    "question": "How many categories does the dataset contain?",
+    "answers": [
+      {
+        "text": "80"
+      }
+    ]
+  },
+  {
+    "context": "The train departs from Central Station at 6:15 AM and arrives at Northgate at 8:42 AM, a journey of approximately 2 hours and 27 minutes.",
+    "question": "What time does the train depart from Central Station?",
+    "answers": [
+      {
+        "text": "6:15 AM"
+      }
+    ]
+  }
+]

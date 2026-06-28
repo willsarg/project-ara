@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS profiles (
     captured_at  TEXT NOT NULL,
     profile_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS benchmark_results (
+    machine_key  TEXT NOT NULL,
+    model_id     TEXT NOT NULL,
+    use_case     TEXT NOT NULL,
+    engine_key   TEXT,
+    backend      TEXT,
+    base_model   TEXT,
+    quant        TEXT,
+    benchmark_id TEXT,
+    tier         TEXT NOT NULL DEFAULT 'measured',
+    score        REAL NOT NULL,
+    max_score    REAL,
+    sample_size  INTEGER,
+    source       TEXT NOT NULL,
+    measured_at  TEXT NOT NULL,
+    PRIMARY KEY (machine_key, model_id, use_case)
+);
 """
 
 
@@ -203,5 +221,44 @@ def list_profiles(con: sqlite3.Connection, machine_key: str) -> list[dict]:
     """Every profile capture for this machine, newest first."""
     rows = con.execute(
         "SELECT * FROM profiles WHERE machine_key=? ORDER BY captured_at DESC, rowid DESC",
+        (machine_key,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- benchmark results (scored model × use-case outcomes, per machine) ---
+def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: str,
+                          use_case: str, *, score: float, source: str,
+                          engine_key: str | None = None, backend: str | None = None,
+                          base_model: str | None = None, quant: str | None = None,
+                          benchmark_id: str | None = None, max_score: float | None = None,
+                          sample_size: int | None = None, tier: str = "measured") -> None:
+    con.execute(
+        "INSERT INTO benchmark_results "
+        "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
+        "benchmark_id, tier, score, max_score, sample_size, source, measured_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(machine_key, model_id, use_case) DO UPDATE SET "
+        "engine_key=excluded.engine_key, backend=excluded.backend, "
+        "base_model=excluded.base_model, quant=excluded.quant, "
+        "benchmark_id=excluded.benchmark_id, tier=excluded.tier, score=excluded.score, "
+        "max_score=excluded.max_score, sample_size=excluded.sample_size, "
+        "source=excluded.source, measured_at=excluded.measured_at",
+        (machine_key, model_id, use_case, engine_key, backend, base_model, quant,
+         benchmark_id, tier, score, max_score, sample_size, source, _now()))
+    con.commit()
+
+
+def get_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: str,
+                         use_case: str) -> dict | None:
+    row = con.execute(
+        "SELECT * FROM benchmark_results WHERE machine_key=? AND model_id=? AND use_case=?",
+        (machine_key, model_id, use_case)).fetchone()
+    return dict(row) if row else None
+
+
+def list_benchmark_results(con: sqlite3.Connection, machine_key: str) -> list[dict]:
+    """All benchmark results for a machine, ordered by model_id then use_case."""
+    rows = con.execute(
+        "SELECT * FROM benchmark_results WHERE machine_key=? ORDER BY model_id, use_case",
         (machine_key,)).fetchall()
     return [dict(r) for r in rows]

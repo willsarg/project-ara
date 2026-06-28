@@ -2,6 +2,7 @@
 # Copyright 2026 Will Sarg
 """Apple-Silicon backend adapter — drives wmx-suite's MLX measurement out-of-process.
 
+
 A lean device oracle, symmetric with backends/cuda.py: it reads the machine's memory wall and
 runs wmx-suite's crash-safe calibration, but it owns **no persistence** — ARA stores and reuses
 the calibration (see cli.render_profile). It never imports wmx in-process: every engine call
@@ -9,6 +10,8 @@ goes through the isolated ``apple`` env via :mod:`ara.engine_env`, so nothing ML
 in ARA's interpreter and the core stays engine-free at runtime, not just at lock time.
 """
 from __future__ import annotations
+
+import json
 
 # Core, engine-free helpers (no wmx) — safe to import at module load and patchable in tests.
 from ara import calibration, db, engine_env
@@ -201,3 +204,26 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
     if bits is not None:
         argv += ["--kv-bits", str(bits)]
     return engine_env.run_worker("apple", argv, input=prompt)
+
+
+def benchmark(model: str, prompts: list, *, max_context: int,
+              max_tokens: int = DEFAULT_MAX_TOKENS, kv_quant: str = "f16") -> dict:
+    """Multi-prompt MLX benchmark, governed: max_context is the characterized safe ceiling.
+
+    Spawns the isolated ``apple`` env's python running
+    ``python -m wmx_suite.benchmark <model> <max_context> --margin G --overhead G
+    --max-tokens N [--kv-bits N]`` with the JSON prompt array on stdin. The worker loads
+    the model once and iterates over all prompts; per-prompt governance enforces the ceiling
+    for each item individually. Returns the worker dict verbatim:
+    ``{"context": N, "results": [...]}`` or a gate refusal ``{"context": N, "refused": true,
+    "reason": "..."}``. ARA never imports MLX in-process; max_context is the characterized
+    safe ceiling.
+    """
+    margin, overhead = _budget_params()
+    argv = ["-m", "wmx_suite.benchmark", model, str(max_context),
+            "--margin", str(margin), "--overhead", str(overhead),
+            "--max-tokens", str(max_tokens)]
+    bits = _MLX_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
+    return engine_env.run_worker("apple", argv, input=json.dumps(prompts))

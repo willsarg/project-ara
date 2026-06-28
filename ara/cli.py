@@ -15,8 +15,9 @@ from dataclasses import asdict
 from importlib import metadata
 from pathlib import Path
 
-from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, hf_auth, mlx,
-                 ollama, profile, calibration, pythons, scoring, serialize, status, versions)
+from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
+                 hf_auth, mlx, ollama, profile, calibration, pythons, scoring, serialize,
+                 status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -154,6 +155,9 @@ _COMMAND_HELP = {
             "[--chunked-prefill] [--json]"),
     "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
               "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
+    "benchmark": ("ara benchmark <model> --use-case <coding|reasoning|agentic|extraction|rag> "
+                  "[--engine E] [--ctx N] [--yes] [--json] — run a capability probe set and "
+                  "store the measured score"),
     "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
 }
 
@@ -213,6 +217,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "recommend", "catalog models that fit, ranked by usable context"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
+    c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
@@ -1306,7 +1311,10 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                      "binding": fit["binding"], "fits": True,
                      "characterized": row["model_id"] in best})
     if use_case is not None:
-        recs = scoring.rank(recs, use_case, imported=scoring.load_imported())
+        rows = db.list_benchmark_results(con, profile.machine_key())
+        measured = ({(r["model_id"], r["use_case"]): {"score": r["score"], "source": r["source"]}
+                     for r in rows} or None)
+        recs = scoring.rank(recs, use_case, measured=measured, imported=scoring.load_imported())
     else:
         recs.sort(key=lambda r: r["est_context"], reverse=True)
 
@@ -1349,6 +1357,80 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     c.emit()
     c.emit(c.style("dim", f"  {len(recs)} fit · {n_char} characterized here"))
     _unrankable_note()
+    c.emit()
+    return 0
+
+
+def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
+                     ctx: int | None = None, assume_yes: bool = False,
+                     as_json: bool = False) -> int:
+    """Run a capability probe set against *model* and store the score as a measured tier result.
+
+    Requires a characterization ceiling (or explicit ``--ctx``) and an engine backend that supports
+    ``benchmark`` (Apple/MLX only for now). Spec 2026-06-28-recommend-use-case-and-serve-selection."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if use_case not in benchmark.USE_CASES:
+        return err(f"unknown use-case {use_case!r} — choose one of: "
+                   f"{', '.join(benchmark.USE_CASES)}")
+
+    key = engines.resolve(engine) if engine else engines.for_hardware()
+    backend = engines.ENGINES.get(key, {}).get("backend") if key else None
+    bk = get_backend(backend) if backend else None
+    if bk is None or not hasattr(bk, "benchmark"):
+        be_name = backend or "none"
+        return err(f"benchmark isn't supported on {be_name} yet (MLX/apple only for now)")
+
+    con = db.connect()
+    mk = profile.machine_key()
+    if ctx is not None:
+        if ctx <= 0:
+            return err("--ctx must be a positive integer")
+        safe = ctx
+    else:
+        row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
+        if not row or row.get("safe_context") is None:
+            return err(f"no measured ceiling for {model} — run: ara characterize {model} "
+                       f"(or pass --ctx N)")
+        safe = row["safe_context"]
+
+    items = benchmark.load_probe(use_case)
+    n = len(items)
+    if not as_json and not assume_yes and sys.stdin.isatty():
+        if use_case == "coding":
+            c.emit(c.style("warn", "  warning: the coding benchmark EXECUTES model-generated "
+                                   "Python in a sandboxed subprocess"))
+        if not _confirm(f"Benchmark {model} on {use_case} ({n} prompts)? "
+                        f"loads the model at ≤{safe} ctx"):
+            c.emit(c.style("dim", "  skipped."))
+            return 0
+
+    prompts = [benchmark.prompt_for(use_case, it) for it in items]
+    result = bk.benchmark(model, prompts, max_context=safe)
+    if result.get("refused"):
+        return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+
+    completions = [""] * len(prompts)
+    for r in result.get("results", []):
+        completions[r["prompt_index"]] = r.get("completion", "")
+
+    score = benchmark.score_probe_set(use_case, items, completions)
+    source = f"{key} probe={n} ({model})"
+    db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
+                             engine_key=key, backend=backend,
+                             base_model=scoring.base_key(model),
+                             benchmark_id=use_case, sample_size=n)
+    con.commit()
+
+    if as_json:
+        print(json.dumps({"model": model, "use_case": use_case, "score": score,
+                          "sample_size": n, "engine": key, "stored": True}))
+        return 0
+    c.emit(c.style("good", f"  {use_case}: {score * 100:.0f}% measured here  "
+                           f"({n} prompts, {model})"))
+    c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
     c.emit()
     return 0
 
@@ -2130,6 +2212,13 @@ def _main_impl() -> int:
             return _arg_err("usage: ara serve <model> [--ctx N] [--name NAME]")
         return render_serve(c, rest[1], ctx=serve_ctx, name=serve_name, engine=engine,
                             assume_yes=assume_yes, as_json=as_json)
+
+    if cmd == "benchmark":
+        if len(rest) < 2 or use_case is None:
+            return _arg_err("usage: ara benchmark <model> "
+                            "--use-case <coding|reasoning|agentic|extraction|rag>")
+        return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
+                                assume_yes=assume_yes, as_json=as_json)
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.

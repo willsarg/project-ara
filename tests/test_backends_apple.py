@@ -464,3 +464,111 @@ def test_serve_returns_proc_url_context(monkeypatch):
     assert proc is _SENTINEL_PROC
     assert url == "http://127.0.0.1:9999"
     assert ctx == 8192
+
+
+# --------------------------------------------------------------------------- #
+# benchmark — governed multi-prompt MLX inference (2026-06-28-benchmark-verb)
+# --------------------------------------------------------------------------- #
+
+def test_benchmark_builds_exact_argv(monkeypatch):
+    """benchmark() builds the exact wmx_suite.benchmark argv and passes prompts as JSON stdin."""
+    import json
+
+    _patch_budget(monkeypatch)
+    seen: dict = {}
+
+    def worker(name, argv, *, input=None):
+        seen["name"] = name
+        seen["argv"] = argv
+        seen["input"] = input
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.benchmark("org/m", ["prompt1", "prompt2"], max_context=4096)
+    assert seen["name"] == "apple"
+    assert seen["argv"] == [
+        "-m", "wmx_suite.benchmark", "org/m", "4096",
+        "--margin", "2.0", "--overhead", "1.0",
+        "--max-tokens", "256",
+    ]
+    assert seen["input"] == json.dumps(["prompt1", "prompt2"])
+
+
+def test_benchmark_appends_kv_bits_for_q4_0(monkeypatch):
+    """kv_quant='q4_0' → --kv-bits 4 appended after the core argv."""
+    _patch_budget(monkeypatch)
+    seen: dict = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.benchmark("org/m", [], max_context=4096, kv_quant="q4_0")
+    assert "--kv-bits" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--kv-bits") + 1] == "4"
+
+
+def test_benchmark_appends_kv_bits_for_q8_0(monkeypatch):
+    """kv_quant='q8_0' → --kv-bits 8 appended after the core argv."""
+    _patch_budget(monkeypatch)
+    seen: dict = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.benchmark("org/m", [], max_context=4096, kv_quant="q8_0")
+    assert "--kv-bits" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--kv-bits") + 1] == "8"
+
+
+def test_benchmark_omits_kv_bits_for_f16(monkeypatch):
+    """kv_quant='f16' (default) → --kv-bits must NOT appear in argv."""
+    _patch_budget(monkeypatch)
+    seen: dict = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.benchmark("org/m", [], max_context=4096)
+    assert "--kv-bits" not in seen["argv"]
+
+
+def test_benchmark_returns_worker_dict_verbatim(monkeypatch):
+    """benchmark() returns the worker dict without modification."""
+    import json
+
+    _patch_budget(monkeypatch)
+    worker_result = {"context": 4096, "results": [{"prompt_index": 0, "completion": "ok"}]}
+
+    def worker(name, argv, *, input=None):
+        return dict(worker_result)
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = apple.benchmark("org/m", ["hi"], max_context=4096)
+    assert out == worker_result
+
+
+def test_benchmark_passes_custom_max_tokens(monkeypatch):
+    """max_tokens kwarg threads through to --max-tokens in argv."""
+    _patch_budget(monkeypatch)
+    seen: dict = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 8192, "results": []}
+
+    monkeypatch.setattr(apple, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    apple.benchmark("org/m", [], max_context=8192, max_tokens=512)
+    idx = seen["argv"].index("--max-tokens")
+    assert seen["argv"][idx + 1] == "512"

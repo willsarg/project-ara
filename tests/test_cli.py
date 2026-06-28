@@ -4804,3 +4804,179 @@ def test_main_serve_name_flag_at_end_is_none(monkeypatch):
                         lambda c, model, **kw: rec.update(serve=kw) or 0)
     _run_main(monkeypatch, ["serve", "m", "--name"])
     assert rec["serve"]["name"] is None
+
+
+# --------------------------------------------------------------------------- #
+# ara benchmark — capability probe + measured tier (Spec 2026-06-28)
+# --------------------------------------------------------------------------- #
+def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine_key="wmx"):
+    """Wire up all dependencies for render_benchmark; returns the captured-save dict."""
+    if items is None:
+        items = [{"id": 0}, {"id": 1}]
+    monkeypatch.setattr(cli.engines, "for_hardware", lambda: engine_key)
+    monkeypatch.setattr(cli.engines, "resolve", lambda e: engine_key)
+    # Patch ENGINES so key → backend mapping works without touching real hardware detection.
+    orig = dict(cli.engines.ENGINES)
+    orig[engine_key] = {**orig.get(engine_key, {}), "backend": "apple"}
+    monkeypatch.setattr(cli.engines, "ENGINES", orig)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": ceiling} if e == engine_key else None)
+
+    saved = {}
+
+    def fake_save(con, mk, model, uc, *, score, source, engine_key=None, backend=None,
+                  base_model=None, benchmark_id=None, sample_size=None, **kw):
+        saved.update(model=model, use_case=uc, score=score,
+                     engine_key=engine_key, sample_size=sample_size)
+
+    monkeypatch.setattr(cli.db, "save_benchmark_result", fake_save)
+    monkeypatch.setattr(cli.benchmark, "load_probe", lambda uc: list(items))
+    monkeypatch.setattr(cli.benchmark, "prompt_for", lambda uc, it: f"prompt-{it['id']}")
+    monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda uc, its, comps: score)
+
+    n = len(items)
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context,
+            "results": [{"prompt_index": i, "completion": f"ans{i}"} for i in range(n)],
+        }
+    )
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    return saved
+
+
+def test_render_benchmark_happy_path(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    assert rc == 0
+    assert saved["model"] == "org/m"
+    assert saved["use_case"] == "coding"
+    assert saved["score"] == 0.75
+    assert saved["engine_key"] == "wmx"
+    assert saved["sample_size"] == 2
+    out = buf.getvalue()
+    assert "coding" in out and "75%" in out and "stored" in out
+
+
+def test_render_benchmark_rejects_unknown_use_case(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="chatting", assume_yes=True)
+    assert rc == 1
+    assert "chatting" in buf.getvalue() and "choose one of" in buf.getvalue()
+
+
+def test_render_benchmark_refuses_no_ceiling(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    # Override get_characterization to return None (no ceiling stored).
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: None)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert rc == 1
+    assert "no measured ceiling" in buf.getvalue() and "ara characterize" in buf.getvalue()
+
+
+def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
+    # A backend without a `benchmark` attr → clear error pointing at MLX/apple.
+    monkeypatch.setattr(cli.engines, "for_hardware", lambda: "cpu")
+    orig = dict(cli.engines.ENGINES)
+    orig["cpu"] = {**orig.get("cpu", {}), "backend": "cpu"}
+    monkeypatch.setattr(cli.engines, "ENGINES", orig)
+    bk = types.SimpleNamespace()   # intentionally no .benchmark attr
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    assert rc == 1
+    assert "MLX/apple only" in buf.getvalue()
+
+
+def test_render_benchmark_consent_decline(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="extraction", assume_yes=False)
+    assert rc == 0
+    assert "skipped" in buf.getvalue()
+
+
+def test_render_benchmark_coding_shows_sandbox_warning(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    warned = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": (warned.append(True), "n")[1])
+    c, buf = make_console()
+    cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=False)
+    assert "EXECUTES model-generated Python" in buf.getvalue()
+
+
+def test_render_benchmark_engine_refused(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    # Override the backend to return a pre-load refusal.
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context, "refused": True, "reason": "model too large"
+        }
+    )
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    assert rc == 1
+    assert "model too large" in buf.getvalue()
+
+
+def test_render_benchmark_json_output(monkeypatch, capsys):
+    _wire_benchmark(monkeypatch, score=0.6)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="agentic", assume_yes=True, as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["model"] == "org/m"
+    assert payload["use_case"] == "agentic"
+    assert payload["score"] == 0.6
+    assert payload["stored"] is True
+
+
+# benchmark dispatch (main argv parsing)
+def test_main_benchmark_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "coding"])
+    assert rec["benchmark"]["model"] == "org/m"
+    assert rec["benchmark"]["use_case"] == "coding"
+
+
+def test_main_benchmark_missing_use_case_returns_error(monkeypatch):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["benchmark", "org/m"]) == 1
+
+
+def test_main_benchmark_missing_model_returns_error(monkeypatch):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["benchmark"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# recommend: measured tier beats imported (Spec 2026-06-28)
+# --------------------------------------------------------------------------- #
+def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_platform):
+    # A measured score in db overrides an imported one: Strong has measured 0.9, Weak has imported 0.7.
+    # Strong must rank first (measured wins) and the output must show "measured".
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Strong", weights_gb=4.0, max_context=131072),
+                     _model_row("org/Weak", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.db, "list_benchmark_results",
+                        lambda con, mk: [{"model_id": "org/Strong", "use_case": "coding",
+                                          "score": 0.9, "source": "wmx probe=5 (org/Strong)"}])
+    monkeypatch.setattr(cli.scoring, "load_imported",
+                        lambda: {"org/Strong": {"coding": {"score": 0.5, "source": "HumanEval"}},
+                                 "org/Weak": {"coding": {"score": 0.7, "source": "HumanEval"}}})
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    # Strong's measured 0.9 beats Weak's imported 0.7, so Strong ranks first.
+    assert out.index("org/Strong") < out.index("org/Weak")
+    assert "measured" in out

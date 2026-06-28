@@ -1,0 +1,269 @@
+[
+  {
+    "context": "The Eiffel Tower is located in Paris, France. It was built between 1887 and 1889 as the entrance arch for the 1889 World's Fair.",
+    "question": "In which city is the Eiffel Tower located?",
+    "answers": [
+      {
+        "text": "Paris"
+      }
+    ]
+  },
+  {
+    "context": "Photosynthesis is the process used by plants to convert light energy, usually from the sun, into chemical energy that can be later released to fuel the plant's activities.",
+    "question": "What do plants convert during photosynthesis?",
+    "answers": [
+      {
+        "text": "light energy"
+      }
+    ]
+  },
+  {
+    "context": "The Amazon River is the largest river in the world by discharge volume. It flows through Brazil and empties into the Atlantic Ocean.",
+    "question": "Into which ocean does the Amazon River empty?",
+    "answers": [
+      {
+        "text": "the Atlantic Ocean"
+      },
+      {
+        "text": "Atlantic Ocean"
+      }
+    ]
+  },
+  {
+    "context": "Penicillin was discovered by Alexander Fleming in 1928. It was the first antibiotic to be used therapeutically.",
+    "question": "Who discovered penicillin?",
+    "answers": [
+      {
+        "text": "Alexander Fleming"
+      }
+    ]
+  },
+  {
+    "context": "The Great Wall of China stretches over 13,000 miles and was built over many centuries to protect against invasions from the north.",
+    "question": "How long is the Great Wall of China?",
+    "answers": [
+      {
+        "text": "over 13,000 miles"
+      },
+      {
+        "text": "13,000 miles"
+      }
+    ]
+  },
+  {
+    "context": "Mount Everest, located in the Himalayas on the border of Nepal and Tibet, is the highest mountain above sea level at 8,849 meters.",
+    "question": "What is the height of Mount Everest?",
+    "answers": [
+      {
+        "text": "8,849 meters"
+      }
+    ]
+  },
+  {
+    "context": "The speed of light in a vacuum is approximately 299,792,458 meters per second, often approximated as 300,000 km/s.",
+    "question": "What is the approximate speed of light in a vacuum?",
+    "answers": [
+      {
+        "text": "299,792,458 meters per second"
+      },
+      {
+        "text": "300,000 km/s"
+      }
+    ]
+  },
+  {
+    "context": "William Shakespeare was an English playwright and poet, widely regarded as the greatest writer in the English language. He was born in Stratford-upon-Avon in 1564.",
+    "question": "Where was Shakespeare born?",
+    "answers": [
+      {
+        "text": "Stratford-upon-Avon"
+      }
+    ]
+  },
+  {
+    "context": "The human brain contains approximately 86 billion neurons. These neurons communicate through synaptic connections.",
+    "question": "How many neurons does the human brain contain?",
+    "answers": [
+      {
+        "text": "approximately 86 billion"
+      },
+      {
+        "text": "86 billion"
+      }
+    ]
+  },
+  {
+    "context": "Jupiter is the largest planet in our solar system. It has at least 95 known moons, the largest of which is Ganymede.",
+    "question": "What is the largest moon of Jupiter?",
+    "answers": [
+      {
+        "text": "Ganymede"
+      }
+    ]
+  },
+  {
+    "context": "The Magna Carta was signed by King John of England in 1215. It established for the first time that the king was subject to the rule of law.",
+    "question": "When was the Magna Carta signed?",
+    "answers": [
+      {
+        "text": "1215"
+      },
+      {
+        "text": "in 1215"
+      }
+    ]
+  },
+  {
+    "context": "DNA stands for deoxyribonucleic acid. It carries genetic information in all living organisms and many viruses.",
+    "question": "What does DNA stand for?",
+    "answers": [
+      {
+        "text": "deoxyribonucleic acid"
+      }
+    ]
+  },
+  {
+    "context": "The Pacific Ocean is the largest and deepest ocean on Earth, covering more than 165 million square kilometers.",
+    "question": "What is the area of the Pacific Ocean?",
+    "answers": [
+      {
+        "text": "more than 165 million square kilometers"
+      },
+      {
+        "text": "165 million square kilometers"
+      }
+    ]
+  },
+  {
+    "context": "Albert Einstein developed the theory of general relativity in 1915. He was awarded the Nobel Prize in Physics in 1921 for his discovery of the photoelectric effect.",
+    "question": "For what discovery did Einstein receive the Nobel Prize?",
+    "answers": [
+      {
+        "text": "the photoelectric effect"
+      },
+      {
+        "text": "photoelectric effect"
+      }
+    ]
+  },
+  {
+    "context": "The Python programming language was created by Guido van Rossum and first released in 1991. Python emphasizes code readability and simplicity.",
+    "question": "Who created Python?",
+    "answers": [
+      {
+        "text": "Guido van Rossum"
+      }
+    ]
+  },
+  {
+    "context": "The International Space Station orbits Earth at an average altitude of approximately 408 kilometers. It has been continuously inhabited since November 2000.",
+    "question": "At what altitude does the ISS orbit?",
+    "answers": [
+      {
+        "text": "approximately 408 kilometers"
+      },
+      {
+        "text": "408 kilometers"
+      }
+    ]
+  },
+  {
+    "context": "Beethoven composed his Ninth Symphony between 1822 and 1824. He was almost completely deaf when he composed it.",
+    "question": "When did Beethoven compose the Ninth Symphony?",
+    "answers": [
+      {
+        "text": "between 1822 and 1824"
+      },
+      {
+        "text": "1822 and 1824"
+      }
+    ]
+  },
+  {
+    "context": "The boiling point of water at sea level is 100 degrees Celsius or 212 degrees Fahrenheit.",
+    "question": "At what temperature does water boil at sea level in Celsius?",
+    "answers": [
+      {
+        "text": "100 degrees Celsius"
+      },
+      {
+        "text": "100"
+      }
+    ]
+  },
+  {
+    "context": "The Internet was developed in the late 1960s as ARPANET by the United States Department of Defense. It became publicly available in the 1990s.",
+    "question": "What was the predecessor to the Internet?",
+    "answers": [
+      {
+        "text": "ARPANET"
+      }
+    ]
+  },
+  {
+    "context": "The Colosseum in Rome was built between 70 and 80 AD. It could hold between 50,000 and 80,000 spectators.",
+    "question": "How many spectators could the Colosseum hold?",
+    "answers": [
+      {
+        "text": "between 50,000 and 80,000 spectators"
+      },
+      {
+        "text": "50,000 to 80,000"
+      }
+    ]
+  },
+  {
+    "context": "Marie Curie was the first woman to win a Nobel Prize and the only person to win Nobel Prizes in two different sciences: Physics in 1903 and Chemistry in 1911.",
+    "question": "How many Nobel Prizes did Marie Curie win?",
+    "answers": [
+      {
+        "text": "two"
+      },
+      {
+        "text": "2"
+      }
+    ]
+  },
+  {
+    "context": "The Sahara Desert is the largest hot desert in the world, covering approximately 9.2 million square kilometers across North Africa.",
+    "question": "Where is the Sahara Desert located?",
+    "answers": [
+      {
+        "text": "North Africa"
+      }
+    ]
+  },
+  {
+    "context": "Glucose is the primary source of energy for the body's cells. It is a type of sugar with the chemical formula C6H12O6.",
+    "question": "What is the chemical formula for glucose?",
+    "answers": [
+      {
+        "text": "C6H12O6"
+      }
+    ]
+  },
+  {
+    "context": "The French Revolution began in 1789 with the storming of the Bastille on July 14. It ended with Napoleon Bonaparte's rise to power in 1799.",
+    "question": "What event began the French Revolution?",
+    "answers": [
+      {
+        "text": "the storming of the Bastille"
+      },
+      {
+        "text": "storming of the Bastille"
+      }
+    ]
+  },
+  {
+    "context": "The mitochondria are organelles found in eukaryotic cells that generate most of the cell's supply of ATP, used as a source of chemical energy.",
+    "question": "What do mitochondria generate?",
+    "answers": [
+      {
+        "text": "ATP"
+      },
+      {
+        "text": "most of the cell's supply of ATP"
+      }
+    ]
+  }
+]

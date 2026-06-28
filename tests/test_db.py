@@ -229,3 +229,56 @@ def test_profile_history_kept_latest_wins(store):
     assert db.get_latest_profile(store, "m")["profile_json"] == '{"v": 2}'
     rows = db.list_profiles(store, "m")
     assert [r["profile_json"] for r in rows] == ['{"v": 2}', '{"v": 1}']   # newest first, history kept
+
+
+# --- benchmark results ---
+def test_benchmark_result_save_and_get_round_trips_all_fields(store):
+    db.save_benchmark_result(
+        store, "machine-abc", "org/model", "coding",
+        score=0.72, source="mmlu-v1",
+        engine_key="wcx", backend="cuda", base_model="llama3", quant="q4_0",
+        benchmark_id="run-001", max_score=1.0, sample_size=100, tier="measured")
+    row = db.get_benchmark_result(store, "machine-abc", "org/model", "coding")
+    assert row is not None
+    assert row["machine_key"] == "machine-abc"
+    assert row["model_id"] == "org/model"
+    assert row["use_case"] == "coding"
+    assert row["score"] == 0.72
+    assert row["source"] == "mmlu-v1"
+    assert row["engine_key"] == "wcx"
+    assert row["backend"] == "cuda"
+    assert row["base_model"] == "llama3"
+    assert row["quant"] == "q4_0"
+    assert row["benchmark_id"] == "run-001"
+    assert row["max_score"] == 1.0
+    assert row["sample_size"] == 100
+    assert row["tier"] == "measured"
+    assert row["measured_at"]   # auto-filled timestamp
+
+
+def test_benchmark_result_get_missing_is_none(store):
+    assert db.get_benchmark_result(store, "nope", "org/model", "coding") is None
+
+
+def test_benchmark_result_upsert_updates_score_no_duplicate(store):
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.5, source="run-1")
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.8, source="run-2")
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["score"] == 0.8
+    assert row["source"] == "run-2"
+    # Only one row — no duplicate
+    count = store.execute(
+        "SELECT COUNT(*) FROM benchmark_results WHERE machine_key='m' AND model_id='org/model' AND use_case='coding'"
+    ).fetchone()[0]
+    assert count == 1
+
+
+def test_list_benchmark_results_returns_machine_rows_only(store):
+    db.save_benchmark_result(store, "m", "org/a", "coding", score=0.7, source="s1")
+    db.save_benchmark_result(store, "m", "org/b", "math", score=0.6, source="s2")
+    db.save_benchmark_result(store, "other-machine", "org/c", "coding", score=0.9, source="s3")
+    rows = db.list_benchmark_results(store, "m")
+    assert len(rows) == 2
+    assert {r["model_id"] for r in rows} == {"org/a", "org/b"}
+    # other-machine excluded
+    assert all(r["machine_key"] == "m" for r in rows)
