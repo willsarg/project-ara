@@ -5001,6 +5001,114 @@ def test_render_benchmark_no_advisory_when_ctx_under_measured_ceiling(make_conso
     assert "note:" not in buf.getvalue()
 
 
+# --------------------------------------------------------------------------- #
+# Fix 1: load-failure refused renders as clean one-line error (no traceback)
+# --------------------------------------------------------------------------- #
+
+def test_render_benchmark_load_failure_renders_clean_error(make_console, monkeypatch):
+    """Backend refused due to load failure → clean one-line error; no raw traceback."""
+    _wire_benchmark(monkeypatch)
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context,
+            "refused": True,
+            "reason": "failed to load org/m: RuntimeError: mlx version too old",
+        }
+    )
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert rc == 1
+    out = buf.getvalue()
+    assert "failed to load" in out
+    assert "RuntimeError" in out
+    assert "Traceback" not in out
+    assert "File " not in out
+
+
+# --------------------------------------------------------------------------- #
+# Fix 2: low_confidence label when sample_size < 100
+# --------------------------------------------------------------------------- #
+
+def test_render_benchmark_low_confidence_note_when_small_probe_set(make_console, monkeypatch):
+    """n < 100 → low-confidence note in text output; source string carries the flag."""
+    items = [{"id": i} for i in range(30)]   # 30 < 100
+    _wire_benchmark(monkeypatch, score=0.7, items=items)
+    saved_source: list[str] = []
+
+    def capture_source(con, mk, model, uc, *, score, source, **kw):
+        saved_source.append(source)
+
+    monkeypatch.setattr(cli.db, "save_benchmark_result", capture_source)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert rc == 0
+    out = buf.getvalue()
+    assert "low-confidence" in out
+    assert "n=30" in out
+    assert saved_source and "low_confidence n=30" in saved_source[0]
+
+
+def test_render_benchmark_no_low_confidence_note_when_100_items(make_console, monkeypatch):
+    """n == 100 (threshold) → no low-confidence annotation."""
+    items = [{"id": i} for i in range(100)]
+    _wire_benchmark(monkeypatch, score=0.7, items=items)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert rc == 0
+    assert "low-confidence" not in buf.getvalue()
+
+
+def test_render_benchmark_low_confidence_in_json_output(monkeypatch, capsys):
+    """--json with n < 100 → low_confidence: true in payload."""
+    items = [{"id": i} for i in range(30)]
+    _wire_benchmark(monkeypatch, score=0.7, items=items)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["low_confidence"] is True
+
+
+def test_render_benchmark_no_low_confidence_in_json_for_large_set(monkeypatch, capsys):
+    """--json with n >= 100 → low_confidence key absent from payload."""
+    items = [{"id": i} for i in range(100)]
+    _wire_benchmark(monkeypatch, score=0.7, items=items)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "low_confidence" not in payload
+
+
+# --------------------------------------------------------------------------- #
+# Fix 3: impossible-result advisory for flat 0% / 100% scores
+# --------------------------------------------------------------------------- #
+
+def test_render_benchmark_advisory_on_zero_score(make_console, monkeypatch):
+    """score == 0.0 → impossible-result advisory emitted."""
+    _wire_benchmark(monkeypatch, score=0.0)
+    c, buf = make_console()
+    cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert "flat 0%/100%" in buf.getvalue()
+
+
+def test_render_benchmark_advisory_on_perfect_score(make_console, monkeypatch):
+    """score == 1.0 → impossible-result advisory emitted."""
+    _wire_benchmark(monkeypatch, score=1.0)
+    c, buf = make_console()
+    cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert "flat 0%/100%" in buf.getvalue()
+
+
+def test_render_benchmark_no_advisory_on_mid_score(make_console, monkeypatch):
+    """score == 0.5 → no impossible-result advisory."""
+    _wire_benchmark(monkeypatch, score=0.5)
+    c, buf = make_console()
+    cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert "flat 0%/100%" not in buf.getvalue()
+
+
 def test_serve_mlx_emits_advisory_when_ctx_exceeds_measured_ceiling(make_console, monkeypatch, set_platform):
     """serve --engine wmx --ctx above the stored ceiling emits advisory but proceeds (rc=0)."""
     set_platform("Darwin", "arm64")

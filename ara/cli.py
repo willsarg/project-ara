@@ -1433,7 +1433,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             completions[idx] = r.get("completion", "")
 
     score = benchmark.score_probe_set(use_case, items, completions)
+    low_confidence = n < 100
     source = f"{key} probe={n} ({model})"
+    if low_confidence:
+        source += f"; low_confidence n={n}"
     db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
                              engine_key=key, backend=backend,
                              base_model=scoring.base_key(model),
@@ -1441,12 +1444,20 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     con.commit()
 
     if as_json:
-        print(json.dumps({"model": model, "use_case": use_case, "score": score,
-                          "sample_size": n, "engine": key, "stored": True}))
+        payload: dict = {"model": model, "use_case": use_case, "score": score,
+                         "sample_size": n, "engine": key, "stored": True}
+        if low_confidence:
+            payload["low_confidence"] = True
+        print(json.dumps(payload))
         return 0
-    c.emit(c.style("good", f"  {use_case}: {score * 100:.0f}% measured here  "
-                           f"({n} prompts, {model})"))
+    score_line = (f"  {use_case}: {score * 100:.0f}% measured here  ({n} prompts, {model})")
+    if low_confidence:
+        score_line += f" (low-confidence: n={n})"
+    c.emit(c.style("good", score_line))
     c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
+    if score == 0.0 or score == 1.0:
+        c.emit(c.style("warn", "  note: a flat 0%/100% often means a broken probe or "
+                               "misconfig — verify before trusting"))
     c.emit()
     return 0
 
