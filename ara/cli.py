@@ -1397,6 +1397,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         if ctx <= 0:
             return err("--ctx must be a positive integer")
         safe = ctx
+        # Advisory when an explicit --ctx exceeds the measured safe ceiling.
+        _row = db.get_characterization(con, mk, key, model)
+        _measured = _row.get("safe_context") if _row else None
+        if _measured is not None and ctx > _measured:
+            c.emit(c.style("warn", f"  note: --ctx {ctx} exceeds the measured safe ceiling "
+                                   f"{_measured} — proceeding; the engine gate is the backstop"))
     else:
         row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
         if not row or row.get("safe_context") is None:
@@ -1630,6 +1636,12 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
         if ctx <= 0:
             return err("--ctx must be a positive integer")
         safe, source = ctx, "requested"
+        # Advisory when an explicit --ctx exceeds the measured safe ceiling.
+        _row = db.get_characterization(con, mk, engine_key, model)
+        _measured = _row.get("safe_context") if _row else None
+        if _measured is not None and ctx > _measured:
+            c.emit(c.style("warn", f"  note: --ctx {ctx} exceeds the measured safe ceiling "
+                                   f"{_measured} — proceeding; the engine gate is the backstop"))
     else:
         row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
         if not row or row.get("safe_context") is None:

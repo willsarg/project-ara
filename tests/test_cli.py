@@ -4979,6 +4979,71 @@ def test_main_benchmark_missing_model_returns_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Bug fix: --ctx above the measured ceiling emits an advisory (bug audit)
+# --------------------------------------------------------------------------- #
+
+def test_render_benchmark_emits_advisory_when_ctx_exceeds_measured_ceiling(make_console, monkeypatch):
+    """--ctx above the stored ceiling emits a visible advisory but still proceeds (rc=0)."""
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=16000, assume_yes=True)
+    assert rc == 0
+    out = buf.getvalue()
+    assert "note: --ctx 16000 exceeds the measured safe ceiling 8000" in out
+
+
+def test_render_benchmark_no_advisory_when_ctx_under_measured_ceiling(make_console, monkeypatch):
+    """--ctx below the stored ceiling: no advisory emitted."""
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000, assume_yes=True)
+    assert rc == 0
+    assert "note:" not in buf.getvalue()
+
+
+def test_serve_mlx_emits_advisory_when_ctx_exceeds_measured_ceiling(make_console, monkeypatch, set_platform):
+    """serve --engine wmx --ctx above the stored ceiling emits advisory but proceeds (rc=0)."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+
+    class _Proc:
+        def wait(self): pass
+
+    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
+        return _Proc(), f"http://127.0.0.1:{port}", max_context
+
+    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
+    c, buf = make_console()
+    rc = cli.render_serve(c, "org/m", engine="wmx", ctx=16000, assume_yes=True)
+    assert rc == 0
+    assert "note: --ctx 16000 exceeds the measured safe ceiling 8000" in buf.getvalue()
+
+
+def test_serve_mlx_no_advisory_when_ctx_under_measured_ceiling(make_console, monkeypatch, set_platform):
+    """serve --engine wmx --ctx below the stored ceiling: no advisory."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+
+    class _Proc:
+        def wait(self): pass
+
+    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
+        return _Proc(), f"http://127.0.0.1:{port}", max_context
+
+    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
+    c, buf = make_console()
+    rc = cli.render_serve(c, "org/m", engine="wmx", ctx=4000, assume_yes=True)
+    assert rc == 0
+    assert "note:" not in buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 # recommend: measured tier beats imported (Spec 2026-06-28)
 # --------------------------------------------------------------------------- #
 def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_platform):

@@ -2,14 +2,13 @@
 # Copyright 2026 Will Sarg
 """Judge-free benchmark probe data and scoring for ARA's five use-cases.
 
-SAFETY NOTE — coding scorer: ``score("coding", ...)`` executes model-generated Python in a
-subprocess. This is **NOT a security sandbox** — the child runs with the caller's full OS
-privileges (filesystem, network). Containment here is only: a 10-second timeout, output
-discarded, and a process-group kill on timeout (``start_new_session`` + ``killpg``) so a
-child's own children die too. A completion that deliberately ``setsid``s away can still
-escape. Callers MUST therefore gate execution on **explicit, un-bypassable consent** (see
-cli's ``--exec-consent``); never run it unattended. Real isolation (``sandbox-exec`` /
-seccomp) is the proper fix and is tracked separately.
+SAFETY NOTE — coding scorer: ``score("coding", ...)`` executes model-generated Python. On macOS it
+runs under a Seatbelt sandbox (``sandbox-exec``): **no network, no filesystem writes**, exec confined
+to the Python framework — plus a 10s timeout + process-group kill. Off macOS (no ``sandbox-exec``) it
+falls back to process-isolation only and emits a loud ``RuntimeWarning``. Either way, callers MUST
+gate execution on explicit consent (cli's ``--exec-consent``); never run it unattended. The residual
+risk under the sandbox is read-only (no write/network → nothing read can be exfiltrated). Linux
+containment (bubblewrap) is a tracked follow-up.
 
 2026-06-28-benchmark-layer
 """
@@ -18,17 +17,37 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import string
 import subprocess
 import sys
 import tempfile
+import warnings
 from collections import Counter
 from pathlib import Path
 
 USE_CASES: tuple[str, ...] = ("coding", "reasoning", "agentic", "extraction", "rag")
 
 _DATA_DIR = Path(__file__).parent / "data" / "benchmarks"
+
+# macOS Seatbelt sandbox for the coding scorer's untrusted-code execution (deprecated-but-present
+# on current macOS; needs no root/entitlement). Verified: denies network + all filesystem writes +
+# any exec outside the Python framework, while a normal stdlib HumanEval script still runs. file-read
+# stays broad (dyld needs version-specific paths) — safe because no-write + no-network block
+# exfiltration. None on Linux/Windows → caller falls back to process-isolation + a loud warning.
+_SANDBOX_EXEC: str | None = shutil.which("sandbox-exec")
+
+_SB_PROFILE_TMPL = """\
+(version 1)
+(deny default)
+(deny network*)
+(deny file-write*)
+(allow process-exec (subpath "{python_base}"))
+(allow process-fork)
+(allow process-info*)
+(allow file-read*)
+"""
 
 _PROBE_FILES: dict[str, str] = {
     "coding":     "humaneval_25.json",
@@ -123,9 +142,11 @@ def _extract_code(text: str) -> str:
 def _score_coding(item: dict, completion: str) -> float:
     """Run the HumanEval unit tests against prompt + completion. 1.0 iff every assert passes.
 
-    NOT a security sandbox (see the module SAFETY NOTE): process isolation + a 10s timeout +
-    a process-group kill only. The assembled script ends with ``check(<entry_point>)`` — the
-    asserts do NOT run unless that call is present (this was the bug the audit caught).
+    Executes model-generated code under a macOS Seatbelt sandbox (``sandbox-exec``) when present —
+    no network, no filesystem writes, exec confined to the Python framework — plus a 10s timeout and
+    a process-group kill. Off macOS (no ``sandbox-exec``) it falls back to process-isolation only and
+    emits a ``RuntimeWarning`` (never a silent downgrade). The assembled script ends with
+    ``check(<entry_point>)`` — the asserts don't run without that call (the bug the audit caught).
     """
     body = _extract_code(completion)
     code = (item["prompt"] + body + "\n" + item["test"]
@@ -135,14 +156,31 @@ def _score_coding(item: dict, completion: str) -> float:
     ) as tmp:
         tmp.write(code)
         tmp_path = tmp.name
+
+    python_bin = str(Path(sys.executable).resolve())
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    sb_path: str | None = None
+    if _SANDBOX_EXEC:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sb", delete=False,
+                                         encoding="utf-8") as pf:
+            pf.write(_SB_PROFILE_TMPL.format(python_base=sys.base_prefix))
+            sb_path = pf.name
+        cmd = [_SANDBOX_EXEC, "-f", sb_path, python_bin, tmp_path]
+    else:
+        warnings.warn(
+            "sandbox-exec not found — the coding benchmark is running WITHOUT an OS sandbox; "
+            "model-generated code has full filesystem + network access.",
+            RuntimeWarning, stacklevel=2,
+        )
+        cmd = [python_bin, tmp_path]
+
     proc = None
     try:
         # start_new_session: the child leads its own process group, so killpg reaps any
         # processes the model's code spawned in that group (a plain proc.kill would not).
         proc = subprocess.Popen(
-            [sys.executable, tmp_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=env,
         )
         try:
             return 1.0 if proc.wait(timeout=10) == 0 else 0.0
@@ -156,6 +194,8 @@ def _score_coding(item: dict, completion: str) -> float:
                 proc.kill()
             proc.wait()
         Path(tmp_path).unlink(missing_ok=True)
+        if sb_path:
+            Path(sb_path).unlink(missing_ok=True)
 
 
 _NUM = r"-?[\d,]+(?:\.\d+)?"  # signed int/decimal with thousands commas; rejects "3-4"

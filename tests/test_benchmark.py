@@ -505,3 +505,39 @@ def test_bfcl_scalar_args_not_list_wrapped():
         for arg, val in it["expected"]["arguments"].items():
             _flag_list_wrapped(arg, val, props.get(arg, {}), it["id"], bad)
     assert not bad, f"scalar args wrapped in lists (flatten artifact): {bad}"
+
+
+# ── sandbox containment (live, macOS) ────────────────────────────────────────
+@pytest.mark.skipif(not _bm._SANDBOX_EXEC, reason="sandbox-exec is macOS-only")
+def test_coding_sandbox_blocks_filesystem_write():
+    import os as _os
+    sentinel = "/tmp/ara_sb_sentinel_fswrite"
+    if _os.path.exists(sentinel):
+        _os.remove(sentinel)
+    item = {"prompt": "def f():\n", "entry_point": "f", "test": "def check(c):\n    c()\n"}
+    _bm.score("coding", item, f"    open({sentinel!r}, 'w').write('escaped')\n")
+    try:
+        assert not _os.path.exists(sentinel), "sandbox FAILED to block a filesystem write"
+    finally:
+        if _os.path.exists(sentinel):
+            _os.remove(sentinel)
+
+
+@pytest.mark.skipif(not _bm._SANDBOX_EXEC, reason="sandbox-exec is macOS-only")
+def test_coding_sandbox_blocks_network():
+    import os as _os
+    sentinel = "/tmp/ara_sb_sentinel_net"
+    if _os.path.exists(sentinel):
+        _os.remove(sentinel)
+    item = {"prompt": "def f():\n", "entry_point": "f", "test": "def check(c):\n    c()\n"}
+    body = (
+        "    import socket\n"
+        "    socket.create_connection(('8.8.8.8', 53), timeout=3)\n"
+        f"    open({sentinel!r}, 'w').write('net')\n"
+    )
+    _bm.score("coding", item, body)
+    try:
+        assert not _os.path.exists(sentinel), "sandbox FAILED to block network"
+    finally:
+        if _os.path.exists(sentinel):
+            _os.remove(sentinel)
