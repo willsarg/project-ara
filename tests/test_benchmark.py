@@ -295,7 +295,9 @@ _TINY_CODING_ITEM = {
     "task_id": "test/0",
     "prompt": "def add(a, b):\n",
     "entry_point": "add",
-    "test": "assert add(1, 2) == 3\nassert add(0, 0) == 0\n",
+    # Real HumanEval shape: a `check(candidate)` the scorer must invoke (bare asserts here
+    # would never exercise the candidate and would mask a scorer that doesn't call check).
+    "test": "def check(candidate):\n    assert candidate(1, 2) == 3\n    assert candidate(0, 0) == 0\n",
 }
 
 
@@ -406,3 +408,100 @@ def test_probe_json_file_exists_and_parses(filename, expected_count):
     data = json.loads(path.read_text())
     assert isinstance(data, list)
     assert len(data) == expected_count
+
+
+# ── audit regression tests (2026-06-28 code audit) ───────────────────────────
+# These load the REAL shipped probe data so a scorer that doesn't actually run the
+# test (or that false-passes) cannot make them green.
+from ara import benchmark as _bm  # noqa: E402
+
+_CORRECT_HAS_CLOSE = (
+    "    for i in range(len(numbers)):\n"
+    "        for j in range(i + 1, len(numbers)):\n"
+    "            if abs(numbers[i] - numbers[j]) < threshold:\n"
+    "                return True\n"
+    "    return False\n"
+)
+
+
+def _coding_item0():
+    it = _bm.load_probe("coding")[0]
+    assert it["entry_point"] == "has_close_elements"  # guard: dataset shape assumption
+    return it
+
+
+def test_coding_wrong_completion_scores_zero_on_real_data():
+    # CRITICAL: a wrong body must NOT score 1.0. (Bug: check() was never called.)
+    assert _bm.score("coding", _coding_item0(), "    return None\n") == 0.0
+
+
+def test_coding_correct_completion_scores_one_on_real_data():
+    assert _bm.score("coding", _coding_item0(), _CORRECT_HAS_CLOSE) == 1.0
+
+
+def test_coding_strips_code_fences_preserving_indent():
+    fenced = "```python\n" + _CORRECT_HAS_CLOSE + "```"
+    assert _bm.score("coding", _coding_item0(), fenced) == 1.0
+
+
+def test_reasoning_does_not_crash_on_range_string():
+    assert _bm.score("reasoning", {"answer": "#### 42"}, "Answer: 3-4") == 0.0
+
+
+def test_reasoning_takes_last_answer_not_first():
+    out = "First I guessed Answer: 50, but rechecking: Answer: 42"
+    assert _bm.score("reasoning", {"answer": "#### 42"}, out) == 1.0
+
+
+def test_agentic_parses_json_after_preamble():
+    item = {"expected": {"name": "f", "arguments": {"x": 1}}}
+    assert _bm.score("agentic", item, 'Sure, here you go: {"name":"f","arguments":{"x":1}}') == 1.0
+
+
+def test_score_probe_set_empty_returns_zero_not_crash():
+    assert _bm.score_probe_set("coding", [], []) == 0.0
+
+
+def test_token_f1_counts_repeated_tokens():
+    # "cat cat" vs "cat cat cat": Counter intersection = 2, not set's 1.
+    f1 = _bm._token_f1("cat cat", "cat cat cat")
+    assert f1 == pytest.approx(2 * (2 / 2) * (2 / 3) / ((2 / 2) + (2 / 3)))
+
+
+def test_extraction_answers_are_extractable_from_context():
+    # Every accepted answer must be a normalized span of the passage (caches a "2" vs "two" bug).
+    items = _bm.load_probe("extraction")
+    bad = []
+    for i, it in enumerate(items):
+        ctx = _bm._normalize_text(it["context"])
+        for a in it["answers"]:
+            if _bm._normalize_text(a["text"]) not in ctx:
+                bad.append((i, a["text"]))
+    assert not bad, f"non-extractable extraction answers: {bad}"
+
+
+def _flag_list_wrapped(name, val, schema, item_id, bad):
+    # A list value is only a bug when the declared type is SCALAR (a BFCL flatten artifact);
+    # genuine `array`-typed args (poker hands, number lists) are correct and must NOT be flagged.
+    t = schema.get("type")
+    if t in ("array", "list"):
+        return
+    if t == "dict" and isinstance(val, dict):
+        nested = schema.get("properties", {})
+        for k, v in val.items():
+            _flag_list_wrapped(f"{name}.{k}", v, nested.get(k, {}), item_id, bad)
+        return
+    if isinstance(val, list):
+        bad.append((item_id, name))
+
+
+def test_bfcl_scalar_args_not_list_wrapped():
+    # A scalar param whose expected value is a list = BFCL flatten artifact; the agentic scorer
+    # would then compare list-vs-scalar and score every correct call 0. (array-typed args are fine.)
+    items = _bm.load_probe("agentic")
+    bad = []
+    for it in items:
+        props = it["function"]["parameters"].get("properties", {})
+        for arg, val in it["expected"]["arguments"].items():
+            _flag_list_wrapped(arg, val, props.get(arg, {}), it["id"], bad)
+    assert not bad, f"scalar args wrapped in lists (flatten artifact): {bad}"

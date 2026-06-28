@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import platformdirs
@@ -127,7 +128,8 @@ def remove(name: str) -> bool:
     return True
 
 
-def start_worker_server(name: str, args: list[str]) -> tuple[subprocess.Popen, dict]:
+def start_worker_server(name: str, args: list[str], *,
+                        ready_timeout: float = 600.0) -> tuple[subprocess.Popen, dict]:
     """Spawn engine *name*'s python with *args* as a long-lived server process.
 
     Companion to :func:`run_worker`, but the process is **not waited on** — the server
@@ -141,17 +143,47 @@ def start_worker_server(name: str, args: list[str]) -> tuple[subprocess.Popen, d
     """
     cmd = [str(python_path(name)), *args]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
-    for line in proc.stdout:
-        if line.lstrip().startswith("{"):
+    box: dict = {}
+
+    def _read_ready() -> None:
+        try:
+            for line in proc.stdout:
+                if line.lstrip().startswith("{"):
+                    box["line"] = line
+                    return
+        except Exception as exc:                       # reader died (pipe broke, decode, …)
+            box["error"] = exc
+
+    # Read the handshake in a thread so a stalled child (e.g. a hung model load) can't hang
+    # us forever — ready_timeout bounds the wait. On ANY failure we reap the child in the
+    # finally-equivalent except, so we never leak a process holding the GPU + the port.
+    reader = threading.Thread(target=_read_ready, daemon=True)
+    reader.start()
+    reader.join(ready_timeout)
+    try:
+        if reader.is_alive():
+            raise EngineEnvError(
+                f"server {name!r} timed out after {ready_timeout:.0f}s waiting for a ready signal")
+        if "error" in box:
+            raise EngineEnvError(f"server {name!r} failed reading the ready signal: {box['error']}")
+        line = box.get("line")
+        if line is None:
+            raise EngineEnvError(f"server {name!r} exited without a ready signal")
+        try:
             ready = json.loads(line)
-            if ready.get("error") or ready.get("refused"):
-                proc.wait()
-                reason = ready.get("reason") or ready.get("error", "unknown")
-                raise EngineEnvError(f"server {name!r} refused: {reason}")
-            return proc, ready
-    # stdout exhausted — process exited without a ready signal
-    proc.wait()
-    raise EngineEnvError(f"server {name!r} exited without a ready signal")
+        except json.JSONDecodeError as exc:
+            raise EngineEnvError(f"server {name!r} emitted an invalid ready signal: {exc}")
+        if ready.get("error") or ready.get("refused"):
+            reason = ready.get("reason") or ready.get("error", "unknown")
+            raise EngineEnvError(f"server {name!r} refused: {reason}")
+        return proc, ready
+    except BaseException:
+        for _step in (proc.kill, proc.wait):           # reap; never leak the child
+            try:
+                _step()
+            except Exception:
+                pass
+        raise
 
 
 def run_worker(name: str, args: list[str], *, input: str | None = None,

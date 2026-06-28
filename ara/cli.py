@@ -1312,9 +1312,10 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                      "characterized": row["model_id"] in best})
     if use_case is not None:
         rows = db.list_benchmark_results(con, profile.machine_key())
-        measured = ({(r["model_id"], r["use_case"]): {"score": r["score"], "source": r["source"]}
-                     for r in rows} or None)
-        recs = scoring.rank(recs, use_case, measured=measured, imported=scoring.load_imported())
+        bench_measured = ({(r["model_id"], r["use_case"]): {"score": r["score"], "source": r["source"]}
+                           for r in rows} or None)
+        recs = scoring.rank(recs, use_case, measured=bench_measured,
+                            imported=scoring.load_imported())
     else:
         recs.sort(key=lambda r: r["est_context"], reverse=True)
 
@@ -1363,7 +1364,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
 
 def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
                      ctx: int | None = None, assume_yes: bool = False,
-                     as_json: bool = False) -> int:
+                     exec_consent: bool = False, as_json: bool = False) -> int:
     """Run a capability probe set against *model* and store the score as a measured tier result.
 
     Requires a characterization ceiling (or explicit ``--ctx``) and an engine backend that supports
@@ -1375,6 +1376,13 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if use_case not in benchmark.USE_CASES:
         return err(f"unknown use-case {use_case!r} — choose one of: "
                    f"{', '.join(benchmark.USE_CASES)}")
+
+    # Hard gate on code execution — un-bypassable by --json/--yes/non-tty (those only suppress the
+    # interactive prompt). The coding benchmark runs model-generated Python with full user
+    # privileges (NOT a security sandbox); require deliberate, explicit consent in every mode.
+    if use_case == "coding" and not exec_consent:
+        return err("the coding benchmark executes model-generated Python on this machine "
+                   "(NOT a security sandbox) — re-run with --exec-consent to allow it")
 
     key = engines.resolve(engine) if engine else engines.for_hardware()
     backend = engines.ENGINES.get(key, {}).get("backend") if key else None
@@ -1401,7 +1409,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if not as_json and not assume_yes and sys.stdin.isatty():
         if use_case == "coding":
             c.emit(c.style("warn", "  warning: the coding benchmark EXECUTES model-generated "
-                                   "Python in a sandboxed subprocess"))
+                                   "Python in a subprocess (NOT a security sandbox)"))
         if not _confirm(f"Benchmark {model} on {use_case} ({n} prompts)? "
                         f"loads the model at ≤{safe} ctx"):
             c.emit(c.style("dim", "  skipped."))
@@ -1414,7 +1422,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 
     completions = [""] * len(prompts)
     for r in result.get("results", []):
-        completions[r["prompt_index"]] = r.get("completion", "")
+        idx = r.get("prompt_index")
+        if isinstance(idx, int) and 0 <= idx < len(completions):
+            completions[idx] = r.get("completion", "")
 
     score = benchmark.score_probe_set(use_case, items, completions)
     source = f"{key} probe={n} ({model})"
@@ -1652,7 +1662,20 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
         c.emit(c.style("dim", "  serving in the foreground — Ctrl-C to stop."))
         c.emit()
     sys.stdout.flush()                             # hand the endpoint to a piped reader BEFORE we block
-    proc.wait()                                    # our child IS the server; stay alive to serve
+    # Stay alive to keep serving. Ctrl-C (SIGINT) hits the whole group, but a bare `kill <pid>`
+    # (SIGTERM) would terminate us without running cleanup and orphan the child (GPU + port leak);
+    # install a handler that terminates the child first.
+    import signal
+
+    def _stop(_sig, _frame):
+        proc.terminate()
+        sys.exit(0)
+
+    old = signal.signal(signal.SIGTERM, _stop)
+    try:
+        proc.wait()                                # our child IS the server; stay alive to serve
+    finally:
+        signal.signal(signal.SIGTERM, old)
     return 0
 
 
@@ -2030,6 +2053,7 @@ def _main_impl() -> int:
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
+    exec_consent = "--exec-consent" in argv      # explicit opt-in to model-code execution (benchmark)
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
     chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
@@ -2126,7 +2150,8 @@ def _main_impl() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--no-flash-attn", "--flash-attn",
+        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent",
+                 "--no-flash-attn", "--flash-attn",
                  "--chunked-prefill", "-h", "--help"):
             continue
         rest.append(a)
@@ -2218,7 +2243,7 @@ def _main_impl() -> int:
             return _arg_err("usage: ara benchmark <model> "
                             "--use-case <coding|reasoning|agentic|extraction|rag>")
         return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
-                                assume_yes=assume_yes, as_json=as_json)
+                                assume_yes=assume_yes, exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.

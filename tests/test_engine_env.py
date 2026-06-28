@@ -370,9 +370,13 @@ class _FakeServerProc:
         self.stdout = iter(lines)
         self.returncode = rc
         self.waited = False
+        self.killed = False
 
     def wait(self):
         self.waited = True
+
+    def kill(self):
+        self.killed = True
 
 
 def _mock_server_popen(monkeypatch, lines, rc=0):
@@ -433,3 +437,32 @@ def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
     engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve", "org/m"])
     assert cmd[0] == str(engines_root / "apple" / "bin" / "python")
     assert cmd[1:] == ["-m", "wmx_suite.serve", "org/m"]
+
+
+def test_start_worker_server_times_out_and_kills_child(engines_root, monkeypatch):
+    # A child that never emits a ready line must not hang us forever — bounded + child reaped.
+    import time
+
+    class _Blocking:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            time.sleep(5)
+            raise StopIteration
+
+    proc = _FakeServerProc([])
+    proc.stdout = _Blocking()
+    monkeypatch.setattr(engine_env.subprocess, "Popen",
+                        lambda cmd, *, stdout, text: proc)
+    with pytest.raises(engine_env.EngineEnvError, match="timed out"):
+        engine_env.start_worker_server("apple", ["-m", "x"], ready_timeout=0.2)
+    assert proc.killed
+
+
+def test_start_worker_server_invalid_json_raises_and_kills(engines_root, monkeypatch):
+    # A malformed ready line → EngineEnvError (not a raw JSONDecodeError) + child reaped (no leak).
+    proc, _ = _mock_server_popen(monkeypatch, ["{not valid json\n"])
+    with pytest.raises(engine_env.EngineEnvError, match="invalid ready signal"):
+        engine_env.start_worker_server("apple", ["-m", "x"])
+    assert proc.killed

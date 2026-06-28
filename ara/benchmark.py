@@ -2,21 +2,28 @@
 # Copyright 2026 Will Sarg
 """Judge-free benchmark probe data and scoring for ARA's five use-cases.
 
-SAFETY NOTE — coding scorer: ``score("coding", ...)`` executes model-generated
-Python inside a subprocess with a 10-second timeout.  Callers MUST gate execution
-on explicit user consent (the ``characterize`` command's consent surface is the
-canonical example).  Never invoke it in a non-interactive pipeline without consent.
+SAFETY NOTE — coding scorer: ``score("coding", ...)`` executes model-generated Python in a
+subprocess. This is **NOT a security sandbox** — the child runs with the caller's full OS
+privileges (filesystem, network). Containment here is only: a 10-second timeout, output
+discarded, and a process-group kill on timeout (``start_new_session`` + ``killpg``) so a
+child's own children die too. A completion that deliberately ``setsid``s away can still
+escape. Callers MUST therefore gate execution on **explicit, un-bypassable consent** (see
+cli's ``--exec-consent``); never run it unattended. Real isolation (``sandbox-exec`` /
+seccomp) is the proper fix and is tracked separately.
 
 2026-06-28-benchmark-layer
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import string
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 USE_CASES: tuple[str, ...] = ("coding", "reasoning", "agentic", "extraction", "rag")
@@ -97,62 +104,108 @@ def score_probe_set(
             f"items ({len(items)}) and completions ({len(completions)}) must have equal length"
         )
     scores = [score(use_case, it, c) for it, c in zip(items, completions)]
-    return sum(scores) / len(scores)
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 # ── private scorers ────────────────────────────────────────────────────────
 
 
-def _score_coding(item: dict, completion: str) -> float:
-    """Execute prompt + completion + tests in a sandboxed subprocess.
+def _extract_code(text: str) -> str:
+    """Pull a function body out of a completion, tolerating markdown fences.
 
-    The 10-second timeout and ``capture_output=True`` keep side effects contained.
+    Indentation is preserved (code is whitespace-sensitive, unlike :func:`_extract_json`):
+    the fenced content is returned verbatim, only the ``` ```lang ``` / ``` ``` `` lines removed.
     """
-    code = item["prompt"] + completion + "\n" + item["test"]
+    m = re.search(r"```[a-zA-Z]*\n(.*?)```", text, re.DOTALL)
+    return m.group(1) if m else text
+
+
+def _score_coding(item: dict, completion: str) -> float:
+    """Run the HumanEval unit tests against prompt + completion. 1.0 iff every assert passes.
+
+    NOT a security sandbox (see the module SAFETY NOTE): process isolation + a 10s timeout +
+    a process-group kill only. The assembled script ends with ``check(<entry_point>)`` — the
+    asserts do NOT run unless that call is present (this was the bug the audit caught).
+    """
+    body = _extract_code(completion)
+    code = (item["prompt"] + body + "\n" + item["test"]
+            + f"\ncheck({item['entry_point']})\n")
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
     ) as tmp:
         tmp.write(code)
         tmp_path = tmp.name
+    proc = None
     try:
-        result = subprocess.run(
+        # start_new_session: the child leads its own process group, so killpg reaps any
+        # processes the model's code spawned in that group (a plain proc.kill would not).
+        proc = subprocess.Popen(
             [sys.executable, tmp_path],
-            timeout=10,
-            capture_output=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        return 1.0 if result.returncode == 0 else 0.0
-    except subprocess.TimeoutExpired:
-        return 0.0
+        try:
+            return 1.0 if proc.wait(timeout=10) == 0 else 0.0
+        except subprocess.TimeoutExpired:
+            return 0.0
     finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            proc.wait()
         Path(tmp_path).unlink(missing_ok=True)
 
 
+_NUM = r"-?[\d,]+(?:\.\d+)?"  # signed int/decimal with thousands commas; rejects "3-4"
+
+
 def _score_reasoning(item: dict, completion: str) -> float:
-    """Exact numeric match (±1e-6) against the GSM8K '#### N' answer."""
-    gt_match = re.search(r"####\s*([\d,.\-]+)", item["answer"])
-    pred_match = re.search(r"Answer:\s*([\d,.\-]+)", completion, re.IGNORECASE)
-    if not gt_match or not pred_match:
+    """Exact numeric match (±1e-6) against the GSM8K '#### N' answer.
+
+    Takes the LAST ``Answer:`` value (chain-of-thought may state a wrong one first), and
+    never lets a malformed number crash the run.
+    """
+    gt_match = re.search(rf"####\s*({_NUM})", item["answer"])
+    preds = re.findall(rf"Answer:\s*({_NUM})", completion, re.IGNORECASE)
+    if not gt_match or not preds:
         return 0.0
-    gt = float(gt_match.group(1).replace(",", ""))
-    pred = float(pred_match.group(1).replace(",", ""))
+    try:
+        gt = float(gt_match.group(1).replace(",", ""))
+        pred = float(preds[-1].replace(",", ""))
+    except (ValueError, OverflowError):
+        return 0.0
     return 1.0 if abs(pred - gt) < 1e-6 else 0.0
 
 
-def _strip_fences(text: str) -> str:
-    """Remove markdown code fences (```...```) from text."""
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text.strip())
-    text = re.sub(r"\n?```$", "", text)
-    return text.strip()
+def _extract_json(text: str):
+    """Parse the first JSON object found anywhere in *text* (tolerates prose + fences).
+
+    Unlike code, JSON is whitespace-insensitive, so a greedy ``{...}`` scan is safe.
+    Returns the parsed object, or ``None`` if nothing parses.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group())
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 def _score_agentic(item: dict, completion: str) -> float:
-    """Name + arg exact match (str case-insensitive, numeric ±1e-4)."""
-    try:
-        parsed = json.loads(_strip_fences(completion))
-    except (json.JSONDecodeError, ValueError):
+    """Name + arg exact match (name + str args case-insensitive, numeric ±1e-4)."""
+    parsed = _extract_json(completion)
+    if not isinstance(parsed, dict):
         return 0.0
     expected = item["expected"]
-    if parsed.get("name") != expected["name"]:
+    if str(parsed.get("name", "")).lower() != str(expected["name"]).lower():
         return 0.0
     pred_args = parsed.get("arguments", {})
     for arg, exp_val in expected["arguments"].items():
@@ -183,11 +236,13 @@ def _token_f1(prediction: str, ground_truth: str) -> float:
     """Token-level F1 between prediction and ground_truth."""
     pred_tokens = _normalize_text(prediction).split()
     gt_tokens = _normalize_text(ground_truth).split()
-    common = set(pred_tokens) & set(gt_tokens)
-    if not common:
+    if not pred_tokens or not gt_tokens:
         return 0.0
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gt_tokens)
+    common = sum((Counter(pred_tokens) & Counter(gt_tokens)).values())
+    if common == 0:
+        return 0.0
+    precision = common / len(pred_tokens)
+    recall = common / len(gt_tokens)
     return 2 * precision * recall / (precision + recall)
 
 

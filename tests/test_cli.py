@@ -4849,7 +4849,7 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
 def test_render_benchmark_happy_path(make_console, monkeypatch):
     saved = _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
     c, buf = make_console()
-    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True, exec_consent=True)
     assert rc == 0
     assert saved["model"] == "org/m"
     assert saved["use_case"] == "coding"
@@ -4858,6 +4858,24 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
+
+
+def test_render_benchmark_coding_requires_exec_consent(make_console, monkeypatch):
+    # Coding runs model-generated code — refuse without explicit consent, NOT bypassable by --yes.
+    saved = _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    assert rc == 1
+    assert "exec-consent" in buf.getvalue()
+    assert "model" not in saved          # nothing executed or stored
+
+
+def test_render_benchmark_coding_json_mode_does_not_bypass_consent(monkeypatch):
+    # --json must NOT silently bypass the code-execution gate.
+    _wire_benchmark(monkeypatch)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="coding", as_json=True)
+    assert rc == 1
 
 
 def test_render_benchmark_rejects_unknown_use_case(make_console, monkeypatch):
@@ -4887,7 +4905,7 @@ def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
     bk = types.SimpleNamespace()   # intentionally no .benchmark attr
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     c, buf = make_console()
-    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
     assert "MLX/apple only" in buf.getvalue()
 
@@ -4908,8 +4926,9 @@ def test_render_benchmark_coding_shows_sandbox_warning(make_console, monkeypatch
     warned = []
     monkeypatch.setattr("builtins.input", lambda prompt="": (warned.append(True), "n")[1])
     c, buf = make_console()
-    cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=False)
+    cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=False, exec_consent=True)
     assert "EXECUTES model-generated Python" in buf.getvalue()
+    assert "NOT a security sandbox" in buf.getvalue()   # honest wording, not "sandboxed"
 
 
 def test_render_benchmark_engine_refused(make_console, monkeypatch):
@@ -4922,7 +4941,7 @@ def test_render_benchmark_engine_refused(make_console, monkeypatch):
     )
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     c, buf = make_console()
-    rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True)
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
     assert "model too large" in buf.getvalue()
 

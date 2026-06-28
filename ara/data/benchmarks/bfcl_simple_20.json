@@ -87,7 +87,7 @@
           },
           "permeability": {
             "type": "float",
-            "description": "The magnetic permeability. Default is 12.57e10 (Vacuum Permeability)."
+            "description": "The magnetic permeability. Default is 1.2566e-6 (Vacuum Permeability)."
           }
         },
         "required": [
@@ -100,8 +100,7 @@
       "name": "calculate_magnetic_field",
       "arguments": {
         "current": 5,
-        "radius": 4,
-        "permeability": 125700000000.0
+        "radius": 4
       }
     }
   },
@@ -497,8 +496,7 @@
     "expected": {
       "name": "history_api.get_president_by_year",
       "arguments": {
-        "year": 1940,
-        "full_term_only": true
+        "year": 1940
       }
     }
   },
@@ -555,21 +553,13 @@
       "name": "paint_requirement.calculate",
       "arguments": {
         "area": {
-          "width": [
-            20
-          ],
-          "height": [
-            12
-          ]
+          "width": 20,
+          "height": 12
         },
         "paint_coverage": 350,
         "exclusion": {
-          "type": [
-            "window"
-          ],
-          "area": [
-            15
-          ]
+          "type": "window",
+          "area": 15
         }
       }
     }
@@ -688,7 +678,7 @@
   },
   {
     "id": "simple_340",
-    "question": "Determine the winner in a Poker game with John having a Hand of 8\u2665, 10\u2665, J\u2665, Q\u2665, K\u2665 and Mike having 9\u2660, J\u2660, 10\u2660, Q\u2660, K\u2660.",
+    "question": "Determine the winner in a Poker game with John having a Hand of 8♥, 10♥, J♥, Q♥, K♥ and Mike having 9♠, J♠, 10♠, Q♠, K♠.",
     "function": {
       "name": "card_games.poker_determine_winner",
       "description": "Determines the winner in a game of Poker based on the cards in each players' hands.",
@@ -704,7 +694,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The list of cards (as strings) in first player's hand. E.g ['10\u2660', 'J\u2660']"
+            "description": "The list of cards (as strings) in first player's hand. E.g ['10♠', 'J♠']"
           },
           "player2": {
             "type": "string",
@@ -715,7 +705,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The list of cards (as strings) in second player's hand. E.g ['9\u2665', '10\u2665']"
+            "description": "The list of cards (as strings) in second player's hand. E.g ['9♥', '10♥']"
           }
         },
         "required": [
@@ -731,19 +721,19 @@
       "arguments": {
         "player1": "John",
         "hand1": [
-          "8\u2665",
-          "10\u2665",
-          "J\u2665",
-          "Q\u2665",
-          "K\u2665"
+          "8♥",
+          "10♥",
+          "J♥",
+          "Q♥",
+          "K♥"
         ],
         "player2": "Mike",
         "hand2": [
-          "9\u2660",
-          "J\u2660",
-          "10\u2660",
-          "Q\u2660",
-          "K\u2660"
+          "9♠",
+          "J♠",
+          "10♠",
+          "Q♠",
+          "K♠"
         ]
       }
     }
