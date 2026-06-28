@@ -16,7 +16,7 @@ from importlib import metadata
 from pathlib import Path
 
 from ara import (acquire, apps, catalog, db, detect, engines, estimate, hub, hf_auth, mlx,
-                 ollama, profile, calibration, pythons, serialize, status, versions)
+                 ollama, profile, calibration, pythons, scoring, serialize, status, versions)
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -1268,13 +1268,21 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     c.emit()
 
 
-def render_recommend(c: Console, *, as_json: bool = False) -> int:
+def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None = None) -> int:
     """Analytic recommendations — which cataloged models fit this machine, ranked by the context
     the estimated budget supports (most first), marking those already characterized here.
 
     Engine-free: reuses ``estimate.limits``/``model_fit`` (profile's math, anti-silo) over the
     catalog (which records each model's on-disk weight). No engine, no model load. Only models
-    with a rankable context estimate are listed. Spec 2026-06-23-capability-pipeline."""
+    with a rankable context estimate are listed. With ``use_case``, ranks by a capability score —
+    *measured here* (a local benchmark on the actual quant) or *imported* (a published number,
+    labelled), never a guess (Rule #3). Stays engine-free either way. Spec
+    2026-06-23-capability-pipeline + 2026-06-28-recommend-use-case-and-serve-selection."""
+    if use_case is not None and use_case not in scoring.USE_CASES:
+        msg = (f"unknown use-case {use_case!r} — choose one of: "
+               f"{', '.join(scoring.USE_CASES)}")
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
     con = db.connect()
     catalog.scan(con)                 # refresh the catalog from the local cache first
     # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
@@ -1297,9 +1305,16 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
                      "est_context": fit["est_context"], "max_context": fit["max_context"],
                      "binding": fit["binding"], "fits": True,
                      "characterized": row["model_id"] in best})
-    recs.sort(key=lambda r: r["est_context"], reverse=True)
+    if use_case is not None:
+        recs = scoring.rank(recs, use_case, imported=scoring.load_imported())
+    else:
+        recs.sort(key=lambda r: r["est_context"], reverse=True)
 
     if as_json:
+        if use_case is not None:
+            recs = [{**r, "score": (None if r["score"] is None else
+                                    {"tier": r["score"].tier, "value": r["score"].value,
+                                     "source": r["score"].source})} for r in recs]
         print(json.dumps(recs, indent=2))
         return 0
 
@@ -1309,8 +1324,9 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
                                    "(architecture unknown) — try ara profile --model <model>"))
 
     c.emit()
-    c.emit(c.section("  RECOMMENDED MODELS")
-           + c.style("dim", "  (estimated — fits this machine, most context first)"))
+    sub = ("  (estimated — fits this machine, most context first)" if use_case is None
+           else f"  (for {use_case} — capability-ranked; measured-here or imported)")
+    c.emit(c.section("  RECOMMENDED MODELS") + c.style("dim", sub))
     if not recs:
         c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                               "try a smaller / more-quantized model"))
@@ -1321,6 +1337,10 @@ def render_recommend(c: Console, *, as_json: bool = False) -> int:
         tail = f"~{r['est_context']} tok est."
         if r["binding"] == "context_window":
             tail += " (full window)"
+        if use_case is not None:
+            s = r.get("score")
+            tail = (("unknown (not measured or imported) · " if s is None
+                     else f"{use_case} {s.value * 100:.0f}% ({s.tier}) · ") + tail)
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
         c.emit("  " + c.style("metric", r["model_id"])
                + c.style("dim", f"  {r['modality'] or '?'}  →  ")
@@ -1492,7 +1512,70 @@ def _find_loaded(entries: list[dict], served: str) -> dict | None:
                  or m.get("name", "").startswith(served + ":")), None)
 
 
+def _free_port() -> int:
+    """An OS-assigned free TCP port on localhost (small bind/close race, acceptable for v1)."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | None = None,
+                      assume_yes: bool = False, as_json: bool = False,
+                      kv_quant: str = "f16") -> int:
+    """Stand *model* up on the governed MLX server (wmx-suite), capped at the MEASURED apple
+    ceiling (or explicit ``--ctx``), and hand back an OpenAI-compatible endpoint. ARA owns the
+    server subprocess, so it stays foreground until Ctrl-C. The wmx ceiling is valid here because
+    serve and characterize share the mlx_lm allocation path (seam-mismatch rule, the other way).
+    Spec 2026-06-28-recommend-use-case-and-serve-selection."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    con = db.connect()
+    mk = profile.machine_key()
+    if ctx is not None:
+        if ctx <= 0:
+            return err("--ctx must be a positive integer")
+        safe, source = ctx, "requested"
+    else:
+        row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
+        if not row or row.get("safe_context") is None:
+            return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
+                       f"(or pass --ctx N).")
+        safe, source = row["safe_context"], "measured"
+
+    if not as_json and not assume_yes and sys.stdin.isatty():
+        if not _confirm(f"Serve {model} on MLX, governed at ≤{safe} ctx?"):
+            c.emit(c.style("dim", "  skipped."))
+            return 0
+
+    port = _free_port()
+    try:
+        proc, url, served_ctx = get_backend("apple").serve(
+            model, port=port, max_context=safe, kv_quant=kv_quant)
+    except Exception as exc:                       # gate refusal / engine not installed / etc.
+        return err(f"couldn't start the MLX server: {exc}")
+
+    endpoint = url.rstrip("/") + "/v1"
+    if as_json:
+        print(json.dumps({"endpoint": endpoint, "model": model, "served_context": served_ctx,
+                          "ceiling_source": source, "openai_base_url": endpoint,
+                          "runtime": "mlx"}, indent=2))
+    else:
+        c.emit()
+        c.emit(c.field("serving", f"{model}  (MLX @ {served_ctx} ctx, {source})"))
+        c.emit(c.field("endpoint", f"{endpoint}  (OpenAI-compatible)"))
+        c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
+        c.emit(c.style("dim", "  serving in the foreground — Ctrl-C to stop."))
+        c.emit()
+    sys.stdout.flush()                             # hand the endpoint to a piped reader BEFORE we block
+    proc.wait()                                    # our child IS the server; stay alive to serve
+    return 0
+
+
 def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | None = None,
+                 engine: str | None = None,
                  assume_yes: bool = False, as_json: bool = False) -> int:
     """Stand *model* up as a **governed** OpenAI-compatible endpoint on a local Ollama, capped at a
     safe context ceiling, and hand back the connection — then get out of the way (BYO consumer).
@@ -1502,7 +1585,14 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     governing per-request isn't enough. The ceiling is *measured* (a llama.cpp-class
     characterization) or *explicit* (``--ctx``) — never a silent guess (Rule #1/#3). After load it
     verifies the ceiling actually took before returning an endpoint. Spec
-    2026-06-26-ara-serve-governed-endpoint."""
+    2026-06-26-ara-serve-governed-endpoint. ``--engine wmx`` routes to the governed MLX server
+    instead (spec 2026-06-28); the Ollama path below is unchanged."""
+    if engine is not None:
+        key = engines.resolve(engine)
+        if key and engines.ENGINES.get(key, {}).get("backend") == "apple":
+            return _render_serve_mlx(c, model, engine_key=key, ctx=ctx,
+                                     assume_yes=assume_yes, as_json=as_json)
+
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
@@ -1871,6 +1961,7 @@ def _main_impl() -> int:
     prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
     serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
     serve_name: str | None = None                # `serve --name X`: derived served-model name
+    use_case: str | None = None                  # `recommend --use-case X`: capability dimension
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -1934,6 +2025,13 @@ def _main_impl() -> int:
             continue
         if a.startswith("--name="):
             serve_name = a.split("=", 1)[1] or None
+            continue
+        if a == "--use-case":
+            use_case = argv[i + 1] if i + 1 < len(argv) else None
+            skip = True
+            continue
+        if a.startswith("--use-case="):
+            use_case = a.split("=", 1)[1] or None
             continue
         if a in ("--include", "--exclude"):
             (include if a == "--include" else exclude).extend(
@@ -2016,7 +2114,7 @@ def _main_impl() -> int:
         return render_profile(c, as_json=as_json, model=model, engine=engine)
 
     if cmd == "recommend":
-        return render_recommend(c, as_json=as_json)
+        return render_recommend(c, as_json=as_json, use_case=use_case)
 
     if cmd == "run":
         if len(rest) < 2:
@@ -2030,7 +2128,7 @@ def _main_impl() -> int:
     if cmd == "serve":
         if len(rest) < 2:
             return _arg_err("usage: ara serve <model> [--ctx N] [--name NAME]")
-        return render_serve(c, rest[1], ctx=serve_ctx, name=serve_name,
+        return render_serve(c, rest[1], ctx=serve_ctx, name=serve_name, engine=engine,
                             assume_yes=assume_yes, as_json=as_json)
 
     if cmd == "install":

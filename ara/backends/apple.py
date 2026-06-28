@@ -158,6 +158,31 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
     )
 
 
+def serve(model: str, *, port: int, max_context: int,
+          kv_quant: str = "f16") -> tuple:
+    """Start a governed MLX server for *model* via wmx_suite.serve, out-of-process.
+
+    Spawns the isolated ``apple`` env's python running
+    ``python -m wmx_suite.serve <model> <max_context> --margin G --overhead G --port N
+    [--kv-bits N]``. Reads stdout until the worker emits its ready JSON
+    (``{"ready": true, "url": "...", "context": N}``), then returns
+    ``(proc, url, context)`` without waiting — the server keeps running.
+
+    ARA never imports MLX in-process; all engine calls go through
+    :func:`engine_env.start_worker_server`. The ceiling passed as *max_context* must
+    be the characterized safe ceiling for this machine (Rule #1).
+    """
+    margin, overhead = _budget_params()
+    argv = ["-m", "wmx_suite.serve", model, str(max_context),
+            "--margin", str(margin), "--overhead", str(overhead),
+            "--port", str(port)]
+    bits = _MLX_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
+    proc, info = engine_env.start_worker_server("apple", argv)
+    return proc, info["url"], info["context"]
+
+
 DEFAULT_MAX_TOKENS = 256
 
 

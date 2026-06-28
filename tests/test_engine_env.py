@@ -357,3 +357,79 @@ def test_run_worker_stream_true_no_json_still_raises(engines_root, monkeypatch):
                         lambda cmd, *, input=None, stream=False: (0, "logs only, no json", ""))
     with pytest.raises(engine_env.EngineEnvError, match="no JSON"):
         engine_env.run_worker("apple", ["-m", "w"], stream=True)
+
+
+# --------------------------------------------------------------------------- #
+# start_worker_server — long-lived governed server seam
+# --------------------------------------------------------------------------- #
+
+class _FakeServerProc:
+    """Minimal Popen stand-in for start_worker_server tests."""
+
+    def __init__(self, lines, rc=0):
+        self.stdout = iter(lines)
+        self.returncode = rc
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
+def _mock_server_popen(monkeypatch, lines, rc=0):
+    """Replace subprocess.Popen with a fake that returns a FakeServerProc."""
+    proc = _FakeServerProc(lines, rc)
+    captured_cmd = []
+
+    def fake_popen(cmd, *, stdout, text):
+        captured_cmd.extend(cmd)
+        return proc
+
+    monkeypatch.setattr(engine_env.subprocess, "Popen", fake_popen)
+    return proc, captured_cmd
+
+
+def test_start_worker_server_returns_proc_and_dict_on_ready_json(engines_root, monkeypatch):
+    """Happy path: a ready JSON line → (proc, dict) returned; server keeps running."""
+    ready = '{"ready": true, "url": "http://127.0.0.1:8080", "context": 4096}\n'
+    proc, _ = _mock_server_popen(monkeypatch, ["log line\n", ready])
+    result_proc, result_dict = engine_env.start_worker_server(
+        "apple", ["-m", "wmx_suite.serve"])
+    assert result_proc is proc
+    assert result_dict == {"ready": True, "url": "http://127.0.0.1:8080", "context": 4096}
+    # proc must NOT be waited on — the server keeps running
+    assert not proc.waited
+
+
+def test_start_worker_server_raises_on_refused(engines_root, monkeypatch):
+    """refused=true JSON → EngineEnvError with the reason; process is waited."""
+    refused = '{"refused": true, "reason": "model exceeds safe budget"}\n'
+    proc, _ = _mock_server_popen(monkeypatch, [refused])
+    with pytest.raises(engine_env.EngineEnvError, match="model exceeds safe budget"):
+        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+    assert proc.waited
+
+
+def test_start_worker_server_raises_on_error(engines_root, monkeypatch):
+    """error key in JSON → EngineEnvError with the error text; process is waited."""
+    error = '{"error": "load failed: model not found"}\n'
+    proc, _ = _mock_server_popen(monkeypatch, [error])
+    with pytest.raises(engine_env.EngineEnvError, match="load failed"):
+        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+    assert proc.waited
+
+
+def test_start_worker_server_raises_when_no_json_before_exit(engines_root, monkeypatch):
+    """Stdout exhausted with no JSON line → EngineEnvError 'exited without a ready signal'."""
+    proc, _ = _mock_server_popen(monkeypatch, ["log: starting\n", "log: crash\n"])
+    with pytest.raises(engine_env.EngineEnvError, match="exited without a ready signal"):
+        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+
+
+def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
+    """start_worker_server uses the engine's isolated python, not the ambient interpreter."""
+    monkeypatch.setattr(engine_env, "_is_windows", lambda: False)
+    ready = '{"ready": true, "url": "http://127.0.0.1:9000", "context": 2048}\n'
+    _proc, cmd = _mock_server_popen(monkeypatch, [ready])
+    engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve", "org/m"])
+    assert cmd[0] == str(engines_root / "apple" / "bin" / "python")
+    assert cmd[1:] == ["-m", "wmx_suite.serve", "org/m"]

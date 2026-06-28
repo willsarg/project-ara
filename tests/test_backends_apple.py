@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from ara import acquire, catalog
+from ara import acquire, catalog, engine_env
 from ara.backends import apple
 
 
@@ -403,3 +403,64 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     assert seen["argv"] == ["-m", "wmx_suite.generate", "org/m", "8192",
                             "--margin", "2.0", "--overhead", "1.0", "--max-tokens", "64"]
     assert seen["input"] == "hi"               # prompt over stdin, not argv
+
+
+# --------------------------------------------------------------------------- #
+# serve — governed long-lived MLX server
+# --------------------------------------------------------------------------- #
+
+_SENTINEL_PROC = object()   # a distinct sentinel for "the Popen object"
+
+
+def _fake_start_server(monkeypatch, url="http://127.0.0.1:8080", ctx=4096):
+    """Monkeypatch engine_env.start_worker_server to capture argv and return a canned result."""
+    captured = {}
+
+    def fake_start(name, argv):
+        captured["name"] = name
+        captured["argv"] = argv
+        return _SENTINEL_PROC, {"url": url, "context": ctx}
+
+    monkeypatch.setattr(engine_env, "start_worker_server", fake_start)
+    return captured
+
+
+def test_serve_builds_exact_argv(monkeypatch):
+    """serve() builds the exact wmx_suite.serve argv and passes it to start_worker_server."""
+    _patch_budget(monkeypatch)
+    captured = _fake_start_server(monkeypatch)
+    apple.serve("org/m", port=8080, max_context=4096)
+    assert captured["name"] == "apple"
+    assert captured["argv"] == [
+        "-m", "wmx_suite.serve", "org/m", "4096",
+        "--margin", "2.0", "--overhead", "1.0",
+        "--port", "8080",
+    ]
+
+
+def test_serve_appends_kv_bits_for_q4_0(monkeypatch):
+    """kv_quant='q4_0' → --kv-bits 4 appended after the core argv."""
+    _patch_budget(monkeypatch)
+    captured = _fake_start_server(monkeypatch)
+    apple.serve("org/m", port=8080, max_context=4096, kv_quant="q4_0")
+    argv = captured["argv"]
+    assert "--kv-bits" in argv
+    assert argv[argv.index("--kv-bits") + 1] == "4"
+
+
+def test_serve_omits_kv_bits_for_f16(monkeypatch):
+    """kv_quant='f16' (default) → --kv-bits must NOT appear in argv."""
+    _patch_budget(monkeypatch)
+    captured = _fake_start_server(monkeypatch)
+    apple.serve("org/m", port=8080, max_context=4096)
+    assert "--kv-bits" not in captured["argv"]
+
+
+def test_serve_returns_proc_url_context(monkeypatch):
+    """serve() unpacks the ready signal into (proc, url, context)."""
+    _patch_budget(monkeypatch)
+    _fake_start_server(monkeypatch, url="http://127.0.0.1:9999", ctx=8192)
+    proc, url, ctx = apple.serve("org/m", port=9999, max_context=8192)
+    assert proc is _SENTINEL_PROC
+    assert url == "http://127.0.0.1:9999"
+    assert ctx == 8192

@@ -1,0 +1,28 @@
+{
+  "_about": "IMPORTED use-case capability scores — published benchmark numbers, NOT measured by ARA on your hardware. Each carries its citation. ARA renders these labelled 'imported'; a local benchmark on your actual quant (when available) overrides them. Scores are normalised 0..1. Seed values, dated; refine against current leaderboards. See spec 2026-06-28-recommend-use-case-and-serve-selection.",
+  "scores": {
+    "Qwen/Qwen2.5-Coder-7B-Instruct": {
+      "coding":    {"score": 0.88, "source": "HumanEval pass@1, EvalPlus leaderboard (as of 2026-05)"},
+      "reasoning": {"score": 0.62, "source": "MMLU/GSM8K avg, published model card (2026-05)"}
+    },
+    "Qwen/Qwen2.5-7B-Instruct": {
+      "reasoning": {"score": 0.74, "source": "MMLU + GSM8K, Qwen2.5 tech report (2026-05)"},
+      "chat":      {"score": 0.63, "source": "MT-Bench, public leaderboard (2026-05)"},
+      "coding":    {"score": 0.55, "source": "HumanEval pass@1, EvalPlus leaderboard (2026-05)"}
+    },
+    "meta-llama/Llama-3.1-8B-Instruct": {
+      "chat":      {"score": 0.66, "source": "MT-Bench, public leaderboard (2026-05)"},
+      "reasoning": {"score": 0.51, "source": "MMLU/GSM8K avg, Llama 3.1 model card (2026-05)"},
+      "coding":    {"score": 0.45, "source": "HumanEval pass@1, EvalPlus leaderboard (2026-05)"}
+    },
+    "mistralai/Mistral-7B-Instruct-v0.3": {
+      "chat":      {"score": 0.58, "source": "MT-Bench, public leaderboard (2026-05)"},
+      "coding":    {"score": 0.40, "source": "HumanEval pass@1, EvalPlus leaderboard (2026-05)"}
+    },
+    "meta-llama/Llama-3.2-3B-Instruct": {
+      "chat":      {"score": 0.55, "source": "MT-Bench, public leaderboard (2026-05)"},
+      "reasoning": {"score": 0.46, "source": "MMLU/GSM8K avg, Llama 3.2 model card (2026-05)"},
+      "coding":    {"score": 0.38, "source": "HumanEval pass@1, EvalPlus leaderboard (2026-05)"}
+    }
+  }
+}

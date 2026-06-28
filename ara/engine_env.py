@@ -127,6 +127,33 @@ def remove(name: str) -> bool:
     return True
 
 
+def start_worker_server(name: str, args: list[str]) -> tuple[subprocess.Popen, dict]:
+    """Spawn engine *name*'s python with *args* as a long-lived server process.
+
+    Companion to :func:`run_worker`, but the process is **not waited on** — the server
+    keeps running after this call returns. Stdout is read line-by-line until the first
+    ``{``-prefixed line; that JSON is parsed and returned with the Popen handle.
+
+    On a ``refused`` or ``error`` payload the process is waited and
+    :class:`EngineEnvError` is raised with the reason. If the process exits before
+    emitting any ``{``-line, :class:`EngineEnvError` is raised with
+    ``"exited without a ready signal"``.
+    """
+    cmd = [str(python_path(name)), *args]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        if line.lstrip().startswith("{"):
+            ready = json.loads(line)
+            if ready.get("error") or ready.get("refused"):
+                proc.wait()
+                reason = ready.get("reason") or ready.get("error", "unknown")
+                raise EngineEnvError(f"server {name!r} refused: {reason}")
+            return proc, ready
+    # stdout exhausted — process exited without a ready signal
+    proc.wait()
+    raise EngineEnvError(f"server {name!r} exited without a ready signal")
+
+
 def run_worker(name: str, args: list[str], *, input: str | None = None,
                stream: bool = False) -> dict:
     """Spawn engine *name*'s python with *args*, return the single JSON object it emits.

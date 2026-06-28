@@ -99,7 +99,8 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
-                        lambda c, as_json=False: (rec.update(recommend=as_json) or 0))
+                        lambda c, as_json=False, use_case=None:
+                        (rec.update(recommend=as_json, recommend_uc=use_case) or 0))
     monkeypatch.setattr(cli, "render_run",
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
@@ -1842,10 +1843,91 @@ def test_recommend_json(monkeypatch, set_platform, capsys):
     assert payload[0]["fits"] is True and "est_context" in payload[0]
 
 
+def test_recommend_use_case_ranks_by_capability_and_labels(make_console, monkeypatch, set_platform):
+    # With --use-case, models rank by capability (not context), and provenance is labelled.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Weak", weights_gb=4.0, max_context=131072),
+                     _model_row("org/Strong", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported",
+                        lambda: {"org/Strong": {"coding": {"score": 0.9, "source": "HumanEval"}},
+                                 "org/Weak": {"coding": {"score": 0.3, "source": "HumanEval"}}})
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert out.index("org/Strong") < out.index("org/Weak")   # capability-ranked, not context
+    assert "imported" in out                                 # provenance shown, not a bare number
+
+
+def test_recommend_use_case_unknown_score_is_honest(make_console, monkeypatch, set_platform):
+    # A fitting model with no score is shown as `unknown`, never dropped or guessed (Rule #3).
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Unscored", weights_gb=4.0)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert "org/Unscored" in out and "unknown" in out
+
+
+def test_recommend_rejects_unknown_use_case(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/X")])
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="cooking") == 1
+    assert "cooking" in buf.getvalue()
+
+
 def test_main_recommend_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["recommend", "--json"])
     assert rec["recommend"] is True
+
+
+def test_main_recommend_use_case_dispatch(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["recommend", "--use-case", "coding"])
+    assert rec["recommend_uc"] == "coding"
+
+
+# --------------------------------------------------------------------------- #
+# ara serve --engine wmx — governed MLX endpoint (this Mac)
+# Spec 2026-06-28-recommend-use-case-and-serve-selection
+# --------------------------------------------------------------------------- #
+def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_platform):
+    # `serve --engine wmx` stands the model up on the governed MLX server at the MEASURED apple
+    # ceiling, hands back an OpenAI-compatible /v1 endpoint, and stays foreground (proc.wait).
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    # Characterizations are keyed by ENGINE KEY ("wmx"), not backend name ("apple").
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+    captured = {}
+
+    class _Proc:
+        def wait(self):
+            captured["waited"] = True
+
+    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
+        captured.update(model=model, port=port, max_context=max_context)
+        return _Proc(), f"http://127.0.0.1:{port}", max_context
+
+    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
+    c, buf = make_console()
+    rc = cli.render_serve(c, "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                          engine="wmx", assume_yes=True)
+    assert rc == 0
+    assert captured["max_context"] == 8000 and captured["port"] == 12399
+    assert captured["waited"] is True                      # foreground: our child IS the server
+    assert "OPENAI_BASE_URL=http://127.0.0.1:12399/v1" in buf.getvalue()
+
+
+def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, set_platform):
+    # No measured MLX ceiling + no --ctx → refuse, point at characterize (never a guessed ceiling).
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/Uncharacterized", engine="wmx", assume_yes=True) == 1
+    assert "characterize" in buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -4688,7 +4770,7 @@ def test_main_serve_dispatches_with_ctx_and_name(monkeypatch):
     monkeypatch.setattr(cli, "render_serve",
                         lambda c, model, **kw: rec.update(serve={"model": model, **kw}) or 0)
     _run_main(monkeypatch, ["serve", "qwen3:0.6b", "--ctx", "8192", "--name", "srv"])
-    assert rec["serve"] == {"model": "qwen3:0.6b", "ctx": 8192, "name": "srv",
+    assert rec["serve"] == {"model": "qwen3:0.6b", "ctx": 8192, "name": "srv", "engine": None,
                             "assume_yes": False, "as_json": False}
 
 
