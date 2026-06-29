@@ -365,8 +365,11 @@ def generate(model: str, ctx: int, prompt: str, *, vram_margin_gb: float, ram_ma
     bad = _verify_offload(stderr, b)
     if bad is not None:
         return _refused(ctx, bad)
-    out = llm.create_completion(prompt, max_tokens=max_tokens)
-    return {"context": ctx, "gpu_layers": k, "completion": out["choices"][0]["text"]}
+    # create_chat_completion applies the GGUF's embedded chat template (instruct models need it —
+    # raw create_completion yields empty/garbage on template-strict models like gemma). Rule #3.
+    out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
+                                     max_tokens=max_tokens)
+    return {"context": ctx, "gpu_layers": k, "completion": out["choices"][0]["message"]["content"]}
 
 
 def benchmark(model: str, ctx: int, prompts: list, *, vram_margin_gb: float, ram_margin_gb: float,
@@ -394,8 +397,9 @@ def benchmark(model: str, ctx: int, prompts: list, *, vram_margin_gb: float, ram
             results.append({"prompt_index": i, "refused": True,
                             "reason": f"prompt fills context ceiling {ctx}"})
             continue
-        out = llm.create_completion(prompt, max_tokens=allowed)
-        results.append({"prompt_index": i, "completion": out["choices"][0]["text"]})
+        out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
+                                         max_tokens=allowed)
+        results.append({"prompt_index": i, "completion": out["choices"][0]["message"]["content"]})
     return {"context": ctx, "gpu_layers": k, "results": results}
 
 

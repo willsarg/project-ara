@@ -427,8 +427,11 @@ def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb
           else {"type_k": _KV_GGML_TYPE[kv_quant], "type_v": _KV_GGML_TYPE[kv_quant]})
     llm = Llama(model_path=gguf, n_ctx=ctx, n_gpu_layers=-1,
                 flash_attn=flash_attn, verbose=False, **kv)
-    out = llm.create_completion(prompt, max_tokens=max_tokens)
-    return {"context": ctx, "completion": out["choices"][0]["text"]}
+    # create_chat_completion applies the GGUF's embedded chat template (instruct models need it —
+    # raw create_completion yields empty/garbage on template-strict models like gemma). Rule #3.
+    out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
+                                     max_tokens=max_tokens)
+    return {"context": ctx, "completion": out["choices"][0]["message"]["content"]}
 
 
 def benchmark(model: str, ctx: int, prompts: list, *, margin_gb: float, overhead_gb: float,
@@ -477,8 +480,9 @@ def benchmark(model: str, ctx: int, prompts: list, *, margin_gb: float, overhead
             results.append({"prompt_index": i, "refused": True,
                             "reason": f"prompt fills context ceiling {ctx}"})
             continue
-        out = llm.create_completion(prompt, max_tokens=allowed)
-        results.append({"prompt_index": i, "completion": out["choices"][0]["text"]})
+        out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
+                                         max_tokens=allowed)
+        results.append({"prompt_index": i, "completion": out["choices"][0]["message"]["content"]})
     return {"context": ctx, "results": results}
 
 

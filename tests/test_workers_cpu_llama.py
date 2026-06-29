@@ -136,14 +136,16 @@ def test_generate_returns_completion_when_safe(monkeypatch):
         def __init__(self, **kw):
             seen["n_ctx"] = kw.get("n_ctx")
 
-        def create_completion(self, prompt, max_tokens):
-            seen["prompt"], seen["max_tokens"] = prompt, max_tokens
-            return {"choices": [{"text": " 42"}]}
+        def create_chat_completion(self, messages, max_tokens):
+            seen["messages"], seen["max_tokens"] = messages, max_tokens
+            return {"choices": [{"message": {"content": " 42"}}]}
 
     monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_Llama))
     out = w.generate("org/m", 4000, "meaning?", margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
     assert out == {"context": 4000, "completion": " 42"}
-    assert seen == {"n_ctx": 4000, "prompt": "meaning?", "max_tokens": 8}   # KV capped at ceiling
+    # the prompt is wrapped as a chat message so llama.cpp applies the GGUF's embedded template
+    assert seen["messages"] == [{"role": "user", "content": "meaning?"}]
+    assert seen["max_tokens"] == 8 and seen["n_ctx"] == 4000   # KV capped at ceiling
 
 
 def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
@@ -204,8 +206,8 @@ class _FakeLlama:
     def tokenize(self, b):
         return b.split()                       # 1 "token" per whitespace word
 
-    def create_completion(self, prompt, max_tokens):
-        return {"choices": [{"text": f"<{max_tokens}>{prompt}"}]}
+    def create_chat_completion(self, messages, max_tokens):
+        return {"choices": [{"message": {"content": f"<{max_tokens}>{messages[0]['content']}"}}]}
 
 
 def test_benchmark_refuses_whole_load_when_gate_blocks(monkeypatch):
