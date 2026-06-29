@@ -36,16 +36,16 @@
     ]
   },
   {
-    "context": "The server room maintains a temperature of 68\u00b0F and humidity between 40% and 60%. The cooling system uses liquid nitrogen as a secondary coolant.",
+    "context": "The server room maintains a temperature of 68°F and humidity between 40% and 60%. The cooling system uses liquid nitrogen as a secondary coolant.",
     "question": "What temperature is maintained in the server room?",
     "answers": [
       {
-        "text": "68\u00b0F"
+        "text": "68°F"
       }
     ]
   },
   {
-    "context": "Dr. Amara Osei presented findings from a three-year longitudinal study of 1,200 children. The study tracked cognitive development from ages 4 to 7.",
+    "context": "Dr. Amara Osei presented findings from a longitudinal study that ran for three years, following 1,200 children. The study tracked cognitive development from ages 4 to 7.",
     "question": "How long did the longitudinal study run?",
     "answers": [
       {
@@ -54,11 +54,11 @@
     ]
   },
   {
-    "context": "The recipe requires 2 cups of almond flour, 3 eggs, and half a cup of honey. Bake at 350\u00b0F for 25 minutes.",
+    "context": "The recipe requires 2 cups of almond flour, 3 eggs, and half a cup of honey. Bake at 350°F for 25 minutes.",
     "question": "At what temperature should the dish be baked?",
     "answers": [
       {
-        "text": "350\u00b0F"
+        "text": "350°F"
       }
     ]
   },
@@ -182,6 +182,291 @@
     "answers": [
       {
         "text": "6:15 AM"
+      }
+    ]
+  },
+  {
+    "context": "The quarterly earnings report shows net income of $2.1 million on revenues of $9.7 million. This represents a 15 percent improvement over the same quarter last year.",
+    "question": "What was the net income in the quarterly report?",
+    "answers": [
+      {
+        "text": "$2.1 million"
+      }
+    ]
+  },
+  {
+    "context": "The maintenance window is scheduled for Saturday between 2:00 AM and 5:00 AM UTC. All services will be unavailable during this period.",
+    "question": "When is the maintenance window scheduled?",
+    "answers": [
+      {
+        "text": "Saturday between 2:00 AM and 5:00 AM UTC"
+      }
+    ]
+  },
+  {
+    "context": "The contract requires a minimum order quantity of 500 units. Bulk discounts of 10 percent apply to orders exceeding 2,000 units.",
+    "question": "What is the minimum order quantity?",
+    "answers": [
+      {
+        "text": "500 units"
+      }
+    ]
+  },
+  {
+    "context": "The study found that participants who slept fewer than 6 hours per night were 3.5 times more likely to develop a cold than those who slept 8 or more hours.",
+    "question": "How much more likely are short sleepers to develop a cold?",
+    "answers": [
+      {
+        "text": "3.5 times"
+      }
+    ]
+  },
+  {
+    "context": "Version 4.2 of the software introduces support for real-time collaboration, dark mode, and offline editing. The release date is set for September 14, 2026.",
+    "question": "When is version 4.2 of the software being released?",
+    "answers": [
+      {
+        "text": "September 14, 2026"
+      }
+    ]
+  },
+  {
+    "context": "The carbon footprint of the manufacturing process was reduced by 28 percent after switching to renewable energy sources in the Guadalajara facility.",
+    "question": "By how much was the carbon footprint reduced?",
+    "answers": [
+      {
+        "text": "28 percent"
+      }
+    ]
+  },
+  {
+    "context": "Employees are entitled to 20 days of paid annual leave after completing one year of service. Leave accrues at a rate of 1.67 days per month.",
+    "question": "How many days of paid annual leave are employees entitled to?",
+    "answers": [
+      {
+        "text": "20 days"
+      }
+    ]
+  },
+  {
+    "context": "The warehouse in Phoenix holds up to 12,000 pallets and operates 24 hours a day, 7 days a week. It employs a staff of 350 workers.",
+    "question": "How many pallets can the Phoenix warehouse hold?",
+    "answers": [
+      {
+        "text": "12,000 pallets"
+      },
+      {
+        "text": "up to 12,000 pallets"
+      }
+    ]
+  },
+  {
+    "context": "Interest on the loan accrues at an annual percentage rate of 4.75 percent. Payments are due on the first business day of each month.",
+    "question": "What is the annual interest rate on the loan?",
+    "answers": [
+      {
+        "text": "4.75 percent"
+      }
+    ]
+  },
+  {
+    "context": "The proposal requires a co-payment of $35 per specialist visit and $15 per primary care visit. Emergency room visits have a $200 co-payment.",
+    "question": "What is the co-payment for a primary care visit?",
+    "answers": [
+      {
+        "text": "$15"
+      }
+    ]
+  },
+  {
+    "context": "The pilot program was launched in three cities: Austin, Denver, and Portland. Enrollment is open to residents aged 25 to 64.",
+    "question": "In which cities was the pilot program launched?",
+    "answers": [
+      {
+        "text": "Austin, Denver, and Portland"
+      }
+    ]
+  },
+  {
+    "context": "The API rate limit is 1,000 requests per minute for standard tier accounts and 10,000 requests per minute for enterprise accounts.",
+    "question": "What is the API rate limit for standard tier accounts?",
+    "answers": [
+      {
+        "text": "1,000 requests per minute"
+      }
+    ]
+  },
+  {
+    "context": "The new product line will debut at the trade show on March 3, 2027. Pre-orders will open two weeks before the official launch.",
+    "question": "When will the new product line debut?",
+    "answers": [
+      {
+        "text": "March 3, 2027"
+      }
+    ]
+  },
+  {
+    "context": "Shipping costs are free on orders over $75. Standard shipping takes 5 to 7 business days and costs $6.99 for smaller orders.",
+    "question": "What is the threshold for free shipping?",
+    "answers": [
+      {
+        "text": "$75"
+      },
+      {
+        "text": "over $75"
+      }
+    ]
+  },
+  {
+    "context": "The turbine generates 2.5 megawatts of power at full capacity. It requires a minimum wind speed of 12 kilometers per hour to operate.",
+    "question": "What is the minimum wind speed required for the turbine to operate?",
+    "answers": [
+      {
+        "text": "12 kilometers per hour"
+      }
+    ]
+  },
+  {
+    "context": "The referendum passed with 62 percent of voters in favor. Turnout was 71 percent of eligible voters, the highest in 20 years.",
+    "question": "What percentage of voters approved the referendum?",
+    "answers": [
+      {
+        "text": "62 percent"
+      }
+    ]
+  },
+  {
+    "context": "Session tokens expire after 30 minutes of inactivity. Users can extend a session by interacting with the application before the timeout.",
+    "question": "How long before a session token expires due to inactivity?",
+    "answers": [
+      {
+        "text": "30 minutes"
+      }
+    ]
+  },
+  {
+    "context": "The invoice is due within 45 days of the billing date. A late fee of 1.5 percent per month applies to overdue balances.",
+    "question": "How many days are allowed for invoice payment?",
+    "answers": [
+      {
+        "text": "45 days"
+      }
+    ]
+  },
+  {
+    "context": "The building has a LEED Platinum certification and consumes 40 percent less energy than a comparable conventional building.",
+    "question": "What certification does the building have?",
+    "answers": [
+      {
+        "text": "LEED Platinum certification"
+      },
+      {
+        "text": "LEED Platinum"
+      }
+    ]
+  },
+  {
+    "context": "The grant awards up to $150,000 per project for research into sustainable agriculture practices. Applications close on November 30.",
+    "question": "What is the maximum award per project?",
+    "answers": [
+      {
+        "text": "$150,000"
+      },
+      {
+        "text": "up to $150,000"
+      }
+    ]
+  },
+  {
+    "context": "The team achieved a 99.97 percent uptime over the previous 12 months, exceeding the contractual SLA of 99.9 percent.",
+    "question": "What was the team's uptime over the previous 12 months?",
+    "answers": [
+      {
+        "text": "99.97 percent"
+      }
+    ]
+  },
+  {
+    "context": "Customer support is available Monday through Friday from 8 AM to 8 PM Eastern Time. Phone and live chat support are both offered.",
+    "question": "What hours is customer support available?",
+    "answers": [
+      {
+        "text": "8 AM to 8 PM Eastern Time"
+      }
+    ]
+  },
+  {
+    "context": "The new regulation takes effect on January 1, 2027, and applies to all companies with more than 250 employees.",
+    "question": "When does the new regulation take effect?",
+    "answers": [
+      {
+        "text": "January 1, 2027"
+      }
+    ]
+  },
+  {
+    "context": "Survey results show that 84 percent of customers rated the service as excellent or good. Only 3 percent rated it as poor.",
+    "question": "What percentage of customers rated the service as excellent or good?",
+    "answers": [
+      {
+        "text": "84 percent"
+      }
+    ]
+  },
+  {
+    "context": "The research team consists of 8 principal investigators and 24 graduate students across four departments.",
+    "question": "How many principal investigators are on the research team?",
+    "answers": [
+      {
+        "text": "8"
+      }
+    ]
+  },
+  {
+    "context": "The vehicle achieves a fuel efficiency of 38 miles per gallon on the highway and 32 miles per gallon in the city.",
+    "question": "What is the highway fuel efficiency of the vehicle?",
+    "answers": [
+      {
+        "text": "38 miles per gallon"
+      }
+    ]
+  },
+  {
+    "context": "The conference will feature 120 speakers over three days. Registration is limited to 500 attendees and closes on February 15.",
+    "question": "How many speakers will the conference feature?",
+    "answers": [
+      {
+        "text": "120 speakers"
+      },
+      {
+        "text": "120"
+      }
+    ]
+  },
+  {
+    "context": "The app requires iOS 16 or later and at least 200 MB of free storage space. Android support is planned for Q2 2027.",
+    "question": "What is the minimum iOS version required for the app?",
+    "answers": [
+      {
+        "text": "iOS 16"
+      }
+    ]
+  },
+  {
+    "context": "The scholarship covers full tuition plus a monthly stipend of $1,200. It is renewable for up to four years pending satisfactory academic progress.",
+    "question": "What monthly stipend does the scholarship provide?",
+    "answers": [
+      {
+        "text": "$1,200"
+      }
+    ]
+  },
+  {
+    "context": "The reactor core operates at a temperature of 315 degrees Celsius and a pressure of 155 bar during normal operation.",
+    "question": "At what temperature does the reactor core operate?",
+    "answers": [
+      {
+        "text": "315 degrees Celsius"
       }
     ]
   }

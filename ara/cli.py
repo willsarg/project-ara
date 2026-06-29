@@ -1426,8 +1426,19 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if result.get("refused"):
         return err(f"the engine refused: {result.get('reason', 'no reason given')}")
 
+    results = result.get("results", [])
+    refused_n = sum(1 for r in results if r.get("refused"))
+    if prompts and refused_n == len(prompts):
+        # Every prompt was refused by per-prompt governance (e.g. --ctx too small) — that's NOT a
+        # 0% capability measurement; refuse to store a misleading score (Rule #3).
+        return err("every prompt was refused by per-prompt governance (is --ctx too small?) — "
+                   "no measurement taken")
+    if refused_n:
+        c.emit(c.style("warn", f"  note: {refused_n}/{len(prompts)} prompts were refused by "
+                               f"governance and scored 0 — the result is depressed accordingly"))
+
     completions = [""] * len(prompts)
-    for r in result.get("results", []):
+    for r in results:
         idx = r.get("prompt_index")
         if isinstance(idx, int) and 0 <= idx < len(completions):
             completions[idx] = r.get("completion", "")

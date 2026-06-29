@@ -259,5 +259,260 @@
         "text": "most of the cell's supply of ATP"
       }
     ]
+  },
+  {
+    "context": "The Great Barrier Reef is the world's largest coral reef system, stretching over 2,300 kilometers along the northeastern coast of Australia.",
+    "question": "How long is the Great Barrier Reef?",
+    "answers": [
+      {
+        "text": "over 2,300 kilometers"
+      }
+    ]
+  },
+  {
+    "context": "The speed of sound in air at 20 degrees Celsius is approximately 343 meters per second.",
+    "question": "What is the speed of sound in air at 20 degrees Celsius?",
+    "answers": [
+      {
+        "text": "343 meters per second"
+      },
+      {
+        "text": "approximately 343 meters per second"
+      }
+    ]
+  },
+  {
+    "context": "Neil Armstrong became the first human to walk on the Moon on July 20, 1969, during the Apollo 11 mission.",
+    "question": "Who was the first human to walk on the Moon?",
+    "answers": [
+      {
+        "text": "Neil Armstrong"
+      }
+    ]
+  },
+  {
+    "context": "The human body has 206 bones in adulthood. Infants are born with approximately 270 to 300 bones.",
+    "question": "How many bones does the adult human body have?",
+    "answers": [
+      {
+        "text": "206"
+      }
+    ]
+  },
+  {
+    "context": "Leonardo da Vinci painted the Mona Lisa between approximately 1503 and 1519. It is currently displayed in the Louvre Museum in Paris.",
+    "question": "Where is the Mona Lisa currently displayed?",
+    "answers": [
+      {
+        "text": "the Louvre Museum in Paris"
+      },
+      {
+        "text": "Louvre Museum in Paris"
+      }
+    ]
+  },
+  {
+    "context": "The Nile River is 6,650 kilometers long, making it the longest river in Africa and one of the longest in the world.",
+    "question": "How long is the Nile River?",
+    "answers": [
+      {
+        "text": "6,650 kilometers"
+      }
+    ]
+  },
+  {
+    "context": "Oxygen was discovered by Carl Wilhelm Scheele in 1772 and independently by Joseph Priestley in 1774.",
+    "question": "Who first discovered oxygen?",
+    "answers": [
+      {
+        "text": "Carl Wilhelm Scheele"
+      }
+    ]
+  },
+  {
+    "context": "The Pythagorean theorem states that in a right triangle, the square of the hypotenuse equals the sum of the squares of the other two sides.",
+    "question": "What does the Pythagorean theorem state?",
+    "answers": [
+      {
+        "text": "the square of the hypotenuse equals the sum of the squares of the other two sides"
+      },
+      {
+        "text": "square of the hypotenuse equals the sum of the squares of the other two sides"
+      }
+    ]
+  },
+  {
+    "context": "The element with the highest melting point is tungsten, which melts at 3,422 degrees Celsius.",
+    "question": "Which element has the highest melting point?",
+    "answers": [
+      {
+        "text": "tungsten"
+      }
+    ]
+  },
+  {
+    "context": "Venus rotates on its axis very slowly, taking approximately 243 Earth days to complete one rotation, which is longer than its year of 225 Earth days.",
+    "question": "How long does Venus take to complete one rotation?",
+    "answers": [
+      {
+        "text": "approximately 243 Earth days"
+      },
+      {
+        "text": "243 Earth days"
+      }
+    ]
+  },
+  {
+    "context": "The Treaty of Westphalia was signed in 1648 and ended the Thirty Years War in the Holy Roman Empire.",
+    "question": "What war did the Treaty of Westphalia end?",
+    "answers": [
+      {
+        "text": "the Thirty Years War"
+      },
+      {
+        "text": "Thirty Years War"
+      }
+    ]
+  },
+  {
+    "context": "The first programmable electronic computer, ENIAC, was completed in 1945 at the University of Pennsylvania.",
+    "question": "Where was ENIAC completed?",
+    "answers": [
+      {
+        "text": "the University of Pennsylvania"
+      },
+      {
+        "text": "University of Pennsylvania"
+      }
+    ]
+  },
+  {
+    "context": "The human genome contains approximately 3 billion base pairs and around 20,000 to 25,000 protein-coding genes.",
+    "question": "How many base pairs does the human genome contain?",
+    "answers": [
+      {
+        "text": "approximately 3 billion"
+      },
+      {
+        "text": "3 billion"
+      }
+    ]
+  },
+  {
+    "context": "The Black Death pandemic reached Europe in 1347 and killed between 30 and 60 percent of the European population.",
+    "question": "When did the Black Death reach Europe?",
+    "answers": [
+      {
+        "text": "1347"
+      }
+    ]
+  },
+  {
+    "context": "Antibiotics work by either killing bacteria directly or inhibiting their ability to reproduce and spread.",
+    "question": "How do antibiotics work?",
+    "answers": [
+      {
+        "text": "killing bacteria directly or inhibiting their ability to reproduce and spread"
+      },
+      {
+        "text": "either killing bacteria directly or inhibiting their ability to reproduce and spread"
+      }
+    ]
+  },
+  {
+    "context": "The Roman Colosseum was built between 70 and 80 AD under emperors Vespasian and Titus.",
+    "question": "Under which emperors was the Colosseum built?",
+    "answers": [
+      {
+        "text": "Vespasian and Titus"
+      }
+    ]
+  },
+  {
+    "context": "Carbon dioxide has the chemical formula CO2. It is a greenhouse gas that contributes to global warming.",
+    "question": "What is the chemical formula for carbon dioxide?",
+    "answers": [
+      {
+        "text": "CO2"
+      }
+    ]
+  },
+  {
+    "context": "Isaac Newton formulated the laws of motion and universal gravitation in his 1687 work Principia Mathematica.",
+    "question": "What work did Newton use to formulate his laws of motion?",
+    "answers": [
+      {
+        "text": "Principia Mathematica"
+      }
+    ]
+  },
+  {
+    "context": "The ozone layer is found in the stratosphere, approximately 15 to 35 kilometers above Earth's surface.",
+    "question": "Where is the ozone layer found?",
+    "answers": [
+      {
+        "text": "the stratosphere"
+      },
+      {
+        "text": "stratosphere"
+      }
+    ]
+  },
+  {
+    "context": "Mount Kilimanjaro in Tanzania is the highest peak in Africa, standing at 5,895 meters above sea level.",
+    "question": "What is the height of Mount Kilimanjaro?",
+    "answers": [
+      {
+        "text": "5,895 meters"
+      },
+      {
+        "text": "5,895 meters above sea level"
+      }
+    ]
+  },
+  {
+    "context": "The speed of a computer processor is measured in hertz. Modern processors typically operate at several gigahertz.",
+    "question": "What unit measures processor speed?",
+    "answers": [
+      {
+        "text": "hertz"
+      }
+    ]
+  },
+  {
+    "context": "The first successful powered airplane flight was made by Orville Wright on December 17, 1903, at Kitty Hawk, North Carolina.",
+    "question": "Where did the first successful powered airplane flight take place?",
+    "answers": [
+      {
+        "text": "Kitty Hawk, North Carolina"
+      }
+    ]
+  },
+  {
+    "context": "Water is composed of two hydrogen atoms and one oxygen atom, giving it the chemical formula H2O.",
+    "question": "What is the chemical formula for water?",
+    "answers": [
+      {
+        "text": "H2O"
+      }
+    ]
+  },
+  {
+    "context": "The World Wide Web was invented by Tim Berners-Lee in 1989 while working at CERN in Switzerland.",
+    "question": "Who invented the World Wide Web?",
+    "answers": [
+      {
+        "text": "Tim Berners-Lee"
+      }
+    ]
+  },
+  {
+    "context": "Saturn has 146 known moons, more than any other planet in the solar system. Its largest moon is Titan.",
+    "question": "How many known moons does Saturn have?",
+    "answers": [
+      {
+        "text": "146"
+      }
+    ]
   }
 ]

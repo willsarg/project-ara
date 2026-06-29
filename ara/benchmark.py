@@ -179,7 +179,8 @@ def _score_coding(item: dict, completion: str) -> float:
         # start_new_session: the child leads its own process group, so killpg reaps any
         # processes the model's code spawned in that group (a plain proc.kill would not).
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=env,
         )
         try:
