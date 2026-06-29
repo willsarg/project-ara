@@ -40,8 +40,16 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
     budget from recon facts; never loads an engine or a model.
   - `characterize` — **the command that measures**: opt-in; crosses the seam into the engine to
     find a model's real safe context ceiling (refusing before it risks the memory wall).
-  - `recommend` — ranks cached models that fit this machine's budget, by estimated usable context.
+  - `benchmark` — **the measured-capability tier**: opt-in; runs probe sets through the model's
+    *actual* quant on the engine and scores them judge-free against canonical references
+    (HumanEval / GSM8K / SQuAD), storing the score. The deepest measurement — after `characterize`
+    proves a model *fits*, `benchmark` measures how *well* it performs. `--max-tokens N` lifts the
+    generation cap for thinking models. Coding is execution-consent-gated (and sandboxed only where
+    a sandbox exists — macOS Seatbelt; skipped on un-sandboxable hosts).
+  - `recommend` — ranks cached models that fit this machine's budget, by estimated usable context
+    (and measured capability, where `benchmark` has run, via `--use-case`).
   - `run` — governed one-shot inference, capped under the measured safe ceiling (CPU · MLX · CUDA).
+  - `serve` — governed OpenAI-compatible endpoint, capped under the measured ceiling (on Ollama / MLX).
   - `models` / `search` — catalog cached models (with measured ceilings) / search the HF Hub.
   - `hf login` / `logout` / `status` — manage the Hugging Face token (needed for gated models). An
     **action** command (writes the standard HF token store, so every fetch + worker reads it), not
@@ -62,8 +70,13 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
   `pyproject.toml`. ARA probes the machine and installs the matched suite at runtime via
   `ara install` (`ara/engines.py` is the catalog + `uv pip install git+<spec>` logic). This
   keeps the core universal, the lock engine-free, and `uv sync` identical on every OS — and
-  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|cpu|auto}` is the consent surface
-  (the flag itself authorizes the install, so it stays scriptable).
+  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|cpu|vulkan|cuda-gguf|auto}` is the
+  consent surface (the flag itself authorizes the install, so it stays scriptable). `vulkan`
+  (GGUF on an AMD APU's iGPU) and `cuda-gguf` (GGUF on NVIDIA via **partial** offload —
+  `n_gpu_layers=K`) are opt-in GPU-offload lanes; `cuda-gguf` is ARA's first **two-wall** engine,
+  governing discrete VRAM *and* system RAM at once (a model too big for VRAM runs K layers on the
+  GPU, the rest on CPU). The full engine matrix is runtime × backend: mlx/torch/llamacpp/ollama ×
+  apple/cuda/cpu/vulkan.
 
 ## Hard rules
 
