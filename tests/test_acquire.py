@@ -243,6 +243,20 @@ def test_valid_model_ref_accepts_repo_id_and_local_gguf(tmp_path):
     assert acquire.valid_model_ref(str(f)) is True           # local .gguf file
 
 
+def test_valid_model_ref_accepts_repo_quant_selector():
+    # `repo:filename.gguf` pins a specific quant in an HF repo — the workers' _resolve_gguf
+    # supports it, so the CLI must too (essential for quant-ladder benchmarking).
+    assert acquire.valid_model_ref("bartowski/Qwen2.5-14B-Instruct-GGUF:"
+                                   "Qwen2.5-14B-Instruct-Q4_K_M.gguf") is True
+
+
+def test_valid_model_ref_rejects_repo_quant_selector_when_not_gguf():
+    # the filename half must be a .gguf, and must not be flag-like (argv-injection guard)
+    assert acquire.valid_model_ref("org/name:notes.txt") is False
+    assert acquire.valid_model_ref("org/name:-rf.gguf") is False
+    assert acquire.valid_model_ref("--evil/x:m.gguf") is False     # repo half must be valid
+
+
 def test_valid_model_ref_rejects_flag_like_and_malformed():
     for bad in ("--evil", "a=b", "a b", "-rf"):
         assert acquire.valid_model_ref(bad) is False

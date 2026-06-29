@@ -42,11 +42,23 @@ def is_local_gguf(model: str) -> bool:
             and not model.startswith("-") and os.path.isfile(model))
 
 
+def valid_repo_gguf_ref(model: str) -> bool:
+    """True if *model* is the ``repo:filename.gguf`` quant-selector form — a specific quantization
+    inside an HF repo. The engine workers' ``_resolve_gguf`` resolves this directly, and it's how a
+    caller pins a quant (essential for quant-ladder benchmarking). Safe as a worker argv positional:
+    the repo half is id-validated and the file half must be a non-flag ``.gguf``."""
+    if not isinstance(model, str) or ":" not in model:
+        return False
+    repo, _, fname = model.partition(":")
+    return (valid_model_id(repo) and fname.endswith(".gguf")
+            and not fname.startswith("-"))
+
+
 def valid_model_ref(model: str) -> bool:
     """True if *model* is a usable model reference safe to pass to an engine worker: a well-formed
-    HF repo id, or a local ``.gguf`` file path. The single guard the CLI applies before a model
-    becomes worker argv. (Slug: 2026-06-25-local-gguf-cli-support)"""
-    return valid_model_id(model) or is_local_gguf(model)
+    HF repo id, a ``repo:filename.gguf`` quant selector, or a local ``.gguf`` file path. The single
+    guard the CLI applies before a model becomes worker argv. (Slug: 2026-06-25-local-gguf-cli-support)"""
+    return valid_model_id(model) or valid_repo_gguf_ref(model) or is_local_gguf(model)
 
 
 _REASON_GATED = "gated"
