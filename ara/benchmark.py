@@ -19,13 +19,13 @@ import os
 import re
 import shutil
 import signal
-import string
 import subprocess
 import sys
 import tempfile
 import warnings
-from collections import Counter
 from pathlib import Path
+
+from ara import _canonical_scoring as _canon
 
 USE_CASES: tuple[str, ...] = ("coding", "reasoning", "agentic", "extraction", "rag")
 
@@ -129,18 +129,12 @@ def score_probe_set(
 # ── private scorers ────────────────────────────────────────────────────────
 
 
-def _extract_code(text: str) -> str:
-    """Pull a function body out of a completion, tolerating markdown fences.
-
-    Indentation is preserved (code is whitespace-sensitive, unlike :func:`_extract_json`):
-    the fenced content is returned verbatim, only the ``` ```lang ``` / ``` ``` `` lines removed.
-    """
-    m = re.search(r"```[a-zA-Z]*\n(.*?)```", text, re.DOTALL)
-    return m.group(1) if m else text
-
-
 def _score_coding(item: dict, completion: str) -> float:
     """Run the HumanEval unit tests against prompt + completion. 1.0 iff every assert passes.
+
+    Program assembly is the canonical HumanEval recipe with robust chat-completion code extraction
+    (:func:`ara._canonical_scoring.humaneval_program`) — it handles both a bare body continuation
+    and a full ``def`` wrapped in fences/prose, so a more verbose model is not falsely failed.
 
     Executes model-generated code under a macOS Seatbelt sandbox (``sandbox-exec``) when present —
     no network, no filesystem writes, exec confined to the Python framework — plus a 10s timeout and
@@ -148,9 +142,9 @@ def _score_coding(item: dict, completion: str) -> float:
     emits a ``RuntimeWarning`` (never a silent downgrade). The assembled script ends with
     ``check(<entry_point>)`` — the asserts don't run without that call (the bug the audit caught).
     """
-    body = _extract_code(completion)
-    code = (item["prompt"] + body + "\n" + item["test"]
-            + f"\ncheck({item['entry_point']})\n")
+    code = _canon.humaneval_program(
+        item["prompt"], completion, item["test"], item["entry_point"]
+    )
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
     ) as tmp:
@@ -199,23 +193,20 @@ def _score_coding(item: dict, completion: str) -> float:
             Path(sb_path).unlink(missing_ok=True)
 
 
-_NUM = r"-?[\d,]+(?:\.\d+)?"  # signed int/decimal with thousands commas; rejects "3-4"
-
-
 def _score_reasoning(item: dict, completion: str) -> float:
     """Exact numeric match (±1e-6) against the GSM8K '#### N' answer.
 
-    Takes the LAST ``Answer:`` value (chain-of-thought may state a wrong one first), and
-    never lets a malformed number crash the run.
+    Prediction is extracted the canonical lm-eval way (an explicit ``Answer:``/``####`` marker if
+    present, else the LAST number anywhere — the ``flexible-extract`` metric leaderboards report),
+    so a model that reasons to a final number without the marker is still scored. Never crashes
+    on a malformed number.
     """
-    gt_match = re.search(rf"####\s*({_NUM})", item["answer"])
-    preds = re.findall(rf"Answer:\s*({_NUM})", completion, re.IGNORECASE)
-    if not gt_match or not preds:
+    gt_match = re.search(r"####\s*(-?[\d,]+(?:\.\d+)?)", item["answer"])
+    if not gt_match:
         return 0.0
-    try:
-        gt = float(gt_match.group(1).replace(",", ""))
-        pred = float(preds[-1].replace(",", ""))
-    except (ValueError, OverflowError):
+    gt = _canon._to_number(gt_match.group(1))
+    pred = _canon.gsm8k_extract_number(completion)
+    if gt is None or pred is None:
         return 0.0
     return 1.0 if abs(pred - gt) < 1e-6 else 0.0
 
@@ -265,46 +256,27 @@ def _score_agentic(item: dict, completion: str) -> float:
     return 1.0
 
 
-def _normalize_text(text: str) -> str:
-    """SQuAD-style normalization: lowercase, strip articles and punctuation."""
-    text = text.lower()
-    text = re.sub(r"\b(a|an|the)\b", " ", text)
-    text = text.translate(str.maketrans("", "", string.punctuation))
-    return " ".join(text.split())
-
-
-def _token_f1(prediction: str, ground_truth: str) -> float:
-    """Token-level F1 between prediction and ground_truth."""
-    pred_tokens = _normalize_text(prediction).split()
-    gt_tokens = _normalize_text(ground_truth).split()
-    if not pred_tokens or not gt_tokens:
-        return 0.0
-    common = sum((Counter(pred_tokens) & Counter(gt_tokens)).values())
-    if common == 0:
-        return 0.0
-    precision = common / len(pred_tokens)
-    recall = common / len(gt_tokens)
-    return 2 * precision * recall / (precision + recall)
+# Canonical SQuAD normalize / token-F1 (vendored in ``_canonical_scoring``); these aliases keep
+# the historical private names other call sites and tests reference.
+_normalize_text = _canon.squad_normalize
+_token_f1 = _canon.squad_f1
 
 
 def _score_extraction(item: dict, completion: str) -> float:
-    """SQuAD normalize → exact-match → 1.0, else max token-F1 over answers."""
-    norm_pred = _normalize_text(completion)
-    best = 0.0
-    for ans in item["answers"]:
-        norm_gt = _normalize_text(ans["text"])
-        if norm_pred == norm_gt:
-            return 1.0
-        f1 = _token_f1(completion, ans["text"])
-        if f1 > best:
-            best = f1
-    return best
+    """Canonical SQuAD: exact-match → 1.0, else max token-F1 over accepted answers."""
+    golds = [ans["text"] for ans in item["answers"]]
+    if _canon.max_over_golds(_canon.squad_em, completion, golds):
+        return 1.0
+    return _canon.max_over_golds(_canon.squad_f1, completion, golds)
 
 
 def _score_rag(item: dict, completion: str) -> float:
-    """Normalized exact-match over accepted answers → 1.0 or 0.0."""
-    norm_pred = _normalize_text(completion)
-    for ans in item["answers"]:
-        if norm_pred == _normalize_text(ans["text"]):
-            return 1.0
-    return 0.0
+    """Canonical SQuAD token-F1 over accepted answers (EM short-circuits to 1.0).
+
+    RAG answers are full phrases, so this is F1-scored exactly like extraction — the prior
+    exact-match-only scorer returned a false flat-zero for every verbose answer.
+    """
+    golds = [ans["text"] for ans in item["answers"]]
+    if _canon.max_over_golds(_canon.squad_em, completion, golds):
+        return 1.0
+    return _canon.max_over_golds(_canon.squad_f1, completion, golds)

@@ -523,6 +523,78 @@ def test_coding_sandbox_blocks_filesystem_write():
             _os.remove(sentinel)
 
 
+# ── canonical scorer swap (2026-06-29-canonical-scorer-swap) ─────────────────
+# Failing-first tests for the three grading bugs the validation sweep exposed.
+
+def test_rag_verbose_answer_gets_f1_credit():
+    # Bug: _score_rag did normalized EXACT-MATCH only → any verbose answer scored 0 (flat-zero
+    # sweep result). Canonical SQuAD token-F1 must give partial credit.
+    item = {"context": "Paris is the capital of France.",
+            "question": "What is the capital of France?",
+            "answers": [{"text": "Paris"}]}
+    assert _bm.score("rag", item, "The capital is Paris.") > 0.0
+
+
+def test_coding_full_function_with_prose_no_fence_scores_1():
+    # Bug: a chat model emits a full `def` wrapped in prose with no fence; the naive extractor
+    # prepended the prose to the signature → SyntaxError → false 0 (the coding-inversion mechanism:
+    # a more verbose/better model is penalised). Robust AST extraction must score it 1.0.
+    completion = "Here is the solution:\n\ndef add(a, b):\n    return a + b\n"
+    assert _bm.score("coding", _TINY_CODING_ITEM, completion) == 1.0
+
+
+def test_coding_fenced_full_function_scores_1():
+    # A FENCED full function (not a bare body): the naive path re-defined the signature on top of
+    # the prompt's → SyntaxError. Must detect the full def and score 1.0.
+    completion = "```python\ndef add(a, b):\n    return a + b\n```"
+    assert _bm.score("coding", _TINY_CODING_ITEM, completion) == 1.0
+
+
+def test_reasoning_bare_last_number_scores_1():
+    # Canonical GSM8K flexible-extract: a model that reasons to a final number WITHOUT the
+    # "Answer:" marker must still be scored (the leaderboard-reported metric).
+    item = {"question": "q", "answer": "#### 42"}
+    assert _bm.score("reasoning", item, "First 20, then 22, so the total is 42.") == 1.0
+
+
+def test_extract_json_braces_present_but_unparseable_returns_none():
+    # A `{...}` span that isn't valid JSON → None (not a crash), so agentic scores 0 cleanly.
+    assert _bm._extract_json("here you go: {name: bad, no quotes} end") is None
+
+
+def test_coding_without_sandbox_warns_and_still_scores(monkeypatch):
+    # Off-macOS fallback (no sandbox-exec): a LOUD RuntimeWarning + process-isolation only — never a
+    # silent downgrade. Runs our own trusted "return a + b", so executing un-sandboxed here is safe.
+    monkeypatch.setattr(_bm, "_SANDBOX_EXEC", None)
+    with pytest.warns(RuntimeWarning, match="WITHOUT an OS sandbox"):
+        assert _bm.score("coding", _TINY_CODING_ITEM, "    return a + b\n") == 1.0
+
+
+def test_canon_f1_both_empty_after_normalization_scores_1():
+    # Two answers that normalize to empty (pure articles/punct) are identical → 1.0, not a crash.
+    from ara import _canonical_scoring as _c
+    assert _c.squad_f1("the", "a") == 1.0
+    assert _c.squad_f1("", "Paris") == 0.0
+
+
+def test_canon_to_number_rejects_garbage():
+    # A flexible-extract match that isn't a real number ("$,." → stripped to "") → None, not crash.
+    from ara import _canonical_scoring as _c
+    assert _c._to_number("$,.") is None
+    assert _c.gsm8k_extract_number("the price is $,. today") is None
+
+
+def test_canon_largest_parseable_empty_for_prose_only():
+    # A completion with no parseable Python at all → "" (and a full-def scorer path → score 0).
+    from ara import _canonical_scoring as _c
+    assert _c._largest_parseable("   \n  ") == ""
+
+
+def test_reasoning_gold_without_marker_scores_0():
+    # An item whose answer has no '#### N' gold → 0.0 (can't grade), never a crash.
+    assert _bm.score("reasoning", {"answer": "no gold number here"}, "Answer: 5") == 0.0
+
+
 @pytest.mark.skipif(not _bm._SANDBOX_EXEC, reason="sandbox-exec is macOS-only")
 def test_coding_sandbox_blocks_network():
     import os as _os
