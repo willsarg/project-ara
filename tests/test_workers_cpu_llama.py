@@ -158,3 +158,101 @@ def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
     monkeypatch.setattr(psutil, "virtual_memory",
                         lambda: types.SimpleNamespace(used=next(reads)))
     assert w._used_gb() == pytest.approx(3.0)   # max(1,3,2) GiB, not min (1.0)
+
+
+# ── per-prompt governance (parity with the MLX/Vulkan governed_max_tokens) ──
+def test_governed_max_tokens_allows_when_fits():
+    # prompt 100 + request 256 = 356 <= 2048 → allow the full request.
+    assert w.governed_max_tokens(100, 256, 2048) == 256
+
+
+def test_governed_max_tokens_refuses_when_prompt_alone_fills_ceiling():
+    # prompt >= ceiling → None (can't even ingest the prompt under the wall).
+    assert w.governed_max_tokens(2048, 1, 2048) is None
+    assert w.governed_max_tokens(3000, 256, 2048) is None
+
+
+def test_governed_max_tokens_refuses_when_prompt_plus_request_exceeds_ceiling():
+    # 1900 + 256 = 2156 > 2048 → refuse (no silent truncation, matches MLX/Vulkan).
+    assert w.governed_max_tokens(1900, 256, 2048) is None
+
+
+def test_governed_max_tokens_clamps_to_remaining_room():
+    assert w.governed_max_tokens(2000, 40, 2048) == 40       # 2040 <= 2048 → allow 40
+    assert w.governed_max_tokens(2000, 49, 2048) is None     # 2049 > 2048 → refuse
+
+
+# --- benchmark: governed multi-prompt completion, model loaded ONCE ---
+def _patch_safe_bench(monkeypatch, *, meta=None):
+    """Patch the gate-passing path so benchmark reaches the load+iterate body."""
+    monkeypatch.setattr(w, "_resolve_gguf", lambda m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda p: meta or _GEN_META)
+    monkeypatch.setattr(w, "_total_gb", lambda: 64.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda p, o: 2.0)
+    monkeypatch.setattr(w, "safety_gate", lambda **k: None)        # safe
+
+
+class _FakeLlama:
+    """Counts instantiations (load-once proof) and tokenizes by whitespace word count."""
+    instances = 0
+
+    def __init__(self, **kw):
+        type(self).instances += 1
+        self.n_ctx = kw.get("n_ctx")
+
+    def tokenize(self, b):
+        return b.split()                       # 1 "token" per whitespace word
+
+    def create_completion(self, prompt, max_tokens):
+        return {"choices": [{"text": f"<{max_tokens}>{prompt}"}]}
+
+
+def test_benchmark_refuses_whole_load_when_gate_blocks(monkeypatch):
+    # The a-priori L4 gate refuses the whole load before any model load when base busts budget.
+    monkeypatch.setattr(w, "_resolve_gguf", lambda m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda p: _GEN_META)
+    monkeypatch.setattr(w, "_total_gb", lambda: 8.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda p, o: 50.0)    # base alone > budget
+    out = w.benchmark("org/m", 4000, ["a", "b"], margin_gb=2.0, overhead_gb=1.0, max_tokens=16)
+    assert out["refused"] is True and out["reason"] and out["context"] == 4000
+
+
+def test_benchmark_refuses_on_resolve_error(monkeypatch):
+    def boom(m):
+        raise RuntimeError("no gguf for model")
+    monkeypatch.setattr(w, "_resolve_gguf", boom)
+    out = w.benchmark("bad/m", 4000, ["a"], margin_gb=2.0, overhead_gb=1.0, max_tokens=16)
+    assert out["refused"] is True and "no gguf" in out["reason"]
+
+
+def test_benchmark_loads_once_and_completes_each_prompt(monkeypatch):
+    import sys as _sys
+    import types as _t
+
+    _patch_safe_bench(monkeypatch)
+    _FakeLlama.instances = 0
+    monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_FakeLlama))
+    out = w.benchmark("org/m", 2048, ["hi there", "yo"],
+                      margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
+    assert _FakeLlama.instances == 1                       # model loaded ONCE, not per-prompt
+    assert out["context"] == 2048
+    assert [r["prompt_index"] for r in out["results"]] == [0, 1]
+    assert out["results"][0]["completion"] == "<8>hi there"   # governed max_tokens reached gen
+    assert out["results"][1]["completion"] == "<8>yo"
+
+
+def test_benchmark_refuses_individual_prompt_that_fills_ceiling(monkeypatch):
+    import sys as _sys
+    import types as _t
+
+    _patch_safe_bench(monkeypatch)
+    _FakeLlama.instances = 0
+    monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_FakeLlama))
+    # ceiling 3, max_tokens 2: "a b c d" = 4 words >= 3 → refused; "a" (1 tok) + 2 = 3 ≤ 3 → runs.
+    out = w.benchmark("org/m", 3, ["a b c d", "a"],
+                      margin_gb=2.0, overhead_gb=1.0, max_tokens=2)
+    assert out["results"][0]["refused"] is True and "ceiling 3" in out["results"][0]["reason"]
+    assert out["results"][1]["completion"] == "<2>a"          # small prompt runs, clamped to 2
+    assert _FakeLlama.instances == 1                          # still a single load

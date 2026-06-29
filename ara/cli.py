@@ -1368,7 +1368,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     """Run a capability probe set against *model* and store the score as a measured tier result.
 
     Requires a characterization ceiling (or explicit ``--ctx``) and an engine backend that supports
-    ``benchmark`` (Apple/MLX only for now). Spec 2026-06-28-recommend-use-case-and-serve-selection."""
+    ``benchmark`` (Apple/MLX, CPU, Vulkan, and CUDA). Spec 2026-06-28-recommend-use-case-and-serve-selection."""
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
@@ -1389,7 +1389,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     bk = get_backend(backend) if backend else None
     if bk is None or not hasattr(bk, "benchmark"):
         be_name = backend or "none"
-        return err(f"benchmark isn't supported on {be_name} yet (MLX/apple only for now)")
+        return err(f"benchmark isn't supported on the {be_name} engine")
 
     con = db.connect()
     mk = profile.machine_key()

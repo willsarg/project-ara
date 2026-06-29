@@ -443,6 +443,43 @@ def test_generate_appends_prefill_chunk(monkeypatch):
     assert seen["argv"][-2:] == ["--prefill-chunk", "256"]
 
 
+# --------------------------------------------------------------------------- #
+# benchmark — load-once multi-prompt completion via wcx_suite.benchmark
+# --------------------------------------------------------------------------- #
+def test_benchmark_drives_worker_with_json_prompts(monkeypatch):
+    import json
+
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["name"], seen["argv"], seen["input"] = name, argv, input
+        return {"context": 4096, "results": [{"prompt_index": 0, "completion": "x"}]}
+
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = cuda.benchmark("org/m", ["p0", "p1"], max_context=4096, max_tokens=128)
+    assert out["results"][0]["completion"] == "x"          # worker dict verbatim
+    assert seen["name"] == "cuda"
+    assert seen["argv"] == ["-m", "wcx_suite.benchmark", "org/m", "4096",
+                            "--margin", "1.0", "--overhead", "0.6", "--max-tokens", "128"]
+    assert json.loads(seen["input"]) == ["p0", "p1"]       # prompts as JSON array over stdin
+
+
+def test_benchmark_appends_levers(monkeypatch):
+    seen = {}
+    _patch_budget(monkeypatch, margin=1.0, overhead=0.6)
+    monkeypatch.setattr(cuda, "engine_env", type("E", (), {"run_worker": staticmethod(
+        lambda name, argv, *, input=None: seen.update(argv=argv) or {"context": 4096, "results": []})}))
+    cuda.benchmark("org/m", ["p"], max_context=4096, max_tokens=64,
+                   kv_quant="q4_0", flash_attn=True, weight_quant="int8", prefill_chunk=256)
+    a = seen["argv"]
+    assert a[a.index("--kv-bits") + 1] == "4"
+    assert "--flash-attn" in a
+    assert a[a.index("--weight-quant") + 1] == "int8"
+    assert a[a.index("--prefill-chunk") + 1] == "256"
+
+
 def test_fp8_capable_reads_device_worker(monkeypatch):
     monkeypatch.setattr(cuda, "safe_limits", lambda: {"fp8_capable": True})
     assert cuda.fp8_capable() is True

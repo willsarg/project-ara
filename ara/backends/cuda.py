@@ -14,6 +14,8 @@ Unlike Apple's hidden cold-start overhead, the VRAM wall is read exactly from nv
 """
 from __future__ import annotations
 
+import json
+
 # Core, engine-free helpers (no wcx) — safe to import at module load and patchable in tests.
 from ara import calibration, db, engine_env
 from ara.contracts import driver
@@ -215,3 +217,29 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
     if prefill_chunk is not None:
         argv += ["--prefill-chunk", str(prefill_chunk)]
     return engine_env.run_worker("cuda", argv, input=prompt)
+
+
+def benchmark(model, prompts: list, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
+              kv_quant: str = "f16", flash_attn: bool = False, weight_quant: str = "none",
+              prefill_chunk: int | None = None) -> dict:
+    """Load-once multi-prompt CUDA benchmark, governed: ``max_context`` is the characterized safe
+    ceiling, so the worker gates each prompt under the wall and loads weights only after a prompt's
+    gate passes. Out-of-process in the isolated ``cuda`` env via wcx-suite's ``benchmark`` worker;
+    the prompts go as a JSON array over stdin, never argv. ``kv_quant``/``flash_attn``/
+    ``weight_quant``/``prefill_chunk`` should match how *model* was characterized. Returns the
+    worker dict verbatim — ``{"context": N, "results": [...]}`` or a whole-run refusal
+    ``{"context": N, "refused": true, "reason": "..."}``. ARA never imports torch in-process."""
+    margin, overhead = _budget_params()
+    argv = ["-m", "wcx_suite.benchmark", model, str(max_context),
+            "--margin", str(margin), "--overhead", str(overhead),
+            "--max-tokens", str(max_tokens)]
+    bits = _CUDA_KV_BITS[kv_quant]
+    if bits is not None:
+        argv += ["--kv-bits", str(bits)]
+    if flash_attn:
+        argv.append("--flash-attn")
+    if weight_quant != "none":
+        argv += ["--weight-quant", weight_quant]
+    if prefill_chunk is not None:
+        argv += ["--prefill-chunk", str(prefill_chunk)]
+    return engine_env.run_worker("cuda", argv, input=json.dumps(prompts))

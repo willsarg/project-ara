@@ -4897,17 +4897,17 @@ def test_render_benchmark_refuses_no_ceiling(make_console, monkeypatch):
 
 
 def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
-    # A backend without a `benchmark` attr → clear error pointing at MLX/apple.
-    monkeypatch.setattr(cli.engines, "for_hardware", lambda: "cpu")
+    # A backend without a `benchmark` attr → clear engine-named error.
+    monkeypatch.setattr(cli.engines, "for_hardware", lambda: "fauxengine")
     orig = dict(cli.engines.ENGINES)
-    orig["cpu"] = {**orig.get("cpu", {}), "backend": "cpu"}
+    orig["fauxengine"] = {**orig.get("fauxengine", {}), "backend": "fauxengine"}
     monkeypatch.setattr(cli.engines, "ENGINES", orig)
     bk = types.SimpleNamespace()   # intentionally no .benchmark attr
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     c, buf = make_console()
     rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
-    assert "MLX/apple only" in buf.getvalue()
+    assert "benchmark isn't supported on the fauxengine engine" in buf.getvalue()
 
 
 def test_render_benchmark_consent_decline(make_console, monkeypatch):

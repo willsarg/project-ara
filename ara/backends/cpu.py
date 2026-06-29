@@ -19,6 +19,7 @@ Apple↔CPU differences are the env name, the worker, and the wall source.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
@@ -149,3 +150,20 @@ def generate(model: str, prompt: str, *, max_context: int,
          "--margin", str(margin), "--overhead", str(overhead),
          "--max-tokens", str(max_tokens)],
         input=prompt)
+
+
+def benchmark(model: str, prompts: list, *, max_context: int,
+              max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+    """Multi-prompt CPU benchmark, governed: the worker loads the GGUF **once** (KV capped at
+    ``max_context`` — the characterized safe ceiling) and iterates the prompt array, enforcing the
+    ceiling per item. The prompts go as a JSON array over stdin, never argv. Returns the worker
+    dict verbatim: ``{"context": N, "results": [...]}`` or a gate refusal ``{"context": N,
+    "refused": true, "reason": "..."}``. ARA never imports llama.cpp in-process; ``max_context``
+    is the characterized safe ceiling."""
+    margin, overhead = _budget_params()
+    return engine_env.run_worker(
+        ENV_NAME,
+        [str(WORKER), model, str(max_context), "--benchmark",
+         "--margin", str(margin), "--overhead", str(overhead),
+         "--max-tokens", str(max_tokens)],
+        input=json.dumps(prompts))

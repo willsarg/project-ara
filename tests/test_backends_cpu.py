@@ -226,3 +226,28 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     assert "--generate" in seen["argv"]
     assert "--max-tokens" in seen["argv"] and "64" in seen["argv"]
     assert seen["input"] == "say hi"          # prompt over stdin, not argv
+
+
+# --------------------------------------------------------------------------- #
+# benchmark — governed multi-prompt completion (load-once), JSON prompts on stdin
+# --------------------------------------------------------------------------- #
+def test_benchmark_drives_worker_with_json_prompts(monkeypatch):
+    import json
+
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["name"], seen["argv"], seen["input"] = name, argv, input
+        return {"context": 4096, "results": [{"prompt_index": 0, "completion": "x"}]}
+
+    monkeypatch.setattr(cpu, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(cpu, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = cpu.benchmark("org/model", ["p0", "p1"], max_context=4096, max_tokens=128)
+    assert out["results"][0]["completion"] == "x"        # worker dict returned verbatim
+    assert seen["name"] == "cpu"
+    assert seen["argv"][0].endswith("cpu_llama.py")
+    assert seen["argv"][1] == "org/model" and seen["argv"][2] == "4096"   # governed ceiling
+    assert "--benchmark" in seen["argv"]
+    assert "--max-tokens" in seen["argv"] and "128" in seen["argv"]
+    assert json.loads(seen["input"]) == ["p0", "p1"]     # prompts as JSON array over stdin
