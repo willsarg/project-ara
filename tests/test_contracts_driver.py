@@ -126,6 +126,21 @@ def test_l2_stops_when_measured_reaches_budget():
     assert r["safe_context"] is None       # first rung over budget → <2 usable points
 
 
+def test_null_safe_context_includes_stopped_reason_and_preflight():
+    # When the L1 gate blocks ALL rungs (model too large for every scheduled context),
+    # the driver must include stopped_reason + base_gb/budget_gb so callers can explain
+    # why — not just emit a bare null.  Mirrors gemma-2-2b-it on RTX 2070: base_gb=6.68,
+    # budget=7.0, slope 0.198/k → ctx=2000 predicted at 7.08 >= 7.0, plan_next returns None.
+    est = _est(base_gb=6.68, slope_gb_per_k=0.198, budget_gb=7.0, max_context=8192)
+    r = driver.characterize("m", preflight=lambda m: est,
+                            measure=lambda m, ctx: {"context": ctx, "mem_gb": 4.0},
+                            schedule=[2000, 4000])
+    assert r["safe_context"] is None
+    assert isinstance(r.get("stopped_reason"), str) and r["stopped_reason"]
+    assert r.get("base_gb") == est["base_gb"]
+    assert r.get("budget_gb") == est["budget_gb"]
+
+
 def test_threads_ref_baseline_into_ceiling():
     # delta fit: model base 5, slope 1; live OS baseline 8 → ceiling (36-8-5)/1 = 23k
     est = _est(base_gb=13.0, ref_baseline_gb=8.0)
@@ -171,6 +186,22 @@ def test_decode_context_larger_than_safe_context_when_meta_available(monkeypatch
     assert r["decode_context"] is not None
     assert isinstance(r["decode_context"], int)
     assert r["decode_context"] > r["safe_context"]
+
+
+def test_decode_context_describes_repo_for_quant_selector(monkeypatch):
+    # A `repo:filename.gguf` quant selector must be described by its REPO half — the catalog
+    # can't resolve the `:filename`, which otherwise leaves decode_context null for pinned-quant
+    # GGUFs (the cuda-gguf 14B symptom). #101.
+    from ara.contracts import driver as drv
+    from ara import catalog
+    seen = {}
+    monkeypatch.setattr(catalog, "describe",
+                        lambda m: seen.update(arg=m) or dict(_META_DICT))
+    est = _est(slope_gb_per_k=2.0)
+    r = drv.characterize("org/Model-GGUF:Model-Q4_K_M.gguf", preflight=lambda m: est,
+                         measure=_linear(5.0, 2.0), schedule=[2000, 4000, 8000])
+    assert seen["arg"] == "org/Model-GGUF"          # described the repo, not the selector
+    assert r["decode_context"] is not None          # so the analytic ceiling is computed
 
 
 def test_decode_context_scales_with_kv_dtype_bytes(monkeypatch):

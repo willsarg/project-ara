@@ -2799,6 +2799,36 @@ def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     assert cli.db.get_characterization(store, "mkey", "wmx", "org/Big")["safe_context"] is None
 
 
+def test_render_characterize_no_ceiling_explains_with_budget(make_console, store, monkeypatch):
+    # When the driver surfaces base_gb/budget_gb for a null ceiling (#105), the message explains
+    # why (base near budget) and suggests weight-quant — not the vague "too big or borderline".
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": None,
+                                               "decode_context": None, "points": [],
+                                               "stopped_reason": "insufficient points",
+                                               "base_gb": 6.68, "budget_gb": 7.0})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Big") == 0
+    out = buf.getvalue()
+    assert "6.68" in out and "7.0" in out and "weight-quant" in out
+
+
+def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, store, monkeypatch):
+    # --json null path forwards the present diagnostic fields and SKIPS the ones that are None
+    # (here stopped_reason is absent → must not appear), so automated callers get only real values.
+    import json as _j
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": None,
+                                               "decode_context": None, "points": [],
+                                               "base_gb": 6.68, "budget_gb": 7.0})  # no stopped_reason
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Big", as_json=True) == 0
+    data = _j.loads(buf.getvalue())
+    assert data["safe_context"] is None
+    assert data["base_gb"] == 6.68 and data["budget_gb"] == 7.0
+    assert "stopped_reason" not in data        # a None field is skipped, not forwarded as null
+
+
 def test_render_characterize_engine_not_installed(make_console, monkeypatch):
     _wire_characterize(monkeypatch, engine_ok=False)
     c, buf = make_console()

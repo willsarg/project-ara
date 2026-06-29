@@ -21,8 +21,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ara import catalog
+from ara import acquire, catalog
 from ara.contracts import ramp, worker
+
+
+def _describe_ref(model: str) -> str:
+    """The reference to look up in the catalog. For a ``repo:filename.gguf`` quant selector,
+    that's the repo half — the catalog can't resolve the ``:filename``, which otherwise left
+    ``decode_context`` null for pinned-quant GGUFs (#101). Other refs pass through unchanged."""
+    return model.split(":", 1)[0] if acquire.valid_repo_gguf_ref(model) else model
 
 
 def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
@@ -74,7 +81,7 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
                    max_context=est["max_context"])
     decode_context = None
     if res.fit is not None:
-        meta = catalog.describe(model) or {}
+        meta = catalog.describe(_describe_ref(model)) or {}
         kv_slope = ramp.analytic_kv_slope_gb_per_k(
             meta.get("n_layers"), meta.get("kv_heads"), meta.get("head_dim"),
             kv_dtype_bytes=kv_dtype_bytes)
@@ -82,6 +89,13 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
             decode_context, _ = ramp.decode_ceiling(
                 res.fit.intercept_gb, kv_slope, est["budget_gb"],
                 est["ref_baseline_gb"], est["max_context"])
-    return {"model": model, "safe_context": res.safe_context, "binding": res.binding,
-            "decode_context": decode_context,
-            "points": [{"context": c, "mem_gb": m} for c, m in res.points]}
+    out = {"model": model, "safe_context": res.safe_context, "binding": res.binding,
+           "decode_context": decode_context,
+           "points": [{"context": c, "mem_gb": m} for c, m in res.points]}
+    if res.safe_context is None:
+        # Surface the stop reason and budget numbers so callers can explain the null — e.g.
+        # "all contexts predicted over safe budget" — rather than silently emitting bare null.
+        out["stopped_reason"] = res.stopped_reason
+        out["base_gb"] = est.get("base_gb")
+        out["budget_gb"] = est.get("budget_gb")
+    return out

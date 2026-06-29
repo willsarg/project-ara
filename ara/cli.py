@@ -1172,8 +1172,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     catalog.remember(con, model)
 
     if as_json:
-        print(json.dumps({"model": model, "safe_context": ceiling,
-                          "decode_context": result.get("decode_context")}, indent=2))
+        out: dict = {"model": model, "safe_context": ceiling,
+                     "decode_context": result.get("decode_context")}
+        if ceiling is None:
+            # Carry through the diagnostic fields the driver surfaced so automated callers
+            # can explain why — not just a bare null.
+            for k in ("stopped_reason", "base_gb", "budget_gb"):
+                if result.get(k) is not None:
+                    out[k] = result[k]
+        print(json.dumps(out, indent=2))
         return 0
     if ceiling:
         c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
@@ -1183,7 +1190,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
                    + c.style("dim", "  · grow-by-streaming, not a prompt size"))
     else:
-        c.emit(c.style("warn", "  couldn't fit a ceiling — the model may be too big or borderline"))
+        base = result.get("base_gb")
+        budget = result.get("budget_gb")
+        if base is not None and budget is not None:
+            c.emit(c.style("warn",
+                           f"  couldn't fit a ceiling — estimated base {base:.2f} GiB"
+                           f" already near {budget:.1f} GiB safe budget"))
+        else:
+            c.emit(c.style("warn", "  couldn't fit a ceiling — the model may be too big or borderline"))
+        c.emit(c.style("dim", "  try: --weight-quant int4 or int8, or a smaller/quantized model"))
     c.emit()
     return 0
 
