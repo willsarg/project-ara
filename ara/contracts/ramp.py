@@ -215,6 +215,12 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
     more headroom → conservative). This is an estimate, not a measurement.
 
     In binary GiB per 1000 tokens (``GIB``), matching budget/baseline/intercept — see the GIB note.
+
+    NOTE 2026-06-28: an audit flagged this as a GiB/GB mismatch (wmx-suite + hardware.py convert
+    memory with /1e9, so the analytic slope may be ~7.4% inconsistent → decode ceiling over-claimed).
+    A deliberate prior test (test_analytic_kv_slope_uses_binary_gib_not_decimal_gb) asserts binary
+    is correct. UNRESOLVED — needs a units-trace of intercept_gb/budget_gb at the decode_ceiling
+    call site before changing. Left as-is pending that.
     """
     if not (n_layers and kv_heads and head_dim):
         return None
