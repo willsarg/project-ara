@@ -133,6 +133,21 @@ def safety_gate(*, base_gb: float, slope_gb_per_k: float, ctx: int,
     return None
 
 
+def governed_max_tokens(prompt_tokens: int, requested_max_tokens: int,
+                        ceiling: int) -> int | None:
+    """Allowed max_tokens for one prompt under *ceiling*, or None to refuse the prompt.
+
+    Identical contract to wmx-suite ``serve.governed_max_tokens`` (the MLX path), so both engines
+    govern per-prompt the same way (Rule #1): refuse if the prompt alone fills the ceiling, or if
+    ``prompt_tokens + requested_max_tokens`` would exceed it; otherwise allow the request (the
+    ``min`` is a conservative clamp belt — it equals the request in the acceptance branch)."""
+    if prompt_tokens >= ceiling:
+        return None
+    if prompt_tokens + requested_max_tokens > ceiling:
+        return None
+    return min(requested_max_tokens, ceiling - prompt_tokens)
+
+
 def parse_offloaded(stderr: str) -> tuple[int, int] | None:
     """Parse llama.cpp's ``load_tensors: offloaded N/M layers to GPU`` → (N, M), or None.
 
@@ -416,6 +431,57 @@ def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb
     return {"context": ctx, "completion": out["choices"][0]["text"]}
 
 
+def benchmark(model: str, ctx: int, prompts: list, *, margin_gb: float, overhead_gb: float,
+              max_tokens: int, flash_attn: bool = True, kv_quant: str = "f16") -> dict:
+    """Gate (L4) once, then load fully offloaded with the KV cache capped at *ctx* and complete
+    every prompt with the model loaded a SINGLE time (load-once, not reload-per-prompt).
+    Per-prompt governance (Rule #1/#3): a prompt that wouldn't leave room to generate ``max_tokens``
+    under the ceiling is refused individually rather than risking a context overflow. *ctx* is
+    ARA's characterized safe ceiling, so memory never exceeds it.
+
+    Returns ``{"context": ctx, "results": [{"prompt_index": i, "completion": str} |
+    {"prompt_index": i, "refused": true, "reason": str}]}`` or a whole-load refusal
+    ``{"context": ctx, "refused": true, "reason": str}`` if the L4 gate blocks the load."""
+    try:
+        gguf = _resolve_gguf(model)
+        meta = _read_meta(gguf)
+    except Exception as e:
+        return _refused(ctx, str(e))
+    total = _total_gb()
+    budget = safe_threshold_gb(total, effective_margin_gb(total, margin_gb))
+    base_gb = _used_gb() + _model_base_gb(gguf, overhead_gb)
+    reason = safety_gate(base_gb=base_gb,
+                         slope_gb_per_k=kv_slope_gb_per_k(meta, kv_bytes=_KV_BYTES[kv_quant]),
+                         ctx=ctx, budget_gb=budget)
+    if reason is not None:
+        return _refused(ctx, reason)
+    # Honest-offload preflight (Rule #3): reuse the proven offload-verifying probe. If the model
+    # can't actually load offloaded to the GPU (CPU-only wheel, software rasterizer, OOM), refuse
+    # rather than silently benchmarking a CPU run and storing it as a `vulkan` capability score.
+    probe = _run_probe_child(gguf, ctx, budget, flash_attn, kv_quant)
+    if probe.get("status") != "ok":
+        return _refused(ctx, f"offload preflight failed: {probe.get('note', 'unknown')}")
+    if kv_quant != "f16":
+        flash_attn = True            # quantized KV cache requires flash-attention
+    from llama_cpp import Llama
+
+    kv = ({} if kv_quant == "f16"
+          else {"type_k": _KV_GGML_TYPE[kv_quant], "type_v": _KV_GGML_TYPE[kv_quant]})
+    llm = Llama(model_path=gguf, n_ctx=ctx, n_gpu_layers=-1,
+                flash_attn=flash_attn, verbose=False, **kv)
+    results = []
+    for i, prompt in enumerate(prompts):
+        n_prompt = len(llm.tokenize(prompt.encode("utf-8")))
+        allowed = governed_max_tokens(n_prompt, max_tokens, ctx)
+        if allowed is None:
+            results.append({"prompt_index": i, "refused": True,
+                            "reason": f"prompt fills context ceiling {ctx}"})
+            continue
+        out = llm.create_completion(prompt, max_tokens=allowed)
+        results.append({"prompt_index": i, "completion": out["choices"][0]["text"]})
+    return {"context": ctx, "results": results}
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Safe single-context Vulkan/GPU memory measurement.")
     ap.add_argument("model", nargs="?", help="local .gguf, HF repo id, or repo:filename.gguf")
@@ -433,6 +499,9 @@ def main(argv=None) -> None:
     ap.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     ap.add_argument("--generate", action="store_true",
                     help="one-shot completion at <ctx> (the governed ceiling); prompt on stdin")
+    ap.add_argument("--benchmark", action="store_true",
+                    help="multi-prompt completion at <ctx> (load-once); JSON array of prompts on "
+                         "stdin; prints {context, results:[{prompt_index, completion|refused}]}")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--no-flash-attn", action="store_true",
                     help="disable Vulkan flash-attention (on by default; FA ~doubles the context "
@@ -455,6 +524,10 @@ def main(argv=None) -> None:
         result = generate(args.model, args.ctx, sys.stdin.read(),
                           margin_gb=args.margin, overhead_gb=args.overhead,
                           max_tokens=args.max_tokens, flash_attn=flash_attn, kv_quant=kv_quant)
+    elif args.benchmark:
+        result = benchmark(args.model, args.ctx, json.loads(sys.stdin.read()),
+                           margin_gb=args.margin, overhead_gb=args.overhead,
+                           max_tokens=args.max_tokens, flash_attn=flash_attn, kv_quant=kv_quant)
     else:
         result = run(args.model, args.ctx, margin_gb=args.margin, overhead_gb=args.overhead,
                      flash_attn=flash_attn, kv_quant=kv_quant, repeats=args.repeats)

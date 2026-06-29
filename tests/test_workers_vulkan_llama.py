@@ -144,6 +144,30 @@ def test_safety_gate_passes_when_safe():
     assert w.safety_gate(base_gb=2.0, slope_gb_per_k=0.5, ctx=2000, budget_gb=9.9) is None
 
 
+# ── per-prompt governance (parity with the MLX wmx-suite serve.governed_max_tokens) ──
+def test_governed_max_tokens_allows_when_fits():
+    # prompt 100 + request 256 = 356 <= 2048 → allow the full request.
+    assert w.governed_max_tokens(100, 256, 2048) == 256
+
+
+def test_governed_max_tokens_refuses_when_prompt_alone_fills_ceiling():
+    # prompt >= ceiling → None (the model can't even ingest the prompt under the wall).
+    assert w.governed_max_tokens(2048, 1, 2048) is None
+    assert w.governed_max_tokens(3000, 256, 2048) is None
+
+
+def test_governed_max_tokens_refuses_when_prompt_plus_request_exceeds_ceiling():
+    # 1900 + 256 = 2156 > 2048 → refuse (matches MLX: no silent truncation).
+    assert w.governed_max_tokens(1900, 256, 2048) is None
+
+
+def test_governed_max_tokens_clamps_to_remaining_room():
+    # The conservative clamp belt: request larger than the room left → clamp to (ceiling - prompt),
+    # but only in the acceptance branch (here prompt+request would exceed, so it actually refuses).
+    assert w.governed_max_tokens(2000, 40, 2048) == 40       # 2040 <= 2048 → allow 40
+    assert w.governed_max_tokens(2000, 49, 2048) is None     # 2049 > 2048 → refuse
+
+
 def test_kv_slope_uses_gqa_kv_heads():
     meta = {"general.architecture": "llama", "llama.block_count": "2",
             "llama.embedding_length": "16", "llama.attention.head_count": "4",

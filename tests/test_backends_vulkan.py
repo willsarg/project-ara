@@ -336,3 +336,77 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     assert "--generate" in seen["argv"]
     assert "--max-tokens" in seen["argv"] and "64" in seen["argv"]
     assert seen["input"] == "say hi"          # prompt over stdin, not argv
+
+
+# ── benchmark (multi-prompt, load-once) ───────────────────────────────────────
+import json as _json  # noqa: E402
+
+
+def test_benchmark_builds_argv_and_passes_prompts_as_json_stdin(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen.update(name=name, argv=argv, input=input)
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    out = vulkan.benchmark("org/m", ["p1", "p2"], max_context=4096)
+    assert seen["name"] == "vulkan"
+    assert seen["argv"][:4] == [str(vulkan.WORKER), "org/m", "4096", "--benchmark"]
+    assert _json.loads(seen["input"]) == ["p1", "p2"]
+    assert out == {"context": 4096, "results": []}
+
+
+def test_benchmark_threads_no_flash_attn_and_kv_quant(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    vulkan.benchmark("m", [], max_context=4096, flash_attn=False, kv_quant="q8_0")
+    assert "--no-flash-attn" in seen["argv"]
+    assert "--kv-quant" in seen["argv"] and "q8_0" in seen["argv"]
+
+
+def test_benchmark_omits_kv_quant_for_f16(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    vulkan.benchmark("m", [], max_context=4096)  # f16 default
+    assert "--kv-quant" not in seen["argv"]
+    assert "--no-flash-attn" not in seen["argv"]
+
+
+def test_benchmark_threads_max_tokens(monkeypatch):
+    seen = {}
+
+    def worker(name, argv, *, input=None):
+        seen["argv"] = argv
+        return {"context": 4096, "results": []}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(worker)}))
+    vulkan.benchmark("m", [], max_context=4096, max_tokens=128)
+    assert seen["argv"][seen["argv"].index("--max-tokens") + 1] == "128"
+
+
+def test_benchmark_returns_worker_dict_verbatim(monkeypatch):
+    result = {"context": 4096, "results": [{"prompt_index": 0, "completion": "ok"}]}
+
+    monkeypatch.setattr(vulkan, "_budget_params", lambda: (2.0, 1.0))
+    monkeypatch.setattr(vulkan, "engine_env",
+                        type("E", (), {"run_worker": staticmethod(lambda *a, **k: dict(result))}))
+    assert vulkan.benchmark("m", ["hi"], max_context=4096) == result
