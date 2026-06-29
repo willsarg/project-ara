@@ -40,6 +40,7 @@ def test_resolve_passes_through_explicit_engine():
     assert engines.resolve("wcx") == "wcx"
     assert engines.resolve("cpu") == "cpu"
     assert engines.resolve("vulkan") == "vulkan"
+    assert engines.resolve("cuda-gguf") == "cuda-gguf"
 
 
 def test_resolve_auto_uses_hardware_pick(monkeypatch):
@@ -58,10 +59,18 @@ def test_resolve_unknown_is_none():
 
 def test_for_backend_maps_backend_to_engine():
     assert engines.for_backend("apple") == "wmx"
-    assert engines.for_backend("cuda") == "wcx"
+    assert engines.for_backend("cuda") == "wcx"          # NVIDIA still auto-picks wcx
     assert engines.for_backend("cpu") == "cpu"
     assert engines.for_backend("vulkan") == "vulkan"
+    assert engines.for_backend("cuda_gguf") == "cuda-gguf"
     assert engines.for_backend("unsupported") is None
+
+
+def test_for_backend_cuda_still_returns_wcx_not_cuda_gguf():
+    # cuda-gguf is opt-in only; hardware auto-pick for NVIDIA is wcx (backend="cuda").
+    # for_backend("cuda") must NOT return "cuda-gguf" (its backend is "cuda_gguf", distinct).
+    assert engines.for_backend("cuda") == "wcx"
+    assert engines.for_backend("cuda") != "cuda-gguf"
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +306,7 @@ def test_uninstall_removes_the_env(monkeypatch):
 # model_kinds — every shipping engine declares which model formats it accepts
 # --------------------------------------------------------------------------- #
 def test_every_shipping_engine_has_model_kinds():
-    for key in ("wmx", "wcx", "cpu", "vulkan"):
+    for key in ("wmx", "wcx", "cpu", "vulkan", "cuda-gguf"):
         assert "model_kinds" in engines.ENGINES[key], f"{key!r} missing model_kinds"
 
 
@@ -306,6 +315,40 @@ def test_vulkan_is_gguf_capable_but_cpu_stays_the_gguf_default():
     # a bare .gguf to the CPU engine (vulkan is opt-in via --engine). (2026-06-25-vulkan-amd-engine-lane)
     assert "gguf" in engines.ENGINES["vulkan"]["model_kinds"]
     assert engines.engine_for_model("model-Q4_K_M.gguf") == "cpu"
+
+
+def test_cuda_gguf_is_gguf_capable_but_cpu_stays_the_gguf_default():
+    # cuda-gguf also accepts GGUF, ordered AFTER cpu (and vulkan) so the default is still cpu.
+    # Opt-in via --engine cuda-gguf. (2026-06-29-cuda-gguf-hybrid-two-wall-engine)
+    assert "gguf" in engines.ENGINES["cuda-gguf"]["model_kinds"]
+    assert engines.engine_for_model("model-Q4_K_M.gguf") == "cpu"
+
+
+# --------------------------------------------------------------------------- #
+# cuda-gguf install targets — prebuilt CUDA-124 wheel on Linux/Windows
+# --------------------------------------------------------------------------- #
+def test_install_targets_cuda_gguf_forces_prebuilt_wheel_on_linux(monkeypatch):
+    # CUDA wheels only exist for Linux + Windows; must be forced with --only-binary.
+    # (Slug: 2026-06-29-cuda-gguf-hybrid-two-wall-engine)
+    monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
+    targets = engines._install_targets("cuda-gguf")
+    spec = engines.ENGINES["cuda-gguf"]["wheel_only"]["llama-cpp-python"]
+    assert spec["index"].endswith("/whl/cu124")
+    assert "--only-binary" in targets
+    assert "--extra-index-url" in targets
+
+
+def test_install_targets_cuda_gguf_forces_prebuilt_wheel_on_windows(monkeypatch):
+    monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
+    targets = engines._install_targets("cuda-gguf")
+    assert "--only-binary" in targets
+    assert "--extra-index-url" in targets
+
+
+def test_install_targets_cuda_gguf_plain_on_macos(monkeypatch):
+    # macOS isn't in cuda-gguf's wheel_platforms (no NVIDIA discrete GPU target on Mac).
+    monkeypatch.setattr(engines.platform, "system", lambda: "Darwin")
+    assert engines._install_targets("cuda-gguf") == engines.ENGINES["cuda-gguf"]["packages"]
 
 
 # --------------------------------------------------------------------------- #

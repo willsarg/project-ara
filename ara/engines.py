@@ -106,6 +106,29 @@ ENGINES: dict[str, dict] = {
         "wheel_platforms": ("Linux", "Windows"),
         "python": "3.12",
     },
+    "cuda-gguf": {
+        "backend": "cuda_gguf",
+        "package": "llama.cpp (CUDA)",
+        "available": True,
+        "builtin": True,           # worker ships in ARA; only its deps install into the env
+        "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
+        "model_kinds": ("gguf",),
+        # CUDA-offload GGUF via llama.cpp's CUDA build (opt-in, --engine cuda-gguf). Enables the
+        # two-wall hybrid path: K layers on NVIDIA VRAM, N-K on CPU RAM, auto-fitted each run.
+        # NOT a hardware auto-pick — NVIDIA still auto-picks ``wcx`` (the full-GPU transformers
+        # engine). Prebuilt CUDA-124 wheels on the project's own index; we MUST force the prebuilt
+        # wheel (same reason as vulkan: a plain install gets the CPU wheel from cache). `--only-binary`
+        # (added in _builtin_targets) makes that deterministic. Kept AFTER `vulkan` so the GGUF
+        # auto-default stays `cpu`. Linux + Windows only (macOS has no NVIDIA discrete GPU target).
+        "wheel_only": {
+            "llama-cpp-python": {
+                "index": "https://abetlen.github.io/llama-cpp-python/whl/cu124",
+                "max_version": "0.3.31",
+            },
+        },
+        "wheel_platforms": ("Linux", "Windows"),
+        "python": "3.12",
+    },
 }
 
 

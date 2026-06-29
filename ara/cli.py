@@ -1604,7 +1604,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # --------------------------------------------------------------------------- #
 # Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
 # engines transfers; the MLX (wmx) ceiling does NOT (different allocation model — the seam mismatch).
-_OLLAMA_CEILING_ENGINES = ("cpu", "vulkan")
+_OLLAMA_CEILING_ENGINES = ("cpu", "vulkan", "cuda-gguf")
 
 
 def _ollama_safe_ceiling(con, mk: str, model: str):

@@ -4759,6 +4759,15 @@ def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
     assert cli._ollama_safe_ceiling(object(), "mk", "m") is None
 
 
+def test_ollama_safe_ceiling_cuda_gguf_wins(monkeypatch):
+    # cuda-gguf characterization is also a llama.cpp ceiling → transfers to Ollama.
+    # (2026-06-29-cuda-gguf-hybrid-two-wall-engine)
+    chars = {"cpu": {"safe_context": 4000}, "vulkan": {"safe_context": 5000},
+             "cuda-gguf": {"safe_context": 12000}}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured")
+
+
 # serve dispatch (main argv parsing)
 def test_main_serve_usage_without_model(monkeypatch):
     _capture_dispatch(monkeypatch)

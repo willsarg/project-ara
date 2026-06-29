@@ -234,11 +234,13 @@ def _budgets(vram_margin_gb: float, ram_margin_gb: float) -> dict:
     """Both walls, read exactly (no calibration): VRAM via nvidia-smi, RAM via psutil."""
     vram_total, vram_used = _vram_total_used_gb()
     ram_total = _total_ram_gb()
+    ram_used = _used_ram_gb()
     return {
         "vram_total_gb": round(vram_total, 3),
         "vram_used_gb": round(vram_used, 3),
         "vram_budget_gb": safe_threshold_gb(vram_total - vram_used, vram_margin_gb),
         "ram_total_gb": round(ram_total, 3),
+        "ram_used_gb": round(ram_used, 3),        # ambient base added to OUR measured CPU buffers
         "ram_budget_gb": safe_threshold_gb(ram_total, effective_margin_gb(ram_total, ram_margin_gb)),
     }
 
@@ -270,6 +272,8 @@ def preflight(model: str, *, vram_margin_gb: float, ram_margin_gb: float) -> dic
         "base_gb": round(live + ram_estimate(k, n, weights, slope, 0, 0.0), 4),
         "ref_baseline_gb": round(live, 4),
         "slope_gb_per_k": slope,
+        "budget_gb": b["ram_budget_gb"],   # the driver ramps ctx on the RAM wall (the binding one
+                                           # as K shrinks at high ctx); the worker guards VRAM per rung
         "n_layers": n,
         "fit_layers": k,
         "vram_budget_gb": b["vram_budget_gb"],
