@@ -4845,12 +4845,14 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda uc, its, comps: score)
 
     n = len(items)
-    bk = types.SimpleNamespace(
-        benchmark=lambda model, prompts, *, max_context, **kw: {
+    def fake_bench(model, prompts, *, max_context, **kw):
+        saved["bench_kw"] = kw          # capture max_tokens threading
+        return {
             "context": max_context,
             "results": [{"prompt_index": i, "completion": f"ans{i}"} for i in range(n)],
         }
-    )
+
+    bk = types.SimpleNamespace(benchmark=fake_bench)
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     return saved
 
@@ -4975,6 +4977,45 @@ def test_main_benchmark_dispatch(monkeypatch):
     _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "coding"])
     assert rec["benchmark"]["model"] == "org/m"
     assert rec["benchmark"]["use_case"] == "coding"
+    assert rec["benchmark"]["max_tokens"] is None       # default: backend's own default applies
+
+
+def test_main_benchmark_parses_max_tokens(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--max-tokens", "512"])
+    assert rec["benchmark"]["max_tokens"] == 512
+
+
+def test_main_benchmark_parses_max_tokens_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--max-tokens=768"])
+    assert rec["benchmark"]["max_tokens"] == 768
+
+
+def test_render_benchmark_threads_max_tokens_to_backend(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+    c, _ = make_console()
+    cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, max_tokens=512)
+    assert saved["bench_kw"].get("max_tokens") == 512
+
+
+def test_render_benchmark_omits_max_tokens_when_unset(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+    c, _ = make_console()
+    cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
+    assert "max_tokens" not in saved["bench_kw"]        # backend default (256) applies
+
+
+def test_render_benchmark_rejects_nonpositive_max_tokens(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True,
+                                max_tokens=0) == 1
+    assert "max-tokens" in buf.getvalue()
 
 
 def test_main_benchmark_missing_use_case_returns_error(monkeypatch):

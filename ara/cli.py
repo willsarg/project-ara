@@ -156,8 +156,8 @@ _COMMAND_HELP = {
     "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
               "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
     "benchmark": ("ara benchmark <model> --use-case <coding|reasoning|agentic|extraction|rag> "
-                  "[--engine E] [--ctx N] [--yes] [--json] — run a capability probe set and "
-                  "store the measured score"),
+                  "[--engine E] [--ctx N] [--max-tokens N] [--yes] [--json] — run a capability "
+                  "probe set and store the measured score"),
     "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
 }
 
@@ -1363,7 +1363,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
 
 
 def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
-                     ctx: int | None = None, assume_yes: bool = False,
+                     ctx: int | None = None, max_tokens: int | None = None,
+                     assume_yes: bool = False,
                      exec_consent: bool = False, as_json: bool = False) -> int:
     """Run a capability probe set against *model* and store the score as a measured tier result.
 
@@ -1376,6 +1377,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if use_case not in benchmark.USE_CASES:
         return err(f"unknown use-case {use_case!r} — choose one of: "
                    f"{', '.join(benchmark.USE_CASES)}")
+    if max_tokens is not None and max_tokens <= 0:
+        return err("--max-tokens must be a positive integer")
 
     # Hard gate on code execution — un-bypassable by --json/--yes/non-tty (those only suppress the
     # interactive prompt). The coding benchmark runs model-generated Python with full user
@@ -1422,7 +1425,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             return 0
 
     prompts = [benchmark.prompt_for(use_case, it) for it in items]
-    result = bk.benchmark(model, prompts, max_context=safe)
+    # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
+    # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
+    bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
+    result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
     if result.get("refused"):
         return err(f"the engine refused: {result.get('reason', 'no reason given')}")
 
@@ -2102,6 +2108,7 @@ def _main_impl() -> int:
     serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
     serve_name: str | None = None                # `serve --name X`: derived served-model name
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension
+    max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -2158,6 +2165,13 @@ def _main_impl() -> int:
             continue
         if a.startswith("--ctx="):
             serve_ctx = _int_or_none(a.split("=", 1)[1])
+            continue
+        if a == "--max-tokens":
+            max_tokens_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
+            skip = True
+            continue
+        if a.startswith("--max-tokens="):
+            max_tokens_val = _int_or_none(a.split("=", 1)[1])
             continue
         if a == "--name":
             serve_name = argv[i + 1] if i + 1 < len(argv) else None
@@ -2277,7 +2291,8 @@ def _main_impl() -> int:
             return _arg_err("usage: ara benchmark <model> "
                             "--use-case <coding|reasoning|agentic|extraction|rag>")
         return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
-                                assume_yes=assume_yes, exec_consent=exec_consent, as_json=as_json)
+                                max_tokens=max_tokens_val, assume_yes=assume_yes,
+                                exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
