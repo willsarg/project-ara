@@ -50,11 +50,11 @@ _SB_PROFILE_TMPL = """\
 """
 
 _PROBE_FILES: dict[str, str] = {
-    "coding":     "humaneval_25.json",
-    "reasoning":  "gsm8k_30.json",
-    "agentic":    "bfcl_simple_20.json",
-    "extraction": "extraction_25.json",
-    "rag":        "rag_20.json",
+    "coding":     "humaneval.json",
+    "reasoning":  "gsm8k.json",
+    "agentic":    "bfcl_simple.json",
+    "extraction": "extraction.json",
+    "rag":        "rag.json",
 }
 
 

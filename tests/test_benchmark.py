@@ -79,8 +79,8 @@ def test_probe_counts():
     assert len(load_probe("coding")) == 164
     assert len(load_probe("reasoning")) == 100
     assert len(load_probe("agentic")) == 100
-    assert len(load_probe("extraction")) == 50
-    assert len(load_probe("rag")) == 50
+    assert len(load_probe("extraction")) == 100
+    assert len(load_probe("rag")) == 100
 
 
 # ── prompt_for includes question/prompt text ─────────────────────────────────
@@ -396,11 +396,11 @@ _DATA_DIR = Path(__file__).parent.parent / "ara" / "data" / "benchmarks"
 
 
 @pytest.mark.parametrize("filename,expected_count", [
-    ("humaneval_25.json", 164),
-    ("gsm8k_30.json", 100),
-    ("bfcl_simple_20.json", 100),
-    ("extraction_25.json", 50),
-    ("rag_20.json", 50),
+    ("humaneval.json", 164),
+    ("gsm8k.json", 100),
+    ("bfcl_simple.json", 100),
+    ("extraction.json", 100),
+    ("rag.json", 100),
 ])
 def test_probe_json_file_exists_and_parses(filename, expected_count):
     path = _DATA_DIR / filename
