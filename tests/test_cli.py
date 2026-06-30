@@ -2813,9 +2813,10 @@ def test_render_characterize_no_ceiling_explains_with_budget(make_console, store
     assert "6.68" in out and "7.0" in out and "weight-quant" in out
 
 
-def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, store, monkeypatch):
+def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, store, monkeypatch, capsys):
     # --json null path forwards the present diagnostic fields and SKIPS the ones that are None
     # (here stopped_reason is absent → must not appear), so automated callers get only real values.
+    # The JSON payload goes to stdout via print() (read it from capsys), not the console buffer.
     import json as _j
     _wire_characterize(monkeypatch,
                        characterize=lambda m: {"model": m, "safe_context": None,
@@ -2823,7 +2824,7 @@ def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, 
                                                "base_gb": 6.68, "budget_gb": 7.0})  # no stopped_reason
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Big", as_json=True) == 0
-    data = _j.loads(buf.getvalue())
+    data = _j.loads(capsys.readouterr().out)
     assert data["safe_context"] is None
     assert data["base_gb"] == 6.68 and data["budget_gb"] == 7.0
     assert "stopped_reason" not in data        # a None field is skipped, not forwarded as null
