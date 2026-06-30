@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
 
 UNIT_NAME = "ara-node.service"
@@ -54,8 +55,9 @@ def _unit_path() -> Path:
 
 
 def _unit_text(host: str, port: int) -> str:
-    """The systemd unit. ExecStart uses the ``ara`` console-script at the ``%h``-relative pip
-    ``--user`` location so the unit needs no absolute, machine-specific path."""
+    """The systemd unit. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
+    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv,
+    a conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there."""
     return (
         "[Unit]\n"
         "Description=ARA node daemon\n"
@@ -64,7 +66,7 @@ def _unit_text(host: str, port: int) -> str:
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart=%h/.local/bin/ara node serve --host {host} --port {port}\n"
+        f"ExecStart={sys.executable} -m ara.cli node serve --host {host} --port {port}\n"
         "Restart=on-failure\n"
         "\n"
         "[Install]\n"

@@ -60,7 +60,7 @@ def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     service.install("0.0.0.0", 9100)
     unit = tmp_path / "sd" / "ara-node.service"
     text = unit.read_text()
-    assert "ExecStart=%h/.local/bin/ara node serve --host 0.0.0.0 --port 9100" in text
+    assert f"ExecStart={service.sys.executable} -m ara.cli node serve --host 0.0.0.0 --port 9100" in text
     assert "WantedBy=default.target" in text
     assert calls == [["systemctl", "--user", "daemon-reload"],
                      ["systemctl", "--user", "enable", "--now", "ara-node.service"]]
