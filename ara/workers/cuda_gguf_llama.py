@@ -32,6 +32,45 @@ import statistics
 import subprocess
 import sys
 
+
+def _add_cuda_dll_dirs() -> list[str]:
+    """Windows: add CUDA runtime DLL dirs to the search path BEFORE llama_cpp loads its CUDA build.
+
+    Under a non-interactive / headless launch (Win32-OpenSSH session, a detached no-console
+    process), the session PATH can lack the CUDA bin dir, so the bundled ``llama.dll`` can't
+    resolve its CUDA dependencies (cudart/cublas) and raises a bare "Failed to load shared
+    library" — a failure that reproduces only headless, never in a normal terminal where CUDA is
+    on PATH. ``os.add_dll_directory`` (py3.8+) makes resolution explicit and context-independent.
+    No-op off Windows or when no CUDA dir is present. (#110)
+    """
+    if sys.platform != "win32":
+        return []
+    import glob
+    cands: list[str] = []
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        cands.append(os.path.join(cuda_path, "bin"))
+    cands += sorted(glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*\bin"))
+    added: list[str] = []
+    for d in cands:
+        if os.path.isdir(d):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
+            # PATH prepend is the RELIABLE lever: ctypes/LoadLibraryEx load the bundled llama.dll
+            # with LOAD_WITH_ALTERED_SEARCH_PATH, which resolves that DLL's own dependencies
+            # (cudart64/cublas64) via PATH — NOT the os.add_dll_directory user dirs. Verified on
+            # willw11: add_dll_directory(v12.6\bin) alone did NOT fix the load; PATH prepend does.
+            if d not in os.environ.get("PATH", "").split(os.pathsep):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            added.append(d)
+    return added
+
+
+# Runs once at import — before any lazy ``from llama_cpp import Llama`` in this worker.
+_add_cuda_dll_dirs()
+
 GIB = 1024 ** 3
 DEFAULT_REPEATS = 3
 KV_BYTES_F16 = 2
