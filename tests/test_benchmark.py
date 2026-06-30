@@ -649,8 +649,11 @@ def test_coding_killpg_falls_back_to_proc_kill(monkeypatch):
     fake = _FakeProc()
     monkeypatch.setattr(_bm, "_SANDBOX_EXEC", "/usr/bin/sandbox-exec")   # force the sandbox cmd branch
     monkeypatch.setattr(_bm.subprocess, "Popen", lambda *a, **k: fake)
-    monkeypatch.setattr(_bm.os, "getpgid", lambda pid: pid)
+    # raising=False: os.killpg/os.getpgid don't exist on Windows — there the reap hits AttributeError
+    # and falls back to proc.kill() (the production fix); on POSIX the mocked killpg raises instead.
+    monkeypatch.setattr(_bm.os, "getpgid", lambda pid: pid, raising=False)
     monkeypatch.setattr(_bm.os, "killpg",
-                        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError("gone")))
+                        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError("gone")),
+                        raising=False)
     assert _bm.score("coding", _TINY_CODING_ITEM, "    return a + b\n") == 0.0   # timed out → 0
-    assert fake.killed is True          # fell back to proc.kill() after killpg raised
+    assert fake.killed is True          # fell back to proc.kill() when killpg couldn't reap

@@ -185,7 +185,9 @@ def _score_coding(item: dict, completion: str) -> float:
         if proc is not None and proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, AttributeError):
+                # group already gone / EPERM, or no os.killpg at all (Windows: POSIX process
+                # groups don't exist) → fall back to killing just the child, which works everywhere.
                 proc.kill()
             proc.wait()
         Path(tmp_path).unlink(missing_ok=True)
