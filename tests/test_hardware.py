@@ -937,6 +937,11 @@ def test_memory_info_exception_returns_empty(monkeypatch):
 # ---------------------------------------------------------------------------
 
 # --- Windows fixture (real winbox Get-PhysicalDisk output) ---
+# MediaType/BusType are friendly STRINGS ("SSD"/"NVMe"/...), not the uint16 enum codes the raw CIM
+# carries — verified 2026-06-30 on willw11 (PowerShell 5.1): `Get-PhysicalDisk | ConvertTo-Json`
+# serializes the top-level fields the parser reads as strings (the ints surface only in the nested
+# CimInstanceProperties dump we don't touch). So exact-string matching in _drives_windows is correct
+# — unlike the Win32_PhysicalMemory path, whose SMBIOSMemoryType genuinely comes through as an int.
 _WIN_PHYSICAL_DISKS = [
     {"FriendlyName": "Samsung SSD 990 EVO 1TB", "MediaType": "SSD", "BusType": "NVMe",
      "Size": 1000204886016},
