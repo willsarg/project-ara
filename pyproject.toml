@@ -52,7 +52,11 @@ branch = true
 # not in ARA's test venv — so they can't be exercised here, exactly like the external
 # wmx-suite. Their pure logic still has unit tests (tests/test_workers_*), they're just
 # out of the 100% core gate.
-omit = ["ara/workers/*"]
+#
+# ara/_vendor/* is the vendored engine source (wmx_suite, wcx_suite) — it ships in the wheel
+# but is never imported in ARA's process (it's pip-installed into the isolated engine env and
+# driven over a subprocess). It has its own suites' test suites, so it's outside ARA's gate.
+omit = ["ara/workers/*", "ara/_vendor/*"]
 
 [tool.coverage.report]
 show_missing = true

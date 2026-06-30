@@ -1,0 +1,30 @@
+[project]
+name = "wmx-suite"
+version = "0.1.0"
+description = "Custom memory/stress bench for local MLX inference on Apple Silicon — finds safe context ceilings without crashing the machine."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Will Sarg" }]
+requires-python = ">=3.12"
+dependencies = [
+    "kokoro-mlx>=0.1.2",
+    "mlx-embeddings>=0.1.0",
+    "mlx-lm>=0.31",
+    "soundfile>=0.14.0",
+]
+
+[project.scripts]
+wmx-suite = "wmx_suite.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wmx_suite"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

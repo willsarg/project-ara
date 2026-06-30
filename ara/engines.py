@@ -24,6 +24,7 @@ import platform
 import re
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 from ara import engine_env
 
@@ -34,12 +35,13 @@ ENGINES: dict[str, dict] = {
         "backend": "apple",
         "package": "wmx-suite",
         "available": True,
-        "spec": "git+https://github.com/willsarg/wmx-suite",
-        # Pinned engine commit this ARA release ships — a SHA is immutable, so a given ARA version
-        # always installs the exact engine code it was tested against (reproducible releases). Bump
-        # via scripts/pin_engines.py before tagging an ARA release. The ARA_WMX_SOURCE dev override
-        # bypasses this entirely (local checkout).
-        "ref": "b942887e90edccbd084a25f03368e3f69de29ba4",
+        # Vendored: the wmx_suite source ships in ARA's wheel under ara/_vendor/wmx and installs into
+        # the isolated `apple` env from there — no git fetch at install time, so a release is
+        # reproducible from the wheel alone. Folded 2026-06-30 from wmx-suite@374c47d (the #107
+        # single-BOS + turn-end stop fixes). Re-vendor via scripts/vendor_engine.py to bump.
+        # ARA_WMX_SOURCE still overrides to a local checkout (editable) for engine dev. MLX +
+        # transformers stay engine-env-only — never ARA dependencies.
+        "vendored": True,
         "python": "3.12",          # wmx-suite requires >=3.12
         "model_kinds": ("transformers",),
     },
@@ -49,9 +51,10 @@ ENGINES: dict[str, dict] = {
         # Converted to the isolated-env worker model (backends/cuda.py drives wcx-suite's
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
-        "spec": "git+https://github.com/willsarg/wcx-suite",
-        "ref": "205b8ecb333e7832f2b02a4c4a418afcbf003836",   # pinned engine commit (see wmx note)
-        "extras": "cuda",                        # pulls torch + transformers
+        # Vendored (see the wmx note): wcx_suite ships in ARA's wheel under ara/_vendor/wcx and
+        # installs into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
+        "vendored": True,
+        "extras": "cuda",                        # pulls torch + transformers (into the env, not ARA)
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default
         # PyPI torch on Windows/Linux is CPU-only).
         "pip_args": ["--torch-backend=auto"],
@@ -171,20 +174,24 @@ def is_installed(key: str) -> bool:
     return engine is not None and engine_env.exists(engine["backend"])
 
 
-def source_for(key: str) -> str:
-    """The install source for an external engine *key*: its git spec pinned to a commit, or a
-    dev override.
+def _vendored_source(key: str) -> Path:
+    """The directory of engine *key*'s vendored package source — ``ara/_vendor/<key>``, which holds
+    the engine's ``pyproject.toml``. This is the path handed to ``uv pip install``: uv builds the
+    engine package from it into the isolated env. Ships inside ARA's wheel (no network at install)."""
+    return Path(__file__).resolve().parent / "_vendor" / key
 
-    Default is ``spec@ref`` — the git URL pinned to the engine's recorded commit SHA, so a given
-    ARA release always installs the exact engine code it shipped with (reproducible). Setting
-    ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) replaces it with a local checkout
-    for development — used verbatim, with no pin appended."""
+
+def source_for(key: str) -> str:
+    """The install source for an external engine *key*: a dev override, else the vendored path.
+
+      * ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) — a local checkout for engine
+        development; used verbatim (installed editable by :func:`_install_targets`).
+      * otherwise the package source ARA ships under ``ara/_vendor/<key>``, so a release installs the
+        exact engine code in the wheel — reproducibly and offline (no git fetch)."""
     override = os.environ.get(f"ARA_{key.upper()}_SOURCE")
     if override:
         return override
-    engine = ENGINES[key]
-    ref = engine.get("ref")
-    return f"{engine['spec']}@{ref}" if ref else engine["spec"]
+    return str(_vendored_source(key))
 
 
 @dataclass(frozen=True)
@@ -230,10 +237,10 @@ def _install_targets(key: str) -> list[str]:
     """The trailing ``uv pip install`` args (pip flags + targets) for engine *key*'s env.
 
     Built-in engines install a plain package list (with per-platform prebuilt-wheel handling — see
-    :func:`_builtin_targets`). External suites install their source: a git/remote ``spec``
-    (folding in an ``extras`` group via a PEP 508 direct reference) or a local path installed
-    editable (``-e``) for dev. Any ``pip_args`` (e.g. ``--torch-backend=auto`` to fetch the
-    right CUDA torch wheel) come first.
+    :func:`_builtin_targets`). External suites install from a local path, with any ``extras`` group
+    appended (e.g. ``[cuda]``): the **vendored** source installed plain (read-only inside ARA's
+    wheel), or a dev-override local checkout installed editable (``-e``). Any ``pip_args``
+    (e.g. ``--torch-backend=auto`` to fetch the right CUDA torch wheel) come first.
     """
     engine = ENGINES[key]
     if engine.get("builtin"):
@@ -241,12 +248,12 @@ def _install_targets(key: str) -> list[str]:
     pip_args = list(engine.get("pip_args", []))
     extras = engine.get("extras")
     suffix = f"[{extras}]" if extras else ""
-    source = source_for(key)
-    if source.startswith(("git+", "http://", "https://")):
-        # PEP 508 direct reference: ``name[extra] @ git+url``
-        target = f"{engine['package']}{suffix} @ {source}" if extras else source
-        return [*pip_args, target]
-    return [*pip_args, "-e", f"{source}{suffix}"]
+    # A dev override (ARA_<KEY>_SOURCE) installs editable so engine edits are live; the vendored
+    # default installs plain — its source is read-only inside ARA's wheel.
+    target = f"{source_for(key)}{suffix}"
+    if os.environ.get(f"ARA_{key.upper()}_SOURCE"):
+        return [*pip_args, "-e", target]
+    return [*pip_args, target]
 
 
 def install(key: str) -> InstallResult:

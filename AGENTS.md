@@ -63,14 +63,19 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
 - **Pure-Python core, swappable backend adapters.** The core (`ara/detect.py`, `cli.py`,
   recon modules) must **never import a hardware-specific engine**. Backends live behind a
   registry and are loaded lazily — only the one chosen for the machine.
-- **Apple backend wraps [`wmx-suite`](https://github.com/willsarg/wmx-suite).** The engine
-  import happens *inside* the adapter's functions, not at module load — so nothing
-  MLX-shaped loads until ARA actually runs the engine.
-- **Engines install on demand, not as dependencies.** The hardware engine is **not** in
-  `pyproject.toml`. ARA probes the machine and installs the matched suite at runtime via
-  `ara install` (`ara/engines.py` is the catalog + `uv pip install git+<spec>` logic). This
-  keeps the core universal, the lock engine-free, and `uv sync` identical on every OS — and
-  never ships MLX to a non-Apple machine. `--engine {wmx|wcx|cpu|vulkan|cuda-gguf|auto}` is the
+- **Apple backend wraps `wmx-suite`; CUDA backend wraps `wcx-suite`.** Both are now **vendored**
+  into ARA (`ara/_vendor/wmx`, `ara/_vendor/wcx`) — pure-Python source shipped in ARA's wheel, never
+  imported in-process. The engine import happens *inside* the adapter's functions, not at module
+  load — so nothing MLX/torch-shaped loads until ARA actually runs the engine (always over a
+  subprocess in the isolated env).
+- **Engines install on demand, not as dependencies.** The hardware engine's heavy deps (MLX, torch)
+  are **not** in ARA's `pyproject.toml`. ARA probes the machine and installs the matched suite at
+  runtime via `ara install` (`ara/engines.py` is the catalog). The folded suites install from their
+  **vendored source** (`uv pip install ara/_vendor/<key>`) — no git fetch, so a release installs the
+  exact engine code in its wheel, reproducibly and offline. (`ARA_<KEY>_SOURCE=../<repo>` overrides
+  to a local checkout, installed editable, for engine dev; re-vendor a bump with
+  `scripts/vendor_engine.py`.) This keeps the core universal, the lock engine-free, and `uv sync`
+  identical on every OS — and never ships MLX/torch to a machine that can't use it. `--engine {wmx|wcx|cpu|vulkan|cuda-gguf|auto}` is the
   consent surface (the flag itself authorizes the install, so it stays scriptable). `vulkan`
   (GGUF on an AMD APU's iGPU) and `cuda-gguf` (GGUF on NVIDIA via **partial** offload —
   `n_gpu_layers=K`) are opt-in GPU-offload lanes; `cuda-gguf` is ARA's first **two-wall** engine,
