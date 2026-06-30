@@ -1,6 +1,6 @@
 [project]
 name = "project-ara"
-version = "0.0.4"
+dynamic = ["version"]          # derived from the latest git tag by hatch-vcs (see [build-system])
 description = "AI Runs Anywhere — backend-agnostic local inference that fits any hardware safely."
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,8 +25,15 @@ dependencies = [
 ara = "ara.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# Version is derived from the latest git tag (hatch-vcs) — there is NO hardcoded version. A commit
+# tagged v0.0.5 builds as 0.0.5; commits past a tag build as a dev version (e.g. 0.0.5.devN+g<sha>).
+# The tag IS the version, so it can never drift from / collide with what's published. Releasing is
+# just: tag vX.Y.Z and push the tag (CI builds the clean version from it).
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ara"]
