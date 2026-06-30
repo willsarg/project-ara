@@ -2212,6 +2212,31 @@ def render_server(c: Console, rest: list[str], *, host: str, port: int, as_json:
             return _node_err(c, as_json, _missing)
         return _server_say(c, as_json, "migrate ok")
 
+    if sub == "createadmin":
+        username = rest[2] if len(rest) > 2 else "admin"
+        try:
+            info = service.create_admin(username)
+        except ImportError:
+            return _node_err(c, as_json, _missing)
+        if as_json:
+            print(json.dumps({"ok": True, "username": info["username"],
+                              "password": info["password"]}))
+        else:                                   # the generated password is shown ONCE — make it loud
+            c.emit(c.field("ara server", f"superuser '{info['username']}' ready"))
+            c.emit(c.field("password", info["password"]))
+            c.emit(c.field("login", "at the dashboard /admin/ — save this, it won't be shown again"))
+        return 0
+
+    if sub == "addnode":
+        if len(rest) < 5:
+            return _node_err(c, as_json, "usage: ara server addnode <name> <base_url> <token>")
+        try:
+            info = service.add_node(rest[2], rest[3], rest[4])
+        except ImportError:
+            return _node_err(c, as_json, _missing)
+        return _server_say(c, as_json, f"registered node '{info['name']}' -> {info['base_url']}",
+                           node=info["name"], url=info["base_url"])
+
     if sub in ("install", "start", "stop", "status", "uninstall"):
         try:
             if sub == "install":
@@ -2228,8 +2253,8 @@ def render_server(c: Console, rest: list[str], *, host: str, port: int, as_json:
             return _node_err(c, as_json, str(exc))
 
     return _node_err(c, as_json,
-                     "usage: ara server {serve|migrate|install|start|stop|status|uninstall} "
-                     "[--host H] [--port N]")
+                     "usage: ara server {serve|migrate|createadmin|addnode|install|start|stop|"
+                     "status|uninstall} [--host H] [--port N]")
 
 
 def main() -> int:

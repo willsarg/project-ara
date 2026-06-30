@@ -126,3 +126,41 @@ def serve(host: str, port: int) -> None:
 
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", SETTINGS_MODULE)
     uvicorn.run("ara.server.asgi:application", host=host, port=port)
+
+
+def _django_setup() -> None:
+    """Initialize Django against the server settings (idempotent) — the ORM-touching ops share it."""
+    import django
+
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", SETTINGS_MODULE)
+    django.setup()
+
+
+def create_admin(username: str) -> dict:
+    """Create — or reset the password of — a Django superuser for the dashboard, returning
+    ``{username, password, created}``. The password is GENERATED and returned once (the CLI has no
+    interactive prompt). ``django`` imports lazily; tests monkeypatch this whole function."""
+    import secrets
+
+    _django_setup()
+    from django.contrib.auth import get_user_model
+
+    password = secrets.token_urlsafe(12)
+    user_model = get_user_model()
+    user, created = user_model.objects.get_or_create(username=username)
+    user.is_staff = True
+    user.is_superuser = True
+    user.set_password(password)
+    user.save()
+    return {"username": username, "password": password, "created": created}
+
+
+def add_node(name: str, base_url: str, token: str) -> dict:
+    """Register (or update) a node in the server's registry, returning ``{name, base_url}``.
+    Idempotent on the node name. ``django`` imports lazily; tests monkeypatch this whole function."""
+    _django_setup()
+    from ara.server.nodes.models import Node
+
+    node, _created = Node.objects.update_or_create(
+        name=name, defaults={"base_url": base_url.rstrip("/"), "token": token, "enabled": True})
+    return {"name": node.name, "base_url": node.base_url}

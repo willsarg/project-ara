@@ -130,3 +130,67 @@ def test_no_subcommand_is_usage_error(con):
 def test_unknown_subcommand_json_usage_error(con, capsys):
     assert _server(con, "bogus", as_json=True) == 1
     assert "usage: ara server" in json.loads(capsys.readouterr().out)["error"]
+
+
+# --- createadmin ---
+def test_createadmin_default_username(con, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(service, "create_admin",
+                        lambda u: seen.update(u=u) or {"username": u, "password": "pw", "created": True})
+    assert _server(con, "createadmin") == 0
+    assert seen["u"] == "admin"                       # defaults to 'admin'
+    out = con[1].getvalue()
+    assert "admin" in out and "pw" in out             # prints the generated password once
+
+
+def test_createadmin_explicit_username(con, monkeypatch):
+    monkeypatch.setattr(service, "create_admin",
+                        lambda u: {"username": u, "password": "pw", "created": True})
+    assert _server(con, "createadmin", "alice") == 0
+    assert "alice" in con[1].getvalue()
+
+
+def test_createadmin_json(con, capsys, monkeypatch):
+    monkeypatch.setattr(service, "create_admin",
+                        lambda u: {"username": "admin", "password": "s3cret", "created": True})
+    assert _server(con, "createadmin", as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["username"] == "admin" and out["password"] == "s3cret"
+
+
+def test_createadmin_missing_extra(con, monkeypatch):
+    def _boom(u):
+        raise ImportError("no django")
+    monkeypatch.setattr(service, "create_admin", _boom)
+    assert _server(con, "createadmin") == 1
+    assert "project-ara[server]" in con[1].getvalue()
+
+
+# --- addnode ---
+def test_addnode_registers(con, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(service, "add_node",
+                        lambda n, u, t: seen.update(n=n, u=u, t=t) or {"name": n, "base_url": u})
+    assert _server(con, "addnode", "rog", "http://192.168.1.50:8473", "TOK") == 0
+    assert seen == {"n": "rog", "u": "http://192.168.1.50:8473", "t": "TOK"}
+    assert "rog" in con[1].getvalue()
+
+
+def test_addnode_json(con, capsys, monkeypatch):
+    monkeypatch.setattr(service, "add_node", lambda n, u, t: {"name": n, "base_url": u})
+    assert _server(con, "addnode", "rog", "http://x", "T", as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["node"] == "rog" and out["url"] == "http://x"
+
+
+def test_addnode_insufficient_args(con):
+    assert _server(con, "addnode", "rog") == 1
+    assert "usage: ara server addnode" in con[1].getvalue()
+
+
+def test_addnode_missing_extra(con, monkeypatch):
+    def _boom(n, u, t):
+        raise ImportError("no django")
+    monkeypatch.setattr(service, "add_node", _boom)
+    assert _server(con, "addnode", "rog", "http://x", "T") == 1
+    assert "project-ara[server]" in con[1].getvalue()
