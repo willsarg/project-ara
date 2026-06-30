@@ -3,7 +3,7 @@
 // and must never be imported from a Client Component.
 import "server-only";
 import Database from "better-sqlite3";
-import { randomBytes } from "node:crypto";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
@@ -75,19 +75,45 @@ function setMeta(key: string, value: string): void {
     .run(key, value);
 }
 
-/** The admin password: from env if set, else a stable one generated + persisted on first run. */
-export function getAdminPassword(): string {
-  const fromEnv = process.env.ARA_COORDINATOR_PASSWORD;
-  if (fromEnv && fromEnv.length > 0) return fromEnv;
-  const existing = getMeta("admin_password");
-  if (existing) return existing;
+// Admin password is NEVER stored in plaintext. When no env password is set we generate one, log it
+// ONCE for the operator, and persist only a salted scrypt hash — so a leaked DB doesn't leak the
+// credential. Login verifies by hashing the submitted password with the stored salt (timing-safe).
+
+function _scrypt(password: string, salt: Buffer): Buffer {
+  return scryptSync(password, salt, 32);
+}
+
+function _eq(a: Buffer, b: Buffer): boolean {
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** First-run setup of the generated admin password: hash+persist, log the plaintext exactly once.
+ *  No-op when ARA_COORDINATOR_PASSWORD is set (that path stores nothing) or a hash already exists. */
+export function ensureAdminPassword(): void {
+  if (process.env.ARA_COORDINATOR_PASSWORD) return;
+  if (getMeta("admin_pw_hash")) return;
   const generated = randomBytes(15).toString("base64url");
-  setMeta("admin_password", generated);
-  // Log it exactly once (when we generate it), so an operator can read it from stdout.
+  const salt = randomBytes(16);
+  setMeta("admin_pw_salt", salt.toString("hex"));
+  setMeta("admin_pw_hash", _scrypt(generated, salt).toString("hex"));
+  open().prepare("DELETE FROM meta WHERE key = 'admin_password'").run(); // scrub any legacy plaintext
   console.log(
     `\n[ara-coordinator] No ARA_COORDINATOR_PASSWORD set — generated an admin password:\n` +
       `[ara-coordinator]   ${generated}\n` +
-      `[ara-coordinator] Set ARA_COORDINATOR_PASSWORD to override. This was logged once.\n`,
+      `[ara-coordinator] Set ARA_COORDINATOR_PASSWORD to override. Logged once; only its hash is stored.\n`,
   );
-  return generated;
+}
+
+/** Verify a submitted admin password, constant-time. Env password → direct compare; otherwise the
+ *  salted scrypt hash. Never reveals or returns the stored credential. */
+export function verifyAdminPassword(submitted: string): boolean {
+  const fromEnv = process.env.ARA_COORDINATOR_PASSWORD;
+  if (fromEnv && fromEnv.length > 0) {
+    return _eq(Buffer.from(submitted), Buffer.from(fromEnv));
+  }
+  ensureAdminPassword();
+  const saltHex = getMeta("admin_pw_salt");
+  const hashHex = getMeta("admin_pw_hash");
+  if (!saltHex || !hashHex) return false;
+  return _eq(_scrypt(submitted, Buffer.from(saltHex, "hex")), Buffer.from(hashHex, "hex"));
 }

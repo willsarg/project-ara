@@ -6,13 +6,13 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { SESSION_COOKIE, createSession } from "@/lib/auth";
-import { addNode, deleteNode, getAdminPassword, toggleNode } from "@/lib/db";
+import { addNode, deleteNode, toggleNode, verifyAdminPassword } from "@/lib/db";
 
 const SESSION_TTL_S = 60 * 60 * 24 * 7;
 
 export async function loginAction(_prev: { error?: string } | undefined, form: FormData) {
   const password = String(form.get("password") ?? "");
-  if (password !== getAdminPassword()) {
+  if (!verifyAdminPassword(password)) {        // constant-time; compares against the stored hash
     return { error: "Incorrect password." };
   }
   const token = await createSession();
