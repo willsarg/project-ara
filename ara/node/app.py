@@ -45,20 +45,23 @@ def create_app(runner, providers: dict[str, Callable[[], dict]], *, version: str
     def health() -> dict:                       # open: liveness probe, leaks nothing
         return {"service": "ara-node", "status": "ok", "version": version}
 
-    @app.get("/status")
-    def status(_: None = gate) -> dict:
+    # No `-> dict` return annotation on the read endpoints: a verb's --json may be a list (e.g.
+    # `ara models --json` is an array), and FastAPI would 500 trying to validate a list against dict.
+    # `response_model=None` keeps it a transparent pass-through of whatever the verb emitted.
+    @app.get("/status", response_model=None)
+    def status(_: None = gate):
         return providers["status"]()
 
-    @app.get("/detect")
-    def detect(_: None = gate) -> dict:
+    @app.get("/detect", response_model=None)
+    def detect(_: None = gate):
         return providers["detect"]()
 
-    @app.get("/profile")
-    def profile(_: None = gate) -> dict:
+    @app.get("/profile", response_model=None)
+    def profile(_: None = gate):
         return providers["profile"]()
 
-    @app.get("/models")
-    def models(_: None = gate) -> dict:
+    @app.get("/models", response_model=None)
+    def models(_: None = gate):
         return providers["models"]()
 
     @app.post("/jobs", status_code=202)

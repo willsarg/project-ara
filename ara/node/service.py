@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
+"""Run the node on boot (systemd --user) + the uvicorn launcher.
+
+Two concerns live here. :func:`serve` is the foreground launcher — it builds the real app
+(:mod:`ara.node.wiring`) and hands it to uvicorn. The ``install``/``start``/``stop``/``status``/
+``uninstall`` functions manage a **user** systemd unit (``systemctl --user``, no root): the node
+comes back after a reboot or a crash without touching system-wide config, matching ARA's
+install-into-your-own-space philosophy.
+
+Linux first — systemd is the only init covered today; the other platforms raise a clear error via
+:func:`_require_linux` rather than silently no-op'ing (Rule #3). The one external boundary is
+:func:`_run` (every ``systemctl`` call), which tests stub; ``uvicorn`` is imported lazily so this
+module imports without the optional ``[node]`` extra present.
+"""
+from __future__ import annotations
+
+import os
+import platform
+import subprocess
+from pathlib import Path
+
+UNIT_NAME = "ara-node.service"
+
+
+def _run(cmd: list[str]) -> tuple[int, str, str]:
+    """Run *cmd*, return (returncode, stdout, stderr). The one external boundary (mirrors
+    :func:`ara.engine_env._run`); tests stub it so no real ``systemctl`` ever runs."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _require_linux() -> None:
+    """Guard the systemd path. Checks ``platform.system()`` (not ``hasattr``) so tests can mock the
+    OS per the project's cross-OS rule — the branch stays exercisable on any host."""
+    if platform.system() != "Linux":
+        raise RuntimeError(
+            f"`ara node install` uses systemd --user and is Linux-only (this is "
+            f"{platform.system()}); run `ara node start` to launch it in the foreground instead")
+
+
+def _unit_dir() -> Path:
+    """Where the unit file is written — ``ARA_NODE_SYSTEMD_DIR`` if set (tests), else the standard
+    per-user systemd directory."""
+    override = os.environ.get("ARA_NODE_SYSTEMD_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _unit_path() -> Path:
+    """Full path of the node's systemd unit file."""
+    return _unit_dir() / UNIT_NAME
+
+
+def _unit_text(host: str, port: int) -> str:
+    """The systemd unit. ExecStart uses the ``ara`` console-script at the ``%h``-relative pip
+    ``--user`` location so the unit needs no absolute, machine-specific path."""
+    return (
+        "[Unit]\n"
+        "Description=ARA node daemon\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart=%h/.local/bin/ara node serve --host {host} --port {port}\n"
+        "Restart=on-failure\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def install(host: str, port: int) -> None:
+    """Write the unit, reload systemd, and enable+start it so the node survives reboots."""
+    _require_linux()
+    path = _unit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_unit_text(host, port))
+    _run(["systemctl", "--user", "daemon-reload"])
+    _run(["systemctl", "--user", "enable", "--now", UNIT_NAME])
+
+
+def start() -> None:
+    """Start the installed node unit now."""
+    _require_linux()
+    _run(["systemctl", "--user", "start", UNIT_NAME])
+
+
+def stop() -> None:
+    """Stop the running node unit."""
+    _require_linux()
+    _run(["systemctl", "--user", "stop", UNIT_NAME])
+
+
+def status() -> str:
+    """Return ``systemctl status`` output for the node unit (the human-readable state block)."""
+    _require_linux()
+    _rc, out, _err = _run(["systemctl", "--user", "status", UNIT_NAME])
+    return out
+
+
+def uninstall() -> None:
+    """Disable+stop the unit, remove its file, and reload so systemd forgets it."""
+    _require_linux()
+    _run(["systemctl", "--user", "disable", "--now", UNIT_NAME])
+    _unit_path().unlink(missing_ok=True)         # idempotent: fine if it was never installed
+    _run(["systemctl", "--user", "daemon-reload"])
+
+
+def serve(host: str, port: int, *, version: str | None = None) -> None:
+    """Foreground launcher: build the real node app and run it under uvicorn.
+
+    ``uvicorn``/``wiring`` are imported lazily so this module imports without the optional ``[node]``
+    extra; tests monkeypatch ``uvicorn.run`` (and ``wiring.build_app``) to avoid binding a port."""
+    import uvicorn
+
+    from ara.node import wiring
+    uvicorn.run(wiring.build_app(version), host=host, port=port)

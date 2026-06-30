@@ -51,6 +51,20 @@ def test_read_endpoints_return_provider_data(client):
     assert client.get("/models").json() == {"models": []}
 
 
+def test_read_endpoint_passes_through_a_list(tmp_path, monkeypatch):
+    # `ara models --json` is a JSON array — the endpoint must pass it through, not 500 validating
+    # it against a dict response model (regression).
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "j.db"))
+    tok = auth.ensure_token()
+    application = node_app.create_app(jobs.JobRunner({}, spawn=lambda fn: fn()),
+                                      {"status": dict, "detect": dict, "profile": dict,
+                                       "models": lambda: [{"model_id": "m"}]})
+    c = TestClient(application)
+    r = c.get("/models", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200 and r.json() == [{"model_id": "m"}]
+
+
 def test_submit_job_returns_202_and_runs_it(client):
     r = client.post("/jobs", json={"kind": "run", "args": {"prompt": "hi"}})
     assert r.status_code == 202

@@ -218,6 +218,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
+    c.emit(_cmd(c, "node <sub>", "run ARA as a daemon you can drive over HTTP (serve/install/…)"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
@@ -2102,6 +2103,73 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
 # --------------------------------------------------------------------------- #
 # entry
 # --------------------------------------------------------------------------- #
+def _node_say(c: Console, as_json: bool, msg: str, **fields) -> int:
+    """Success line for an `ara node` subcommand: a JSON object under --json, a styled field else."""
+    if as_json:
+        print(json.dumps({"ok": True, "message": msg, **fields}))
+    else:
+        c.emit(c.field("ara node", msg))
+    return 0
+
+
+def _node_err(c: Console, as_json: bool, msg: str) -> int:
+    """Failure line for an `ara node` subcommand (Rule #3: structured under --json, styled warn else)."""
+    print(json.dumps({"error": msg})) if as_json else c.emit(c.style("warn", f"  {msg}"))
+    return 1
+
+
+def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: bool = False) -> int:
+    """`ara node <sub>` — run/manage the headless node daemon (a FastAPI API over ARA's verbs).
+
+    Subcommands: ``serve`` (foreground launcher — what the systemd unit runs and what you run to
+    debug), ``install`` (write + enable the systemd --user boot unit), ``start``/``stop``/``status``/
+    ``uninstall`` (service lifecycle), and ``token`` (print, or ``token rotate`` to replace, the
+    bearer token every endpoint requires). The systemd path is Linux-only and raises a clear message
+    elsewhere; the web stack is the optional ``[node]`` extra and a missing import becomes an
+    actionable hint, never a traceback.
+    """
+    from ara.node import auth, service
+
+    sub = rest[1] if len(rest) > 1 else None
+
+    if sub == "token":
+        tok = auth.rotate_token() if rest[2:3] == ["rotate"] else auth.ensure_token()
+        print(json.dumps({"token": tok})) if as_json else c.emit(c.field("node token", tok))
+        return 0
+
+    if sub == "serve":
+        tok = auth.ensure_token()
+        if not as_json:
+            c.emit(c.field("ara node", f"serving on http://{host}:{port}"))
+            c.emit(c.field("token", tok))
+        try:
+            service.serve(host, port)          # blocks until the process is stopped
+        except ImportError:
+            return _node_err(c, as_json,
+                             "node web stack not installed — run: pip install 'project-ara[node]'")
+        return 0
+
+    if sub in ("install", "start", "stop", "status", "uninstall"):
+        try:
+            if sub == "install":
+                tok = auth.ensure_token()
+                service.install(host, port)
+                return _node_say(c, as_json, f"installed + started on http://{host}:{port}",
+                                 endpoint=f"http://{host}:{port}", token=tok)
+            if sub == "status":
+                out = service.status()
+                print(json.dumps({"status": out})) if as_json else c.emit(out.rstrip())
+                return 0
+            getattr(service, sub)()            # start | stop | uninstall
+            return _node_say(c, as_json, f"{sub} ok")
+        except RuntimeError as exc:             # the systemd path is Linux-only
+            return _node_err(c, as_json, str(exc))
+
+    return _node_err(c, as_json,
+                     "usage: ara node {serve|install|start|stop|status|uninstall|token} "
+                     "[--host H] [--port N]")
+
+
 def main() -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
@@ -2139,6 +2207,8 @@ def _main_impl() -> int:
     prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
     serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
     serve_name: str | None = None                # `serve --name X`: derived served-model name
+    node_host: str = "0.0.0.0"                   # `node --host H`: daemon bind address (LAN by default)
+    node_port: int = 8473                        # `node --port N`: daemon bind port
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension
     max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
     include: list[str] = []
@@ -2211,6 +2281,20 @@ def _main_impl() -> int:
             continue
         if a.startswith("--name="):
             serve_name = a.split("=", 1)[1] or None
+            continue
+        if a == "--host":
+            node_host = argv[i + 1] if i + 1 < len(argv) else node_host
+            skip = True
+            continue
+        if a.startswith("--host="):
+            node_host = a.split("=", 1)[1] or node_host
+            continue
+        if a == "--port":
+            node_port = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "") or node_port
+            skip = True
+            continue
+        if a.startswith("--port="):
+            node_port = _int_or_none(a.split("=", 1)[1]) or node_port
             continue
         if a == "--use-case":
             use_case = argv[i + 1] if i + 1 < len(argv) else None
@@ -2338,6 +2422,9 @@ def _main_impl() -> int:
     if cmd == "hf":
         return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
 
+    if cmd == "node":
+        return render_node(c, rest, host=node_host, port=node_port, as_json=as_json)
+
     if as_json:
         return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")
     c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
@@ -2346,3 +2433,7 @@ def _main_impl() -> int:
         + c.style("dim", " with no arguments to see the planned commands.")
     )
     return 1
+
+
+if __name__ == "__main__":   # pragma: no cover — so `python -m ara.cli ...` works (node wiring shells out this way)
+    sys.exit(main())
