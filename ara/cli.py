@@ -1033,6 +1033,39 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
     return None
 
 
+def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
+                      *, as_json: bool, progress: bool) -> int | None:
+    """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
+
+    So wcx/wmx fetch on demand like the GGUF engines (which download in-worker), instead of the
+    worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
+    ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
+    No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
+    cuda-gguf report cached (they acquire the GGUF in-worker), so this only fetches for apple/cuda.
+    Returns 1 (after printing) on a disk-space or fetch error, else None.
+    """
+    incompatible = engines.engine_for_model(model) not in (None, engine_key)
+    cached = getattr(bk, "calibration_model_cached", None)
+    if incompatible or cached is None or cached(model):
+        return None
+    size_gb = acquire.repo_size_gb(model)
+    free_gb = acquire.free_disk_gb()
+    if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
+        msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
+               f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
+    c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
+    try:
+        bk.download_calibration_model(model, progress=progress)
+    except Exception as exc:
+        msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    return None
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
                         flash_attn_optin: bool = False, kv_quant: str = "f16",
@@ -1081,31 +1114,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
         return 1
     progress = (not as_json) and sys.stderr.isatty()
-    # Pre-fetch: ensure weights are in the HF cache before the engine's preflight runs.
-    # Without this, the worker's blobs/ scan yields weights_gb≈0 for uncached transformers
-    # models, so the a-priori safety gates (L1/L4) under-predict memory on the first rung.
-    # cpu.calibration_model_cached() always returns True, so this only fires for apple/cuda.
-    incompatible = engines.engine_for_model(model) not in (None, sel.engine_key)
-    if not incompatible and not bk.calibration_model_cached(model):
-        size_gb = acquire.repo_size_gb(model)
-        free_gb = acquire.free_disk_gb()
-        if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
-            msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
-                   f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
-            if as_json:
-                print(json.dumps({"error": msg}))
-            else:
-                c.emit(c.style("bad", f"  {msg}"))
-            return 1
-        _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
-        c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
-        try:
-            bk.download_calibration_model(model, progress=progress)
-        except Exception as exc:
-            reason = acquire.classify_repo_error(exc)
-            msg = _fetch_error_msg(model, reason)
-            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-            return 1
+    # Pre-fetch weights into the HF cache before the engine's preflight runs (#109).
+    if (rc := _prefetch_weights(c, model, bk, sel.engine_key,
+                                as_json=as_json, progress=progress)) is not None:
+        return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     cal_con = db.connect()
@@ -1443,6 +1455,11 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
     # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
+    # Pre-fetch weights so wcx/wmx benchmark uncached models on demand (like the GGUF engines),
+    # instead of the worker refusing "model not found in HF cache" (#109).
+    progress = (not as_json) and sys.stderr.isatty()
+    if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
+        return rc
     result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
     if result.get("refused"):
         return err(f"the engine refused: {result.get('reason', 'no reason given')}")

@@ -4879,7 +4879,8 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
             "results": [{"prompt_index": i, "completion": f"ans{i}"} for i in range(n)],
         }
 
-    bk = types.SimpleNamespace(benchmark=fake_bench)
+    bk = types.SimpleNamespace(benchmark=fake_bench,
+                               calibration_model_cached=lambda m: True)  # cached -> skip pre-fetch (#109)
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     return saved
 
@@ -4896,6 +4897,20 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
+
+
+def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, monkeypatch):
+    """render_benchmark pre-fetches uncached weights for wcx/wmx (like the GGUF engines, #109);
+    a disk shortfall during that fetch is a clean error, not a crash."""
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
+    bk = cli.get_backend("apple")
+    bk.calibration_model_cached = lambda m: False        # uncached -> pre-fetch fires
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 999.0)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
+    c, buf = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="extraction", assume_yes=True)
+    assert rc == 1
+    assert "not enough disk" in buf.getvalue()
 
 
 def test_render_benchmark_coding_requires_exec_consent(make_console, monkeypatch):
