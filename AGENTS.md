@@ -68,6 +68,11 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
   imported in-process. The engine import happens *inside* the adapter's functions, not at module
   load — so nothing MLX/torch-shaped loads until ARA actually runs the engine (always over a
   subprocess in the isolated env).
+  - **The `wmx-suite` / `wcx-suite` git repos are NO LONGER part of ARA (folded 2026-06-30).** ARA's
+    copy of record is the vendored tree under `ara/_vendor/<key>`. **Leave the upstream repos alone**
+    — do not clone, edit, commit to, or release them as part of ARA work *unless explicitly asked*.
+    To change a folded engine, edit/re-vendor through ARA (`scripts/vendor_engine.py`), never the
+    standalone repo.
 - **Engines install on demand, not as dependencies.** The hardware engine's heavy deps (MLX, torch)
   are **not** in ARA's `pyproject.toml`. ARA probes the machine and installs the matched suite at
   runtime via `ara install` (`ara/engines.py` is the catalog). The folded suites install from their
