@@ -50,34 +50,48 @@ def default_providers() -> dict[str, Callable[[], dict]]:
             for verb in ("status", "detect", "profile", "models")}
 
 
+def _safe(value: str, field: str) -> str:
+    """Guard a value that becomes a CLI argv token: reject a leading ``-`` so it can't be smuggled in
+    as a flag (argv flag-injection — e.g. a model named ``--exec-consent`` flipping a safety gate).
+
+    ARA's CLI uses a hand-rolled parser with NO ``--`` end-of-options sentinel, so a ``--`` separator
+    wouldn't work (it'd become a stray positional); validation is the right defense. The /jobs caller
+    is token-authorized — and could already set these flags explicitly — so this is defense-in-depth +
+    correctness (a model id / engine / use-case starting with ``-`` is invalid anyway). Raising →
+    the JobRunner records it as a failed job."""
+    if not isinstance(value, str) or value.startswith("-"):
+        raise ValueError(f"invalid {field}: must be a string not starting with '-'")
+    return value
+
+
 def _characterize(args: dict) -> dict:
     """``ara characterize <model> [--engine E]`` — measure + store a model's safe ceiling."""
-    cli = ["characterize", args["model"]]
+    cli = ["characterize", _safe(args["model"], "model")]
     if args.get("engine"):
-        cli += ["--engine", args["engine"]]
+        cli += ["--engine", _safe(args["engine"], "engine")]
     return _run_cli(cli)
 
 
 def _run(args: dict) -> dict:
     """``ara run <model> <prompt> [--engine E] --yes`` — one governed generation."""
-    cli = ["run", args["model"]]
+    cli = ["run", _safe(args["model"], "model")]
     if args.get("engine"):
-        cli += ["--engine", args["engine"]]
+        cli += ["--engine", _safe(args["engine"], "engine")]
     cli.append("--yes")                          # non-interactive: no TTY to confirm at
     if args.get("prompt"):
-        cli.append(args["prompt"])               # the prompt is positional and trails the flags
+        cli.append(str(args["prompt"]))          # the prompt is one trailing free-text positional
     return _run_cli(cli)
 
 
 def _serve(args: dict) -> dict:
     """``ara serve <model> [--engine E] [--ctx N] [--name X] --yes`` — stand a model up + endpoint."""
-    cli = ["serve", args["model"]]
+    cli = ["serve", _safe(args["model"], "model")]
     if args.get("engine"):
-        cli += ["--engine", args["engine"]]
+        cli += ["--engine", _safe(args["engine"], "engine")]
     if args.get("ctx") is not None:
         cli += ["--ctx", str(args["ctx"])]
     if args.get("name"):
-        cli += ["--name", args["name"]]
+        cli += ["--name", _safe(args["name"], "name")]
     cli.append("--yes")
     return _run_cli(cli)
 
@@ -87,9 +101,9 @@ def _benchmark(args: dict) -> dict:
 
     The coding benchmark's code-execution gate (``--exec-consent``) is NOT auto-supplied — that's a
     deliberate per-job opt-in, so it's only added when the caller sets ``exec_consent`` in args."""
-    cli = ["benchmark", args["model"], "--use-case", args["use_case"]]
+    cli = ["benchmark", _safe(args["model"], "model"), "--use-case", _safe(args["use_case"], "use_case")]
     if args.get("engine"):
-        cli += ["--engine", args["engine"]]
+        cli += ["--engine", _safe(args["engine"], "engine")]
     if args.get("ctx") is not None:
         cli += ["--ctx", str(args["ctx"])]
     if args.get("max_tokens") is not None:

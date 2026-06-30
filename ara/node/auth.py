@@ -34,9 +34,13 @@ def load_token() -> str | None:
 
 def _write_token(token: str) -> str:
     path = _token_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(token, encoding="utf-8")
-    path.chmod(0o600)          # owner-only; on Windows this sets the read-only attribute (no raise)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Atomic owner-only create (O_CREAT|O_TRUNC, mode 0o600): the token is a credential, so it must
+    # NEVER be world/group-readable even for the instant between write and chmod. On Windows the mode
+    # is advisory (ACLs govern), but the call still creates/truncates correctly.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token)
     return token
 
 

@@ -164,3 +164,35 @@ def test_build_app_defaults_version_to_ara_version(monkeypatch):
     monkeypatch.setattr("ara.node.jobs.JobRunner", lambda workers: None)
     monkeypatch.setattr(wiring, "_ara_version", lambda: "0.0.fake")
     assert wiring.build_app() == "0.0.fake"
+
+
+# --- argv flag-injection guard (_safe): no job arg may be smuggled in as a CLI flag ---
+@pytest.mark.parametrize("worker, args", [
+    (wiring._characterize, {"model": "--evil"}),
+    (wiring._run, {"model": "-x"}),
+    (wiring._serve, {"model": "--engine"}),
+    (wiring._benchmark, {"model": "--exec-consent", "use_case": "coding"}),
+])
+def test_workers_reject_flag_like_model(worker, args):
+    with pytest.raises(ValueError):
+        worker(args)
+
+
+def test_worker_rejects_flag_like_engine():
+    with pytest.raises(ValueError):
+        wiring._characterize({"model": "org/m", "engine": "--bad"})
+
+
+def test_serve_rejects_flag_like_name():
+    with pytest.raises(ValueError):
+        wiring._serve({"model": "org/m", "name": "--n"})
+
+
+def test_benchmark_rejects_flag_like_use_case():
+    with pytest.raises(ValueError):
+        wiring._benchmark({"model": "org/m", "use_case": "--x"})
+
+
+def test_safe_rejects_non_string():
+    with pytest.raises(ValueError):
+        wiring._safe(123, "model")
