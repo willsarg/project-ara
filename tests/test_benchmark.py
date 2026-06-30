@@ -174,13 +174,17 @@ def test_agentic_wrong_arg_scores_0():
 
 
 def test_agentic_numeric_tolerance():
+    # Exercise the ±1e-4 band in BOTH directions — identical values would never enter the
+    # tolerance branch (an exact-only scorer would pass too, proving nothing about tolerance).
     from ara.benchmark import score
     item = {
         "id": "t1", "question": "q", "function": {},
         "expected": {"name": "calc", "arguments": {"x": 3.14159}},
     }
-    completion = '{"name": "calc", "arguments": {"x": 3.14159}}'
-    assert score("agentic", item, completion) == 1.0
+    within = '{"name": "calc", "arguments": {"x": 3.1416}}'    # diff 1e-5 < 1e-4 → match
+    outside = '{"name": "calc", "arguments": {"x": 3.1417}}'   # diff 1.1e-4 > 1e-4 → no match
+    assert score("agentic", item, within) == 1.0
+    assert score("agentic", item, outside) == 0.0
 
 
 def test_agentic_case_insensitive_string():
@@ -597,19 +601,59 @@ def test_reasoning_gold_without_marker_scores_0():
 
 @pytest.mark.skipif(not _bm._SANDBOX_EXEC, reason="sandbox-exec is macOS-only")
 def test_coding_sandbox_blocks_network():
-    import os as _os
-    sentinel = "/tmp/ara_sb_sentinel_net"
-    if _os.path.exists(sentinel):
-        _os.remove(sentinel)
-    item = {"prompt": "def f():\n", "entry_point": "f", "test": "def check(c):\n    c()\n"}
-    body = (
-        "    import socket\n"
-        "    socket.create_connection(('8.8.8.8', 53), timeout=3)\n"
-        f"    open({sentinel!r}, 'w').write('net')\n"
-    )
-    _bm.score("coding", item, body)
+    # NETWORK egress is the observable — NOT a sentinel file. The profile denies file-write*
+    # unconditionally, so a "write a file iff the socket connects" proof passes even with the
+    # network rule removed (it never reaches the write). Instead, the body's ONLY statement is a
+    # connect to a real local listener: under the sandbox the connect is denied → the program
+    # raises → exits nonzero → score 0.0. A local listener guarantees the target is reachable, so
+    # a green result means the sandbox blocked egress, not that the host was offline. If
+    # `(deny network*)` were dropped from _SB_PROFILE_TMPL, the child would connect and the program
+    # would exit 0 → score 1.0, failing this test (verified by flipping the rule).
+    import socket as _socket
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
     try:
-        assert not _os.path.exists(sentinel), "sandbox FAILED to block network"
+        item = {"prompt": "def f():\n", "entry_point": "f", "test": "def check(c):\n    c()\n"}
+        body = (
+            "    import socket\n"
+            f"    socket.create_connection(('127.0.0.1', {port}), timeout=3).close()\n"
+        )
+        assert _bm.score("coding", item, body) == 0.0, "sandbox FAILED to block network egress"
     finally:
-        if _os.path.exists(sentinel):
-            _os.remove(sentinel)
+        srv.close()
+
+
+def test_coding_killpg_falls_back_to_proc_kill(monkeypatch):
+    # When the timed-out child can't be reaped by killpg (already gone / EPERM), fall back to
+    # proc.kill() so a stuck child is never leaked. Force the sandbox branch + mock the subprocess
+    # so this is host-independent (covers the reap fallback on any OS, instantly — no real 10s hang).
+    import subprocess as _sp
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 999999
+            self.killed = False
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise _sp.TimeoutExpired(cmd="x", timeout=timeout)   # the 10s wait "times out"
+
+        def poll(self):
+            return None          # still running at the finally → reap path runs
+
+        def kill(self):
+            self.killed = True
+
+    fake = _FakeProc()
+    monkeypatch.setattr(_bm, "_SANDBOX_EXEC", "/usr/bin/sandbox-exec")   # force the sandbox cmd branch
+    monkeypatch.setattr(_bm.subprocess, "Popen", lambda *a, **k: fake)
+    # raising=False: os.killpg/os.getpgid don't exist on Windows — there the reap hits AttributeError
+    # and falls back to proc.kill() (the production fix); on POSIX the mocked killpg raises instead.
+    monkeypatch.setattr(_bm.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(_bm.os, "killpg",
+                        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError("gone")),
+                        raising=False)
+    assert _bm.score("coding", _TINY_CODING_ITEM, "    return a + b\n") == 0.0   # timed out → 0
+    assert fake.killed is True          # fell back to proc.kill() when killpg couldn't reap

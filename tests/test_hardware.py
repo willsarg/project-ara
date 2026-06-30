@@ -929,19 +929,27 @@ def test_memory_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
     mi = hw.memory_info()
     assert isinstance(mi, hw.MemoryInfo)
+    assert mi.modules == []          # pin the "empty" claim, not just the type
 
 
 # ---------------------------------------------------------------------------
 # Task 4: Storage detail
 # ---------------------------------------------------------------------------
 
-# --- Windows fixture (real winbox Get-PhysicalDisk output) ---
+# --- Windows fixture (Get-PhysicalDisk shape; generic drive models, no personal hardware) ---
+# Drive FriendlyNames are placeholders — the parser only passes them through; classification keys
+# entirely off MediaType/BusType. Those are friendly STRINGS ("SSD"/"NVMe"/...), NOT the uint16 enum
+# codes the raw CIM carries — verified 2026-06-30 on a real PowerShell 5.1 box: `Get-PhysicalDisk |
+# ConvertTo-Json` serializes the top-level fields the parser reads as strings (the ints surface only
+# in the nested CimInstanceProperties dump we don't touch). So exact-string matching in
+# _drives_windows is correct — unlike the Win32_PhysicalMemory path, whose SMBIOSMemoryType
+# genuinely comes through as an int.
 _WIN_PHYSICAL_DISKS = [
-    {"FriendlyName": "Samsung SSD 990 EVO 1TB", "MediaType": "SSD", "BusType": "NVMe",
+    {"FriendlyName": "Generic NVMe SSD 1TB", "MediaType": "SSD", "BusType": "NVMe",
      "Size": 1000204886016},
-    {"FriendlyName": "ST2000DM008-2FR102", "MediaType": "HDD", "BusType": "SATA",
+    {"FriendlyName": "Generic SATA HDD 2TB", "MediaType": "HDD", "BusType": "SATA",
      "Size": 2000398934016},
-    {"FriendlyName": "QNAP TR-004 DISK00", "MediaType": "Unspecified", "BusType": "USB",
+    {"FriendlyName": "Generic USB HDD 8TB", "MediaType": "Unspecified", "BusType": "USB",
      "Size": 8001456963584},
 ]
 
@@ -1012,12 +1020,12 @@ _LINUX_LSBLK_JSON_UNKNOWN = """\
 
 def test_drives_windows_nvme_classification():
     """BusType=NVMe → 'nvme-ssd' regardless of MediaType."""
-    drives = hw._drives_windows([{"FriendlyName": "Samsung SSD 990 EVO 1TB",
+    drives = hw._drives_windows([{"FriendlyName": "Generic NVMe SSD 1TB",
                                    "MediaType": "SSD", "BusType": "NVMe",
                                    "Size": 1000204886016}])
     assert len(drives) == 1
     d = drives[0]
-    assert d.model == "Samsung SSD 990 EVO 1TB"
+    assert d.model == "Generic NVMe SSD 1TB"
     assert d.media == "nvme-ssd"
     assert d.size_gb == round(1000204886016 / 1e9, 1)
 
@@ -1032,7 +1040,7 @@ def test_drives_windows_sata_ssd_classification():
 
 def test_drives_windows_hdd_classification():
     """MediaType=HDD → 'hdd'."""
-    drives = hw._drives_windows([{"FriendlyName": "ST2000DM008-2FR102",
+    drives = hw._drives_windows([{"FriendlyName": "Generic SATA HDD 2TB",
                                    "MediaType": "HDD", "BusType": "SATA",
                                    "Size": 2000398934016}])
     assert drives[0].media == "hdd"
@@ -1040,7 +1048,7 @@ def test_drives_windows_hdd_classification():
 
 def test_drives_windows_usb_classification():
     """BusType=USB → 'usb'."""
-    drives = hw._drives_windows([{"FriendlyName": "QNAP TR-004 DISK00",
+    drives = hw._drives_windows([{"FriendlyName": "Generic USB HDD 8TB",
                                    "MediaType": "Unspecified", "BusType": "USB",
                                    "Size": 8001456963584}])
     assert drives[0].media == "usb"
@@ -1061,9 +1069,9 @@ def test_drives_windows_full_winbox_fixture():
     assert drives[0].media == "nvme-ssd"
     assert drives[1].media == "hdd"
     assert drives[2].media == "usb"
-    assert drives[0].model == "Samsung SSD 990 EVO 1TB"
-    assert drives[1].model == "ST2000DM008-2FR102"
-    assert drives[2].model == "QNAP TR-004 DISK00"
+    assert drives[0].model == "Generic NVMe SSD 1TB"
+    assert drives[1].model == "Generic SATA HDD 2TB"
+    assert drives[2].model == "Generic USB HDD 8TB"
 
 
 def test_drives_windows_empty_list():
@@ -1210,6 +1218,7 @@ def test_storage_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(hw, "_disk_free_gb", lambda: None)
     si = hw.storage_info()
     assert isinstance(si, hw.StorageInfo)
+    assert si.drives == [] and si.free_gb is None   # pin the "empty" claim, not just the type
 
 
 # --- _drives_macos branch coverage ---
@@ -1332,7 +1341,7 @@ def test_board_macos_missing_fields():
     assert b.bios_version is None
 
 
-def test_board_macos_sets_vendor_apple_always():
+def test_board_macos_no_model_name_leaves_vendor_none():
     """Any text that lacks 'Model Name:' → system_vendor is still None (not forced to Apple
     unless we actually found hardware info — honest gap)."""
     b = hw._board_macos("Some hardware text without expected keys\n")
@@ -1507,6 +1516,7 @@ def test_board_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(hw, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     b = hw.board_info()
     assert isinstance(b, hw.BoardInfo)
+    assert b.board_vendor is None   # pin the "empty" claim, not just the type
 
 
 # ---------------------------------------------------------------------------
@@ -1623,6 +1633,7 @@ def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
     (tmp_path / "card0" / "device").mkdir(parents=True)   # no vendor file
     monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
     monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])   # don't shell out to real vulkaninfo
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo())
     assert hw._gpus_linux() == []
 
@@ -1657,6 +1668,7 @@ def test_gpus_linux_two_gpus_amd_integrated_is_none(tmp_path, monkeypatch):
         (dev / "device").write_text(f"{device}\n")
     monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
     monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])   # don't shell out to real vulkaninfo
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
     gpus = hw._gpus_linux()
     assert len(gpus) == 2
@@ -1674,10 +1686,13 @@ def test_video_controller_gpu_nvidia():
     assert g.vram_gb is None          # 4293918720 ≈ uint32 cap ⇒ unknown, not 4.3
 
 
-def test_video_controller_gpu_amd_real_vram():
+def test_video_controller_gpu_amd_small_adapterram_under_cap():
+    # A sub-4GB AdapterRAM (here a 2GB integrated Radeon carveout) is BELOW the uint32 cap, so it's
+    # trusted: vram_gb = bytes/1e9. (A real RX 6600 is 8GB and would report the uint32-pinned cap →
+    # None, like the NVIDIA case above; don't pair a big-SKU name with a small reading.)
     from ara import hardware as hw
     g = hw._video_controller_gpu({
-        "Name": "AMD Radeon RX 6600", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
+        "Name": "AMD Radeon(TM) Graphics", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
         "DriverVersion": "31.0.21912.14", "AdapterRAM": 2147483648})
     assert g.vendor == "amd" and g.vram_gb == 2.1   # 2147483648/1e9
 

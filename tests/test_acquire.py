@@ -82,15 +82,17 @@ def test_download_calls_snapshot_and_restores_bars(monkeypatch):
 
 
 def test_download_leaves_bars_disabled_if_already_disabled(monkeypatch):
+    order = []
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: None)
     monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: True)
-    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
-    enabled = []
-    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: enabled.append(True))
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: order.append("disable"))
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: order.append("enable"))
 
     acquire.download("org/repo")
 
-    assert enabled == []  # they were already off → not re-enabled
+    # Asserting only "enable never called" would also pass if the whole finally restore were
+    # deleted. Pin that the restore actually ran and chose the disable branch (prior state).
+    assert order == ["disable", "disable"]  # silence for the download, then restore to disabled
 
 
 def test_download_restores_bars_even_on_error(monkeypatch):
