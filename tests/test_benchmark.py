@@ -623,3 +623,34 @@ def test_coding_sandbox_blocks_network():
         assert _bm.score("coding", item, body) == 0.0, "sandbox FAILED to block network egress"
     finally:
         srv.close()
+
+
+def test_coding_killpg_falls_back_to_proc_kill(monkeypatch):
+    # When the timed-out child can't be reaped by killpg (already gone / EPERM), fall back to
+    # proc.kill() so a stuck child is never leaked. Force the sandbox branch + mock the subprocess
+    # so this is host-independent (covers the reap fallback on any OS, instantly — no real 10s hang).
+    import subprocess as _sp
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 999999
+            self.killed = False
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise _sp.TimeoutExpired(cmd="x", timeout=timeout)   # the 10s wait "times out"
+
+        def poll(self):
+            return None          # still running at the finally → reap path runs
+
+        def kill(self):
+            self.killed = True
+
+    fake = _FakeProc()
+    monkeypatch.setattr(_bm, "_SANDBOX_EXEC", "/usr/bin/sandbox-exec")   # force the sandbox cmd branch
+    monkeypatch.setattr(_bm.subprocess, "Popen", lambda *a, **k: fake)
+    monkeypatch.setattr(_bm.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(_bm.os, "killpg",
+                        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError("gone")))
+    assert _bm.score("coding", _TINY_CODING_ITEM, "    return a + b\n") == 0.0   # timed out → 0
+    assert fake.killed is True          # fell back to proc.kill() after killpg raised

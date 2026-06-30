@@ -5249,3 +5249,206 @@ def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_
     # Strong's measured 0.9 beats Weak's imported 0.7, so Strong ranks first.
     assert out.index("org/Strong") < out.index("org/Weak")
     assert "measured" in out
+
+
+# --------------------------------------------------------------------------- #
+# Coverage completion — branches not hit by the behaviour tests above (serve/benchmark
+# edge paths + the --use-case= argv form). Kept host-independent (no real engine/hardware).
+# --------------------------------------------------------------------------- #
+def test_recommend_use_case_json_serializes_scores(monkeypatch, set_platform, capsys):
+    # --json + --use-case: each score object is flattened to {tier,value,source}; an unscored model
+    # is an honest null (covers both arms of the per-rec score ternary in the json branch).
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Strong", weights_gb=4.0, max_context=131072),
+                     _model_row("org/Unscored", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported",
+                        lambda: {"org/Strong": {"coding": {"score": 0.9, "source": "HumanEval"}}})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True, use_case="coding") == 0
+    by = {p["model_id"]: p for p in json.loads(capsys.readouterr().out)}
+    assert by["org/Strong"]["score"]["value"] == 0.9 and by["org/Strong"]["score"]["source"]
+    assert by["org/Unscored"]["score"] is None
+
+
+def test_render_benchmark_rejects_nonpositive_ctx(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=0, assume_yes=True) == 1
+    assert "positive" in buf.getvalue()
+
+
+def test_render_benchmark_ctx_below_ceiling_no_advisory(make_console, monkeypatch):
+    # explicit --ctx at/under the measured ceiling → no advisory warning (the not-taken branch)
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000, assume_yes=True) == 0
+    assert "exceeds the measured safe ceiling" not in buf.getvalue()
+
+
+def test_render_benchmark_all_prompts_refused_stores_nothing(make_console, monkeypatch):
+    # Every prompt refused by per-prompt governance is NOT a 0% measurement — refuse to store it.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    bk = types.SimpleNamespace(benchmark=lambda model, prompts, *, max_context, **kw: {
+        "context": max_context,
+        "results": [{"prompt_index": i, "refused": True, "reason": "ctx too small"}
+                    for i in range(2)]})
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "every prompt was refused" in buf.getvalue()
+
+
+def test_render_benchmark_some_prompts_refused_warns(make_console, monkeypatch):
+    # A partial refusal depresses the score and emits a note — but still stores a measurement.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    bk = types.SimpleNamespace(benchmark=lambda model, prompts, *, max_context, **kw: {
+        "context": max_context,
+        "results": [{"prompt_index": 0, "refused": True, "reason": "x"},
+                    {"prompt_index": 1, "completion": "ans"}]})
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert "were refused by" in buf.getvalue()
+
+
+def test_render_benchmark_ignores_out_of_range_prompt_index(make_console, monkeypatch):
+    # A result with a missing/out-of-range prompt_index is ignored, not crashed on.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
+    bk = types.SimpleNamespace(benchmark=lambda model, prompts, *, max_context, **kw: {
+        "context": max_context,
+        "results": [{"prompt_index": 0, "completion": "ans0"},
+                    {"prompt_index": 99, "completion": "out-of-range"},   # ignored
+                    {"completion": "no-index"}]})                          # ignored
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+
+
+# --- serve: MLX (wmx) governed-server path ---
+def _wire_serve_mlx(monkeypatch, set_platform, *, ceiling=8000, serve=None):
+    """Route `serve --engine wmx` to the MLX path with the db + port + apple.serve seams stubbed."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: {"safe_context": ceiling} if e == "wmx" else None)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+    if serve is not None:
+        monkeypatch.setattr("ara.backends.apple.serve", serve)
+
+
+def test_serve_mlx_rejects_nonpositive_ctx(make_console, monkeypatch, set_platform):
+    _wire_serve_mlx(monkeypatch, set_platform)
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", ctx=0, assume_yes=True) == 1
+    assert "positive" in buf.getvalue()
+
+
+def test_serve_mlx_confirm_declined_skips(make_console, monkeypatch, set_platform):
+    _wire_serve_mlx(monkeypatch, set_platform)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli, "_confirm", lambda q: False)
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx") == 0     # not --yes → prompts → declined
+    assert "skipped" in buf.getvalue()
+
+
+def test_serve_mlx_handles_serve_failure(make_console, monkeypatch, set_platform):
+    def boom(model, *, port, max_context, kv_quant="f16"):
+        raise RuntimeError("gate refused")
+    _wire_serve_mlx(monkeypatch, set_platform, serve=boom)
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 1
+    out = buf.getvalue()
+    assert "couldn't start the MLX server" in out and "gate refused" in out
+
+
+def test_serve_mlx_json_output(make_console, monkeypatch, set_platform, capsys):
+    class _Proc:
+        def wait(self):
+            pass
+    _wire_serve_mlx(monkeypatch, set_platform, ceiling=8000,
+                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    (_Proc(), f"http://127.0.0.1:{port}", max_context))
+    c, _ = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runtime"] == "mlx" and payload["served_context"] == 8000
+    assert payload["endpoint"].endswith("/v1") and payload["ceiling_source"] == "measured"
+
+
+def test_serve_mlx_sigterm_handler_terminates_child(make_console, monkeypatch, set_platform):
+    import signal as _signal
+    terminated = {}
+
+    class _Proc:
+        def terminate(self):
+            terminated["yes"] = True
+
+        def wait(self):
+            pass
+
+    _wire_serve_mlx(monkeypatch, set_platform,
+                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    (_Proc(), f"http://127.0.0.1:{port}", max_context))
+    captured = {}
+
+    def fake_signal(sig, handler):
+        if sig == _signal.SIGTERM and callable(handler):
+            captured["handler"] = handler
+        return _signal.SIG_DFL
+    monkeypatch.setattr(_signal, "signal", fake_signal)
+    c, _ = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 0
+    # the installed SIGTERM handler must terminate the child, then exit (no orphaned server)
+    with pytest.raises(SystemExit):
+        captured["handler"](_signal.SIGTERM, None)
+    assert terminated.get("yes") is True
+
+
+def test_serve_non_apple_engine_falls_through_to_ollama(make_console, monkeypatch):
+    # `serve --engine <non-apple>` does NOT route to MLX; it falls through to the Ollama path.
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, isatty=False)
+    monkeypatch.setattr(cli.engines, "resolve", lambda e: "cpu")   # non-apple backend
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, engine="cpu") == 0
+    assert "qwen3-0.6b-ara" in buf.getvalue()
+
+
+def test_main_benchmark_use_case_equals_form(monkeypatch):
+    # the `--use-case=coding` (joined) argv form parses identically to the spaced form.
+    captured = {}
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda *a, **k: captured.update(k) or 0)
+    monkeypatch.setattr(cli, "_resolve_want", lambda *a, **k: None)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case=coding", "--yes"])
+    assert captured.get("use_case") == "coding"
+
+
+def test_render_benchmark_confirm_accepted_proceeds(make_console, monkeypatch):
+    # interactive (tty), no --yes: accepting the prompt proceeds to run the benchmark.
+    _wire_benchmark(monkeypatch, score=0.6)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli, "_confirm", lambda q: True)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning") == 0
+    assert "measured here" in buf.getvalue()
+
+
+def test_serve_mlx_confirm_accepted_proceeds(make_console, monkeypatch, set_platform):
+    class _Proc:
+        def wait(self):
+            pass
+    _wire_serve_mlx(monkeypatch, set_platform,
+                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    (_Proc(), f"http://127.0.0.1:{port}", max_context))
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli, "_confirm", lambda q: True)
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx") == 0      # tty + accepted → serves
+    assert "serving" in buf.getvalue()
+
+
+def test_free_port_returns_an_available_port():
+    # exercised directly: every serve test stubs it, so the real bind/close needs its own test.
+    p = cli._free_port()
+    assert isinstance(p, int) and 1024 <= p <= 65535
