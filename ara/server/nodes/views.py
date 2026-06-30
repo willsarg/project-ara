@@ -8,6 +8,7 @@ only ever sees rendered HTML.
 """
 from __future__ import annotations
 
+from django.contrib.admin.views.decorators import staff_member_required
 from django.shortcuts import render
 
 from ara.server import client
@@ -46,6 +47,9 @@ def _probe(node) -> dict:
     return row
 
 
+@staff_member_required          # the dashboard shows the whole fleet — never serve it unauthenticated;
+                                # unauthenticated requests redirect to the admin login (Rule #1 ethos,
+                                # belt to the localhost-by-default bind: safe even if you expose it)
 def dashboard(request):
     nodes = [_probe(n) for n in Node.objects.all().order_by("name")]
     online = sum(1 for n in nodes if n["online"])

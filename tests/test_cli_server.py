@@ -25,9 +25,9 @@ def con():
     return cli.Console(color=False, stream=buf), buf
 
 
-def _server(cb, *args, **kw):
+def _server(cb, *args, host="127.0.0.1", **kw):
     c, _buf = cb
-    return cli.render_server(c, ["server", *args], host="0.0.0.0", port=8474, **kw)
+    return cli.render_server(c, ["server", *args], host=host, port=8474, **kw)
 
 
 # --- serve (foreground) ---
@@ -36,14 +36,20 @@ def test_serve_banner_and_launch(con, monkeypatch):
     monkeypatch.setattr(service, "serve", lambda h, p: seen.update(host=h, port=p))
     assert _server(con, "serve") == 0
     out = con[1].getvalue()
-    assert "http://0.0.0.0:8474" in out and "/admin/" in out
-    assert seen == {"host": "0.0.0.0", "port": 8474}
+    assert "http://127.0.0.1:8474" in out and "localhost only" in out   # localhost by default
+    assert seen == {"host": "127.0.0.1", "port": 8474}
 
 
 def test_serve_json_skips_banner(con, monkeypatch):
     monkeypatch.setattr(service, "serve", lambda h, p: None)
     assert _server(con, "serve", as_json=True) == 0
-    assert con[1].getvalue() == ""               # no banner under --json
+    assert con[1].getvalue() == ""               # no banner under --json (loopback → no warning either)
+
+
+def test_serve_warns_when_exposed(con, monkeypatch):
+    monkeypatch.setattr(service, "serve", lambda h, p: None)
+    assert _server(con, "serve", host="0.0.0.0") == 0
+    assert "exposing the dashboard" in con[1].getvalue()    # the dashboard leak is loud on expose
 
 
 def test_serve_missing_extra_is_actionable(con, monkeypatch):
@@ -82,15 +88,21 @@ def test_install_reports_endpoint(con, monkeypatch):
     seen = {}
     monkeypatch.setattr(service, "install", lambda h, p: seen.update(host=h, port=p))
     assert _server(con, "install") == 0
-    assert seen == {"host": "0.0.0.0", "port": 8474}
+    assert seen == {"host": "127.0.0.1", "port": 8474}
     assert "installed" in con[1].getvalue()
+
+
+def test_install_warns_when_exposed(con, monkeypatch):
+    monkeypatch.setattr(service, "install", lambda h, p: None)
+    assert _server(con, "install", host="0.0.0.0") == 0
+    assert "exposing the dashboard" in con[1].getvalue()
 
 
 def test_install_json_carries_endpoint(con, capsys, monkeypatch):
     monkeypatch.setattr(service, "install", lambda h, p: None)
     assert _server(con, "install", as_json=True) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["ok"] and out["endpoint"] == "http://0.0.0.0:8474"
+    assert out["ok"] and out["endpoint"] == "http://127.0.0.1:8474"
 
 
 def test_status_text(con, monkeypatch):

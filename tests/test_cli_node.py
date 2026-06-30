@@ -20,9 +20,9 @@ def con():
     return cli.Console(color=False, stream=buf), buf
 
 
-def _node(cb, *args, **kw):
+def _node(cb, *args, host="127.0.0.1", **kw):
     c, _buf = cb
-    return cli.render_node(c, ["node", *args], host="0.0.0.0", port=8473, **kw)
+    return cli.render_node(c, ["node", *args], host=host, port=8473, **kw)
 
 
 # --- token ---
@@ -51,15 +51,25 @@ def test_serve_banner_and_launch(con, monkeypatch):
     monkeypatch.setattr(service, "serve", lambda h, p: seen.update(host=h, port=p))
     assert _node(con, "serve") == 0
     out = con[1].getvalue()
-    assert "http://0.0.0.0:8473" in out and "TOK" in out
-    assert seen == {"host": "0.0.0.0", "port": 8473}
+    assert "http://127.0.0.1:8473" in out and "TOK" in out      # localhost by default
+    assert "localhost only" in out                              # the scope hint
+    assert seen == {"host": "127.0.0.1", "port": 8473}
 
 
 def test_serve_json_skips_banner(con, capsys, monkeypatch):
     monkeypatch.setattr(auth, "ensure_token", lambda: "TOK")
     monkeypatch.setattr(service, "serve", lambda h, p: None)
     assert _node(con, "serve", as_json=True) == 0
-    assert con[1].getvalue() == ""               # no banner under --json
+    assert con[1].getvalue() == ""               # no banner under --json (loopback → no warning either)
+
+
+def test_serve_warns_when_exposed(con, monkeypatch):
+    monkeypatch.setattr(auth, "ensure_token", lambda: "TOK")
+    monkeypatch.setattr(service, "serve", lambda h, p: None)
+    assert _node(con, "serve", host="0.0.0.0") == 0
+    out = con[1].getvalue()
+    assert "⚠" in out and "exposing the node" in out            # safe-by-default: exposure is loud
+    assert "scope" not in out                                   # no localhost hint when exposed
 
 
 def test_serve_missing_extra_is_actionable(con, monkeypatch):
@@ -77,8 +87,15 @@ def test_install_reports_endpoint_and_token(con, monkeypatch):
     seen = {}
     monkeypatch.setattr(service, "install", lambda h, p: seen.update(host=h, port=p))
     assert _node(con, "install") == 0
-    assert seen == {"host": "0.0.0.0", "port": 8473}
+    assert seen == {"host": "127.0.0.1", "port": 8473}
     assert "installed" in con[1].getvalue()
+
+
+def test_install_warns_when_exposed(con, monkeypatch):
+    monkeypatch.setattr(auth, "ensure_token", lambda: "TOK")
+    monkeypatch.setattr(service, "install", lambda h, p: None)
+    assert _node(con, "install", host="0.0.0.0") == 0
+    assert "exposing the node" in con[1].getvalue()
 
 
 def test_install_json_carries_endpoint_and_token(con, capsys, monkeypatch):
@@ -86,7 +103,7 @@ def test_install_json_carries_endpoint_and_token(con, capsys, monkeypatch):
     monkeypatch.setattr(service, "install", lambda h, p: None)
     assert _node(con, "install", as_json=True) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["ok"] and out["endpoint"] == "http://0.0.0.0:8473" and out["token"] == "TOK"
+    assert out["ok"] and out["endpoint"] == "http://127.0.0.1:8473" and out["token"] == "TOK"
 
 
 def test_status_text(con, monkeypatch):

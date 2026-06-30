@@ -2119,6 +2119,22 @@ def _node_err(c: Console, as_json: bool, msg: str) -> int:
     return 1
 
 
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _warn_if_exposed(c: Console, host: str, surface: str) -> None:
+    """Warn LOUDLY when binding past loopback — the service then listens on the network, not just this
+    box. ARA binds localhost by default; exposing it is a conscious choice, and the bearer token (node)
+    / admin login (dashboard) is then the ONLY thing between it and anyone who can reach the port. Always
+    emitted (even under --json it goes to the console stream, not stdout) — it's a safety notice."""
+    if host in _LOOPBACK:
+        return
+    c.emit(c.style("warn",
+                   f"  ⚠  exposing {surface} on {host} — reachable from the network, not just this box."))
+    c.emit(c.style("warn",
+                   "     only on a network you trust, and treat the token / login as a real secret."))
+
+
 def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: bool = False) -> int:
     """`ara node <sub>` — run/manage the headless node daemon (a FastAPI API over ARA's verbs).
 
@@ -2140,8 +2156,11 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: b
 
     if sub == "serve":
         tok = auth.ensure_token()
+        _warn_if_exposed(c, host, "the node")
         if not as_json:
             c.emit(c.field("ara node", f"serving on http://{host}:{port}"))
+            if host in _LOOPBACK:
+                c.emit(c.field("scope", "localhost only · pass --host 0.0.0.0 to expose on your network"))
             c.emit(c.field("token", tok))
         try:
             service.serve(host, port)          # blocks until the process is stopped
@@ -2154,6 +2173,7 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: b
         try:
             if sub == "install":
                 tok = auth.ensure_token()
+                _warn_if_exposed(c, host, "the node")
                 service.install(host, port)
                 return _node_say(c, as_json, f"installed + started on http://{host}:{port}",
                                  endpoint=f"http://{host}:{port}", token=tok)
@@ -2196,9 +2216,12 @@ def render_server(c: Console, rest: list[str], *, host: str, port: int, as_json:
     _missing = "server web stack not installed — run: pip install 'project-ara[server]'"
 
     if sub == "serve":
+        _warn_if_exposed(c, host, "the dashboard")
         if not as_json:
             c.emit(c.field("ara server", f"serving on http://{host}:{port}"))
-            c.emit(c.field("dashboard", f"http://{host}:{port}/admin/"))
+            c.emit(c.field("dashboard", f"http://{host}:{port}/  ·  log in (ara server createadmin)"))
+            if host in _LOOPBACK:
+                c.emit(c.field("scope", "localhost only · pass --host 0.0.0.0 to expose on your network"))
         try:
             service.serve(host, port)          # blocks until the process is stopped
         except ImportError:
@@ -2240,6 +2263,7 @@ def render_server(c: Console, rest: list[str], *, host: str, port: int, as_json:
     if sub in ("install", "start", "stop", "status", "uninstall"):
         try:
             if sub == "install":
+                _warn_if_exposed(c, host, "the dashboard")
                 service.install(host, port)
                 return _server_say(c, as_json, f"installed + started on http://{host}:{port}",
                                    endpoint=f"http://{host}:{port}")
@@ -2294,7 +2318,8 @@ def _main_impl() -> int:
     prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
     serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
     serve_name: str | None = None                # `serve --name X`: derived served-model name
-    node_host: str = "0.0.0.0"                   # `node --host H`: daemon bind address (LAN by default)
+    node_host: str = "127.0.0.1"                 # `node/server --host H`: bind LOCALHOST by default —
+                                                 # exposing on the network is an explicit, warned opt-in
     node_port: int = 8473                        # `node --port N`: daemon bind port
     server_port: int = 8474                      # `server --port N`: coordinator bind port (distinct default)
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension

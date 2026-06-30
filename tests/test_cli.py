@@ -138,7 +138,7 @@ def test_main_node_host_port_equals_form(monkeypatch):
 def test_main_node_defaults_when_flags_absent(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["node", "token"]) == 0
-    assert rec["node_host"] == "0.0.0.0" and rec["node_port"] == 8473
+    assert rec["node_host"] == "127.0.0.1" and rec["node_port"] == 8473   # safe: localhost by default
 
 
 def test_main_node_invalid_port_keeps_default(monkeypatch):
@@ -157,7 +157,7 @@ def test_main_server_routes_with_host_port(monkeypatch):
 def test_main_server_default_port_is_8474(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["server", "migrate"]) == 0
-    assert rec["server_host"] == "0.0.0.0" and rec["server_port"] == 8474
+    assert rec["server_host"] == "127.0.0.1" and rec["server_port"] == 8474   # localhost by default
 
 
 def test_main_server_equals_form_overrides_default(monkeypatch):
