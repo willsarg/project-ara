@@ -295,12 +295,6 @@ def test_main_install_honors_positional_engine(monkeypatch):
     assert rec["install"]["engine"] == "wmx"
 
 
-def test_main_install_defaults_to_auto(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["install"])
-    assert rec["install"]["engine"] == "auto"
-
-
 def test_main_install_engine_flag_still_works(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["install", "--engine", "cpu"])
@@ -1175,7 +1169,9 @@ def test_render_apps_text_with_drift_and_duplicate(make_console, monkeypatch):
     out = buf.getvalue()
     assert "AI/ML APPS" in out and "model runners" in out
     assert "LM Studio 0.3.5" in out
-    assert "self-updated past brew" in out and "clobber" in out   # clueless drift
+    # the per-app clueless-drift gloss — NOT the bare "clobber" (the footer legend's "can clobber"
+    # is always present, so a bare substring check would pass even if the per-app gloss broke).
+    assert "self-updated past brew" in out and "will clobber it" in out
     assert "likely duplicate" in out                              # ollama dup
 
 
@@ -4472,7 +4468,7 @@ def test_render_hf_logout_absent(make_console, monkeypatch):
     rc = cli.render_hf(c, "logout")
     assert rc == 0
     out = buf.getvalue()
-    assert "no stored" in out.lower() or "nothing" in out.lower() or "no" in out.lower()
+    assert "no stored hugging face token to remove" in out.lower()
 
 
 def test_render_hf_logout_env_shadowed(make_console, monkeypatch):

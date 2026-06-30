@@ -405,21 +405,21 @@ def test_start_worker_server_returns_proc_and_dict_on_ready_json(engines_root, m
 
 
 def test_start_worker_server_raises_on_refused(engines_root, monkeypatch):
-    """refused=true JSON → EngineEnvError with the reason; process is waited."""
+    """refused=true JSON → EngineEnvError with the reason; child is reaped (kill + wait)."""
     refused = '{"refused": true, "reason": "model exceeds safe budget"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [refused])
     with pytest.raises(engine_env.EngineEnvError, match="model exceeds safe budget"):
         engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
-    assert proc.waited
+    assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
 def test_start_worker_server_raises_on_error(engines_root, monkeypatch):
-    """error key in JSON → EngineEnvError with the error text; process is waited."""
+    """error key in JSON → EngineEnvError with the error text; child is reaped (kill + wait)."""
     error = '{"error": "load failed: model not found"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [error])
     with pytest.raises(engine_env.EngineEnvError, match="load failed"):
         engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
-    assert proc.waited
+    assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
 def test_start_worker_server_raises_when_no_json_before_exit(engines_root, monkeypatch):

@@ -124,6 +124,11 @@ def test_l2_stops_when_measured_reaches_budget():
                             measure=lambda m, ctx: {"context": ctx, "mem_gb": 40.0},
                             schedule=[2000, 4000])
     assert r["safe_context"] is None       # first rung over budget → <2 usable points
+    # The ceiling alone doesn't prove L2 fired: a flat 40.0 line has slope 0, so safe_ceiling
+    # returns None whether or not L2 exists. The discriminating signal is `points` — L2 refuses
+    # each over-budget rung BEFORE it's appended, so nothing is recorded. Without L2 both rungs
+    # would land here as (2000, 40.0)/(4000, 40.0). This assertion is what ties the test to L2.
+    assert r["points"] == []
 
 
 def test_null_safe_context_includes_stopped_reason_and_preflight():
@@ -242,7 +247,9 @@ def test_decode_context_none_when_fit_is_none(monkeypatch):
 
 
 def test_decode_context_does_not_change_prefill_ceiling_or_binding(monkeypatch):
-    # Confirm the L2 gate still keys off the measured peak; decode_context is additive only
+    # decode_context is additive: adding it must NOT perturb the prefill ceiling or binding.
+    # (This is a no-regression check on the decode field — L2's own coverage lives in
+    # test_l2_stops_when_measured_reaches_budget; this gentle ramp never approaches budget.)
     from ara.contracts import driver as drv
     from ara import catalog
     monkeypatch.setattr(catalog, "describe", lambda m: dict(_META_DICT))

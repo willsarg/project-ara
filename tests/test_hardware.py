@@ -929,6 +929,7 @@ def test_memory_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
     mi = hw.memory_info()
     assert isinstance(mi, hw.MemoryInfo)
+    assert mi.modules == []          # pin the "empty" claim, not just the type
 
 
 # ---------------------------------------------------------------------------
@@ -1210,6 +1211,7 @@ def test_storage_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(hw, "_disk_free_gb", lambda: None)
     si = hw.storage_info()
     assert isinstance(si, hw.StorageInfo)
+    assert si.drives == [] and si.free_gb is None   # pin the "empty" claim, not just the type
 
 
 # --- _drives_macos branch coverage ---
@@ -1332,7 +1334,7 @@ def test_board_macos_missing_fields():
     assert b.bios_version is None
 
 
-def test_board_macos_sets_vendor_apple_always():
+def test_board_macos_no_model_name_leaves_vendor_none():
     """Any text that lacks 'Model Name:' → system_vendor is still None (not forced to Apple
     unless we actually found hardware info — honest gap)."""
     b = hw._board_macos("Some hardware text without expected keys\n")
@@ -1507,6 +1509,7 @@ def test_board_info_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(hw, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     b = hw.board_info()
     assert isinstance(b, hw.BoardInfo)
+    assert b.board_vendor is None   # pin the "empty" claim, not just the type
 
 
 # ---------------------------------------------------------------------------
@@ -1623,6 +1626,7 @@ def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
     (tmp_path / "card0" / "device").mkdir(parents=True)   # no vendor file
     monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
     monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])   # don't shell out to real vulkaninfo
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo())
     assert hw._gpus_linux() == []
 
@@ -1657,6 +1661,7 @@ def test_gpus_linux_two_gpus_amd_integrated_is_none(tmp_path, monkeypatch):
         (dev / "device").write_text(f"{device}\n")
     monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
     monkeypatch.setattr(hw, "_lspci_names", lambda: {})
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])   # don't shell out to real vulkaninfo
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
     gpus = hw._gpus_linux()
     assert len(gpus) == 2
@@ -1674,10 +1679,13 @@ def test_video_controller_gpu_nvidia():
     assert g.vram_gb is None          # 4293918720 ≈ uint32 cap ⇒ unknown, not 4.3
 
 
-def test_video_controller_gpu_amd_real_vram():
+def test_video_controller_gpu_amd_small_adapterram_under_cap():
+    # A sub-4GB AdapterRAM (here a 2GB integrated Radeon carveout) is BELOW the uint32 cap, so it's
+    # trusted: vram_gb = bytes/1e9. (A real RX 6600 is 8GB and would report the uint32-pinned cap →
+    # None, like the NVIDIA case above; don't pair a big-SKU name with a small reading.)
     from ara import hardware as hw
     g = hw._video_controller_gpu({
-        "Name": "AMD Radeon RX 6600", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
+        "Name": "AMD Radeon(TM) Graphics", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
         "DriverVersion": "31.0.21912.14", "AdapterRAM": 2147483648})
     assert g.vendor == "amd" and g.vram_gb == 2.1   # 2147483648/1e9
 
