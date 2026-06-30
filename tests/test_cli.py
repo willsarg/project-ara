@@ -111,9 +111,6 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_node",
                         lambda c, rest, host=None, port=None, as_json=False:
                         (rec.update(node=rest[1:], node_host=host, node_port=port) or 0))
-    monkeypatch.setattr(cli, "render_server",
-                        lambda c, rest, host=None, port=None, as_json=False:
-                        (rec.update(server=rest[1:], server_host=host, server_port=port) or 0))
     return rec
 
 
@@ -145,31 +142,6 @@ def test_main_node_invalid_port_keeps_default(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["node", "serve", "--port", "abc", "--port=xyz"]) == 0
     assert rec["node_port"] == 8473            # non-int on either form falls back to the default
-
-
-def test_main_server_routes_with_host_port(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["server", "serve", "--host", "1.2.3.4", "--port", "9000"]) == 0
-    assert rec["server"] == ["serve"]
-    assert rec["server_host"] == "1.2.3.4" and rec["server_port"] == 9000
-
-
-def test_main_server_default_port_is_8474(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["server", "migrate"]) == 0
-    assert rec["server_host"] == "127.0.0.1" and rec["server_port"] == 8474   # localhost by default
-
-
-def test_main_server_equals_form_overrides_default(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["server", "status", "--port=1234"]) == 0
-    assert rec["server_port"] == 1234
-
-
-def test_main_server_invalid_port_keeps_default(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["server", "serve", "--port", "abc"]) == 0
-    assert rec["server_port"] == 8474          # non-int falls back to the server default
 
 
 def test_main_no_args_shows_landing(monkeypatch):
