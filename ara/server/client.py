@@ -24,10 +24,13 @@ def _url(node, path: str) -> str:
     return node.base_url.rstrip("/") + path
 
 
-def get(node, path: str, **params) -> dict | list:
-    """GET *path* on *node* and return the decoded JSON (raises on a non-2xx status)."""
+def get(node, path: str, *, timeout: float = _TIMEOUT, **params) -> dict | list:
+    """GET *path* on *node* and return the decoded JSON (raises on a non-2xx status).
+
+    ``timeout`` is keyword-only so the dashboard can poll many nodes with a short budget (an
+    offline box shouldn't stall the page); query params still pass through as keywords."""
     resp = httpx.get(_url(node, path), headers=_headers(node),
-                     params=params or None, timeout=_TIMEOUT)
+                     params=params or None, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
