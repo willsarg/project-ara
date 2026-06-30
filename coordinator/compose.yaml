@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+services:
+  coordinator:
+    build: .
+    image: ara-coordinator
+    ports:
+      - "3000:3000"
+    environment:
+      # Set this to your admin password. If omitted, one is generated on first run and printed once
+      # to the container logs (docker compose logs coordinator).
+      ARA_COORDINATOR_PASSWORD: ${ARA_COORDINATOR_PASSWORD:-}
+      # Optional explicit cookie-signing secret. If unset it is derived from the password above.
+      ARA_COORDINATOR_SECRET: ${ARA_COORDINATOR_SECRET:-}
+      ARA_COORDINATOR_DB: /app/data/coordinator.db
+    volumes:
+      # Persist the SQLite registry across restarts.
+      - ./data:/app/data
+    restart: unless-stopped

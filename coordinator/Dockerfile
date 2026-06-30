@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Multi-stage build for the ARA coordinator (Next.js standalone output).
+
+# ---- deps: install node modules (incl. compiling better-sqlite3's native binding) -------------
+FROM node:22-bookworm-slim AS deps
+WORKDIR /app
+# better-sqlite3 builds from source → needs python3 + a C++ toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# ---- builder: produce .next/standalone ---------------------------------------------------------
+FROM node:22-bookworm-slim AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ---- runner: slim runtime image ----------------------------------------------------------------
+FROM node:22-bookworm-slim AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+# The SQLite registry lives here; compose mounts a volume over it.
+ENV ARA_COORDINATOR_DB=/app/data/coordinator.db
+
+RUN useradd -m -u 1001 ara
+# Standalone server + its traced node_modules (includes the better-sqlite3 native binding).
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+RUN mkdir -p /app/data && chown -R ara:ara /app
+USER ara
+
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=4s --start-period=10s \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server.js"]

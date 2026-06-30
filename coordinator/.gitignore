@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+next-env.d.ts
+*.tsbuildinfo
+
+# local registry + secrets (volume-mounted in prod)
+/data
+.env
+.env.local

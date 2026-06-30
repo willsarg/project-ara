@@ -14,8 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# anchored to repo root: the bare `lib/`/`lib64/` (Python build-artifact boilerplate) also matched
+# nested source dirs like coordinator/src/lib/ and would silently drop them from commits.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
