@@ -70,10 +70,15 @@ ENGINES: dict[str, dict] = {
         # `--only-binary` (added in _install_targets) makes that deterministic. Scoped to
         # Windows so Linux/macOS/aarch64 (Pi) keep the source build — the abetlen index has no
         # wheel for them, and those platforms ship a toolchain.
-        #   max_version: abetlen's wheels after 0.3.19 are static AVX-512 builds that fault
-        #   (illegal instruction, 0xc000001d) on the many x86 CPUs without AVX-512 — e.g. AMD
-        #   Zen 1–3. 0.3.19 is the newest AVX2-baseline wheel, so it runs on essentially any
-        #   x86-64. Native builds elsewhere pick the host's own ISA, so this cap is Windows-only.
+        #   max_version: 0.3.19 is the last Windows CPU wheel that actually RUNS via this binding.
+        #   The post-0.3.19 /whl/cpu Windows wheels (py3-none-win_amd64) ship a split/runtime-loaded
+        #   ggml backend that llama-cpp-python doesn't initialize (upstream #2069, "no backends
+        #   loaded"). Verified 2026-06-30 on willw11 (Zen-3, cp312): 0.3.21 imports but fails to
+        #   load ANY model (SmolLM2 and gemma-4 both "Failed to load model from file"); 0.3.32's
+        #   llama.dll fails to load outright (WinError 127). (Historically these were also flagged
+        #   as AVX-512 builds that fault on non-AVX-512 CPUs — 0xc000001d.) Native builds elsewhere
+        #   are monolithic + host-ISA, so this cap is Windows-only; Linux/macOS get the latest
+        #   llama-cpp-python (verified Mac cpu engine ships 0.3.31, runs gemma-4).
         "wheel_only": {
             "llama-cpp-python": {
                 "index": "https://abetlen.github.io/llama-cpp-python/whl/cpu",
