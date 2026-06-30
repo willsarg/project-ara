@@ -24,6 +24,14 @@ dependencies = [
 [project.scripts]
 ara = "ara.cli:main"
 
+# Optional web stacks — NEVER base deps, so `pip install project-ara` stays the 4 lean deps above.
+# `ara node`/`ara server` lazy-import these and tell the user to run `ara node install` (which ensures
+# the extra) if absent — the same on-demand philosophy as engines. The node daemon needs FastAPI;
+# the server coordinator is a Django app.
+[project.optional-dependencies]
+node = ["fastapi>=0.115", "uvicorn>=0.30"]
+server = ["django>=5.1"]
+
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
@@ -41,7 +49,10 @@ packages = ["ara"]
 # Test/dev tooling. The suite runs WITHOUT any engine on purpose — it proves the
 # core stays engine-free — so it never needs wmx-suite (the seam uses a fake).
 [dependency-groups]
-dev = ["pytest>=8", "pytest-cov>=5", "mutmut>=3"]
+# fastapi/uvicorn/django/httpx are here (not just in the optional extras) so the node/server code is
+# exercised by the 100% coverage gate — httpx backs FastAPI's TestClient.
+dev = ["pytest>=8", "pytest-cov>=5", "mutmut>=3",
+       "fastapi>=0.115", "uvicorn>=0.30", "django>=5.1", "httpx>=0.27"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
