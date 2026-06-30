@@ -219,6 +219,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
     c.emit(_cmd(c, "node <sub>", "run ARA as a daemon you can drive over HTTP (serve/install/…)"))
+    c.emit(_cmd(c, "server <sub>", "run the ARA coordinator — a dashboard over your nodes (serve/migrate/…)"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
@@ -2170,6 +2171,67 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: b
                      "[--host H] [--port N]")
 
 
+def _server_say(c: Console, as_json: bool, msg: str, **fields) -> int:
+    """Success line for an `ara server` subcommand: a JSON object under --json, a styled field else."""
+    if as_json:
+        print(json.dumps({"ok": True, "message": msg, **fields}))
+    else:
+        c.emit(c.field("ara server", msg))
+    return 0
+
+
+def render_server(c: Console, rest: list[str], *, host: str, port: int, as_json: bool = False) -> int:
+    """`ara server <sub>` — run/manage the Django coordinator (a dashboard + HTTP client of nodes).
+
+    Subcommands: ``serve`` (foreground launcher — Django ASGI under uvicorn, what the systemd unit
+    runs), ``migrate`` (apply Django migrations — set up/upgrade the SQLite registry),
+    ``install``/``start``/``stop``/``status``/``uninstall`` (systemd --user lifecycle, mirroring
+    ``ara node``). The systemd path is Linux-only and raises a clear message elsewhere; the web stack
+    is the optional ``[server]`` extra and a missing import becomes an actionable hint, never a
+    traceback.
+    """
+    from ara.server import service
+
+    sub = rest[1] if len(rest) > 1 else None
+    _missing = "server web stack not installed — run: pip install 'project-ara[server]'"
+
+    if sub == "serve":
+        if not as_json:
+            c.emit(c.field("ara server", f"serving on http://{host}:{port}"))
+            c.emit(c.field("dashboard", f"http://{host}:{port}/admin/"))
+        try:
+            service.serve(host, port)          # blocks until the process is stopped
+        except ImportError:
+            return _node_err(c, as_json, _missing)
+        return 0
+
+    if sub == "migrate":
+        try:
+            service.migrate()
+        except ImportError:
+            return _node_err(c, as_json, _missing)
+        return _server_say(c, as_json, "migrate ok")
+
+    if sub in ("install", "start", "stop", "status", "uninstall"):
+        try:
+            if sub == "install":
+                service.install(host, port)
+                return _server_say(c, as_json, f"installed + started on http://{host}:{port}",
+                                   endpoint=f"http://{host}:{port}")
+            if sub == "status":
+                out = service.status()
+                print(json.dumps({"status": out})) if as_json else c.emit(out.rstrip())
+                return 0
+            getattr(service, sub)()            # start | stop | uninstall
+            return _server_say(c, as_json, f"{sub} ok")
+        except RuntimeError as exc:             # the systemd path is Linux-only
+            return _node_err(c, as_json, str(exc))
+
+    return _node_err(c, as_json,
+                     "usage: ara server {serve|migrate|install|start|stop|status|uninstall} "
+                     "[--host H] [--port N]")
+
+
 def main() -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
@@ -2209,6 +2271,7 @@ def _main_impl() -> int:
     serve_name: str | None = None                # `serve --name X`: derived served-model name
     node_host: str = "0.0.0.0"                   # `node --host H`: daemon bind address (LAN by default)
     node_port: int = 8473                        # `node --port N`: daemon bind port
+    server_port: int = 8474                      # `server --port N`: coordinator bind port (distinct default)
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension
     max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
     include: list[str] = []
@@ -2290,11 +2353,15 @@ def _main_impl() -> int:
             node_host = a.split("=", 1)[1] or node_host
             continue
         if a == "--port":
-            node_port = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "") or node_port
+            _port_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
+            node_port = _port_val or node_port       # one --port feeds both node + server defaults
+            server_port = _port_val or server_port
             skip = True
             continue
         if a.startswith("--port="):
-            node_port = _int_or_none(a.split("=", 1)[1]) or node_port
+            _port_val = _int_or_none(a.split("=", 1)[1])
+            node_port = _port_val or node_port
+            server_port = _port_val or server_port
             continue
         if a == "--use-case":
             use_case = argv[i + 1] if i + 1 < len(argv) else None
@@ -2424,6 +2491,9 @@ def _main_impl() -> int:
 
     if cmd == "node":
         return render_node(c, rest, host=node_host, port=node_port, as_json=as_json)
+
+    if cmd == "server":
+        return render_server(c, rest, host=node_host, port=server_port, as_json=as_json)
 
     if as_json:
         return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")

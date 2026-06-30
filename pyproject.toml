@@ -74,7 +74,10 @@ branch = true
 # ara/_vendor/* is the vendored engine source (wmx_suite, wcx_suite) — it ships in the wheel
 # but is never imported in ARA's process (it's pip-installed into the isolated engine env and
 # driven over a subprocess). It has its own suites' test suites, so it's outside ARA's gate.
-omit = ["ara/workers/*", "ara/_vendor/*"]
+# ara/server/* is the Django coordinator — a separate runtime (its own settings/db/admin), driven
+# over a subprocess by `ara server serve`, never imported in ARA's process. Its CLI surface
+# (ara/cli.py:render_server) IS in the gate and is unit-tested against a mocked ara.server.service.
+omit = ["ara/workers/*", "ara/_vendor/*", "ara/server/*"]
 
 [tool.coverage.report]
 show_missing = true
