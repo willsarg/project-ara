@@ -936,18 +936,20 @@ def test_memory_info_exception_returns_empty(monkeypatch):
 # Task 4: Storage detail
 # ---------------------------------------------------------------------------
 
-# --- Windows fixture (real winbox Get-PhysicalDisk output) ---
-# MediaType/BusType are friendly STRINGS ("SSD"/"NVMe"/...), not the uint16 enum codes the raw CIM
-# carries — verified 2026-06-30 on willw11 (PowerShell 5.1): `Get-PhysicalDisk | ConvertTo-Json`
-# serializes the top-level fields the parser reads as strings (the ints surface only in the nested
-# CimInstanceProperties dump we don't touch). So exact-string matching in _drives_windows is correct
-# — unlike the Win32_PhysicalMemory path, whose SMBIOSMemoryType genuinely comes through as an int.
+# --- Windows fixture (Get-PhysicalDisk shape; generic drive models, no personal hardware) ---
+# Drive FriendlyNames are placeholders — the parser only passes them through; classification keys
+# entirely off MediaType/BusType. Those are friendly STRINGS ("SSD"/"NVMe"/...), NOT the uint16 enum
+# codes the raw CIM carries — verified 2026-06-30 on a real PowerShell 5.1 box: `Get-PhysicalDisk |
+# ConvertTo-Json` serializes the top-level fields the parser reads as strings (the ints surface only
+# in the nested CimInstanceProperties dump we don't touch). So exact-string matching in
+# _drives_windows is correct — unlike the Win32_PhysicalMemory path, whose SMBIOSMemoryType
+# genuinely comes through as an int.
 _WIN_PHYSICAL_DISKS = [
-    {"FriendlyName": "Samsung SSD 990 EVO 1TB", "MediaType": "SSD", "BusType": "NVMe",
+    {"FriendlyName": "Generic NVMe SSD 1TB", "MediaType": "SSD", "BusType": "NVMe",
      "Size": 1000204886016},
-    {"FriendlyName": "ST2000DM008-2FR102", "MediaType": "HDD", "BusType": "SATA",
+    {"FriendlyName": "Generic SATA HDD 2TB", "MediaType": "HDD", "BusType": "SATA",
      "Size": 2000398934016},
-    {"FriendlyName": "QNAP TR-004 DISK00", "MediaType": "Unspecified", "BusType": "USB",
+    {"FriendlyName": "Generic USB HDD 8TB", "MediaType": "Unspecified", "BusType": "USB",
      "Size": 8001456963584},
 ]
 
@@ -1018,12 +1020,12 @@ _LINUX_LSBLK_JSON_UNKNOWN = """\
 
 def test_drives_windows_nvme_classification():
     """BusType=NVMe → 'nvme-ssd' regardless of MediaType."""
-    drives = hw._drives_windows([{"FriendlyName": "Samsung SSD 990 EVO 1TB",
+    drives = hw._drives_windows([{"FriendlyName": "Generic NVMe SSD 1TB",
                                    "MediaType": "SSD", "BusType": "NVMe",
                                    "Size": 1000204886016}])
     assert len(drives) == 1
     d = drives[0]
-    assert d.model == "Samsung SSD 990 EVO 1TB"
+    assert d.model == "Generic NVMe SSD 1TB"
     assert d.media == "nvme-ssd"
     assert d.size_gb == round(1000204886016 / 1e9, 1)
 
@@ -1038,7 +1040,7 @@ def test_drives_windows_sata_ssd_classification():
 
 def test_drives_windows_hdd_classification():
     """MediaType=HDD → 'hdd'."""
-    drives = hw._drives_windows([{"FriendlyName": "ST2000DM008-2FR102",
+    drives = hw._drives_windows([{"FriendlyName": "Generic SATA HDD 2TB",
                                    "MediaType": "HDD", "BusType": "SATA",
                                    "Size": 2000398934016}])
     assert drives[0].media == "hdd"
@@ -1046,7 +1048,7 @@ def test_drives_windows_hdd_classification():
 
 def test_drives_windows_usb_classification():
     """BusType=USB → 'usb'."""
-    drives = hw._drives_windows([{"FriendlyName": "QNAP TR-004 DISK00",
+    drives = hw._drives_windows([{"FriendlyName": "Generic USB HDD 8TB",
                                    "MediaType": "Unspecified", "BusType": "USB",
                                    "Size": 8001456963584}])
     assert drives[0].media == "usb"
@@ -1067,9 +1069,9 @@ def test_drives_windows_full_winbox_fixture():
     assert drives[0].media == "nvme-ssd"
     assert drives[1].media == "hdd"
     assert drives[2].media == "usb"
-    assert drives[0].model == "Samsung SSD 990 EVO 1TB"
-    assert drives[1].model == "ST2000DM008-2FR102"
-    assert drives[2].model == "QNAP TR-004 DISK00"
+    assert drives[0].model == "Generic NVMe SSD 1TB"
+    assert drives[1].model == "Generic SATA HDD 2TB"
+    assert drives[2].model == "Generic USB HDD 8TB"
 
 
 def test_drives_windows_empty_list():

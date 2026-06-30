@@ -3453,8 +3453,8 @@ def _windows_storage() -> StorageInfo:
     return StorageInfo(
         free_gb=500.0,
         drives=[
-            Drive(model="Samsung SSD 990 EVO 1TB", media="nvme-ssd", size_gb=1000.2),
-            Drive(model="ST2000DM008-2FR102", media="hdd", size_gb=2000.4),
+            Drive(model="Generic NVMe SSD 1TB", media="nvme-ssd", size_gb=1000.2),
+            Drive(model="Generic SATA HDD 2TB", media="hdd", size_gb=2000.4),
         ],
     )
 
@@ -3666,10 +3666,10 @@ def test_verbose_storage_detail_drives(make_console, monkeypatch, stub_pythons):
     c, buf = make_console(verbose=True)
     cli.render_detect(c)
     out = buf.getvalue()
-    assert "Samsung SSD 990 EVO 1TB" in out
+    assert "Generic NVMe SSD 1TB" in out
     assert "nvme-ssd" in out
     assert "1000 GB" in out
-    assert "ST2000DM008-2FR102" in out
+    assert "Generic SATA HDD 2TB" in out
     assert "hdd" in out
 
 
@@ -3704,7 +3704,7 @@ def test_non_verbose_no_storage_detail(make_console, monkeypatch, stub_pythons):
     monkeypatch.setattr(cli.detect, "machine", lambda: m)
     c, buf = make_console(verbose=False)
     cli.render_detect(c)
-    assert "Samsung SSD" not in buf.getvalue()
+    assert "Generic NVMe SSD" not in buf.getvalue()   # drive models hidden unless --verbose
 
 
 # --------------------------------------------------------------------------- #
@@ -3807,7 +3807,7 @@ def test_render_detect_json_has_storage_nested(monkeypatch, capsys):
     assert "storage" in payload
     drives = payload["storage"]["drives"]
     assert len(drives) == 2
-    assert drives[0]["model"] == "Samsung SSD 990 EVO 1TB"
+    assert drives[0]["model"] == "Generic NVMe SSD 1TB"
     assert drives[0]["media"] == "nvme-ssd"
 
 
