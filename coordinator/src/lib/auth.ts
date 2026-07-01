@@ -3,21 +3,28 @@
 // the Node runtime (login route) and the Edge runtime (middleware). No third-party auth lib.
 //
 // IMPORTANT: this module is Edge-safe — it must not import node:crypto, better-sqlite3, or db.ts.
-// The signing secret comes only from env (or a dev fallback), never from the SQLite registry, so
-// middleware can verify without a DB read.
+// The signing secret comes ONLY from env, never from the SQLite registry, so middleware (Edge) can
+// verify without a DB read. There is deliberately NO default/fallback secret: signing sessions with
+// a known key would let anyone forge a session cookie, so we fail closed (see the startup guard in
+// instrumentation.ts, which turns this into a clean boot error instead of a per-request throw).
 
 export const SESSION_COOKIE = "ara_coord_session";
 const SESSION_TTL_S = 60 * 60 * 24 * 7; // 7 days
 
-// Resolve the signing secret edge-safely. Order: explicit secret → derived from the admin password
-// → a fixed dev fallback (only hit when nothing is configured; production sets one of the envs).
+// Resolve the signing secret edge-safely: an explicit ARA_COORDINATOR_SECRET, else derived from the
+// admin password. If NEITHER is set we throw rather than fall back to a guessable key — no forgeable
+// sessions, ever. (The Edge runtime can't generate+persist a random secret, so it must be env-given.)
 function secretMaterial(): string {
-  return (
+  const secret =
     process.env.ARA_COORDINATOR_SECRET ||
-    (process.env.ARA_COORDINATOR_PASSWORD
-      ? `pw:${process.env.ARA_COORDINATOR_PASSWORD}`
-      : "ara-coordinator-dev-fallback-secret")
-  );
+    (process.env.ARA_COORDINATOR_PASSWORD ? `pw:${process.env.ARA_COORDINATOR_PASSWORD}` : "");
+  if (!secret) {
+    throw new Error(
+      "ARA coordinator: no session secret configured — set ARA_COORDINATOR_SECRET or " +
+        "ARA_COORDINATOR_PASSWORD. Refusing to sign sessions with a default (forgeable) key.",
+    );
+  }
+  return secret;
 }
 
 function b64urlEncode(bytes: Uint8Array): string {

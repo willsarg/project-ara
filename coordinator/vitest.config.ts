@@ -6,6 +6,9 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.test.ts", "src/**/*.test.ts"],
+    // A default session secret so tests that touch auth.ts don't trip the no-secret guard;
+    // auth.test.ts overrides it per-case with vi.stubEnv.
+    env: { ARA_COORDINATOR_SECRET: "test-secret" },
   },
   resolve: {
     alias: {
