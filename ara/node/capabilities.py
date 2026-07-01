@@ -20,18 +20,12 @@ from pathlib import Path
 
 import psutil
 
-from ara import db, detect, profile
+from ara import db, detect, hardware, profile
 
 # platform.system() → the environment schema's platform enum (linux | darwin | windows).
 _PLATFORMS = {"Linux": "linux", "Darwin": "darwin", "Windows": "windows"}
 # detect.Accelerator.kind → the environment schema's accel enum.
 _ACCELS = {"apple": "metal", "nvidia": "nvidia", "none": "cpu"}
-
-# cgroup memory-ceiling files (Linux). v2 is the unified hierarchy; v1 the legacy split one.
-_CGROUP_V2 = "/sys/fs/cgroup/memory.max"
-_CGROUP_V1 = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-# cgroup v1's "no limit" is a giant sentinel (PAGE_COUNTER_MAX rounded to a page) rather than a flag.
-_V1_UNLIMITED = 0x7FFFFFFFFFFFF000
 
 
 def _read_text(path: str) -> str | None:
@@ -49,43 +43,16 @@ def _path_exists(path: str) -> bool:
     return Path(path).exists()
 
 
-def _cgroup_memory_limit() -> int | None:
-    """This process's cgroup memory ceiling in bytes, or None when there is no real limit.
-
-    cgroup v2 (``memory.max``): the literal ``"max"`` means *no limit*; anything else is the byte
-    ceiling. cgroup v1 (``memory.limit_in_bytes``): a value at/above the unlimited sentinel means
-    *no limit*. Missing files (non-Linux, or no cgroup mounted) → None. A non-integer value is
-    treated as no limit rather than crashing the enroll."""
-    v2 = _read_text(_CGROUP_V2)
-    if v2 is not None:
-        v2 = v2.strip()
-        if v2 == "max":
-            return None
-        try:
-            return int(v2)
-        except ValueError:
-            return None
-    v1 = _read_text(_CGROUP_V1)
-    if v1 is not None:
-        try:
-            limit = int(v1.strip())
-        except ValueError:
-            return None
-        return None if limit >= _V1_UNLIMITED else limit
-    return None
-
-
 def _effective_wall() -> tuple[int, bool]:
     """``(effective_wall_bytes, cgroup_binds)`` — the memory ceiling this node should plan against.
 
-    The wall is the smaller of physical RAM and any real cgroup limit; ``cgroup_binds`` is True iff a
-    cgroup limit exists *and* is below physical (a container squeezed under the host). Off Linux
-    there is no cgroup, so the wall is always physical."""
+    The wall is the smaller of physical RAM and any real cgroup limit (via the shared
+    :func:`hardware.clamp_ram_to_cgroup`); ``cgroup_binds`` is True iff that clamp actually bit — a
+    cgroup limit below physical (a container squeezed under the host). Off Linux there is no cgroup,
+    so the wall is always physical."""
     physical = psutil.virtual_memory().total
-    limit = _cgroup_memory_limit() if platform.system() == "Linux" else None
-    if limit is not None and limit < physical:
-        return limit, True
-    return physical, False
+    wall = hardware.clamp_ram_to_cgroup(physical)
+    return wall, wall < physical
 
 
 def effective_wall() -> int:

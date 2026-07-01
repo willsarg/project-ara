@@ -17,6 +17,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
+from ara import hardware
 from ara.node import capabilities
 
 _SCHEMA_DIR = Path(__file__).resolve().parent.parent / "contracts" / "wire" / "schema"
@@ -48,6 +49,8 @@ def env_io(monkeypatch):
     state = {"files": {}, "exists": set(), "phys": 32 * 1024**3, "system": "Linux"}
     monkeypatch.setattr(capabilities, "_read_text", lambda path: state["files"].get(path))
     monkeypatch.setattr(capabilities, "_path_exists", lambda path: path in state["exists"])
+    # The cgroup wall now reads through the shared hardware boundary — mock it from the same state.
+    monkeypatch.setattr(hardware, "_read_cgroup_file", lambda path: state["files"].get(path))
     monkeypatch.setattr(capabilities.psutil, "virtual_memory",
                         lambda: types.SimpleNamespace(total=state["phys"]))
     monkeypatch.setattr(capabilities.platform, "system", lambda: state["system"])
@@ -81,51 +84,7 @@ def test_path_exists_boundary(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# _cgroup_memory_limit — v2 / v1 / max / sentinel / missing, all mocked file reads
-# --------------------------------------------------------------------------- #
-@pytest.fixture
-def cgroup_files(monkeypatch):
-    files: dict[str, str] = {}
-    monkeypatch.setattr(capabilities, "_read_text", lambda path: files.get(path))
-    return files
-
-
-def test_cgroup_v2_real_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V2] = "2147483648\n"
-    assert capabilities._cgroup_memory_limit() == 2147483648
-
-
-def test_cgroup_v2_max_is_no_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V2] = "max\n"
-    assert capabilities._cgroup_memory_limit() is None
-
-
-def test_cgroup_v2_garbage_is_no_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V2] = "not-a-number"
-    assert capabilities._cgroup_memory_limit() is None
-
-
-def test_cgroup_v1_real_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V1] = "1073741824"
-    assert capabilities._cgroup_memory_limit() == 1073741824
-
-
-def test_cgroup_v1_sentinel_is_no_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V1] = str(capabilities._V1_UNLIMITED)
-    assert capabilities._cgroup_memory_limit() is None
-
-
-def test_cgroup_v1_garbage_is_no_limit(cgroup_files):
-    cgroup_files[capabilities._CGROUP_V1] = "nope"
-    assert capabilities._cgroup_memory_limit() is None
-
-
-def test_cgroup_missing_files_is_no_limit(cgroup_files):
-    assert capabilities._cgroup_memory_limit() is None                    # empty dict → None reads
-
-
-# --------------------------------------------------------------------------- #
-# effective_wall / is_cgroup_bound
+# effective_wall / is_cgroup_bound — the label reads the shared hardware cgroup helper
 # --------------------------------------------------------------------------- #
 def test_effective_wall_is_physical_without_cgroup(env_io):
     env_io["phys"] = 16 * 1024**3
@@ -135,14 +94,14 @@ def test_effective_wall_is_physical_without_cgroup(env_io):
 
 def test_effective_wall_binds_to_cgroup_below_physical(env_io):
     env_io["phys"] = 16 * 1024**3
-    env_io["files"][capabilities._CGROUP_V2] = str(4 * 1024**3)
+    env_io["files"][hardware._CGROUP_V2] = str(4 * 1024**3)
     assert capabilities.effective_wall() == 4 * 1024**3
     assert capabilities.is_cgroup_bound() is True
 
 
 def test_cgroup_limit_at_or_above_physical_does_not_bind(env_io):
     env_io["phys"] = 16 * 1024**3
-    env_io["files"][capabilities._CGROUP_V2] = str(64 * 1024**3)
+    env_io["files"][hardware._CGROUP_V2] = str(64 * 1024**3)
     assert capabilities.effective_wall() == 16 * 1024**3
     assert capabilities.is_cgroup_bound() is False
 
@@ -150,7 +109,7 @@ def test_cgroup_limit_at_or_above_physical_does_not_bind(env_io):
 def test_effective_wall_ignores_cgroup_off_linux(env_io):
     env_io["system"] = "Darwin"
     env_io["phys"] = 16 * 1024**3
-    env_io["files"][capabilities._CGROUP_V2] = str(1 * 1024**3)           # would bind IF read
+    env_io["files"][hardware._CGROUP_V2] = str(1 * 1024**3)               # would bind IF read
     assert capabilities.effective_wall() == 16 * 1024**3
     assert capabilities.is_cgroup_bound() is False
 
@@ -225,7 +184,7 @@ def test_environment_bare_metal_is_physical_and_schema_valid(stub_host, env_io):
 def test_environment_container_honest_cgroup_wall(stub_host, env_io):
     stub_host()
     env_io["phys"] = 16 * 1024**3
-    env_io["files"][capabilities._CGROUP_V2] = str(4 * 1024**3)           # squeezed under the host
+    env_io["files"][hardware._CGROUP_V2] = str(4 * 1024**3)               # squeezed under the host
     env = capabilities.environment()
     assert env["wall_source"] == "cgroup"
     assert env["containerized"] is True                                   # a binding limit implies it

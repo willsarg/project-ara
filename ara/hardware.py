@@ -14,6 +14,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 GB = 1024 ** 3  # GiB — defined locally (NOT imported from detect) to avoid a circular import,
                 # since detect imports hardware. Matches detect.GB exactly.
@@ -671,12 +672,76 @@ def storage_info() -> "StorageInfo":
     return StorageInfo(free_gb=free_gb)
 
 
+# --------------------------------------------------------------------------- #
+# cgroup-honest memory wall (Rule #1) — a container capped below host RAM
+# --------------------------------------------------------------------------- #
+# cgroup memory-ceiling files (Linux). v2 is the unified hierarchy; v1 the legacy split one.
+_CGROUP_V2 = "/sys/fs/cgroup/memory.max"
+_CGROUP_V1 = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+# cgroup v1's "no limit" is a giant sentinel (PAGE_COUNTER_MAX rounded to a page), not a flag.
+_V1_UNLIMITED = 0x7FFFFFFFFFFFF000
+
+
+def _read_cgroup_file(path: str) -> str | None:
+    """Read a cgroup sysfs file, or None if it isn't there (non-Linux, no cgroup, no permission).
+
+    The single mockable filesystem boundary for the cgroup memory probe — tests patch this."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def cgroup_memory_limit_bytes() -> int | None:
+    """This process's cgroup memory ceiling in bytes, or None when there is no real limit.
+
+    cgroup v2 (``memory.max``): the literal ``"max"`` means *no limit*; anything else is the byte
+    ceiling. cgroup v1 (``memory.limit_in_bytes``): a value at/above the unlimited sentinel means
+    *no limit*. Missing files (non-Linux, or no cgroup mounted) → None. A non-integer value is
+    treated as no limit rather than crashing the caller."""
+    v2 = _read_cgroup_file(_CGROUP_V2)
+    if v2 is not None:
+        v2 = v2.strip()
+        if v2 == "max":
+            return None
+        try:
+            return int(v2)
+        except ValueError:
+            return None
+    v1 = _read_cgroup_file(_CGROUP_V1)
+    if v1 is not None:
+        try:
+            limit = int(v1.strip())
+        except ValueError:
+            return None
+        return None if limit >= _V1_UNLIMITED else limit
+    return None
+
+
+def clamp_ram_to_cgroup(total_bytes: int) -> int:
+    """Clamp a physical-RAM byte total down to a binding cgroup memory limit (Rule #1).
+
+    Inside a container capped below the host, the safety gate must size against the cgroup ceiling,
+    not physical RAM, or it over-sizes and OOMs. Returns the smaller of physical RAM and any real
+    cgroup limit; physical is unchanged when no limit binds or off Linux (there is no cgroup)."""
+    if platform.system() != "Linux":
+        return total_bytes
+    limit = cgroup_memory_limit_bytes()
+    if limit is not None and limit < total_bytes:
+        return limit
+    return total_bytes
+
+
 def _psutil_totals() -> tuple[float, float, float]:
-    """Return (total_gb, available_gb, swap_gb) from psutil."""
+    """Return (total_gb, available_gb, swap_gb) from psutil.
+
+    The total is cgroup-honest: inside a container capped below the host it is clamped to the cgroup
+    memory ceiling, so every wall-consumer downstream (``estimate.limits`` → the Rule #1 gate) sizes
+    against the real wall rather than the host's physical RAM."""
     import psutil
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
-    total_gb = round(vm.total / GB, 1)
+    total_gb = round(clamp_ram_to_cgroup(vm.total) / GB, 1)
     available_gb = round(vm.available / GB, 1)
     swap_gb = round(sw.total / GB, 1)
     return total_gb, available_gb, swap_gb

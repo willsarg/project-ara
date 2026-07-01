@@ -89,7 +89,8 @@ def os_version() -> str:
 def _memory_gb() -> tuple[float | None, float | None]:
     try:
         vm = psutil.virtual_memory()
-        return vm.total / GB, vm.available / GB
+        # cgroup-honest total (Rule #1): clamp to a binding container limit below host RAM.
+        return _hardware.clamp_ram_to_cgroup(vm.total) / GB, vm.available / GB
     except Exception:
         return None, None
 

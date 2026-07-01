@@ -8,7 +8,7 @@ context-window limit against the estimated budget.
 """
 from __future__ import annotations
 
-from ara import estimate
+from ara import estimate, hardware
 from ara.detect import Accelerator, Machine
 
 
@@ -54,6 +54,43 @@ def test_limits_missing_ram_is_unknown():
     lim = estimate.limits(_machine(backend="cpu", ram_total_gb=None))
     assert lim["wall_gb"] is None
     assert lim["safe_budget_gb"] is None
+
+
+# --- the Rule #1 gate is cgroup-honest: the wall source is clamped for containers --------- #
+def _clamped_ram_total_gb(monkeypatch, *, system, phys_gb, cgroup_gb=None):
+    """Drive the core RAM-total source (hardware._psutil_totals) under a mocked host + cgroup, and
+    return the total the gate would see. This is the exact value detect feeds Machine.ram_total_gb."""
+    import psutil
+    monkeypatch.setattr(hardware.platform, "system", lambda: system)
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type("vm", (), {"total": int(phys_gb * hardware.GB),
+                                                "available": int(phys_gb * hardware.GB)})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    files = {} if cgroup_gb is None else {hardware._CGROUP_V2: str(int(cgroup_gb * hardware.GB))}
+    monkeypatch.setattr(hardware, "_read_cgroup_file", lambda path: files.get(path))
+    total_gb, _avail, _swap = hardware._psutil_totals()
+    return total_gb
+
+
+def test_gate_wall_reflects_cgroup_limit_below_physical(monkeypatch):
+    # Container capped at 8 GiB on a 32 GiB host: the CPU gate must size against 8, not 32 (else OOM).
+    total = _clamped_ram_total_gb(monkeypatch, system="Linux", phys_gb=32.0, cgroup_gb=8.0)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["total_gb"] == 8.0
+    assert lim["wall_gb"] == 8.0
+    assert lim["safe_budget_gb"] == 8.0 - estimate.MARGIN_GB
+
+
+def test_gate_wall_is_physical_without_cgroup_limit(monkeypatch):
+    total = _clamped_ram_total_gb(monkeypatch, system="Linux", phys_gb=32.0, cgroup_gb=None)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["wall_gb"] == 32.0                                   # no limit binds → physical
+
+
+def test_gate_wall_is_physical_off_linux(monkeypatch):
+    total = _clamped_ram_total_gb(monkeypatch, system="Darwin", phys_gb=32.0, cgroup_gb=8.0)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["wall_gb"] == 32.0                                   # no cgroup off Linux → physical
 
 
 # --- limits: prefer a measured wall when one is supplied ------------------ #
