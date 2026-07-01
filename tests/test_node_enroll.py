@@ -54,6 +54,14 @@ def test_waits_through_pending_then_approves():
     assert fake.poll_count == 2 and slept == [1.5]         # slept once between the two polls
 
 
+def test_waits_through_a_non_active_status_then_approves():
+    slept = []
+    # any status that isn't "active" (here a transient "provisioning") keeps polling, not crashing.
+    fake = FakeClient([{"status": "provisioning"}, {"status": "active", "session_token": "SES"}])
+    cfg = enroll.enroll_flow(_cfg(), client=fake, sleep=lambda s: slept.append(s), poll_interval=0.5)
+    assert cfg.session_token == "SES" and fake.poll_count == 2 and slept == [0.5]
+
+
 def test_times_out_when_never_approved():
     slept = []
     fake = FakeClient([{"status": "pending"}] * 5)

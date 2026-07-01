@@ -168,6 +168,23 @@ describe("work queue", () => {
     expect(db.getWorkById(jobId)!.status).toBe("dispatched");
   });
 
+  it("claims a job exactly once under two back-to-back polls (atomic dispatch)", async () => {
+    const agentId = await activeAgent("box-race");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen", prompt: "hi" });
+
+    // Two polls fired back-to-back (no await between them) race for the single queued job. The
+    // atomic queued→dispatched claim must hand it to exactly one; the other sees nothing → null.
+    const [a, b] = await Promise.all([
+      work.nextForAgent(agentId, 0),
+      work.nextForAgent(agentId, 0),
+    ]);
+
+    const claimed = [a, b].filter((j) => j !== null);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.id).toBe(jobId);
+    expect(db.getWorkById(jobId)!.status).toBe("dispatched");
+  });
+
   it("nextForAgent long-poll resolves null after the wait window (fake timers)", async () => {
     vi.useFakeTimers();
     try {

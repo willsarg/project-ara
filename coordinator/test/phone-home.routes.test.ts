@@ -172,6 +172,155 @@ describe("full enroll → approve → poll → work → result flow", () => {
   });
 });
 
+// Enroll → approve → deliver session token; returns the agent id and its live session token.
+async function activate(machineKey: string): Promise<{ agentId: number; sessionToken: string }> {
+  const { token } = enroll.issueEnrollmentToken();
+  const enrRes = await enrollRoute.POST(
+    req("http://x/api/enroll", {
+      method: "POST",
+      bearer: token,
+      body: JSON.stringify({ ...enrollBody, machine_key: machineKey }),
+    }),
+  );
+  const { enrollment_id } = await enrRes.json();
+  const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+  enroll.approveAgent(agent.id);
+  const sessionToken = (
+    enroll.pollApproval(enrollment_id, token) as { kind: "active"; session_token: string }
+  ).session_token;
+  return { agentId: agent.id, sessionToken };
+}
+
+describe("POST /api/enroll boundary validation", () => {
+  it("400 when machine_key is missing/blank", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const missing = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: token,
+        body: JSON.stringify({ identity: {}, environment: ENV }),
+      }),
+    );
+    expect(missing.status).toBe(400);
+
+    const { token: t2 } = enroll.issueEnrollmentToken();
+    const blank = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: t2,
+        body: JSON.stringify({ machine_key: "", environment: ENV }),
+      }),
+    );
+    expect(blank.status).toBe(400);
+  });
+
+  it("400 when environment is missing or not an object", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const noEnv = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: token,
+        body: JSON.stringify({ machine_key: "box-x" }),
+      }),
+    );
+    expect(noEnv.status).toBe(400);
+
+    const { token: t2 } = enroll.issueEnrollmentToken();
+    const badEnv = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: t2,
+        body: JSON.stringify({ machine_key: "box-x", environment: "nope" }),
+      }),
+    );
+    expect(badEnv.status).toBe(400);
+  });
+
+  it("400 on malformed JSON body (not 500)", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const res = await enrollRoute.POST(
+      req("http://x/api/enroll", { method: "POST", bearer: token, body: "{not json" }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /api/work/[id]/result boundary + error paths", () => {
+  it("404 on an unknown job id (no leak of existence)", async () => {
+    const { sessionToken } = await activate("box-r1");
+    const res = await resultRoute.POST(
+      req("http://x/api/work/job_does_not_exist/result", {
+        method: "POST",
+        bearer: sessionToken,
+        body: JSON.stringify({ status: "done", environment: ENV }),
+      }),
+      params("job_does_not_exist"),
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("404 when reporting on ANOTHER agent's job (still 404, no leak)", async () => {
+    const a = await activate("box-owner");
+    const b = await activate("box-intruder");
+    const { enqueue } = await import("@/lib/work");
+    const jobId = enqueue(a.agentId, "run", { model: "qwen" });
+
+    // b holds a valid session token but the job belongs to a → 404, not 403/200.
+    const res = await resultRoute.POST(
+      req(`http://x/api/work/${jobId}/result`, {
+        method: "POST",
+        bearer: b.sessionToken,
+        body: JSON.stringify({ status: "done", environment: ENV }),
+      }),
+      params(jobId),
+    );
+    expect(res.status).toBe(404);
+    expect(db.getWorkById(jobId)!.status).toBe("queued"); // untouched
+  });
+
+  it("400 on a bad status and on a missing environment", async () => {
+    const { agentId, sessionToken } = await activate("box-r2");
+    const { enqueue } = await import("@/lib/work");
+
+    const jobId1 = enqueue(agentId, "run", { model: "qwen" });
+    const badStatus = await resultRoute.POST(
+      req(`http://x/api/work/${jobId1}/result`, {
+        method: "POST",
+        bearer: sessionToken,
+        body: JSON.stringify({ status: "weird", environment: ENV }),
+      }),
+      params(jobId1),
+    );
+    expect(badStatus.status).toBe(400);
+
+    const jobId2 = enqueue(agentId, "run", { model: "qwen" });
+    const noEnv = await resultRoute.POST(
+      req(`http://x/api/work/${jobId2}/result`, {
+        method: "POST",
+        bearer: sessionToken,
+        body: JSON.stringify({ status: "done" }),
+      }),
+      params(jobId2),
+    );
+    expect(noEnv.status).toBe(400);
+  });
+
+  it("400 on malformed JSON body (not 500)", async () => {
+    const { agentId, sessionToken } = await activate("box-r3");
+    const { enqueue } = await import("@/lib/work");
+    const jobId = enqueue(agentId, "run", { model: "qwen" });
+    const res = await resultRoute.POST(
+      req(`http://x/api/work/${jobId}/result`, {
+        method: "POST",
+        bearer: sessionToken,
+        body: "{ broken",
+      }),
+      params(jobId),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("GET /api/work long-poll timeout", () => {
   it("returns 204 after the wait window with no work (fake timers)", async () => {
     const { token } = enroll.issueEnrollmentToken();

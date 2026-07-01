@@ -4,42 +4,163 @@
 
 Reuses ARA's own recon (``profile.machine_key`` for stable identity, ``detect`` for the
 accelerator) rather than reinventing host probing, and shapes it to the pinned wire contract
-(``enroll.request`` + the shared ``environment`` label). This is STUB-level honesty for the
-walking skeleton: ``capabilities`` is advertised empty and the environment is labelled a physical
-wall. The container-honest environment (cgroup wall_source, virtualization_layer) is a later phase;
-what ships here still validates clean against the schema.
+(``enroll.request`` + the shared ``environment`` label).
+
+The environment label is **container-honest** (Rule #1): it reads the *real* memory ceiling from
+the cgroup, not just ``psutil``. A container capped below the host's RAM is labelled ``wall_source =
+cgroup`` so a coordinator never mistakes a squeezed container for a bare-metal wall; a WSL2 or Docker
+layer is surfaced in ``virtualization_layer``. ``capabilities`` advertises the models this node has
+actually characterized (Rule #1 evidence), read from ARA's own store. All of it validates clean
+against the schema.
 """
 from __future__ import annotations
 
 import platform
+from pathlib import Path
 
-from ara import detect, profile
+import psutil
+
+from ara import db, detect, profile
 
 # platform.system() → the environment schema's platform enum (linux | darwin | windows).
 _PLATFORMS = {"Linux": "linux", "Darwin": "darwin", "Windows": "windows"}
 # detect.Accelerator.kind → the environment schema's accel enum.
 _ACCELS = {"apple": "metal", "nvidia": "nvidia", "none": "cpu"}
 
+# cgroup memory-ceiling files (Linux). v2 is the unified hierarchy; v1 the legacy split one.
+_CGROUP_V2 = "/sys/fs/cgroup/memory.max"
+_CGROUP_V1 = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+# cgroup v1's "no limit" is a giant sentinel (PAGE_COUNTER_MAX rounded to a page) rather than a flag.
+_V1_UNLIMITED = 0x7FFFFFFFFFFFF000
+
+
+def _read_text(path: str) -> str | None:
+    """Read a proc/sys file, or None if it isn't there (non-Linux, no cgroup, no permission).
+
+    The single filesystem boundary for the cgroup/container probes — tests mock this."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _path_exists(path: str) -> bool:
+    """Whether a marker file exists (e.g. ``/.dockerenv``). Mocked in tests."""
+    return Path(path).exists()
+
+
+def _cgroup_memory_limit() -> int | None:
+    """This process's cgroup memory ceiling in bytes, or None when there is no real limit.
+
+    cgroup v2 (``memory.max``): the literal ``"max"`` means *no limit*; anything else is the byte
+    ceiling. cgroup v1 (``memory.limit_in_bytes``): a value at/above the unlimited sentinel means
+    *no limit*. Missing files (non-Linux, or no cgroup mounted) → None. A non-integer value is
+    treated as no limit rather than crashing the enroll."""
+    v2 = _read_text(_CGROUP_V2)
+    if v2 is not None:
+        v2 = v2.strip()
+        if v2 == "max":
+            return None
+        try:
+            return int(v2)
+        except ValueError:
+            return None
+    v1 = _read_text(_CGROUP_V1)
+    if v1 is not None:
+        try:
+            limit = int(v1.strip())
+        except ValueError:
+            return None
+        return None if limit >= _V1_UNLIMITED else limit
+    return None
+
+
+def _effective_wall() -> tuple[int, bool]:
+    """``(effective_wall_bytes, cgroup_binds)`` — the memory ceiling this node should plan against.
+
+    The wall is the smaller of physical RAM and any real cgroup limit; ``cgroup_binds`` is True iff a
+    cgroup limit exists *and* is below physical (a container squeezed under the host). Off Linux
+    there is no cgroup, so the wall is always physical."""
+    physical = psutil.virtual_memory().total
+    limit = _cgroup_memory_limit() if platform.system() == "Linux" else None
+    if limit is not None and limit < physical:
+        return limit, True
+    return physical, False
+
+
+def effective_wall() -> int:
+    """The memory ceiling (bytes) this node should plan against — the binding cgroup limit when a
+    container caps below the host, else physical RAM. Exposed for future gate use."""
+    return _effective_wall()[0]
+
+
+def is_cgroup_bound() -> bool:
+    """True when a cgroup memory limit below physical RAM is the binding ceiling."""
+    return _effective_wall()[1]
+
+
+def _containerized(cgroup_binds: bool) -> bool:
+    """Whether this node runs inside a container. True on a Docker marker file, a container manager
+    named in the cgroup lineage, or a binding cgroup memory limit."""
+    if _path_exists("/.dockerenv"):
+        return True
+    for proc in ("/proc/1/cgroup", "/proc/self/cgroup"):
+        text = _read_text(proc)
+        if text and any(marker in text for marker in ("docker", "containerd", "kubepods")):
+            return True
+    return cgroup_binds
+
+
+def _virtualization_layer() -> str | None:
+    """The virtualization layer, if any: ``"wsl2"`` (``/proc/version`` mentions microsoft),
+    ``"docker"`` (the docker marker file), else None (bare-metal or non-Linux)."""
+    version = _read_text("/proc/version")
+    if version and "microsoft" in version.lower():
+        return "wsl2"
+    if _path_exists("/.dockerenv"):
+        return "docker"
+    return None
+
 
 def environment() -> dict:
     """The shared ``environment`` label for this node (schema: ``environment.json``).
 
-    STUB: every measurement here is treated as a physical (non-container) wall — cgroup-honest
-    labelling lands in a later phase. Still schema-valid."""
+    Container-honest: ``wall_source`` is ``"cgroup"`` when a cgroup limit binds below physical RAM,
+    else ``"physical"``; ``containerized`` and ``virtualization_layer`` surface a container/WSL2
+    wall so it's never mistaken for bare metal."""
+    _wall, cgroup_binds = _effective_wall()
     accel = detect.accelerator(detect.chip_name())
     return {
         "platform": _PLATFORMS.get(platform.system(), "linux"),
         "accel": _ACCELS.get(accel.kind, "unknown"),
-        "containerized": False,
-        "wall_source": "physical",
+        "containerized": _containerized(cgroup_binds),
+        "virtualization_layer": _virtualization_layer(),
+        "wall_source": "cgroup" if cgroup_binds else "physical",
     }
+
+
+def advertised_capabilities() -> list[dict]:
+    """The models this node has characterized (schema: ``capability.json``), one ``serve_model`` per
+    row of ARA's ``characterizations`` store for this machine — evidence ``"characterized"`` (Rule
+    #1: report only what we've empirically measured). Empty when nothing is characterized yet."""
+    con = db.connect()
+    try:
+        rows = db.list_characterizations(con, profile.machine_key())
+    finally:
+        con.close()
+    return [
+        {"kind": "serve_model", "id": row["model_id"], "engine": row["engine"],
+         "evidence": "characterized"}
+        for row in rows
+    ]
 
 
 def self_description() -> dict:
     """This node's enrollment payload (schema: ``enroll.request.json``).
 
     ``machine_key`` is ARA's stable per-machine identity (reused, not reinvented); ``capabilities``
-    is an advertised-empty stub for the skeleton. Validates against the wire contract."""
+    advertises the characterized models; ``environment`` is the container-honest label. Validates
+    against the wire contract."""
     return {
         "machine_key": profile.machine_key(),
         "identity": {
@@ -47,6 +168,6 @@ def self_description() -> dict:
             "os": platform.system(),
             "arch": platform.machine() or "unknown",
         },
-        "capabilities": [],
+        "capabilities": advertised_capabilities(),
         "environment": environment(),
     }

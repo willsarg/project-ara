@@ -21,6 +21,15 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
+  // Lightweight boundary validation (defense-in-depth): reject obviously-malformed payloads before
+  // they reach the lib. A node must send a non-empty machine_key and an environment object.
+  if (typeof body?.machine_key !== "string" || body.machine_key.length === 0) {
+    return NextResponse.json({ error: "machine_key must be a non-empty string" }, { status: 400 });
+  }
+  if (typeof body?.environment !== "object" || body.environment === null || Array.isArray(body.environment)) {
+    return NextResponse.json({ error: "environment must be an object" }, { status: 400 });
+  }
+
   const out = enroll(token!, body);
   if (!out) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   return NextResponse.json(out, { status: 201 });

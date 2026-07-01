@@ -33,8 +33,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
+  // Lightweight boundary validation (defense-in-depth): status must be a known terminal state and
+  // the node must report the environment it ran in as an object.
   if (body?.status !== "done" && body?.status !== "failed") {
     return NextResponse.json({ error: "status must be done|failed" }, { status: 400 });
+  }
+  if (typeof body?.environment !== "object" || body.environment === null || Array.isArray(body.environment)) {
+    return NextResponse.json({ error: "environment must be an object" }, { status: 400 });
   }
 
   recordResult(id, {

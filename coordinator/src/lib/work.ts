@@ -4,13 +4,7 @@
 // cheap sync read, and if there's nothing yet it AWAITS a short timer before the next read. SERVER-ONLY.
 import "server-only";
 import { randomBytes } from "node:crypto";
-import {
-  getQueuedWorkForAgent,
-  getWorkById,
-  insertWork,
-  markWorkDispatched,
-  recordWorkResult,
-} from "./db";
+import { claimNextWorkForAgent, getWorkById, insertWork, recordWorkResult } from "./db";
 
 /** The dispatched job as it goes on the wire (work.response `job`). */
 export interface DispatchedJob {
@@ -30,15 +24,15 @@ export function enqueue(agentId: number, kind: string, args: Record<string, unkn
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** Long-poll for the next queued job, up to `waitMs`. Returns the job (marking it dispatched) as
- *  soon as one is available, or null once the window elapses. Awaits between cheap sync reads so
- *  the synchronous DB never blocks the loop. */
+/** Long-poll for the next queued job, up to `waitMs`. Returns the job (atomically claiming it —
+ *  queued→dispatched in one statement) as soon as one is available, or null once the window elapses.
+ *  The atomic claim guarantees a job is handed out exactly once even under concurrent polls. Awaits
+ *  between cheap sync claims so the synchronous DB never blocks the loop. */
 export async function nextForAgent(agentId: number, waitMs: number): Promise<DispatchedJob | null> {
   const deadline = Date.now() + Math.max(0, waitMs);
   for (;;) {
-    const row = getQueuedWorkForAgent(agentId);
+    const row = claimNextWorkForAgent(agentId);
     if (row) {
-      markWorkDispatched(row.id);
       return {
         id: row.id,
         kind: row.kind,

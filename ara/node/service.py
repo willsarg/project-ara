@@ -54,10 +54,18 @@ def _unit_path() -> Path:
     return _unit_dir() / UNIT_NAME
 
 
+# Watchdog ceiling: systemd kills+restarts the node if it misses a WATCHDOG=1 beat this long. The
+# agent loop pets it every poll iteration (health.heartbeat), so 30s comfortably clears the cadence.
+WATCHDOG_SEC = 30
+
+
 def _unit_text(host: str, port: int) -> str:
-    """The systemd unit. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
-    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv,
-    a conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there."""
+    """The systemd unit for the push-only node. ExecStart runs the phone-home agent loop
+    (``ara node run``) — the loop that pets systemd's watchdog via sd_notify, hence ``Type=notify``
+    and ``WatchdogSec``. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
+    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv, a
+    conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there. (``host``
+    /``port`` are retained for CLI compatibility; the push-only node has no inbound socket to bind.)"""
     return (
         "[Unit]\n"
         "Description=ARA node daemon\n"
@@ -65,8 +73,9 @@ def _unit_text(host: str, port: int) -> str:
         "Wants=network-online.target\n"
         "\n"
         "[Service]\n"
-        "Type=simple\n"
-        f"ExecStart={sys.executable} -m ara.cli node serve --host {host} --port {port}\n"
+        "Type=notify\n"
+        f"ExecStart={sys.executable} -m ara.cli node run\n"
+        f"WatchdogSec={WATCHDOG_SEC}\n"
         "Restart=on-failure\n"
         "\n"
         "[Install]\n"

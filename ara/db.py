@@ -198,11 +198,17 @@ def get_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
 
 
 def list_characterizations(con: sqlite3.Connection, machine_key: str,
-                           engine: str) -> list[dict]:
-    """Every model characterized on this machine + engine, newest fields parsed."""
-    rows = con.execute(
-        "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
-        (machine_key, engine)).fetchall()
+                           engine: str | None = None) -> list[dict]:
+    """Every model characterized on this machine, newest fields parsed. Scoped to one ``engine``
+    when given, else across every engine (ordered by model then engine so it's stable)."""
+    if engine is None:
+        rows = con.execute(
+            "SELECT * FROM characterizations WHERE machine_key=? ORDER BY model_id, engine",
+            (machine_key,)).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
+            (machine_key, engine)).fetchall()
     out = []
     for r in rows:
         d = dict(r)

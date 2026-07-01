@@ -14,7 +14,9 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from ara.node import capabilities, enroll, wiring
+import httpx
+
+from ara.node import capabilities, enroll, health, wiring
 from ara.node.client import NodeClient
 
 
@@ -43,22 +45,47 @@ def _result_payload(result: dict) -> dict:
     return {"status": "done", "result": result, "environment": env}
 
 
+def _is_unauthorized(exc: httpx.HTTPStatusError) -> bool:
+    """A 401 means our session token was revoked or expired — time to re-enroll."""
+    return exc.response.status_code == 401
+
+
+def _reauth(config) -> NodeClient:
+    """Session token rejected (401): drop it, re-run the enroll handshake for a fresh one, and
+    rebuild the client around it."""
+    config.session_token = None
+    enroll.enroll_flow(config)
+    return NodeClient(config.server_url, config.session_token)
+
+
 def run_loop(config, *, client: NodeClient | None = None,
              runner: Callable[[str, dict], dict] | None = None, wait: float = 20.0,
              max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0) -> int:
     """Run the phone-home work loop, returning the number of poll iterations performed.
 
     Ensures the node is enrolled (a session token present), then for each iteration long-polls for a
-    job, runs it, and reports the outcome. ``max_iterations`` bounds the loop (None = forever, the
-    production default); ``client``/``runner``/``sleep`` are injectable for tests."""
+    job, runs it, and reports the outcome. Emits an sd_notify heartbeat + status each iteration so
+    systemd's watchdog is fed (and journald sees liveness off systemd). A 401 on either call means
+    the session token was revoked/expired: the node re-enrolls for a fresh token, rebuilds the
+    client, and carries on rather than crashing. ``max_iterations`` bounds the loop (None = forever,
+    the production default); ``client``/``runner``/``sleep`` are injectable for tests."""
     if not config.session_token:
         enroll.enroll_flow(config)
     client = client or NodeClient(config.server_url, config.session_token)
     runner = runner or default_runner()
+    health.ready()
     count = 0
     while max_iterations is None or count < max_iterations:
         count += 1
-        job = client.get_work(wait)
+        health.heartbeat()
+        health.status(f"polling for work (iteration {count})")
+        try:
+            job = client.get_work(wait)
+        except httpx.HTTPStatusError as exc:
+            if _is_unauthorized(exc):
+                client = _reauth(config)
+                continue
+            raise
         if job is None:
             sleep(poll_gap)
             continue
@@ -67,5 +94,11 @@ def run_loop(config, *, client: NodeClient | None = None,
         except Exception as exc:  # noqa: BLE001 — any run failure becomes a reported failed result
             payload = {"status": "failed", "error": f"{type(exc).__name__}: {exc}",
                        "environment": capabilities.environment()}
-        client.post_result(job["id"], payload)
+        try:
+            client.post_result(job["id"], payload)
+        except httpx.HTTPStatusError as exc:
+            if _is_unauthorized(exc):
+                client = _reauth(config)
+                continue
+            raise
     return count

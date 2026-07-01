@@ -298,6 +298,29 @@ export function getQueuedWorkForAgent(agentId: number): WorkRow | null {
     .get(agentId) as WorkRow | undefined) ?? null;
 }
 
+/** The claimed job as returned by the atomic dispatch (RETURNING projection). */
+export interface ClaimedWork {
+  id: string;
+  kind: string;
+  args_json: string | null;
+}
+
+/** Atomically claim the oldest queued job for this agent: flip queued→dispatched and return the
+ *  claimed row in ONE statement (SQLite RETURNING), so two concurrent polls can never double-dispatch
+ *  the same job. Returns the claimed row, or null when nothing is queued. */
+export function claimNextWorkForAgent(agentId: number): ClaimedWork | null {
+  return (open()
+    .prepare(
+      `UPDATE work SET status = 'dispatched', dispatched_at = datetime('now')
+       WHERE id = (
+         SELECT id FROM work WHERE agent_id = ? AND status = 'queued'
+         ORDER BY created_at, id LIMIT 1
+       )
+       RETURNING id, kind, args_json`,
+    )
+    .get(agentId) as ClaimedWork | undefined) ?? null;
+}
+
 export function markWorkDispatched(id: string): void {
   open()
     .prepare("UPDATE work SET status = 'dispatched', dispatched_at = datetime('now') WHERE id = ?")
