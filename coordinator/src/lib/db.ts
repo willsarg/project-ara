@@ -50,6 +50,7 @@ function open(): Database.Database {
       identity_json         TEXT,
       caps_json             TEXT,
       environment_json      TEXT,
+      enrollment_token_id   INTEGER,        -- binds the poll: ONLY this token may poll this agent (IDOR guard)
       created_at            TEXT NOT NULL DEFAULT (datetime('now')),
       last_seen             TEXT
     );
@@ -170,6 +171,7 @@ export interface AgentRow {
   identity_json: string | null;
   caps_json: string | null;
   environment_json: string | null;
+  enrollment_token_id: number | null;
   created_at: string;
   last_seen: string | null;
 }
@@ -216,14 +218,15 @@ export function markEnrollmentTokenUsed(id: number): void {
 export function createPendingAgent(a: {
   machine_key: string;
   enrollment_id: string;
+  enrollment_token_id: number;
   identity_json: string | null;
   caps_json: string | null;
   environment_json: string | null;
 }): AgentRow {
   const info = open()
     .prepare(
-      `INSERT INTO agents (machine_key, enrollment_id, identity_json, caps_json, environment_json)
-       VALUES (@machine_key, @enrollment_id, @identity_json, @caps_json, @environment_json)`,
+      `INSERT INTO agents (machine_key, enrollment_id, enrollment_token_id, identity_json, caps_json, environment_json)
+       VALUES (@machine_key, @enrollment_id, @enrollment_token_id, @identity_json, @caps_json, @environment_json)`,
     )
     .run(a);
   return getAgentById(Number(info.lastInsertRowid))!;

@@ -49,6 +49,7 @@ export function enroll(
   createPendingAgent({
     machine_key: typeof self?.machine_key === "string" ? self.machine_key : "",
     enrollment_id,
+    enrollment_token_id: tokRow.id, // bind: only this token may poll this agent (IDOR guard)
     identity_json: self?.identity != null ? JSON.stringify(self.identity) : null,
     caps_json: self?.capabilities != null ? JSON.stringify(self.capabilities) : null,
     environment_json: self?.environment != null ? JSON.stringify(self.environment) : null,
@@ -69,9 +70,13 @@ export type PollResult =
 /** Poll for approval. Auth: the enrollment token (allowUsed — enroll already consumed it). On the
  *  first poll after approval, hands back the session token exactly once, then it's gone. */
 export function pollApproval(enrollmentId: string, token: string): PollResult {
-  if (!verifyEnrollmentToken(token, { allowUsed: true })) return { kind: "unauthorized" };
+  const tokRow = verifyEnrollmentToken(token, { allowUsed: true });
+  if (!tokRow) return { kind: "unauthorized" };
   const agent = getAgentByEnrollmentId(enrollmentId);
   if (!agent) return { kind: "not_found" };
+  // A token may only poll the enrollment IT created — a valid-but-different token can't lift
+  // another node's one-time session token (IDOR guard).
+  if (agent.enrollment_token_id !== tokRow.id) return { kind: "unauthorized" };
   if (agent.status === "denied") return { kind: "denied" };
   if (agent.status !== "active") return { kind: "pending" };
 

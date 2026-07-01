@@ -118,6 +118,21 @@ describe("approval + session token delivery", () => {
     expect(auth.verifySessionToken(agent.session_token_hash ?? "x")).toBeNull(); // denied ≠ active
   });
 
+  it("a DIFFERENT valid token cannot poll (or steal the session token of) another agent (IDOR guard)", () => {
+    const victim = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(victim.token, selfDesc("victim"))!;
+    const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+    enroll.approveAgent(agent.id); // session token now waiting to be delivered ONCE
+
+    // An attacker holds their own valid (even used) enrollment token and knows the enrollment_id.
+    const attacker = enroll.issueEnrollmentToken();
+    enroll.enroll(attacker.token, selfDesc("attacker")); // marks it used → still allowUsed for polling
+    expect(enroll.pollApproval(enrollment_id, attacker.token).kind).toBe("unauthorized");
+
+    // The bound (victim's own) token still works and gets the token exactly once.
+    expect(enroll.pollApproval(enrollment_id, victim.token).kind).toBe("active");
+  });
+
   it("listPending / listActive reflect status", () => {
     const before = enroll.listPending().length;
     const { token } = enroll.issueEnrollmentToken();
