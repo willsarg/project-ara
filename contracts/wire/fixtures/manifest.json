@@ -9,6 +9,11 @@
     { "fixture": "work.response.valid.json", "schema": "https://ara.dev/wire/work.response.json", "valid": true },
     { "fixture": "result.request.done.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
     { "fixture": "result.request.failed.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
-    { "fixture": "result.request.invalid-bad-status.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false }
+    { "fixture": "result.request.invalid-bad-status.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "result.request.invalid-done-missing-result.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "result.request.invalid-failed-missing-error.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "result.request.invalid-bad-environment-enum.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "enroll-poll.invalid-active-missing-token.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": false },
+    { "fixture": "enroll.request.invalid-extra-property.json", "schema": "https://ara.dev/wire/enroll.request.json", "valid": false }
   ]
 }
