@@ -41,13 +41,46 @@ def test_limits_cpu_uses_full_ram():
     assert lim["safe_budget_gb"] == 32.0 - estimate.MARGIN_GB
 
 
-def test_limits_cuda_uses_total_vram():
+def test_limits_cuda_single_gpu_wall_is_vram():
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1))
+    lim = estimate.limits(m)
+    assert lim["total_gb"] == 24.0
+    assert lim["wall_gb"] == 24.0
+    assert lim["device"] == "RTX 4090"
+
+
+# --- CUDA multi-GPU: the analytic wall must match what the engine actually governs --------- #
+# The shipped wcx engine measures ONE device (nvml index 0) and does NOT shard a model across
+# GPUs. So on a multi-GPU box the analytic wall must be a *single* card's VRAM — otherwise
+# `profile` (basis="estimated") promises a budget `characterize` (basis="measured") will refuse,
+# violating Rule #3. `total_gb` still reports the true physical total across all cards; a future
+# sharding engine (tensor-parallel) opts back into the summed wall via `sharded=True`.
+def test_limits_cuda_multi_gpu_wall_is_single_device_by_default():
     m = _machine(backend="cuda",
                  accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2))
     lim = estimate.limits(m)
-    assert lim["total_gb"] == 48.0           # 24 GB × 2 GPUs
+    assert lim["total_gb"] == 48.0           # physical truth: 24 GB × 2 cards
+    assert lim["wall_gb"] == 24.0            # governable: one device (wcx measures index 0)
+    assert lim["safe_budget_gb"] == 24.0 - estimate.MARGIN_GB
+
+
+def test_limits_cuda_sharded_sums_across_gpus():
+    # A sharding engine spreads one model across all GPUs, so the wall IS the physical sum.
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2))
+    lim = estimate.limits(m, sharded=True)
+    assert lim["total_gb"] == 48.0
     assert lim["wall_gb"] == 48.0
-    assert lim["device"] == "RTX 4090"
+    assert lim["safe_budget_gb"] == 48.0 - estimate.MARGIN_GB
+
+
+def test_limits_cuda_single_gpu_sharded_is_noop():
+    # One GPU: single-device == sum, so `sharded` changes nothing (regression guard).
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1))
+    assert estimate.limits(m)["wall_gb"] == 24.0
+    assert estimate.limits(m, sharded=True)["wall_gb"] == 24.0
 
 
 def test_limits_missing_ram_is_unknown():

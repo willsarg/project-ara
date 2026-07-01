@@ -17,12 +17,15 @@ MARGIN_GB = 2.0
 APPLE_WORKING_SET = 0.75
 
 
-def limits(machine, measured: dict | None = None) -> dict:
+def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> dict:
     """Analytic memory limits from detect facts — no engine, no model load.
 
-    Mirrors the wall each backend would read: CUDA → total VRAM, Apple → a working-set fraction
-    of unified RAM, CPU → physical RAM. The safe budget is the wall minus ARA's margin. Shape is
-    compatible with the limits dict the engines return.
+    Mirrors the wall each backend would read: CUDA → a single device's VRAM by default (the
+    shipped engine reads device 0 only and does not shard a model across GPUs; pass
+    ``sharded=True`` for a future engine that does, which sums VRAM across all cards), Apple → a
+    working-set fraction of unified RAM, CPU → physical RAM. ``total_gb`` always reports the
+    true physical total across all cards; ``wall_gb`` is the governable budget. The safe budget
+    is the wall minus ARA's margin. Shape is compatible with the limits dict the engines return.
 
     Pure: the heuristic never touches a database. The CALLER may pass *measured* — a stored
     calibration dict carrying ``wall_gb``/``safe_budget_gb`` from the engine's own ``safe_limits``.
@@ -33,9 +36,10 @@ def limits(machine, measured: dict | None = None) -> dict:
     matches the data source — a heuristic is never reported as measured.
     """
     if machine.backend == "cuda":
-        vram = machine.accel.vram_gb
-        total = vram * (machine.accel.count or 1) if vram is not None else None
-        wall = total
+        per_device = machine.accel.vram_gb
+        count = machine.accel.count or 1
+        total = per_device * count if per_device is not None else None
+        wall = total if sharded else per_device
         device = machine.accel.name
     else:
         total = machine.ram_total_gb
