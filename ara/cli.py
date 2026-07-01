@@ -218,7 +218,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
-    c.emit(_cmd(c, "node <sub>", "run ARA as a daemon you can drive over HTTP (serve/install/…)"))
+    c.emit(_cmd(c, "node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
@@ -2118,35 +2118,17 @@ def _node_err(c: Console, as_json: bool, msg: str) -> int:
     return 1
 
 
-_LOOPBACK = ("127.0.0.1", "localhost", "::1")
-
-
-def _warn_if_exposed(c: Console, host: str, surface: str) -> None:
-    """Warn LOUDLY when binding past loopback — the service then listens on the network, not just this
-    box. ARA binds localhost by default; exposing it is a conscious choice, and the bearer token (node)
-    / admin login (dashboard) is then the ONLY thing between it and anyone who can reach the port. Always
-    emitted (even under --json it goes to the console stream, not stdout) — it's a safety notice."""
-    if host in _LOOPBACK:
-        return
-    c.emit(c.style("warn",
-                   f"  ⚠  exposing {surface} on {host} — reachable from the network, not just this box."))
-    c.emit(c.style("warn",
-                   "     only on a network you trust, and treat the token / login as a real secret."))
-
-
-def render_node(c: Console, rest: list[str], *, host: str, port: int, token: str | None = None,
+def render_node(c: Console, rest: list[str], *, token: str | None = None,
                 as_json: bool = False) -> int:
-    """`ara node <sub>` — run/manage the headless node daemon (a FastAPI API over ARA's verbs).
+    """`ara node <sub>` — run/manage the push-only node daemon (a client that phones home).
 
     Subcommands: ``enroll <server_url> --token <t>`` (phone home to a coordinator and wait for
-    approval) and ``run`` (the push-only work loop); ``serve`` (foreground launcher — what the
-    systemd unit runs and what you run to debug), ``install`` (write + enable the systemd --user boot
-    unit), ``start``/``stop``/``status``/``uninstall`` (service lifecycle), and ``token`` (print, or
-    ``token rotate`` to replace, the bearer token every endpoint requires). The systemd path is
-    Linux-only and raises a clear message elsewhere; the web stack is the optional ``[node]`` extra
-    and a missing import becomes an actionable hint, never a traceback.
+    approval) and ``run`` (the push-only work loop); ``install`` (write + enable the systemd --user
+    boot unit, whose ExecStart runs ``ara node run``), and ``start``/``stop``/``status``/
+    ``uninstall`` (service lifecycle). The systemd path is Linux-only and raises a clear message
+    elsewhere. The node holds no inbound socket — it only ever dials out to its coordinator.
     """
-    from ara.node import agent, auth, config, enroll, service
+    from ara.node import agent, config, enroll, service
 
     sub = rest[1] if len(rest) > 1 else None
 
@@ -2170,34 +2152,11 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, token: str
         agent.run_loop(cfg)                         # blocks: phone-home work loop until stopped
         return _node_say(c, as_json, "run loop exited")
 
-    if sub == "token":
-        tok = auth.rotate_token() if rest[2:3] == ["rotate"] else auth.ensure_token()
-        print(json.dumps({"token": tok})) if as_json else c.emit(c.field("node token", tok))
-        return 0
-
-    if sub == "serve":
-        tok = auth.ensure_token()
-        _warn_if_exposed(c, host, "the node")
-        if not as_json:
-            c.emit(c.field("ara node", f"serving on http://{host}:{port}"))
-            if host in _LOOPBACK:
-                c.emit(c.field("scope", "localhost only · pass --host 0.0.0.0 to expose on your network"))
-            c.emit(c.field("token", tok))
-        try:
-            service.serve(host, port)          # blocks until the process is stopped
-        except ImportError:
-            return _node_err(c, as_json,
-                             "node web stack not installed — run: pip install 'project-ara[node]'")
-        return 0
-
     if sub in ("install", "start", "stop", "status", "uninstall"):
         try:
             if sub == "install":
-                tok = auth.ensure_token()
-                _warn_if_exposed(c, host, "the node")
-                service.install(host, port)
-                return _node_say(c, as_json, f"installed + started on http://{host}:{port}",
-                                 endpoint=f"http://{host}:{port}", token=tok)
+                service.install()
+                return _node_say(c, as_json, "installed + started (systemd --user)")
             if sub == "status":
                 out = service.status()
                 print(json.dumps({"status": out})) if as_json else c.emit(out.rstrip())
@@ -2208,8 +2167,7 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, token: str
             return _node_err(c, as_json, str(exc))
 
     return _node_err(c, as_json,
-                     "usage: ara node {enroll|run|serve|install|start|stop|status|uninstall|token} "
-                     "[--host H] [--port N] [--token T]")
+                     "usage: ara node {enroll|run|install|start|stop|status|uninstall}")
 
 
 def main() -> int:
@@ -2249,9 +2207,6 @@ def _main_impl() -> int:
     prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
     serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
     serve_name: str | None = None                # `serve --name X`: derived served-model name
-    node_host: str = "127.0.0.1"                 # `node --host H`: bind LOCALHOST by default —
-                                                 # exposing on the network is an explicit, warned opt-in
-    node_port: int = 8473                        # `node --port N`: daemon bind port
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension
     max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
     include: list[str] = []
@@ -2324,22 +2279,6 @@ def _main_impl() -> int:
             continue
         if a.startswith("--name="):
             serve_name = a.split("=", 1)[1] or None
-            continue
-        if a == "--host":
-            node_host = argv[i + 1] if i + 1 < len(argv) else node_host
-            skip = True
-            continue
-        if a.startswith("--host="):
-            node_host = a.split("=", 1)[1] or node_host
-            continue
-        if a == "--port":
-            _port_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
-            node_port = _port_val or node_port       # `node --port N` bind port
-            skip = True
-            continue
-        if a.startswith("--port="):
-            _port_val = _int_or_none(a.split("=", 1)[1])
-            node_port = _port_val or node_port
             continue
         if a == "--use-case":
             use_case = argv[i + 1] if i + 1 < len(argv) else None
@@ -2468,7 +2407,7 @@ def _main_impl() -> int:
         return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
 
     if cmd == "node":
-        return render_node(c, rest, host=node_host, port=node_port, token=token, as_json=as_json)
+        return render_node(c, rest, token=token, as_json=as_json)
 
     if as_json:
         return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")

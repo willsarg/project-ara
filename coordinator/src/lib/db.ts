@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// The node registry — SQLite, volume-mountable. Holds node tokens; this module is SERVER-ONLY
-// and must never be imported from a Client Component.
+// The agent registry — SQLite, volume-mountable. Holds phone-home agents, enrollment tokens, and the
+// work queue; this module is SERVER-ONLY and must never be imported from a Client Component.
 import "server-only";
 import Database from "better-sqlite3";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-
-export interface Node {
-  id: number;
-  name: string;
-  base_url: string;
-  token: string;
-  enabled: number; // SQLite has no bool — 0/1
-}
 
 const DB_PATH = process.env.ARA_COORDINATOR_DB || "./data/coordinator.db";
 
@@ -26,20 +18,13 @@ function open(): Database.Database {
   const db = new Database(DB_PATH);
   db.pragma("journal_mode = WAL");
   db.exec(`
-    CREATE TABLE IF NOT EXISTS nodes (
-      id        INTEGER PRIMARY KEY AUTOINCREMENT,
-      name      TEXT NOT NULL UNIQUE,
-      base_url  TEXT NOT NULL,
-      token     TEXT NOT NULL,
-      enabled   INTEGER NOT NULL DEFAULT 1
-    );
     CREATE TABLE IF NOT EXISTS meta (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
 
     -- Phone-home (push) model: the node initiates everything. An 'agent' is a node that enrolled
-    -- through the push channel (distinct from the pull-mode 'nodes' registry above, which stays).
+    -- through the push channel — the coordinator never connects back to it.
     CREATE TABLE IF NOT EXISTS agents (
       id                    INTEGER PRIMARY KEY AUTOINCREMENT,
       machine_key           TEXT NOT NULL,
@@ -78,24 +63,6 @@ function open(): Database.Database {
   `);
   _db = db;
   return db;
-}
-
-export function listNodes(): Node[] {
-  return open().prepare("SELECT * FROM nodes ORDER BY name").all() as Node[];
-}
-
-export function addNode(name: string, base_url: string, token: string): void {
-  open()
-    .prepare("INSERT INTO nodes (name, base_url, token, enabled) VALUES (?, ?, ?, 1)")
-    .run(name.trim(), base_url.trim().replace(/\/+$/, ""), token.trim());
-}
-
-export function deleteNode(id: number): void {
-  open().prepare("DELETE FROM nodes WHERE id = ?").run(id);
-}
-
-export function toggleNode(id: number): void {
-  open().prepare("UPDATE nodes SET enabled = 1 - enabled WHERE id = ?").run(id);
 }
 
 // --- meta: small persisted settings (generated admin password, session secret) -----------------
@@ -157,8 +124,8 @@ export function verifyAdminPassword(submitted: string): boolean {
 }
 
 // =================================================================================================
-// Phone-home (push) CRUD. Additive to the pull-mode registry above; nothing here touches `nodes`.
-// These are raw row helpers — hashing, token minting, and auth live in node-auth/enrollment/work.
+// Phone-home (push) CRUD. These are raw row helpers — hashing, token minting, and auth live in
+// node-auth/enrollment/work.
 // =================================================================================================
 
 export interface AgentRow {
@@ -262,6 +229,14 @@ export function setAgentStatus(id: number, status: string): void {
   open().prepare("UPDATE agents SET status = ? WHERE id = ?").run(status, id);
 }
 
+/** Revoke an agent: deny it AND NULL its session-token hash, so any session token it already holds
+ *  stops authenticating immediately (verifySessionToken can no longer match a NULL hash). */
+export function revokeAgent(id: number): void {
+  open()
+    .prepare("UPDATE agents SET status = 'denied', session_token_hash = NULL WHERE id = ?")
+    .run(id);
+}
+
 /** Read the transient plaintext session token exactly once, NULLing it in the same statement. */
 export function takePendingSessionToken(id: number): string | null {
   const db = open();
@@ -281,6 +256,13 @@ export function listAgentsByStatus(status: string): AgentRow[] {
   return open()
     .prepare("SELECT * FROM agents WHERE status = ? ORDER BY created_at DESC, id DESC")
     .all(status) as AgentRow[];
+}
+
+/** Every agent, newest first — regardless of status. Backs the dashboard's enrolled-agents view. */
+export function listAgents(): AgentRow[] {
+  return open()
+    .prepare("SELECT * FROM agents ORDER BY created_at DESC, id DESC")
+    .all() as AgentRow[];
 }
 
 // --- work queue ----------------------------------------------------------------------------------

@@ -2,7 +2,7 @@
   "name": "ara-coordinator",
   "version": "0.1.0",
   "private": true,
-  "description": "ARA fleet coordinator — a server-side HTTP client of ARA nodes.",
+  "description": "ARA fleet coordinator — push-only control plane for phone-home nodes.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

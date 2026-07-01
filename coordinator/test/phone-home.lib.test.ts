@@ -144,6 +144,58 @@ describe("approval + session token delivery", () => {
     expect(enroll.listPending().some((a) => a.id === agent.id)).toBe(false);
     expect(enroll.listActive().some((a) => a.id === agent.id)).toBe(true);
   });
+
+  it("revoke: an active agent's session token no longer authenticates", () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(token, selfDesc("box-revoke"))!;
+    const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+    enroll.approveAgent(agent.id);
+
+    // deliver + capture the one-time session token; it authenticates while active
+    const first = enroll.pollApproval(enrollment_id, token);
+    const sessionToken = (first as { kind: "active"; session_token: string }).session_token;
+    expect(auth.verifySessionToken(sessionToken)!.id).toBe(agent.id);
+
+    // revoke → denied AND session_token_hash NULLed → the token stops authing, agent drops off active
+    enroll.revoke(agent.id);
+    const after = db.getAgentById(agent.id)!;
+    expect(after.status).toBe("denied");
+    expect(after.session_token_hash).toBeNull();
+    expect(auth.verifySessionToken(sessionToken)).toBeNull();
+    expect(enroll.listActive().some((a) => a.id === agent.id)).toBe(false);
+  });
+});
+
+describe("dashboard agent-listing helper", () => {
+  it("summarizes agents newest-first, token-free, with a capabilities count from caps_json", () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(token, selfDesc("box-dash"))!;
+    const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+    enroll.approveAgent(agent.id);
+
+    const summaries = enroll.listAgentSummaries();
+    const row = summaries.find((s) => s.id === agent.id)!;
+    expect(row).toBeTruthy();
+    // selfDesc advertises exactly one capability
+    expect(row.caps_count).toBe(1);
+    expect(row.machine_key).toBe("box-dash");
+    expect(row.status).toBe("active");
+    // token-free shape: no secret fields ever leak into the summary
+    expect(row).not.toHaveProperty("session_token_hash");
+    expect(row).not.toHaveProperty("pending_session_token");
+    // newest-first ordering: this fresh agent is at the front
+    expect(summaries[0].id).toBe(agent.id);
+  });
+
+  it("summarizeAgent yields caps_count 0 for absent or malformed caps_json (never throws)", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    expect(enroll.summarizeAgent({ ...base, caps_json: null } as never).caps_count).toBe(0);
+    expect(enroll.summarizeAgent({ ...base, caps_json: "not json" } as never).caps_count).toBe(0);
+    expect(enroll.summarizeAgent({ ...base, caps_json: "{}" } as never).caps_count).toBe(0);
+    expect(
+      enroll.summarizeAgent({ ...base, caps_json: '[{"a":1},{"b":2}]' } as never).caps_count,
+    ).toBe(2);
+  });
 });
 
 describe("work queue", () => {

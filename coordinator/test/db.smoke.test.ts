@@ -9,10 +9,10 @@ describe("coordinator db harness", () => {
     process.env.ARA_COORDINATOR_DB = ":memory:";
   });
 
-  it("opens an in-memory registry and starts with no nodes", async () => {
-    const { listNodes } = await import("@/lib/db");
-    const nodes = listNodes();
-    expect(Array.isArray(nodes)).toBe(true);
-    expect(nodes.length).toBe(0);
+  it("opens an in-memory registry and starts with no agents", async () => {
+    const { listActive } = await import("@/lib/enrollment");
+    const agents = listActive();
+    expect(Array.isArray(agents)).toBe(true);
+    expect(agents.length).toBe(0);
   });
 });

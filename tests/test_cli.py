@@ -109,9 +109,8 @@ def _capture_dispatch(monkeypatch):
                         lambda c, sub, token=None, as_json=False:
                         (rec.update(hf=sub, hf_token=token) or 0))
     monkeypatch.setattr(cli, "render_node",
-                        lambda c, rest, host=None, port=None, token=None, as_json=False:
-                        (rec.update(node=rest[1:], node_host=host, node_port=port,
-                                    node_token=token) or 0))
+                        lambda c, rest, token=None, as_json=False:
+                        (rec.update(node=rest[1:], node_token=token) or 0))
     return rec
 
 
@@ -120,29 +119,10 @@ def _run_main(monkeypatch, argv):
     return cli.main()
 
 
-def test_main_node_routes_with_host_port_space_form(monkeypatch):
+def test_main_node_routes_subcommand(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["node", "serve", "--host", "1.2.3.4", "--port", "9000"]) == 0
-    assert rec["node"] == ["serve"]
-    assert rec["node_host"] == "1.2.3.4" and rec["node_port"] == 9000
-
-
-def test_main_node_host_port_equals_form(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["node", "status", "--host=5.6.7.8", "--port=1234"]) == 0
-    assert rec["node_host"] == "5.6.7.8" and rec["node_port"] == 1234
-
-
-def test_main_node_defaults_when_flags_absent(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["node", "token"]) == 0
-    assert rec["node_host"] == "127.0.0.1" and rec["node_port"] == 8473   # safe: localhost by default
-
-
-def test_main_node_invalid_port_keeps_default(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["node", "serve", "--port", "abc", "--port=xyz"]) == 0
-    assert rec["node_port"] == 8473            # non-int on either form falls back to the default
+    assert _run_main(monkeypatch, ["node", "run"]) == 0
+    assert rec["node"] == ["run"]              # push-only node: no --host/--port plumbing
 
 
 def test_main_node_enroll_threads_token(monkeypatch):

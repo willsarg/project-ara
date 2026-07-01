@@ -10,8 +10,10 @@ import {
   createPendingAgent,
   getAgentByEnrollmentId,
   insertEnrollmentToken,
+  listAgents,
   listAgentsByStatus,
   markEnrollmentTokenUsed,
+  revokeAgent,
   setAgentStatus,
   takePendingSessionToken,
   type AgentRow,
@@ -96,10 +98,51 @@ export function denyAgent(id: number): void {
   setAgentStatus(id, "denied");
 }
 
+/** Revoke an approved agent: deny it and invalidate its session token (see db.revokeAgent). */
+export function revoke(id: number): void {
+  revokeAgent(id);
+}
+
 export function listPending(): AgentRow[] {
   return listAgentsByStatus("pending");
 }
 
 export function listActive(): AgentRow[] {
   return listAgentsByStatus("active");
+}
+
+/** A render-ready, token-free view of an enrolled agent for the dashboard. Secrets (session token,
+ *  its hash, the transient plaintext) are deliberately excluded — this shape is safe to render. */
+export interface AgentSummary {
+  id: number;
+  machine_key: string;
+  status: string;
+  last_seen: string | null;
+  caps_count: number;
+}
+
+/** Count an agent's advertised capabilities from its stored caps_json (a JSON array), 0 if absent
+ *  or malformed. Never throws — a bad blob just yields 0. */
+export function summarizeAgent(a: AgentRow): AgentSummary {
+  let caps_count = 0;
+  if (a.caps_json) {
+    try {
+      const parsed = JSON.parse(a.caps_json);
+      if (Array.isArray(parsed)) caps_count = parsed.length;
+    } catch {
+      /* malformed caps_json → 0 */
+    }
+  }
+  return {
+    id: a.id,
+    machine_key: a.machine_key,
+    status: a.status,
+    last_seen: a.last_seen,
+    caps_count,
+  };
+}
+
+/** Every enrolled agent, newest first, as token-free summaries for the dashboard. */
+export function listAgentSummaries(): AgentSummary[] {
+  return listAgents().map(summarizeAgent);
 }

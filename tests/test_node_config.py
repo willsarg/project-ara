@@ -16,6 +16,17 @@ def _node_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
 
 
+def test_node_dir_honors_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "override"))
+    assert config.node_dir() == tmp_path / "override"
+
+
+def test_node_dir_defaults_to_os_data_dir(monkeypatch):
+    monkeypatch.delenv("ARA_NODE_DIR", raising=False)
+    d = config.node_dir()
+    assert d.name == "node" and d.parent.name == "ara"   # platformdirs user_data_dir("ara")/node
+
+
 def test_load_is_none_when_absent():
     assert config.load() is None
 

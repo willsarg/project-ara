@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""The node's async job runner — what makes long verbs (characterize, benchmark) bearable over HTTP.
+"""The node's async job runner — submit a kind, run it in a background thread, persist the outcome.
 
-A ``POST`` submits a job and returns immediately with a ``job_id``; the work runs in a background
-thread and its outcome is persisted in the node's SQLite (``db.jobs``). The client polls
-``GET /jobs/{id}`` — the job lives on the node, so a dropped connection or a closed laptop never
-loses it (strictly better than an SSH session that dies with the terminal).
+ORPHANED by the pull->push cutover: its only callers were the deleted inbound HTTP ``/jobs`` API
+(the removed ``ara.node.app``). The push-only agent (:mod:`ara.node.agent`) runs each dispatched job
+synchronously in its work loop instead, so this store is currently unused. Kept as the seam for a
+future async local executor — the two-queue model's node-local store (e.g. an ``ara <verb> --detach``
+that survives a dropped connection). Decide before shipping: wire it, or delete it (+ ``db.jobs``) as
+dead pull-era code. See the Phase-3 note in the migration plan.
 
-The set of runnable ``kind``s is injected (a ``{kind: worker}`` map) so the wiring to ARA's real
-verbs lives in :mod:`ara.node.app`, and tests drive the runner with trivial fake workers.
+The set of runnable ``kind``s is injected (a ``{kind: worker}`` map); tests drive the runner with
+trivial fake workers.
 """
 from __future__ import annotations
 

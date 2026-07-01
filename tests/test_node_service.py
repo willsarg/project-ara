@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""The node service layer — the systemd --user unit lifecycle, the Linux guard, and serve()."""
+"""The node service layer — the systemd --user unit lifecycle and the Linux guard."""
 from __future__ import annotations
-
-import sys
-import types
 
 import pytest
 
@@ -46,8 +43,7 @@ def test_require_linux_passes_on_linux(linux):
 
 
 @pytest.mark.parametrize("fn", [
-    lambda: service.install("127.0.0.1", 9100),
-    service.start, service.stop, service.status, service.uninstall,
+    service.install, service.start, service.stop, service.status, service.uninstall,
 ])
 def test_every_systemd_fn_is_guarded(monkeypatch, fn):
     monkeypatch.setattr(service.platform, "system", lambda: "Windows")
@@ -57,7 +53,7 @@ def test_every_systemd_fn_is_guarded(monkeypatch, fn):
 
 def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path / "sd"))
-    service.install("0.0.0.0", 9100)
+    service.install()
     unit = tmp_path / "sd" / "ara-node.service"
     text = unit.read_text()
     assert f"ExecStart={service.sys.executable} -m ara.cli node run" in text   # push-only agent loop
@@ -97,14 +93,3 @@ def test_uninstall_is_idempotent_when_absent(tmp_path, monkeypatch, linux, calls
     monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))   # no unit file present
     service.uninstall()                                          # must not raise
     assert calls[0] == ["systemctl", "--user", "disable", "--now", "ara-node.service"]
-
-
-def test_serve_runs_uvicorn_with_built_app(monkeypatch):
-    ran = {}
-    fake_uvicorn = types.ModuleType("uvicorn")
-    fake_uvicorn.run = lambda app, host, port: ran.update(app=app, host=host, port=port)
-    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
-    monkeypatch.setattr("ara.node.wiring.build_app", lambda version: f"APP:{version}")
-
-    service.serve("127.0.0.1", 8088, version="3.3")
-    assert ran == {"app": "APP:3.3", "host": "127.0.0.1", "port": 8088}

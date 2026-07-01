@@ -4,10 +4,9 @@
 
 A node holds three facts: the coordinator ``server_url``, the one-shot ``enrollment_token`` an
 admin handed it, and (once approved) the durable ``session_token`` it auths work with. They live in
-the node data dir as ``config.json`` (``ARA_NODE_DIR`` override for tests, else the OS data dir —
-same directory the bearer token uses), written mode 0600 with the atomic owner-only pattern from
-:mod:`ara.node.auth`: a session token is a credential and must never be world/group-readable, even
-for the instant between create and chmod.
+the node data dir as ``config.json`` (``ARA_NODE_DIR`` override for tests, else the OS data dir),
+written mode 0600 with an atomic owner-only create+truncate: a session token is a credential and
+must never be world/group-readable, even for the instant between create and chmod.
 """
 from __future__ import annotations
 
@@ -15,8 +14,15 @@ import dataclasses
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
-from ara.node.auth import node_dir
+import platformdirs
+
+
+def node_dir() -> Path:
+    """The node's state directory — ``ARA_NODE_DIR`` if set (tests), else the OS data dir."""
+    override = os.environ.get("ARA_NODE_DIR")
+    return Path(override) if override else Path(platformdirs.user_data_dir("ara")) / "node"
 
 
 @dataclass

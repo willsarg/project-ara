@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 "use server";
-// Server Actions — login/logout and registry mutations. All run server-side; node tokens written
-// here go straight into SQLite and are never returned to the caller.
+// Server Actions — login/logout and push-channel admin mutations. All run server-side; agent
+// secrets minted here go straight into SQLite (as hashes) and are never returned to the caller.
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { SESSION_COOKIE, createSession } from "@/lib/auth";
-import { addNode, deleteNode, toggleNode, verifyAdminPassword } from "@/lib/db";
-import { approveAgent, denyAgent, issueEnrollmentToken } from "@/lib/enrollment";
+import { verifyAdminPassword } from "@/lib/db";
+import { approveAgent, denyAgent, issueEnrollmentToken, revoke } from "@/lib/enrollment";
 import { enqueue } from "@/lib/work";
 
 const SESSION_TTL_S = 60 * 60 * 24 * 7;
@@ -33,31 +33,6 @@ export async function logoutAction() {
   redirect("/login");
 }
 
-export async function addNodeAction(form: FormData) {
-  const name = String(form.get("name") ?? "").trim();
-  const base_url = String(form.get("base_url") ?? "").trim();
-  const token = String(form.get("token") ?? "").trim();
-  if (name && base_url && token) {
-    addNode(name, base_url, token);
-  }
-  revalidatePath("/nodes");
-  redirect("/nodes");
-}
-
-export async function deleteNodeAction(form: FormData) {
-  const id = Number(form.get("id"));
-  if (id) deleteNode(id);
-  revalidatePath("/nodes");
-  redirect("/nodes");
-}
-
-export async function toggleNodeAction(form: FormData) {
-  const id = Number(form.get("id"));
-  if (id) toggleNode(id);
-  revalidatePath("/nodes");
-  redirect("/nodes");
-}
-
 // --- Phone-home (push) admin actions -------------------------------------------------------------
 
 /** Mint an enrollment token and RETURN the plaintext so the page can show it ONCE (useActionState).
@@ -81,6 +56,14 @@ export async function approveAgentAction(form: FormData) {
 export async function denyAgentAction(form: FormData) {
   const id = Number(form.get("id"));
   if (id) denyAgent(id);
+  revalidatePath("/nodes");
+  redirect("/nodes");
+}
+
+/** Revoke an active agent: deny it and invalidate its session token so it can no longer poll work. */
+export async function revokeAgentAction(form: FormData) {
+  const id = Number(form.get("id"));
+  if (id) revoke(id);
   revalidatePath("/nodes");
   redirect("/nodes");
 }
