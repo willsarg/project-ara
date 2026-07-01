@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/environment.json",
+  "title": "Environment label",
+  "description": "Where a node/measurement lives. Carried on every measurement so a container/WSL2 wall is never mistaken for a bare-metal wall. wall_source records HOW the memory ceiling was read.",
+  "type": "object",
+  "properties": {
+    "platform": { "type": "string", "enum": ["linux", "darwin", "windows"] },
+    "accel": { "type": "string", "enum": ["nvidia", "amd", "metal", "vulkan", "intel", "cpu", "unknown"] },
+    "containerized": { "type": "boolean" },
+    "virtualization_layer": {
+      "type": ["string", "null"],
+      "description": "e.g. wsl2, docker, none/null when bare-metal host"
+    },
+    "wall_source": {
+      "type": "string",
+      "enum": ["cgroup", "physical"],
+      "description": "cgroup = read from cgroup memory.max/limit (container-honest); physical = detected host RAM/VRAM"
+    }
+  },
+  "required": ["platform", "accel", "containerized", "wall_source"],
+  "additionalProperties": false
+}

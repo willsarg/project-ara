@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/enroll.response.json",
+  "title": "Enrollment response (server → node)",
+  "description": "Reply to POST /api/enroll. The node is PENDING; it polls GET /api/enroll/{id} until approved.",
+  "type": "object",
+  "properties": {
+    "enrollment_id": { "type": "string", "minLength": 1 },
+    "status": { "const": "pending" }
+  },
+  "required": ["enrollment_id", "status"],
+  "additionalProperties": false
+}

@@ -1,0 +1,7 @@
+{
+  "job": {
+    "id": "job_01HXYZA1B2C3",
+    "kind": "run",
+    "args": { "model": "qwen2.5-1.5b-instruct", "prompt": "What is the capital of France?" }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "description": "The ARA node<->server wire-contract cases. BOTH the node (tests/test_wire_contract.py) and the coordinator (coordinator/test/contracts.test.ts) validate every fixture against its schema and assert the expected validity. Single source of truth — do not fork per language.",
+  "cases": [
+    { "fixture": "enroll.request.valid.json", "schema": "https://ara.dev/wire/enroll.request.json", "valid": true },
+    { "fixture": "enroll.request.invalid-missing-machine_key.json", "schema": "https://ara.dev/wire/enroll.request.json", "valid": false },
+    { "fixture": "enroll.response.valid.json", "schema": "https://ara.dev/wire/enroll.response.json", "valid": true },
+    { "fixture": "enroll-poll.pending.valid.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": true },
+    { "fixture": "enroll-poll.active.valid.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": true },
+    { "fixture": "work.response.valid.json", "schema": "https://ara.dev/wire/work.response.json", "valid": true },
+    { "fixture": "result.request.done.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
+    { "fixture": "result.request.failed.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
+    { "fixture": "result.request.invalid-bad-status.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false }
+  ]
+}

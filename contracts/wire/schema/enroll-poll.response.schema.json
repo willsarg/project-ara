@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/enroll-poll.response.json",
+  "title": "Enrollment approval poll (server → node)",
+  "description": "Reply to GET /api/enroll/{id}. Either still pending, or active with the one-time per-node session token.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": { "status": { "const": "pending" } },
+      "required": ["status"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": { "const": "active" },
+        "session_token": { "type": "string", "minLength": 1 }
+      },
+      "required": ["status", "session_token"],
+      "additionalProperties": false
+    }
+  ]
+}

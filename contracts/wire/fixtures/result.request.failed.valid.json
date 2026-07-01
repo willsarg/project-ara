@@ -1,0 +1,11 @@
+{
+  "status": "failed",
+  "error": "engine exited: OOM ramping context past 14336 tokens",
+  "environment": {
+    "platform": "linux",
+    "accel": "nvidia",
+    "containerized": true,
+    "virtualization_layer": "docker",
+    "wall_source": "cgroup"
+  }
+}

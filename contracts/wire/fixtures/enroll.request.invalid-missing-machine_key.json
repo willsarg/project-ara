@@ -1,0 +1,10 @@
+{
+  "identity": { "hostname": "rog-ubuntu" },
+  "capabilities": [],
+  "environment": {
+    "platform": "linux",
+    "accel": "vulkan",
+    "containerized": false,
+    "wall_source": "physical"
+  }
+}

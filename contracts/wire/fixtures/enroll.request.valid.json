@@ -1,0 +1,16 @@
+{
+  "machine_key": "rog-ubuntu-9f3a1c",
+  "identity": { "hostname": "rog-ubuntu", "os": "linux", "arch": "x86_64" },
+  "profile_projection": {},
+  "capabilities": [
+    { "kind": "serve_model", "id": "qwen2.5-1.5b-instruct", "engine": "vulkan", "evidence": "characterized" },
+    { "kind": "embeddings", "id": "bge-large-en", "engine": "cpu", "evidence": "estimated" }
+  ],
+  "environment": {
+    "platform": "linux",
+    "accel": "vulkan",
+    "containerized": false,
+    "virtualization_layer": null,
+    "wall_source": "physical"
+  }
+}
