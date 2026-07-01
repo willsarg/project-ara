@@ -54,8 +54,9 @@ def load() -> NodeConfig | None:
 def save(config: NodeConfig) -> None:
     """Persist *config* to the node data dir, owner-only (0600) via an atomic create+truncate.
 
-    Mirrors ``auth._write_token``: the session token is a credential, so the file is never
-    world/group-readable even transiently. On Windows the mode is advisory (ACLs govern)."""
+    The session token is a credential, so the file is created 0600 up front (``os.open`` with the
+    mode, not create-then-chmod) — never world/group-readable, even transiently. On Windows the mode
+    is advisory (ACLs govern)."""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
