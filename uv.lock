@@ -644,6 +644,7 @@ dependencies = [
 [package.optional-dependencies]
 node = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "uvicorn" },
 ]
 
@@ -662,6 +663,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", marker = "extra == 'node'", specifier = ">=0.115" },
     { name = "gguf", specifier = ">=0.19.0" },
+    { name = "httpx", marker = "extra == 'node'", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "platformdirs", specifier = ">=4" },
     { name = "psutil", specifier = ">=5.9" },

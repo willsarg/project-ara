@@ -2134,19 +2134,41 @@ def _warn_if_exposed(c: Console, host: str, surface: str) -> None:
                    "     only on a network you trust, and treat the token / login as a real secret."))
 
 
-def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: bool = False) -> int:
+def render_node(c: Console, rest: list[str], *, host: str, port: int, token: str | None = None,
+                as_json: bool = False) -> int:
     """`ara node <sub>` — run/manage the headless node daemon (a FastAPI API over ARA's verbs).
 
-    Subcommands: ``serve`` (foreground launcher — what the systemd unit runs and what you run to
-    debug), ``install`` (write + enable the systemd --user boot unit), ``start``/``stop``/``status``/
-    ``uninstall`` (service lifecycle), and ``token`` (print, or ``token rotate`` to replace, the
-    bearer token every endpoint requires). The systemd path is Linux-only and raises a clear message
-    elsewhere; the web stack is the optional ``[node]`` extra and a missing import becomes an
-    actionable hint, never a traceback.
+    Subcommands: ``enroll <server_url> --token <t>`` (phone home to a coordinator and wait for
+    approval) and ``run`` (the push-only work loop); ``serve`` (foreground launcher — what the
+    systemd unit runs and what you run to debug), ``install`` (write + enable the systemd --user boot
+    unit), ``start``/``stop``/``status``/``uninstall`` (service lifecycle), and ``token`` (print, or
+    ``token rotate`` to replace, the bearer token every endpoint requires). The systemd path is
+    Linux-only and raises a clear message elsewhere; the web stack is the optional ``[node]`` extra
+    and a missing import becomes an actionable hint, never a traceback.
     """
-    from ara.node import auth, service
+    from ara.node import agent, auth, config, enroll, service
 
     sub = rest[1] if len(rest) > 1 else None
+
+    if sub == "enroll":
+        server_url = rest[2] if len(rest) > 2 else None
+        if not server_url or not token:
+            return _node_err(c, as_json, "usage: ara node enroll <server_url> --token <token>")
+        cfg = config.NodeConfig(server_url=server_url, enrollment_token=token)
+        config.save(cfg)
+        try:
+            enroll.enroll_flow(cfg)
+        except Exception as exc:                    # surface, don't swallow: enrollment can fail
+            return _node_err(c, as_json, f"enrollment failed: {exc}")
+        return _node_say(c, as_json, f"enrolled with {server_url}", endpoint=server_url)
+
+    if sub == "run":
+        cfg = config.load()
+        if cfg is None:
+            return _node_err(c, as_json,
+                             "not enrolled — run: ara node enroll <server_url> --token <token>")
+        agent.run_loop(cfg)                         # blocks: phone-home work loop until stopped
+        return _node_say(c, as_json, "run loop exited")
 
     if sub == "token":
         tok = auth.rotate_token() if rest[2:3] == ["rotate"] else auth.ensure_token()
@@ -2186,8 +2208,8 @@ def render_node(c: Console, rest: list[str], *, host: str, port: int, as_json: b
             return _node_err(c, as_json, str(exc))
 
     return _node_err(c, as_json,
-                     "usage: ara node {serve|install|start|stop|status|uninstall|token} "
-                     "[--host H] [--port N]")
+                     "usage: ara node {enroll|run|serve|install|start|stop|status|uninstall|token} "
+                     "[--host H] [--port N] [--token T]")
 
 
 def main() -> int:
@@ -2446,7 +2468,7 @@ def _main_impl() -> int:
         return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
 
     if cmd == "node":
-        return render_node(c, rest, host=node_host, port=node_port, as_json=as_json)
+        return render_node(c, rest, host=node_host, port=node_port, token=token, as_json=as_json)
 
     if as_json:
         return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")

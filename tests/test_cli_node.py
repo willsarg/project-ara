@@ -9,7 +9,13 @@ import json
 import pytest
 
 import ara.cli as cli
-from ara.node import auth, service
+from ara.node import agent, auth, config, enroll, service
+
+
+@pytest.fixture(autouse=True)
+def _node_dir(tmp_path, monkeypatch):
+    """Point the node data dir at a tmp sandbox so `enroll` never writes the real config."""
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
 
 
 @pytest.fixture
@@ -23,6 +29,57 @@ def con():
 def _node(cb, *args, host="127.0.0.1", **kw):
     c, _buf = cb
     return cli.render_node(c, ["node", *args], host=host, port=8473, **kw)
+
+
+# --- enroll (phone home) ---
+def test_enroll_writes_config_and_runs_flow(con, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(enroll, "enroll_flow", lambda cfg: seen.setdefault("cfg", cfg))
+    assert _node(con, "enroll", "https://c.example", token="ENR") == 0
+    saved = config.load()
+    assert saved.server_url == "https://c.example" and saved.enrollment_token == "ENR"
+    assert seen["cfg"].server_url == "https://c.example"       # the flow ran against the saved config
+    assert "enrolled with https://c.example" in con[1].getvalue()
+
+
+def test_enroll_json_carries_endpoint(con, capsys, monkeypatch):
+    monkeypatch.setattr(enroll, "enroll_flow", lambda cfg: None)
+    assert _node(con, "enroll", "https://c.example", token="ENR", as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] and out["endpoint"] == "https://c.example"
+
+
+def test_enroll_without_server_url_is_usage_error(con):
+    assert _node(con, "enroll", token="ENR") == 1
+    assert "usage: ara node enroll" in con[1].getvalue()
+
+
+def test_enroll_without_token_is_usage_error(con):
+    assert _node(con, "enroll", "https://c.example") == 1        # no --token
+    assert "usage: ara node enroll" in con[1].getvalue()
+
+
+def test_enroll_failure_is_surfaced(con, monkeypatch):
+    def _boom(cfg):
+        raise RuntimeError("coordinator refused")
+    monkeypatch.setattr(enroll, "enroll_flow", _boom)
+    assert _node(con, "enroll", "https://c.example", token="ENR") == 1
+    assert "enrollment failed: coordinator refused" in con[1].getvalue()
+
+
+# --- run (work loop) ---
+def test_run_requires_enrollment(con):
+    assert _node(con, "run") == 1                               # no config on disk yet
+    assert "not enrolled" in con[1].getvalue()
+
+
+def test_run_invokes_the_agent_loop(con, monkeypatch):
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="SES"))
+    seen = {}
+    monkeypatch.setattr(agent, "run_loop", lambda cfg: seen.setdefault("cfg", cfg))
+    assert _node(con, "run") == 0
+    assert seen["cfg"].session_token == "SES"
+    assert "run loop exited" in con[1].getvalue()
 
 
 # --- token ---

@@ -28,7 +28,7 @@ ara = "ara.cli:main"
 # `ara node` lazy-imports these and tells the user to run `ara node install` (which ensures
 # the extra) if absent — the same on-demand philosophy as engines. The node daemon needs FastAPI.
 [project.optional-dependencies]
-node = ["fastapi>=0.115", "uvicorn>=0.30"]
+node = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

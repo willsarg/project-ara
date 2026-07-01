@@ -7,6 +7,8 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { SESSION_COOKIE, createSession } from "@/lib/auth";
 import { addNode, deleteNode, toggleNode, verifyAdminPassword } from "@/lib/db";
+import { approveAgent, denyAgent, issueEnrollmentToken } from "@/lib/enrollment";
+import { enqueue } from "@/lib/work";
 
 const SESSION_TTL_S = 60 * 60 * 24 * 7;
 
@@ -52,6 +54,43 @@ export async function deleteNodeAction(form: FormData) {
 export async function toggleNodeAction(form: FormData) {
   const id = Number(form.get("id"));
   if (id) toggleNode(id);
+  revalidatePath("/nodes");
+  redirect("/nodes");
+}
+
+// --- Phone-home (push) admin actions -------------------------------------------------------------
+
+/** Mint an enrollment token and RETURN the plaintext so the page can show it ONCE (useActionState).
+ *  This is the only path a token's plaintext ever reaches the browser; only its hash is stored. */
+export async function issueEnrollmentTokenAction(
+  _prev: { token?: string } | undefined,
+  _form: FormData,
+): Promise<{ token: string }> {
+  const { token } = issueEnrollmentToken();
+  revalidatePath("/nodes");
+  return { token };
+}
+
+export async function approveAgentAction(form: FormData) {
+  const id = Number(form.get("id"));
+  if (id) approveAgent(id);
+  revalidatePath("/nodes");
+  redirect("/nodes");
+}
+
+export async function denyAgentAction(form: FormData) {
+  const id = Number(form.get("id"));
+  if (id) denyAgent(id);
+  revalidatePath("/nodes");
+  redirect("/nodes");
+}
+
+/** Enqueue a `run` job (model + prompt) for an active agent to pick up on its next work poll. */
+export async function submitJobAction(form: FormData) {
+  const agentId = Number(form.get("agentId"));
+  const model = String(form.get("model") ?? "").trim();
+  const prompt = String(form.get("prompt") ?? "").trim();
+  if (agentId && model) enqueue(agentId, "run", { model, prompt });
   revalidatePath("/nodes");
   redirect("/nodes");
 }

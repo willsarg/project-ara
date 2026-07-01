@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Will Sarg
+"""The push-only node's on-disk config — where it phones home and the tokens it carries.
+
+A node holds three facts: the coordinator ``server_url``, the one-shot ``enrollment_token`` an
+admin handed it, and (once approved) the durable ``session_token`` it auths work with. They live in
+the node data dir as ``config.json`` (``ARA_NODE_DIR`` override for tests, else the OS data dir —
+same directory the bearer token uses), written mode 0600 with the atomic owner-only pattern from
+:mod:`ara.node.auth`: a session token is a credential and must never be world/group-readable, even
+for the instant between create and chmod.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+from dataclasses import dataclass
+
+from ara.node.auth import node_dir
+
+
+@dataclass
+class NodeConfig:
+    """The node's identity toward one coordinator: where to reach it and the tokens it presents."""
+
+    server_url: str
+    enrollment_token: str | None = None
+    session_token: str | None = None
+
+
+def _config_path():
+    return node_dir() / "config.json"
+
+
+def load() -> NodeConfig | None:
+    """The stored config, or None if this node has never been pointed at a coordinator."""
+    path = _config_path()
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return NodeConfig(
+        server_url=data["server_url"],
+        enrollment_token=data.get("enrollment_token"),
+        session_token=data.get("session_token"),
+    )
+
+
+def save(config: NodeConfig) -> None:
+    """Persist *config* to the node data dir, owner-only (0600) via an atomic create+truncate.
+
+    Mirrors ``auth._write_token``: the session token is a credential, so the file is never
+    world/group-readable even transiently. On Windows the mode is advisory (ACLs govern)."""
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(dataclasses.asdict(config), handle)

@@ -109,8 +109,9 @@ def _capture_dispatch(monkeypatch):
                         lambda c, sub, token=None, as_json=False:
                         (rec.update(hf=sub, hf_token=token) or 0))
     monkeypatch.setattr(cli, "render_node",
-                        lambda c, rest, host=None, port=None, as_json=False:
-                        (rec.update(node=rest[1:], node_host=host, node_port=port) or 0))
+                        lambda c, rest, host=None, port=None, token=None, as_json=False:
+                        (rec.update(node=rest[1:], node_host=host, node_port=port,
+                                    node_token=token) or 0))
     return rec
 
 
@@ -142,6 +143,12 @@ def test_main_node_invalid_port_keeps_default(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["node", "serve", "--port", "abc", "--port=xyz"]) == 0
     assert rec["node_port"] == 8473            # non-int on either form falls back to the default
+
+
+def test_main_node_enroll_threads_token(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["node", "enroll", "https://c.example", "--token", "ENR"]) == 0
+    assert rec["node"] == ["enroll", "https://c.example"] and rec["node_token"] == "ENR"
 
 
 def test_main_no_args_shows_landing(monkeypatch):
