@@ -60,15 +60,18 @@ def _reauth(config) -> NodeClient:
 
 def run_loop(config, *, client: NodeClient | None = None,
              runner: Callable[[str, dict], dict] | None = None, wait: float = 20.0,
-             max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0) -> int:
+             max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0,
+             reauth_backoff: float = 5.0) -> int:
     """Run the phone-home work loop, returning the number of poll iterations performed.
 
     Ensures the node is enrolled (a session token present), then for each iteration long-polls for a
     job, runs it, and reports the outcome. Emits an sd_notify heartbeat + status each iteration so
     systemd's watchdog is fed (and journald sees liveness off systemd). A 401 on either call means
     the session token was revoked/expired: the node re-enrolls for a fresh token, rebuilds the
-    client, and carries on rather than crashing. ``max_iterations`` bounds the loop (None = forever,
-    the production default); ``client``/``runner``/``sleep`` are injectable for tests."""
+    client, and carries on rather than crashing — then sleeps ``reauth_backoff`` so a server that
+    persistently 401s can't busy-loop (a 401 returns immediately, with none of the long-poll's
+    natural pacing). ``max_iterations`` bounds the loop (None = forever, the production default);
+    ``client``/``runner``/``sleep`` are injectable for tests."""
     if not config.session_token:
         enroll.enroll_flow(config)
     client = client or NodeClient(config.server_url, config.session_token)
@@ -84,6 +87,7 @@ def run_loop(config, *, client: NodeClient | None = None,
         except httpx.HTTPStatusError as exc:
             if _is_unauthorized(exc):
                 client = _reauth(config)
+                sleep(reauth_backoff)          # backoff: a persistent 401 mustn't busy-loop
                 continue
             raise
         if job is None:
@@ -99,6 +103,7 @@ def run_loop(config, *, client: NodeClient | None = None,
         except httpx.HTTPStatusError as exc:
             if _is_unauthorized(exc):
                 client = _reauth(config)
+                sleep(reauth_backoff)          # backoff: a persistent 401 mustn't busy-loop
                 continue
             raise
     return count
