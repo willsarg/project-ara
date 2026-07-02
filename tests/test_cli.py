@@ -5088,26 +5088,44 @@ def test_main_benchmark_missing_model_returns_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Bug fix: --ctx above the measured ceiling emits an advisory (bug audit)
+# Rule #1: --ctx above the measured ceiling is REFUSED, not warned past
+# (was an advisory; hardened per the 2026-06-28 audit follow-up).
+# Slug: 2026-07-02-rule1-ctx-gate
 # --------------------------------------------------------------------------- #
 
-def test_render_benchmark_emits_advisory_when_ctx_exceeds_measured_ceiling(make_console, monkeypatch):
-    """--ctx above the stored ceiling emits a visible advisory but still proceeds (rc=0)."""
+def test_render_benchmark_refuses_ctx_above_measured_ceiling(make_console, monkeypatch):
+    """--ctx above the stored ceiling is a hard refusal (rc=1) pointing at re-characterize —
+    never exceed the measured memory wall (Rule #1); re-measuring is the sanctioned path up."""
     _wire_benchmark(monkeypatch, ceiling=8000)
     c, buf = make_console()
     rc = cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=16000, assume_yes=True)
-    assert rc == 0
+    assert rc == 1
     out = buf.getvalue()
-    assert "note: --ctx 16000 exceeds the measured safe ceiling 8000" in out
+    assert "--ctx 16000 exceeds the measured safe ceiling 8000" in out
+    assert "Rule #1" in out and "ara characterize org/m" in out
 
 
-def test_render_benchmark_no_advisory_when_ctx_under_measured_ceiling(make_console, monkeypatch):
-    """--ctx below the stored ceiling: no advisory emitted."""
+def test_render_benchmark_refuses_ctx_above_ceiling_in_json(make_console, monkeypatch, capsys):
+    """The refusal honors --json: {"error": ...}, nothing stored."""
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    c, _ = make_console()
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=16000, assume_yes=True,
+                              as_json=True)
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "exceeds the measured safe ceiling" in payload["error"]
+
+
+def test_render_benchmark_allows_ctx_at_or_under_measured_ceiling(make_console, monkeypatch):
+    """--ctx at or below the stored ceiling proceeds (rc=0) with no gate noise. ctx == ceiling
+    is ALLOWED — the measured ceiling itself is safe by definition (a `>=` mutant would refuse)."""
     _wire_benchmark(monkeypatch, ceiling=8000)
     c, buf = make_console()
-    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000, assume_yes=True)
-    assert rc == 0
-    assert "note:" not in buf.getvalue()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=8000,
+                                assume_yes=True) == 0
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+                                assume_yes=True) == 0
+    assert "exceeds the measured safe ceiling" not in buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -5218,29 +5236,25 @@ def test_render_benchmark_no_advisory_on_mid_score(make_console, monkeypatch):
     assert "flat 0%/100%" not in buf.getvalue()
 
 
-def test_serve_mlx_emits_advisory_when_ctx_exceeds_measured_ceiling(make_console, monkeypatch, set_platform):
-    """serve --engine wmx --ctx above the stored ceiling emits advisory but proceeds (rc=0)."""
+def test_serve_mlx_refuses_ctx_above_measured_ceiling(make_console, monkeypatch, set_platform):
+    """serve --engine wmx --ctx above the stored ceiling is a hard refusal (rc=1) — Rule #1.
+    Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
-
-    class _Proc:
-        def wait(self): pass
-
-    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
-        return _Proc(), f"http://127.0.0.1:{port}", max_context
-
-    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
     c, buf = make_console()
     rc = cli.render_serve(c, "org/m", engine="wmx", ctx=16000, assume_yes=True)
-    assert rc == 0
-    assert "note: --ctx 16000 exceeds the measured safe ceiling 8000" in buf.getvalue()
+    assert rc == 1
+    out = buf.getvalue()
+    assert "--ctx 16000 exceeds the measured safe ceiling 8000" in out
+    assert "Rule #1" in out
 
 
-def test_serve_mlx_no_advisory_when_ctx_under_measured_ceiling(make_console, monkeypatch, set_platform):
-    """serve --engine wmx --ctx below the stored ceiling: no advisory."""
+def test_serve_mlx_allows_ctx_under_measured_ceiling(make_console, monkeypatch, set_platform):
+    """serve --engine wmx --ctx at/below the stored ceiling proceeds with no gate noise.
+    Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
@@ -5257,7 +5271,31 @@ def test_serve_mlx_no_advisory_when_ctx_under_measured_ceiling(make_console, mon
     c, buf = make_console()
     rc = cli.render_serve(c, "org/m", engine="wmx", ctx=4000, assume_yes=True)
     assert rc == 0
-    assert "note:" not in buf.getvalue()
+    assert "exceeds the measured safe ceiling" not in buf.getvalue()
+
+
+def test_serve_ollama_refuses_ctx_above_measured_ceiling(make_console, monkeypatch):
+    """Ollama serve with an explicit --ctx above the measured llama.cpp-class ceiling is a hard
+    refusal (rc=1). This path previously never consulted the measurement at all — an explicit
+    override sailed straight past the wall. Slug: 2026-07-02-rule1-ctx-gate"""
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096})
+    c, buf = make_console()
+    rc = cli.render_serve(c, "qwen3:0.6b", ctx=8192)
+    assert rc == 1
+    out = buf.getvalue()
+    assert "--ctx 8192 exceeds the measured safe ceiling 4096" in out
+    assert "Rule #1" in out
+
+
+def test_serve_ollama_allows_ctx_under_measured_ceiling(make_console, monkeypatch):
+    """Ollama serve with --ctx at/below the measured ceiling proceeds.
+    Slug: 2026-07-02-rule1-ctx-gate"""
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 4096,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096}, ps_rows=rows)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=4096) == 0
+    assert "exceeds the measured safe ceiling" not in buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
