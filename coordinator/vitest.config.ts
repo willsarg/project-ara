@@ -17,10 +17,11 @@ export default defineConfig({
       // This mirrors the Python side's 100% bar, which likewise applies to logic, not view markup.
       include: [
         "src/lib/**",
-        "src/middleware.ts",
+        "src/proxy.ts",
         "src/app/api/**",
         "src/app/actions.ts",
         "src/instrumentation.ts",
+        "src/instrumentation-node.ts",
       ],
       exclude: ["**/*.tsx"],
       thresholds: {
