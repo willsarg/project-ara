@@ -2,8 +2,8 @@
 #   - github-actions: keep the SHA-pinned actions fresh (pins otherwise go stale + miss security fixes)
 #   - uv:             the Python deps (pyproject.toml + uv.lock)
 #   - npm:            the coordinator's Node deps (coordinator/package.json + package-lock.json)
-#   - docker:         the coordinator image's base (coordinator/Dockerfile — node:22-bookworm-slim)
-# Every resulting PR is gated by the full test suite (.github/workflows/ci.yml) before it can merge.
+#   - docker:         the coordinator image's base (coordinator/Dockerfile — the node:*-bookworm-slim pin)
+# Every resulting PR is gated by the full suite via .github/workflows/dependabot-ci.yml before it merges.
 # https://docs.github.com/code-security/dependabot
 version: 2
 updates:

@@ -18,7 +18,7 @@
 #
 # Hardening mirrors test.yml / docker-scan.yml: read-only token, actions pinned to commit SHAs,
 # checkout creds not persisted, locked install (`uv sync --frozen`), per-job timeout.
-name: Dependency Contract (huggingface_hub)
+name: "Health · Dependency Contract: huggingface_hub (Tue)"
 
 on:
   workflow_dispatch:

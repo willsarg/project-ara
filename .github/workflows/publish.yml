@@ -9,7 +9,7 @@
 # Security hardening: deny-all token by default (each job opts into the minimum), actions pinned to
 # full commit SHAs (mutable tags are a supply-chain risk), checkout credentials not persisted,
 # id-token:write scoped to the publish job alone, environment binding, per-job timeouts.
-name: Publish to PyPI
+name: Release · Publish to PyPI
 
 on:
   push:
