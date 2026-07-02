@@ -912,6 +912,23 @@ def _confirm(question: str) -> bool:
         return False
 
 
+def _ctx_gate_msg(ctx: int, measured: int | None, model: str) -> str | None:
+    """Rule #1 gate for an explicit ``--ctx``: never proceed past this machine's MEASURED safe
+    ceiling. Returns the refusal message, or None when the request is admissible.
+
+    A measured ceiling exists → ``--ctx`` must stay ≤ it; raising the ceiling goes through
+    ``ara characterize`` (which re-measures safely) — not past the wall on a hunch. No measured
+    ceiling → an explicit ``--ctx`` is allowed as before (explicit beats silent guess; there is
+    no measurement to violate). Replaces the old proceed-with-a-note advisory (2026-06-28 audit
+    follow-up). Slug 2026-07-02-rule1-ctx-gate."""
+    if measured is not None and ctx > measured:
+        return (f"--ctx {ctx} exceeds the measured safe ceiling {measured} for {model} on this "
+                f"machine — refusing (Rule #1: never exceed the measured memory wall). Use "
+                f"--ctx ≤ {measured}, or re-run `ara characterize {model}` if the hardware or "
+                f"engine setup changed.")
+    return None
+
+
 def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
     """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
     meta = catalog.describe(model_id)
@@ -1447,13 +1464,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if ctx is not None:
         if ctx <= 0:
             return err("--ctx must be a positive integer")
-        safe = ctx
-        # Advisory when an explicit --ctx exceeds the measured safe ceiling.
         _row = db.get_characterization(con, mk, key, model)
-        _measured = _row.get("safe_context") if _row else None
-        if _measured is not None and ctx > _measured:
-            c.emit(c.style("warn", f"  note: --ctx {ctx} exceeds the measured safe ceiling "
-                                   f"{_measured} — proceeding; the engine gate is the backstop"))
+        if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+            return err(msg)
+        safe = ctx
     else:
         row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
         if not row or row.get("safe_context") is None:
@@ -1737,13 +1751,10 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     if ctx is not None:
         if ctx <= 0:
             return err("--ctx must be a positive integer")
-        safe, source = ctx, "requested"
-        # Advisory when an explicit --ctx exceeds the measured safe ceiling.
         _row = db.get_characterization(con, mk, engine_key, model)
-        _measured = _row.get("safe_context") if _row else None
-        if _measured is not None and ctx > _measured:
-            c.emit(c.style("warn", f"  note: --ctx {ctx} exceeds the measured safe ceiling "
-                                   f"{_measured} — proceeding; the engine gate is the backstop"))
+        if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+            return err(msg)
+        safe, source = ctx, "requested"
     else:
         row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
         if not row or row.get("safe_context") is None:
@@ -1831,6 +1842,11 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     if ctx is not None:
         if ctx <= 0:
             return err("--ctx must be a positive integer")
+        # Rule #1 gate: an explicit --ctx must not exceed what was MEASURED for this model on
+        # this machine (previously this path never consulted the measurement at all).
+        found = _ollama_safe_ceiling(db.connect(), profile.machine_key(), model)
+        if (msg := _ctx_gate_msg(ctx, found[0] if found else None, model)):
+            return err(msg)
         safe, source = ctx, "requested"
     else:
         found = _ollama_safe_ceiling(db.connect(), profile.machine_key(), model)
