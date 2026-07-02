@@ -133,6 +133,14 @@ is_valid_json() {
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
+# ARA's version is derived from git tags by hatch-vcs, but we ship HEAD via `git archive`, which
+# strips the .git dir — so the build can't see the tags and `uv sync` fails. Compute the version
+# HERE (where .git exists) and hand it to every build via SETUPTOOLS_SCM_PRETEND_VERSION (hatch-vcs
+# honors it). Strip a leading `v`; fall back to 0.0.0 if there's no tag. This is the version the
+# fleet install reports — it's a check environment, so an approximate version is fine.
+PRETEND_VERSION="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+PRETEND_VERSION="${PRETEND_VERSION:-0.0.0}"
+
 # Results, as parallel indexed arrays (again: no associative arrays, bash-3.2-safe).
 RESULT_TARGETS=()
 RESULT_STATUS=()   # PASS | FAIL | UNREACHABLE
@@ -154,7 +162,10 @@ check_local() {
     local target="mac"
     local workdir
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/ara-fleet-check.XXXXXX")"
-    trap 'rm -rf "$workdir"' RETURN
+    # ${workdir:-} guard: a RETURN trap referencing a `local` can fire in a scope where the local
+    # is gone (bash trap+local under set -u), which would crash on an unbound var. Empty -> no-op.
+    trap 'rm -rf "${workdir:-}"' RETURN
+    export SETUPTOOLS_SCM_PRETEND_VERSION="$PRETEND_VERSION"  # subshells below inherit it
 
     log "$target: archiving HEAD into $workdir"
     if ! git -C "$REPO_ROOT" archive HEAD | tar -x -C "$workdir"; then
@@ -162,7 +173,7 @@ check_local() {
         return
     fi
 
-    log "$target: uv sync --frozen --group dev"
+    log "$target: uv sync --frozen --group dev (version pinned via SETUPTOOLS_SCM_PRETEND_VERSION)"
     if ! (cd "$workdir" && uv sync --frozen --group dev) >&2; then
         record_result "$target" "FAIL" "uv sync failed"
         return
@@ -237,21 +248,24 @@ check_posix_remote() {
         return
     fi
 
-    log "$target: uv sync --frozen --group dev"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && uv sync --frozen --group dev" >&2; then
+    # SETUPTOOLS_SCM_PRETEND_VERSION on each remote uv call (git archive stripped .git; see the
+    # global). POSIX remote: `VAR='val' cmd` inline-env form.
+    local envp="SETUPTOOLS_SCM_PRETEND_VERSION='$PRETEND_VERSION'"
+    log "$target: uv sync --frozen --group dev (version pinned)"
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv sync --frozen --group dev" >&2; then
         record_result "$target" "FAIL" "uv sync failed"
         return
     fi
 
     log "$target: uv run pytest"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && uv run pytest" >&2; then
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv run pytest" >&2; then
         record_result "$target" "FAIL" "pytest failed"
         return
     fi
 
     log "$target: uv run ara detect --json"
     local detect_json
-    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && uv run ara detect --json")"; then
+    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv run ara detect --json")"; then
         record_result "$target" "FAIL" "ara detect --json exited non-zero"
         return
     fi
@@ -299,21 +313,24 @@ check_windows_remote() {
         return
     fi
 
-    log "$target: uv sync --frozen --group dev"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && uv sync --frozen --group dev" >&2; then
+    # SETUPTOOLS_SCM_PRETEND_VERSION on each remote uv call (git archive stripped .git). cmd.exe
+    # form: `set "VAR=val"` (quoted, so no trailing-space corruption) chained with &&.
+    local setver="set \"SETUPTOOLS_SCM_PRETEND_VERSION=$PRETEND_VERSION\""
+    log "$target: uv sync --frozen --group dev (version pinned)"
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && $setver && uv sync --frozen --group dev" >&2; then
         record_result "$target" "FAIL" "uv sync failed"
         return
     fi
 
     log "$target: uv run pytest"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && uv run pytest" >&2; then
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && $setver && uv run pytest" >&2; then
         record_result "$target" "FAIL" "pytest failed"
         return
     fi
 
     log "$target: uv run ara detect --json"
     local detect_json
-    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && uv run ara detect --json")"; then
+    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "cd \"$remote_dir\" && $setver && uv run ara detect --json")"; then
         record_result "$target" "FAIL" "ara detect --json exited non-zero"
         return
     fi
