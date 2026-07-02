@@ -9,6 +9,27 @@ export default defineConfig({
     // A default session secret so tests that touch auth.ts don't trip the no-secret guard;
     // auth.test.ts overrides it per-case with vi.stubEnv.
     env: { ARA_COORDINATOR_SECRET: "test-secret" },
+    coverage: {
+      provider: "v8",
+      // SCOPE: the TypeScript LOGIC surface only — libs, middleware, API routes, server actions,
+      // and the startup guard. Presentation-layer .tsx (pages/layout/login UI under src/app) is
+      // deliberately EXCLUDED: it's exercised by `tsc --noEmit` + `next build`, not this unit gate.
+      // This mirrors the Python side's 100% bar, which likewise applies to logic, not view markup.
+      include: [
+        "src/lib/**",
+        "src/middleware.ts",
+        "src/app/api/**",
+        "src/app/actions.ts",
+        "src/instrumentation.ts",
+      ],
+      exclude: ["**/*.tsx"],
+      thresholds: {
+        statements: 100,
+        branches: 100,
+        functions: 100,
+        lines: 100,
+      },
+    },
   },
   resolve: {
     alias: {

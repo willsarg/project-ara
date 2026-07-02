@@ -33,6 +33,13 @@ ENV HOSTNAME=0.0.0.0
 ENV ARA_COORDINATOR_DB=/app/data/coordinator.db
 
 RUN useradd -m -u 1001 ara
+# Strip the base image's own npm/npx/corepack: the standalone server only ever runs `node
+# server.js`, never npm — and the base image's vendored npm ships its OWN pinned transitive deps
+# (e.g. picomatch, sigstore) that lag behind fixes and show up as HIGH vulns in an image scan even
+# though this app never uses them. Removing unused tooling from the runtime image is both a real
+# vuln fix and a smaller attack surface, not a scan suppression.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 # Standalone server + its traced node_modules (includes the better-sqlite3 native binding).
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static

@@ -3,6 +3,7 @@ node_modules
 out
 next-env.d.ts
 *.tsbuildinfo
+coverage
 
 # local registry + secrets (volume-mounted in prod)
 /data
