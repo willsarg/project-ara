@@ -94,6 +94,10 @@ ENGINES: dict[str, dict] = {
         #   as AVX-512 builds that fault on non-AVX-512 CPUs — 0xc000001d.) Native builds elsewhere
         #   are monolithic + host-ISA, so this cap is Windows-only; Linux/macOS get the latest
         #   llama-cpp-python (verified Mac cpu engine ships 0.3.31, runs gemma-4).
+        #   RE-CERTIFY before raising this cap — don't guess. `scripts/certify_llama_cpp_cpu.py`
+        #   installs a candidate version the same way (--only-binary + this index), loads a tiny
+        #   GGUF, and generates a token; exit 0 = safe to bump. Re-run 2026-07-02 on willw11
+        #   re-confirmed 0.3.32 still fails at llama.dll load (WinError 127 → cap stays).
         "wheel_only": {
             "llama-cpp-python": {
                 "index": "https://abetlen.github.io/llama-cpp-python/whl/cpu",
