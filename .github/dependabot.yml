@@ -1,6 +1,9 @@
 # Weekly Dependabot updates, each grouped into a single low-noise PR:
 #   - github-actions: keep the SHA-pinned actions fresh (pins otherwise go stale + miss security fixes)
-#   - uv: keep the Python deps (pyproject.toml + uv.lock) current
+#   - uv:             the Python deps (pyproject.toml + uv.lock)
+#   - npm:            the coordinator's Node deps (coordinator/package.json + package-lock.json)
+#   - docker:         the coordinator image's base (coordinator/Dockerfile — node:22-bookworm-slim)
+# Every resulting PR is gated by the full test suite (.github/workflows/ci.yml) before it can merge.
 # https://docs.github.com/code-security/dependabot
 version: 2
 updates:
@@ -19,3 +22,19 @@ updates:
     groups:
       python:
         patterns: ["*"]      # one combined PR for all Python dep bumps
+
+  - package-ecosystem: npm
+    directory: /coordinator   # where package.json + package-lock.json live
+    schedule:
+      interval: weekly
+    groups:
+      coordinator:
+        patterns: ["*"]      # one combined PR for all Node dep bumps
+
+  - package-ecosystem: docker
+    directory: /coordinator   # the multi-stage Dockerfile's base image
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]      # one combined PR for base-image bumps
