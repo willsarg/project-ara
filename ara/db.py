@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     score        REAL NOT NULL,
     max_score    REAL,
     sample_size  INTEGER,
+    refused_n    INTEGER,
+    errored_n    INTEGER,
     source       TEXT NOT NULL,
     measured_at  TEXT NOT NULL,
     PRIMARY KEY (machine_key, model_id, use_case)
@@ -106,6 +108,13 @@ def connect() -> sqlite3.Connection:
         con.execute("ALTER TABLE calibrations ADD COLUMN wall_gb REAL")
     if "safe_budget_gb" not in cal_cols:
         con.execute("ALTER TABLE calibrations ADD COLUMN safe_budget_gb REAL")
+    # Per-run honesty counts joined benchmark_results later — add to old DBs (Rule #3). NULL is
+    # legacy/unknown (an un-annotated run); 0 is a measured clean run.
+    bench_cols = {r["name"] for r in con.execute("PRAGMA table_info(benchmark_results)")}
+    if "refused_n" not in bench_cols:
+        con.execute("ALTER TABLE benchmark_results ADD COLUMN refused_n INTEGER")
+    if "errored_n" not in bench_cols:
+        con.execute("ALTER TABLE benchmark_results ADD COLUMN errored_n INTEGER")
     # One-time data fix (user_version 0→1): wmx calibrations stored before 2026-07-02 carry
     # decimal-GB walls (~7.4% high vs ARA's binary-GiB contract — the apple boundary now
     # converts). A float can't reveal its own units, so honest re-measurement beats arithmetic
@@ -245,20 +254,24 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
                           engine_key: str | None = None, backend: str | None = None,
                           base_model: str | None = None, quant: str | None = None,
                           benchmark_id: str | None = None, max_score: float | None = None,
-                          sample_size: int | None = None, tier: str = "measured") -> None:
+                          sample_size: int | None = None, tier: str = "measured",
+                          refused_n: int | None = None, errored_n: int | None = None) -> None:
     con.execute(
         "INSERT INTO benchmark_results "
         "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
-        "benchmark_id, tier, score, max_score, sample_size, source, measured_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "benchmark_id, tier, score, max_score, sample_size, refused_n, errored_n, "
+        "source, measured_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(machine_key, model_id, use_case) DO UPDATE SET "
         "engine_key=excluded.engine_key, backend=excluded.backend, "
         "base_model=excluded.base_model, quant=excluded.quant, "
         "benchmark_id=excluded.benchmark_id, tier=excluded.tier, score=excluded.score, "
         "max_score=excluded.max_score, sample_size=excluded.sample_size, "
+        "refused_n=excluded.refused_n, errored_n=excluded.errored_n, "
         "source=excluded.source, measured_at=excluded.measured_at",
         (machine_key, model_id, use_case, engine_key, backend, base_model, quant,
-         benchmark_id, tier, score, max_score, sample_size, source, _now()))
+         benchmark_id, tier, score, max_score, sample_size, refused_n, errored_n,
+         source, _now()))
     con.commit()
 
 

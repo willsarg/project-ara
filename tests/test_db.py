@@ -327,3 +327,79 @@ def test_list_benchmark_results_returns_machine_rows_only(store):
     assert {r["model_id"] for r in rows} == {"org/a", "org/b"}
     # other-machine excluded
     assert all(r["machine_key"] == "m" for r in rows)
+
+
+# --- benchmark result honesty columns: refused_n / errored_n (Spec 2026-07-02-benchmark-honesty-persistence) ---
+def test_benchmark_result_persists_refused_and_errored_counts(store):
+    """A partial-governance run stores its refusal/error counts so the score isn't misread as
+    a clean full run — Rule #3. Spec 2026-07-02-benchmark-honesty-persistence."""
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.4, source="wmx probe",
+                             refused_n=3, errored_n=2)
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["refused_n"] == 3
+    assert row["errored_n"] == 2
+
+
+def test_benchmark_result_refused_errored_default_none_is_legacy_unknown(store):
+    """Omitting the counts stores NULL = legacy/unknown (distinct from 0 = measured clean run).
+    Spec 2026-07-02-benchmark-honesty-persistence."""
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.4, source="s")
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["refused_n"] is None and row["errored_n"] is None
+
+
+def test_benchmark_result_zero_counts_are_a_clean_run(store):
+    """0 counts (a clean run) round-trip as 0, not NULL. Spec 2026-07-02-benchmark-honesty-persistence."""
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.9, source="s",
+                             refused_n=0, errored_n=0)
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["refused_n"] == 0 and row["errored_n"] == 0
+
+
+def test_benchmark_result_upsert_updates_refused_errored_counts(store):
+    """Re-running overwrites the stored counts (ON CONFLICT UPDATE).
+    Spec 2026-07-02-benchmark-honesty-persistence."""
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.4, source="run-1",
+                             refused_n=3, errored_n=2)
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.8, source="run-2",
+                             refused_n=0, errored_n=0)
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["refused_n"] == 0 and row["errored_n"] == 0 and row["score"] == 0.8
+
+
+def test_migration_adds_refused_errored_columns_to_old_schema(tmp_path, monkeypatch):
+    """An existing DB whose benchmark_results predates the honesty columns gets them after
+    connect(), old rows readable with NULL counts. Spec 2026-07-02-benchmark-honesty-persistence."""
+    import sqlite3 as _sqlite3
+    db_path = tmp_path / "old.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(db_path))
+
+    # Build an old-schema benchmark_results table (no refused_n/errored_n) and seed one row.
+    OLD_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS benchmark_results (
+        machine_key  TEXT NOT NULL,
+        model_id     TEXT NOT NULL,
+        use_case     TEXT NOT NULL,
+        tier         TEXT NOT NULL DEFAULT 'measured',
+        score        REAL NOT NULL,
+        source       TEXT NOT NULL,
+        measured_at  TEXT NOT NULL,
+        PRIMARY KEY (machine_key, model_id, use_case)
+    );
+    """
+    old_con = _sqlite3.connect(str(db_path))
+    old_con.row_factory = _sqlite3.Row
+    old_con.executescript(OLD_SCHEMA)
+    old_con.execute(
+        "INSERT INTO benchmark_results (machine_key, model_id, use_case, score, source, measured_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("m", "org/model", "coding", 0.5, "legacy", "2026-01-01T00:00:00+00:00"))
+    old_con.commit()
+    old_con.close()
+
+    con = db.connect()
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(benchmark_results)")}
+    assert {"refused_n", "errored_n"} <= cols
+    row = db.get_benchmark_result(con, "m", "org/model", "coding")
+    assert row is not None and row["score"] == 0.5
+    assert row["refused_n"] is None and row["errored_n"] is None
