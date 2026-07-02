@@ -99,7 +99,8 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (vram_margin, ram_margin). Margins are policy; stored calibration may override."""
     vram_margin = DEFAULT_VRAM_MARGIN_GB
     ram_margin = DEFAULT_RAM_MARGIN_GB
-    stored = calibration.get_calibration(db.connect(), CALIBRATION_ENGINE)
+    with db.connected() as con:
+        stored = calibration.get_calibration(con, CALIBRATION_ENGINE)
     if stored and stored.get("vram_margin_gb") is not None:
         vram_margin = stored["vram_margin_gb"]
     if stored and stored.get("ram_margin_gb") is not None:

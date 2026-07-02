@@ -14,6 +14,32 @@ def test_connect_creates_schema(store):
     assert {"calibrations", "models", "characterizations"} <= tables
 
 
+def test_connected_yields_working_connection_and_closes(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "cm.db"))
+    with db.connected() as con:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "models" in tables          # a live, schema-applied handle
+    # closed on exit — using it now raises ProgrammingError
+    import sqlite3
+    import pytest
+    with pytest.raises(sqlite3.ProgrammingError):
+        con.execute("SELECT 1")
+
+
+def test_connected_closes_on_exception(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "cm.db"))
+    import sqlite3
+    import pytest
+    captured = {}
+    with pytest.raises(ValueError):
+        with db.connected() as con:
+            captured["con"] = con
+            raise ValueError("boom")
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured["con"].execute("SELECT 1")   # still closed despite the error
+
+
 def test_db_path_uses_override(tmp_path, monkeypatch):
     monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "custom.db"))
     assert db._db_path() == tmp_path / "custom.db"

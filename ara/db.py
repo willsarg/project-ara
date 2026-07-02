@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -124,6 +125,24 @@ def connect() -> sqlite3.Connection:
         con.execute("PRAGMA user_version = 1")
         con.commit()
     return con
+
+
+@contextmanager
+def connected():
+    """Open the store, yield the connection, and close it on exit — even on error.
+
+    The write helpers (``upsert_*``/``save_*``) commit as they go, so this contract is purely
+    about releasing the handle: SQLite connections are a finite OS resource, and every
+    ``con = connect()`` caller that returned without closing leaked one. Use as::
+
+        with db.connected() as con:
+            ...
+    """
+    con = connect()
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def _now() -> str:

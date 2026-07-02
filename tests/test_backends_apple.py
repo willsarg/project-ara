@@ -3,6 +3,8 @@
 """backends/apple.py — a lean wmx-suite seam (stateless; ARA owns persistence)."""
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from ara import acquire, catalog, engine_env
@@ -386,7 +388,7 @@ def test_generate_omits_kv_bits_for_fp16(monkeypatch):
 
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
-    monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(apple, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng: {"fixed_overhead_gb": 5.5})}), raising=False)
@@ -395,7 +397,7 @@ def test_budget_params_uses_stored_calibration(monkeypatch):
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
-    monkeypatch.setattr(apple, "db", type("D", (), {"connect": staticmethod(lambda: None)}))
+    monkeypatch.setattr(apple, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
                         raising=False)

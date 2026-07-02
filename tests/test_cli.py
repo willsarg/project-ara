@@ -4742,7 +4742,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     monkeypatch.setattr(cli.ollama, "load", lambda n, keep_alive=-1, timeout=300.0: {"done": True})
     monkeypatch.setattr(cli.ollama, "ps", lambda timeout=2.0: (ps_rows or []))
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
-    monkeypatch.setattr(cli.db, "connect", lambda: object())
+    monkeypatch.setattr(cli.db, "connect", lambda: types.SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
