@@ -1,0 +1,49 @@
+# Vulnerability scan of the built coordinator image with Trivy (Apache-2.0). This catches CVEs in
+# the base OS + Node + installed packages — the class of issue Dependabot's docker ecosystem can't
+# see (it only bumps the FROM digest, and never scans image contents).
+#
+# Triggers:
+#   - schedule:          weekly — re-scans the CURRENT image against Trivy's latest CVE DB, so a
+#                        newly-disclosed CVE in an unchanged image is caught (the main reason to scan).
+#   - workflow_dispatch: on demand from the Actions tab.
+#   - pull_request:      only when Dependabot changes something that alters the image (Dockerfile or
+#                        the lockfile) — so a base-digest or dep bump is scanned before it merges.
+#                        Human PRs don't auto-trigger it (consistent with the Dependabot-only flow);
+#                        run it by hand via workflow_dispatch if needed.
+#
+# The gate fails on FIXABLE High/Critical vulnerabilities (ignore-unfixed) — so it flags what you can
+# actually act on, rather than blocking on an unpatchable base CVE.
+name: Docker Image Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  pull_request:
+    paths:
+      - "coordinator/Dockerfile"
+      - "coordinator/package-lock.json"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    # schedule + manual always run; on a PR, only Dependabot's (matches the dedicated-flow model).
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build coordinator image
+        run: docker build -t ara-coordinator:scan coordinator
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ara-coordinator:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table

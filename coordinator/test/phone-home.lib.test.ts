@@ -166,6 +166,109 @@ describe("approval + session token delivery", () => {
   });
 });
 
+describe("enroll() with an absent/non-string self-description", () => {
+  it("tolerates a bare self-description: empty machine_key, null identity/caps/environment JSON", () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const out = enroll.enroll(token, {});
+    expect(out).toEqual({ enrollment_id: expect.stringMatching(/^enr_/), status: "pending" });
+    const agent = db.getAgentByEnrollmentId(out!.enrollment_id)!;
+    expect(agent.machine_key).toBe("");
+    expect(agent.identity_json).toBeNull();
+    expect(agent.caps_json).toBeNull();
+    expect(agent.environment_json).toBeNull();
+  });
+
+  it("rejects a non-string machine_key the same way (coerced to empty)", () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const out = enroll.enroll(token, { machine_key: 12345 as unknown as string });
+    expect(db.getAgentByEnrollmentId(out!.enrollment_id)!.machine_key).toBe("");
+  });
+});
+
+describe("bearerToken parsing", () => {
+  it("returns null for a missing header, a malformed scheme, and an empty-token 'Bearer'", () => {
+    const noHeader = new Request("http://x", {});
+    expect(auth.bearerToken(noHeader)).toBeNull();
+
+    const wrongScheme = new Request("http://x", { headers: { authorization: "Basic dXNlcjpwYXNz" } });
+    expect(auth.bearerToken(wrongScheme)).toBeNull();
+
+    const noToken = new Request("http://x", { headers: { authorization: "Bearer" } });
+    expect(auth.bearerToken(noToken)).toBeNull();
+  });
+
+  it("extracts and trims the token from a well-formed Bearer header", () => {
+    const ok = new Request("http://x", { headers: { authorization: "Bearer   abc123  " } });
+    expect(auth.bearerToken(ok)).toBe("abc123");
+  });
+});
+
+describe("work.recordResult ternary branches (result/error/measurement presence + type)", () => {
+  it("string error is stored verbatim", async () => {
+    const agentId = await activeAgentHelper("box-err-string");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen" });
+    work.recordResult(jobId, { status: "failed", error: "boom" });
+    expect(db.getWorkById(jobId)!.error).toBe("boom");
+  });
+
+  it("non-string, non-null error is stringified", async () => {
+    const agentId = await activeAgentHelper("box-err-object");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen" });
+    work.recordResult(jobId, { status: "failed", error: { code: 42 } });
+    expect(db.getWorkById(jobId)!.error).toBe("[object Object]");
+  });
+
+  it("absent error/result/measurement all persist as null", async () => {
+    const agentId = await activeAgentHelper("box-err-absent");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen" });
+    work.recordResult(jobId, { status: "failed" });
+    const row = db.getWorkById(jobId)!;
+    expect(row.error).toBeNull();
+    expect(row.result_json).toBeNull();
+    expect(row.measurement_json).toBeNull();
+  });
+});
+
+async function activeAgentHelper(name: string) {
+  const { token } = enroll.issueEnrollmentToken();
+  const { enrollment_id } = enroll.enroll(token, selfDesc(name))!;
+  const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+  enroll.approveAgent(agent.id);
+  return agent.id;
+}
+
+describe("node-auth defensive hash-mismatch guards (simulated DB tampering)", () => {
+  it("verifyEnrollmentToken rejects a row whose stored hash doesn't match the lookup hash", () => {
+    const spy = vi.spyOn(db, "getEnrollmentTokenByHash").mockReturnValueOnce({
+      id: 999,
+      token_hash: "not-the-real-hash",
+      used: 0,
+      created_at: "now",
+    });
+    expect(auth.verifyEnrollmentToken("whatever-token")).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("verifySessionToken rejects an agent whose stored hash doesn't match the lookup hash", () => {
+    const spy = vi.spyOn(db, "getAgentBySessionHash").mockReturnValueOnce({
+      id: 999,
+      machine_key: "tampered",
+      enrollment_id: "enr_tampered",
+      status: "active",
+      session_token_hash: "not-the-real-hash",
+      pending_session_token: null,
+      identity_json: null,
+      caps_json: null,
+      environment_json: null,
+      enrollment_token_id: null,
+      created_at: "now",
+      last_seen: null,
+    });
+    expect(auth.verifySessionToken("whatever-token")).toBeNull();
+    spy.mockRestore();
+  });
+});
+
 describe("dashboard agent-listing helper", () => {
   it("summarizes agents newest-first, token-free, with a capabilities count from caps_json", () => {
     const { token } = enroll.issueEnrollmentToken();
@@ -247,6 +350,21 @@ describe("work queue", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("enqueue tolerates a nullish args (?? {} fallback) — stored/dispatched as an empty object", async () => {
+    const agentId = await activeAgent("box-w4");
+    const jobId = work.enqueue(agentId, "run", null as unknown as Record<string, unknown>);
+    const job = await work.nextForAgent(agentId, 0);
+    expect(job).toEqual({ id: jobId, kind: "run", args: {} });
+  });
+
+  it("nextForAgent yields {} args for a row with no args_json (: {} fallback)", async () => {
+    const agentId = await activeAgent("box-w5");
+    const jobId = "job_no_args";
+    db.insertWork(jobId, agentId, "run", null); // bypass enqueue() — args_json genuinely absent
+    const job = await work.nextForAgent(agentId, 0);
+    expect(job).toEqual({ id: jobId, kind: "run", args: {} });
   });
 
   it("recordResult writes status + result; unknown job → false", () => {

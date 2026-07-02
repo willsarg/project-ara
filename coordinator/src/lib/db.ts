@@ -273,13 +273,6 @@ export function insertWork(id: string, agentId: number, kind: string, argsJson: 
     .run(id, agentId, kind, argsJson);
 }
 
-/** The oldest still-queued job for this agent (FIFO), or null. Cheap synchronous read. */
-export function getQueuedWorkForAgent(agentId: number): WorkRow | null {
-  return (open()
-    .prepare("SELECT * FROM work WHERE agent_id = ? AND status = 'queued' ORDER BY created_at, id LIMIT 1")
-    .get(agentId) as WorkRow | undefined) ?? null;
-}
-
 /** The claimed job as returned by the atomic dispatch (RETURNING projection). */
 export interface ClaimedWork {
   id: string;
@@ -301,12 +294,6 @@ export function claimNextWorkForAgent(agentId: number): ClaimedWork | null {
        RETURNING id, kind, args_json`,
     )
     .get(agentId) as ClaimedWork | undefined) ?? null;
-}
-
-export function markWorkDispatched(id: string): void {
-  open()
-    .prepare("UPDATE work SET status = 'dispatched', dispatched_at = datetime('now') WHERE id = ?")
-    .run(id);
 }
 
 export function getWorkById(id: string): WorkRow | null {

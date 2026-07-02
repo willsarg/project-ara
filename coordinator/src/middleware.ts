@@ -18,5 +18,8 @@ export async function middleware(req: NextRequest) {
 export const config = {
   // Protect everything except /login, ALL of /api (the push channel — nodes auth per-route with a
   // Bearer token in the Node runtime, not this edge cookie gate), Next internals, and static files.
-  matcher: ["/((?!login|api|_next/static|_next/image|favicon.ico).*)"],
+  // Exemptions are SEGMENT-anchored ((?:/|$)) so lookalike paths stay gated: /apikeys or /loginX
+  // must NOT inherit /api's or /login's exemption (prefix confusion — a future route starting with
+  // "api" would otherwise silently skip auth). Covered by test/middleware.test.ts.
+  matcher: ["/((?!(?:login|api|_next/static|_next/image|favicon\\.ico)(?:/|$)).*)"],
 };

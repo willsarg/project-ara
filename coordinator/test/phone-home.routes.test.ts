@@ -321,6 +321,62 @@ describe("POST /api/work/[id]/result boundary + error paths", () => {
   });
 });
 
+describe("GET /api/enroll/[id] on an unknown enrollment id", () => {
+  it("404s with a valid (but unrelated) enrollment token", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const res = await pollRoute.GET(
+      req("http://x/api/enroll/enr_does_not_exist", { bearer: token }),
+      params("enr_does_not_exist"),
+    );
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "unknown enrollment" });
+  });
+});
+
+describe("GET /api/enroll/[id] on a denied enrollment", () => {
+  it("403s (denied)", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const enrRes = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: token,
+        body: JSON.stringify({ ...enrollBody, machine_key: "box-denied-route" }),
+      }),
+    );
+    const { enrollment_id } = await enrRes.json();
+    const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+    enroll.denyAgent(agent.id);
+
+    const res = await pollRoute.GET(
+      req(`http://x/api/enroll/${enrollment_id}`, { bearer: token }),
+      params(enrollment_id),
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "enrollment denied" });
+  });
+});
+
+describe("GET /api/work with a non-numeric or absent wait param", () => {
+  it("treats a NaN wait as 0 (immediate 204 when nothing queued)", async () => {
+    const { sessionToken } = await activate("box-wait-nan");
+    const res = await workRoute.GET(req("http://x/api/work?wait=not-a-number", { bearer: sessionToken }));
+    expect(res.status).toBe(204);
+  });
+
+  it("treats a fully absent wait param as 0 (?? \"0\" fallback)", async () => {
+    const { sessionToken } = await activate("box-wait-absent");
+    const res = await workRoute.GET(req("http://x/api/work", { bearer: sessionToken }));
+    expect(res.status).toBe(204);
+  });
+});
+
+describe("GET /api/work with no Authorization header at all", () => {
+  it("401s (verifySessionToken(null) short-circuit)", async () => {
+    const res = await workRoute.GET(req("http://x/api/work?wait=0"));
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("GET /api/work long-poll timeout", () => {
   it("returns 204 after the wait window with no work (fake timers)", async () => {
     const { token } = enroll.issueEnrollmentToken();
