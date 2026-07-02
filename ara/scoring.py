@@ -19,6 +19,7 @@ import itertools
 import json
 import math
 import re
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -143,13 +144,33 @@ def score_for(model_id: str, use_case: str, *,
     return None
 
 
+def _normalise_imported(raw: dict) -> dict:
+    """Fold a raw ``model_id`` → ``use_case`` → ``{score, source}`` table into ``base_key(model_id)``
+    → ``use_case`` → ``{...}``, warning (never silently) when two distinct model_ids collide on the
+    same base key — e.g. an ``mlx-community`` mirror and its ``meta-llama`` original both normalise
+    to ``llama-3.2-3b-instruct``. The later entry wins (dict-overwrite order), but a dropped entry
+    with no signal would be a lie by omission (Rule #3), so the collision is surfaced."""
+    out: dict = {}
+    for model_id, by_uc in raw.items():
+        key = base_key(model_id)
+        if key in out:
+            warnings.warn(
+                f"load_imported: {model_id!r} normalises to base key {key!r}, which another "
+                "imported model_id already maps to — that entry's scores are being overwritten "
+                "and dropped.",
+                RuntimeWarning, stacklevel=2,
+            )
+        out[key] = by_uc
+    return out
+
+
 def load_imported() -> dict:
     """The shipped table of *imported* (published, not-measured-here) capability scores, keyed
     ``model_id`` → ``use_case`` → ``{score, source}``. Each leaf carries its citation; a
     locally-measured score overrides these when present (see :func:`score_for`)."""
     with _IMPORTED_PATH.open(encoding="utf-8") as f:
         raw = json.load(f)["scores"]
-    return {base_key(model_id): by_uc for model_id, by_uc in raw.items()}
+    return _normalise_imported(raw)
 
 
 def rank(recs: list[dict], use_case: str, *,

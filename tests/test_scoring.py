@@ -9,6 +9,10 @@ separate benchmark step measured (tier="measured"), or an imported published sco
 """
 from __future__ import annotations
 
+import warnings
+
+import pytest
+
 from ara import scoring
 
 
@@ -70,6 +74,34 @@ def test_load_imported_keys_are_base_normalised():
     table = scoring.load_imported()
     for k in table:
         assert k == scoring.base_key(k)
+
+
+def test_normalise_imported_warns_on_base_key_collision():
+    # Two model_ids that normalise to the same base_key (e.g. an mlx-community mirror and its
+    # meta-llama original) must not silently overwrite one another with no signal — Rule #3 says
+    # unknown/dropped data must be surfaced, never hidden. The later entry wins (last write), but
+    # a warning names the collision so it isn't a silent loss.
+    raw = {
+        "mlx-community/Llama-3.2-3B-Instruct": {"coding": {"score": 0.5, "source": "a"}},
+        "meta-llama/Llama-3.2-3B-Instruct": {"coding": {"score": 0.7, "source": "b"}},
+    }
+    with pytest.warns(RuntimeWarning, match="Llama-3.2-3B-Instruct"):
+        table = scoring._normalise_imported(raw)
+    key = scoring.base_key("meta-llama/Llama-3.2-3B-Instruct")
+    assert table.keys() == {key}
+    assert table[key]["coding"]["score"] == 0.7  # last entry wins, not silently the first
+
+
+def test_normalise_imported_no_warning_without_collision():
+    # Distinct base keys → no warning, both entries preserved.
+    raw = {
+        "meta-llama/Llama-3.2-3B-Instruct": {"coding": {"score": 0.7, "source": "b"}},
+        "Qwen/Qwen2.5-Coder-7B-Instruct": {"coding": {"score": 0.71, "source": "c"}},
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        table = scoring._normalise_imported(raw)
+    assert len(table) == 2
 
 
 def test_quant_key_extracts_genuine_quant_token():
