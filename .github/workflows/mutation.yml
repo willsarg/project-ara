@@ -25,7 +25,7 @@
 #
 # Hardening mirrors test.yml / dep-contract.yml: read-only token, actions pinned to commit SHAs,
 # checkout creds not persisted, locked install (`uv sync --frozen`).
-name: Mutation Testing
+name: Health · Mutation Probe (Wed)
 
 on:
   workflow_dispatch:

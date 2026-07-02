@@ -8,7 +8,7 @@
 #
 # Hardening mirrors the other workflows: read-only token, actions SHA-pinned, creds not persisted,
 # locked install, generous timeout (the compose build dominates).
-name: E2E
+name: Health · E2E Phone-Home (Thu)
 
 on:
   workflow_dispatch:

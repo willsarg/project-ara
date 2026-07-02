@@ -18,7 +18,7 @@
 # serve /api/health, and an unauthenticated page must redirect to /login. Trivy says "no known CVEs";
 # the smoke says "it actually boots and the auth gate is live" — a scan-green image that crashes on
 # start or ships an open door would otherwise pass.
-name: Docker Image Scan
+name: Health · Docker Image Scan (Mon)
 
 on:
   workflow_dispatch:

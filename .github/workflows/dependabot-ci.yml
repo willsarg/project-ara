@@ -9,7 +9,7 @@
 #
 # Hardening mirrors test.yml: read-only token, actions pinned to commit SHAs, checkout creds not
 # persisted, locked installs (`uv sync --frozen`, `npm ci`), per-job timeout.
-name: Dependabot CI
+name: Gate · Dependabot PRs
 
 on:
   pull_request:
