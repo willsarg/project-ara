@@ -23,9 +23,15 @@ def sd_notify(state: str) -> bool:
     addr = os.environ.get("NOTIFY_SOCKET")
     if not addr:
         return False
+    family = getattr(socket, "AF_UNIX", None)
+    if family is None:
+        # No Unix-domain sockets on this host (e.g. Windows) — sd_notify is a Linux/systemd
+        # mechanism, so degrade to a no-op rather than crash. NOTIFY_SOCKET is normally unset
+        # off systemd anyway; this covers the case where it is set but AF_UNIX doesn't exist.
+        return False
     if addr.startswith("@"):
         addr = "\0" + addr[1:]
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     try:
         sock.sendto(state.encode("utf-8"), addr)
     finally:

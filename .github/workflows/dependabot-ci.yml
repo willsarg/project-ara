@@ -1,0 +1,49 @@
+# CI for Dependabot's dependency-bump PRs (uv / npm / docker / github-actions). It runs the full
+# suite automatically so a bump can be reviewed and merged in the cloud instead of pulled to a local
+# box to test. It fires ONLY when the PR author is dependabot[bot] — a human's PR does not trigger it
+# (humans can run test.yml on demand via workflow_dispatch).
+#
+# This is CI only — nothing auto-merges. A maintainer still reviews and merges every bump by hand;
+# that manual step is the guard in case a bump (or the bot) is ever bad. Dependabot PR runs get a
+# read-only token and no repo secrets, so the jobs are sandboxed regardless.
+#
+# Hardening mirrors test.yml: read-only token, actions pinned to commit SHAs, checkout creds not
+# persisted, locked installs (`uv sync --frozen`, `npm ci`), per-job timeout.
+name: Dependabot CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The Python core, cross-OS. Delegated to the reusable workflow so a bump is gated by the exact
+  # same suite the release pipeline runs.
+  python:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    uses: ./.github/workflows/test.yml
+
+  coordinator:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest      # the coordinator ships as a Linux container; Linux is the real target
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: coordinator
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"    # matches the Dockerfile base (node:22-bookworm-slim)
+          cache: npm
+          cache-dependency-path: coordinator/package-lock.json
+      - run: npm ci              # locked install from package-lock.json
+      - run: npx tsc --noEmit    # type gate
+      - run: npm test            # vitest run
+      - run: npm run build       # next build — compiles the edge middleware; catches Node-API-in-Edge issues
+        env:
+          # instrumentation.ts fails closed without a secret at *runtime*; build only needs it present.
+          ARA_COORDINATOR_SECRET: ci-build-placeholder
