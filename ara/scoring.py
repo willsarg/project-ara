@@ -15,9 +15,12 @@ A measured score always wins over an imported one. Absent → ``None`` (the call
 """
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import re
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 _IMPORTED_PATH = Path(__file__).parent / "data" / "usecase_scores.json"
@@ -61,6 +64,41 @@ def quant_key(model_id: str) -> str | None:
             return tok
     return None
 
+# llama.cpp's ternary quants aren't an integer bit-width — these are their published
+# bits-per-weight (bpw), used only to ORDER them against ordinary quants.
+_TERNARY_BPW = {"tq1": 1.69, "tq2": 2.06}
+
+
+def quant_bits(quant: str | None) -> float | None:
+    """Effective bit-width of a quant token, *for ordering inversions only* — never a quality
+    claim. Maps float labels (``f32``/``fp32``→32, ``f16``/``fp16``/``bf16``→16), the int/bit
+    families (``int8``/``8bit``/``q8_*``→8, ``int4``/``4bit``/``awq``/``gptq``→4, generic
+    ``<N>bit``→N), llama.cpp ``q<N>_*``/``iq<N>_*``→N, and the ternary quants
+    (``tq1_*``→1.69, ``tq2_*``→2.06). Unknown token or ``None`` → ``None`` (never guessed —
+    Rule #3). Spec 2026-07-02-recommend-inversion-guard."""
+    if quant is None:
+        return None
+    q = quant.lower()
+    if q in ("f32", "fp32"):
+        return 32.0
+    if q in ("f16", "fp16", "bf16"):
+        return 16.0
+    if q in ("int8", "8bit"):
+        return 8.0
+    if q in ("int4", "4bit", "awq", "gptq"):
+        return 4.0
+    m = re.fullmatch(r"(tq[12])(?:_.*)?", q)
+    if m:
+        return _TERNARY_BPW[m.group(1)]
+    m = re.fullmatch(r"i?q(\d+)(?:_.*)?", q)
+    if m:
+        return float(m.group(1))
+    m = re.fullmatch(r"(\d+)bit", q)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 # The use cases v1 supports as `--use-case` values (design §2.1).
 USE_CASES = ("coding", "reasoning", "agentic", "extraction", "rag", "chat")
 
@@ -79,6 +117,9 @@ class Score:
     sample_size: int | None = None
     refused_n: int | None = None
     errored_n: int | None = None
+    # Set by :func:`flag_inversions` when a same-base quant of a different precision upset this
+    # reading's expected precision ordering — a short disclosure, never a re-ranking (Rule #3).
+    inversion: str | None = None
 
 
 def score_for(model_id: str, use_case: str, *,
@@ -121,4 +162,47 @@ def rank(recs: list[dict], use_case: str, *,
     out.sort(key=lambda r: (r["score"] is None,
                             -(r["score"].value if r["score"] is not None else 0.0),
                             -r.get("est_context", 0)))
+    flag_inversions(out, use_case)
     return out
+
+
+def flag_inversions(recs: list[dict], use_case: str) -> None:
+    """Disclose (never silently rank on) quant *inversions*: within a base model, a
+    lower-precision quant that measured HIGHER than a higher-precision one. Rule #3 — the fix is
+    disclosure, so this only annotates ``score.inversion``; it does NOT reorder *recs*.
+
+    Only measured-tier entries with a known quant (:func:`quant_key` → :func:`quant_bits`, both
+    non-``None``) and a non-``None`` ``sample_size`` are eligible; anything else is skipped. For
+    each eligible same-base pair whose bit-widths differ and where the lower-bits reading's value
+    is *strictly* greater, the two-proportion standard error ``se`` decides confidence:
+    ``within_noise`` iff ``|pa-pb| < 1.96*se`` (``se == 0`` counts as within noise). Both entries
+    get a short message naming the *other* quant. An entry in several inversions keeps the FIRST
+    (by ranked order); *use_case* is accepted for API symmetry — *recs* are already scored for it.
+    Spec 2026-07-02-recommend-inversion-guard."""
+    del use_case                                  # recs are already scored for this use_case
+    groups: dict[str, list[tuple[dict, str, float]]] = defaultdict(list)
+    for r in recs:
+        s = r["score"]
+        if s is None or s.tier != "measured" or s.sample_size is None:
+            continue
+        quant = quant_key(r["model_id"])
+        bits = quant_bits(quant)
+        if quant is None or bits is None:
+            continue
+        groups[base_key(r["model_id"])].append((r, quant, bits))
+
+    for members in groups.values():
+        for (ra, qa, ba), (rb, qb, bb) in itertools.combinations(members, 2):
+            if ba == bb:
+                continue
+            (low, low_q), (high, high_q) = ((ra, qa), (rb, qb)) if ba < bb else ((rb, qb), (ra, qa))
+            sl, sh = low["score"], high["score"]
+            if not sl.value > sh.value:            # not an inversion (higher precision won / tied)
+                continue
+            pa, na, pb, nb = sl.value, sl.sample_size, sh.value, sh.sample_size
+            se = math.sqrt(pa * (1 - pa) / na + pb * (1 - pb) / nb)
+            noise = " within noise" if se == 0 or abs(pa - pb) < 1.96 * se else ""
+            if low["score"].inversion is None:
+                low["score"] = replace(sl, inversion=f"outscores {high_q}{noise}")
+            if high["score"].inversion is None:
+                high["score"] = replace(sh, inversion=f"outscored by {low_q}{noise}")

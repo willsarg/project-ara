@@ -1374,7 +1374,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                                      "source": r["score"].source,
                                      "sample_size": r["score"].sample_size,
                                      "refused_n": r["score"].refused_n,
-                                     "errored_n": r["score"].errored_n})} for r in recs]
+                                     "errored_n": r["score"].errored_n,
+                                     "inversion": r["score"].inversion})} for r in recs]
         print(json.dumps(recs, indent=2))
         return 0
 
@@ -1414,6 +1415,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                         head += f" [partial: {', '.join(partial)}]"
                     if s.sample_size is not None and s.sample_size < 100:
                         head += f" [low-confidence n={s.sample_size}]"
+                    if s.inversion:
+                        head += f" [quant-inversion: {s.inversion}]"
             tail = f"{head} · {tail}"
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
         c.emit("  " + c.style("metric", r["model_id"])
