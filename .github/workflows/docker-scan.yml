@@ -13,6 +13,11 @@
 #
 # The gate fails on FIXABLE High/Critical vulnerabilities (ignore-unfixed) — so it flags what you can
 # actually act on, rather than blocking on an unpatchable base CVE.
+#
+# It then runs a BOOT SMOKE (layer 6, testing-architecture spec): the built image is started and must
+# serve /api/health, and an unauthenticated page must redirect to /login. Trivy says "no known CVEs";
+# the smoke says "it actually boots and the auth gate is live" — a scan-green image that crashes on
+# start or ships an open door would otherwise pass.
 name: Docker Image Scan
 
 on:
@@ -47,3 +52,25 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
           format: table
+      - name: Boot smoke — the image starts, serves health, and the auth gate is live
+        run: |
+          docker run -d --name ara-smoke \
+            -e ARA_COORDINATOR_SECRET=ci-boot-smoke -p 3000:3000 ara-coordinator:scan
+          for i in $(seq 1 15); do
+            sleep 2
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/health || true)
+            [ "$code" = "200" ] && break
+          done
+          echo "GET /api/health -> $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::coordinator never became healthy"; docker logs ara-smoke; exit 1
+          fi
+          # The auth gate must be live: an unauthenticated dashboard request redirects to /login.
+          gate=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/nodes || true)
+          echo "GET /nodes (unauth) -> $gate"
+          if [ "$gate" != "307" ]; then
+            echo "::error::auth gate did not redirect an unauthenticated request (got $gate)"; exit 1
+          fi
+      - name: Boot smoke cleanup
+        if: always()
+        run: docker rm -f ara-smoke 2>/dev/null || true
