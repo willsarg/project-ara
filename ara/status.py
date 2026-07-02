@@ -176,13 +176,29 @@ class Proc:
     port: int | None
 
 
-def scan() -> list[Proc]:
-    """All running AI/ML processes, largest memory first. Read-only."""
+@dataclass(frozen=True)
+class AppProc:
+    label: str
+    n_procs: int
+    rss_gb: float
+    uptime_s: float
+
+
+def _scan_all() -> tuple[list[Proc], list[AppProc]]:
+    """One ``psutil.process_iter`` pass, feeding both classifiers.
+
+    ``_classify`` (local ML workloads) and ``_classify_app`` (remote-API client apps) are
+    independent — a process may match neither, either, or both — so each process is tested
+    against both and accumulated into its own list/aggregate. ``scan``/``scan_apps`` are thin
+    wrappers over this so a caller needing both (``status`` renders both sections) pays for
+    only one sweep instead of two. Read-only.
+    """
     gpu = _nvidia_gpu_by_pid()
     now = time.time()
     skip = {os.getpid(), os.getppid()}  # don't report ARA itself
 
-    found: list[Proc] = []
+    procs: list[Proc] = []
+    agg: dict[str, dict] = {}
     for p in psutil.process_iter(["pid", "name", "cmdline", "create_time", "memory_info"]):
         try:
             info = p.info
@@ -191,29 +207,38 @@ def scan() -> list[Proc]:
                 continue
             name = info.get("name") or ""
             tokens = info.get("cmdline") or []
-            label = _classify(name, " ".join(tokens))
-            if not label:
-                continue
+            cmd = " ".join(tokens)
             mem = info.get("memory_info")
             rss_gb = (mem.rss / GB) if mem else 0.0
             created = info.get("create_time") or now
-            found.append(Proc(
-                pid=pid, label=label, detail=_detail(tokens),
-                rss_gb=round(rss_gb, 2), uptime_s=round(now - created, 1),
-                gpu_mb=gpu.get(pid), port=_listen_port(p),
-            ))
+
+            label = _classify(name, cmd)
+            if label:
+                procs.append(Proc(
+                    pid=pid, label=label, detail=_detail(tokens),
+                    rss_gb=round(rss_gb, 2), uptime_s=round(now - created, 1),
+                    gpu_mb=gpu.get(pid), port=_listen_port(p),
+                ))
+
+            app_label = _classify_app(name, cmd)
+            if app_label:
+                a = agg.setdefault(app_label, {"n": 0, "rss": 0.0, "oldest": created})
+                a["n"] += 1
+                a["rss"] += rss_gb
+                a["oldest"] = min(a["oldest"], created)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-    found.sort(key=lambda x: x.rss_gb, reverse=True)
-    return found
+
+    procs.sort(key=lambda x: x.rss_gb, reverse=True)
+    apps_found = [AppProc(label=k, n_procs=v["n"], rss_gb=round(v["rss"], 2),
+                          uptime_s=round(now - v["oldest"], 1)) for k, v in agg.items()]
+    apps_found.sort(key=lambda x: x.rss_gb, reverse=True)
+    return procs, apps_found
 
 
-@dataclass(frozen=True)
-class AppProc:
-    label: str
-    n_procs: int
-    rss_gb: float
-    uptime_s: float
+def scan() -> list[Proc]:
+    """All running AI/ML processes, largest memory first. Read-only."""
+    return _scan_all()[0]
 
 
 def scan_apps() -> list[AppProc]:
@@ -224,29 +249,4 @@ def scan_apps() -> list[AppProc]:
     collapse into a single entry. RSS is ordinary RAM — these consume no local ML resources.
     Read-only.
     """
-    now = time.time()
-    skip = {os.getpid(), os.getppid()}  # don't report ARA itself
-
-    agg: dict[str, dict] = {}
-    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time", "memory_info"]):
-        try:
-            info = p.info
-            pid = info.get("pid")
-            if pid in skip:
-                continue
-            label = _classify_app(info.get("name") or "", " ".join(info.get("cmdline") or []))
-            if not label:
-                continue
-            mem = info.get("memory_info")
-            rss_gb = (mem.rss / GB) if mem else 0.0
-            created = info.get("create_time") or now
-            a = agg.setdefault(label, {"n": 0, "rss": 0.0, "oldest": created})
-            a["n"] += 1
-            a["rss"] += rss_gb
-            a["oldest"] = min(a["oldest"], created)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-    out = [AppProc(label=k, n_procs=v["n"], rss_gb=round(v["rss"], 2),
-                   uptime_s=round(now - v["oldest"], 1)) for k, v in agg.items()]
-    out.sort(key=lambda x: x.rss_gb, reverse=True)
-    return out
+    return _scan_all()[1]

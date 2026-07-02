@@ -335,3 +335,76 @@ def test_scan_apps_handles_missing_mem_and_time(monkeypatch):
     assert found[0].label == "Cursor"
     assert found[0].rss_gb == 0.0          # no memory_info -> 0
     assert found[0].uptime_s == 0.0        # no create_time -> now -> 0
+
+
+# --------------------------------------------------------------------------- #
+# _scan_all — one psutil.process_iter pass feeding both classifiers
+# --------------------------------------------------------------------------- #
+def test_scan_all_makes_one_process_iter_pass(monkeypatch):
+    # Regression: scan() and scan_apps() used to each run their own full
+    # psutil.process_iter sweep, so render_status paid for two passes over every
+    # process on the box. _scan_all must classify workloads and client apps from a
+    # single pass.
+    monkeypatch.setattr(status, "_nvidia_gpu_by_pid", lambda: {})
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    procs = [
+        FakeProc(_proc_info(2001, "ollama", ["ollama", "serve"], rss_gb=1.0, create_time=500.0)),
+        FakeProc(_app_info(2002, "ChatGPT",
+                            ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"],
+                            rss_gb=0.5, create_time=500.0)),
+        FakeProc(_proc_info(2003, "bash", ["bash"], rss_gb=9.0)),   # neither classifier
+    ]
+    calls = {"n": 0}
+
+    def counting_iter(fields):
+        calls["n"] += 1
+        return iter(procs)
+
+    monkeypatch.setattr(status.psutil, "process_iter", counting_iter)
+
+    found_procs, found_apps = status._scan_all()
+    assert calls["n"] == 1
+    assert [p.label for p in found_procs] == ["Ollama"]
+    assert [a.label for a in found_apps] == ["ChatGPT"]
+
+
+def test_scan_and_scan_apps_each_make_exactly_one_pass(monkeypatch):
+    # scan()/scan_apps() stay thin wrappers over _scan_all — each public call still
+    # makes exactly one process_iter pass (not zero, not two).
+    monkeypatch.setattr(status, "_nvidia_gpu_by_pid", lambda: {})
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    procs = [
+        FakeProc(_proc_info(3001, "ollama", ["ollama", "serve"], rss_gb=1.0, create_time=500.0)),
+        FakeProc(_app_info(3002, "ChatGPT",
+                            ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"],
+                            rss_gb=0.5, create_time=500.0)),
+    ]
+    calls = {"n": 0}
+
+    def counting_iter(fields):
+        calls["n"] += 1
+        return iter(procs)
+
+    monkeypatch.setattr(status.psutil, "process_iter", counting_iter)
+
+    assert [p.label for p in status.scan()] == ["Ollama"]
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+    assert [a.label for a in status.scan_apps()] == ["ChatGPT"]
+    assert calls["n"] == 1
+
+
+def test_scan_all_process_matching_both_classifiers_appears_in_both_lists(monkeypatch):
+    # The two classifiers are independent — a single process can match the workload
+    # rules (name/cmdline substring) and the client-app rules (.app bundle path) at
+    # once, and _scan_all must feed it into both accumulators rather than picking one.
+    monkeypatch.setattr(status, "_nvidia_gpu_by_pid", lambda: {})
+    monkeypatch.setattr(status.time, "time", lambda: 1000.0)
+    cmd = "/Applications/ChatGPT.app/Contents/Resources/ollama"   # matches both rule sets
+    procs = [FakeProc(_proc_info(4001, "ollama", [cmd], rss_gb=0.5, create_time=500.0))]
+    monkeypatch.setattr(status.psutil, "process_iter", lambda fields: iter(procs))
+
+    found_procs, found_apps = status._scan_all()
+    assert [p.label for p in found_procs] == ["Ollama"]
+    assert [a.label for a in found_apps] == ["ChatGPT"]

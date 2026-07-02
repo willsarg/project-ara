@@ -58,27 +58,59 @@ def test_brew_version_prefers_formula_then_cask(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# cask_auto_updates
+# cask_auto_updates — takes explicit tokens (not the whole brew cask list), and
+# never blocks on brew's background auto-update check.
 # --------------------------------------------------------------------------- #
-def test_cask_auto_updates_empty_without_casks(monkeypatch):
-    monkeypatch.setattr(versions, "brew_casks", lambda: {})
-    assert versions.cask_auto_updates() == {}
+def test_cask_auto_updates_empty_without_tokens():
+    assert versions.cask_auto_updates([]) == {}
 
 
 def test_cask_auto_updates_parses_json(monkeypatch):
-    monkeypatch.setattr(versions, "brew_casks", lambda: {"lm-studio": "1.0", "cursor": "2.0"})
     payload = '{"casks":[{"token":"lm-studio","auto_updates":true},{"token":"cursor@2","auto_updates":false}]}'
     monkeypatch.setattr(versions.subprocess, "run",
                         lambda *a, **k: types.SimpleNamespace(stdout=payload))
-    got = versions.cask_auto_updates()
+    got = versions.cask_auto_updates(["lm-studio", "cursor"])
     assert got == {"lm-studio": True, "cursor": False}   # token @-suffix stripped
 
 
 def test_cask_auto_updates_empty_on_error(monkeypatch):
-    monkeypatch.setattr(versions, "brew_casks", lambda: {"x": "1"})
     monkeypatch.setattr(versions.subprocess, "run",
                         lambda *a, **k: types.SimpleNamespace(stdout="not json"))
-    assert versions.cask_auto_updates() == {}
+    assert versions.cask_auto_updates(["x"]) == {}
+
+
+def test_cask_auto_updates_scopes_call_to_passed_tokens_only(monkeypatch):
+    # Regression: cask_auto_updates() used to call brew_casks() internally and run
+    # `brew info` against EVERY installed cask (a 15s+ freeze on a big Applications
+    # folder). It must now hit only the tokens the caller passes, and must disable
+    # brew's own network auto-update check so the call can't stall on that either.
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return types.SimpleNamespace(stdout='{"casks":[]}')
+
+    monkeypatch.setattr(versions.subprocess, "run", fake_run)
+    versions.cask_auto_updates(["Cursor", "lm-studio@1"])
+
+    assert captured["cmd"] == ["brew", "info", "--json=v2", "--cask", "cursor", "lm-studio"]
+    assert captured["env"] is not None
+    assert captured["env"]["HOMEBREW_NO_AUTO_UPDATE"] == "1"
+
+
+def test_cask_auto_updates_ignores_installed_casks_not_in_tokens(monkeypatch):
+    monkeypatch.setattr(versions, "brew_casks", lambda: {"unrelated-cask": "9.0"})
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(stdout='{"casks":[]}')
+
+    monkeypatch.setattr(versions.subprocess, "run", fake_run)
+    versions.cask_auto_updates(["cursor"])
+    assert "unrelated-cask" not in captured["cmd"]
+    assert captured["cmd"][-1] == "cursor"
 
 
 # --------------------------------------------------------------------------- #
@@ -136,8 +168,7 @@ def test_brew_versions_skips_blank_lines(monkeypatch):
 
 
 def test_cask_auto_updates_skips_empty_token(monkeypatch):
-    monkeypatch.setattr(versions, "brew_casks", lambda: {"cursor": "2.0"})
     payload = '{"casks":[{"token":"","auto_updates":true},{"token":"cursor","auto_updates":false}]}'
     monkeypatch.setattr(versions.subprocess, "run",
                         lambda *a, **k: types.SimpleNamespace(stdout=payload))
-    assert versions.cask_auto_updates() == {"cursor": False}   # empty-token entry dropped
+    assert versions.cask_auto_updates(["cursor"]) == {"cursor": False}   # empty-token entry dropped

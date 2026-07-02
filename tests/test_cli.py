@@ -544,8 +544,8 @@ def _app(**over):
 
 
 def test_render_status_with_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [_proc(), _proc(pid=5, label="vLLM", rss_gb=4.0)])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.status, "_scan_all",
+                        lambda: ([_proc(), _proc(pid=5, label="vLLM", rss_gb=4.0)], []))
     c, buf = make_console()
     cli.render_status(c)
     out = buf.getvalue()
@@ -556,17 +556,15 @@ def test_render_status_with_processes(make_console, monkeypatch):
 
 
 def test_render_status_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([], []))
     c, buf = make_console()
     cli.render_status(c)
     assert "nothing running right now" in buf.getvalue()
 
 
 def test_render_status_shows_ai_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan_apps",
-                        lambda: [_app(), _app(label="Claude Code", n_procs=1, rss_gb=0.2)])
+    monkeypatch.setattr(cli.status, "_scan_all",
+                        lambda: ([], [_app(), _app(label="Claude Code", n_procs=1, rss_gb=0.2)]))
     c, buf = make_console()
     cli.render_status(c)
     out = buf.getvalue()
@@ -576,16 +574,14 @@ def test_render_status_shows_ai_apps(make_console, monkeypatch):
 
 
 def test_render_status_ai_apps_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
     c, buf = make_console()
     cli.render_status(c)
     assert "no AI apps running" in buf.getvalue()
 
 
 def test_render_status_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [_app()])
+    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_status(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -984,8 +980,8 @@ def test_render_detect_frameworks_surfaced_from_other_interpreter(
 
 
 def test_render_status_gpu_and_no_port(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan",
-                        lambda: [_proc(gpu_mb=8192.0, port=None, detail=None)])
+    monkeypatch.setattr(cli.status, "_scan_all",
+                        lambda: ([_proc(gpu_mb=8192.0, port=None, detail=None)], []))
     c, buf = make_console()
     cli.render_status(c)
     out = buf.getvalue()
@@ -1178,7 +1174,7 @@ def test_render_apps_text_with_drift_and_duplicate(make_console, monkeypatch):
               version="0.1.2", cask_token="ollama"),                            # duplicate
     ]
     monkeypatch.setattr(cli.apps, "scan", lambda: inv)
-    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})  # no auto_updates known
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda tokens: {})  # no auto_updates known
     c, buf = make_console()
     cli.render_apps(c)
     out = buf.getvalue()
@@ -1194,7 +1190,7 @@ def test_render_apps_drift_with_auto_updates_is_benign(make_console, monkeypatch
     inv = [_capp(label="Claude", category="assistant", cask=True, in_app=True,
                  version="2.0", brew_recorded="1.0", cask_token="claude")]
     monkeypatch.setattr(cli.apps, "scan", lambda: inv)
-    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {"claude": True})
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda tokens: {"claude": True})
     c, buf = make_console()
     cli.render_apps(c)
     out = buf.getvalue()
@@ -1205,7 +1201,7 @@ def test_render_apps_drift_with_auto_updates_is_benign(make_console, monkeypatch
 
 def test_render_apps_empty(make_console, monkeypatch):
     monkeypatch.setattr(cli.apps, "scan", lambda: [])
-    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda tokens: {})
     c, buf = make_console()
     cli.render_apps(c)
     assert "none detected" in buf.getvalue()
@@ -1215,7 +1211,7 @@ def test_render_apps_want_filters_category(make_console, monkeypatch):
     inv = [_capp(label="Ollama", category="runner", cask=True, cask_token="ollama"),
            _capp(label="Cursor", category="coding", cask=True, cask_token="cursor")]
     monkeypatch.setattr(cli.apps, "scan", lambda: inv)
-    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {})
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda tokens: {})
     c, buf = make_console()
     cli.render_apps(c, want=lambda k: k == "coding")
     out = buf.getvalue()
@@ -1226,7 +1222,7 @@ def test_render_apps_json(monkeypatch, capsys):
     inv = [_capp(label="LM Studio", cask=True, in_app=True, version="0.3.5",
                  brew_recorded="0.3.0", cask_token="lm-studio")]
     monkeypatch.setattr(cli.apps, "scan", lambda: inv)
-    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda: {"lm-studio": False})
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda tokens: {"lm-studio": False})
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_apps(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
@@ -1392,8 +1388,7 @@ def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pyt
 
 
 def test_render_status_want_excludes_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
     c, buf = make_console()
     cli.render_status(c, want=lambda k: k != "processes")   # workloads section filtered out
     out = buf.getvalue()
@@ -1401,8 +1396,7 @@ def test_render_status_want_excludes_processes(make_console, monkeypatch):
 
 
 def test_render_status_want_excludes_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "scan", lambda: [_proc()])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [_app()])
+    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
     c, buf = make_console()
     cli.render_status(c, want=lambda k: k != "apps")        # apps section filtered out
     out = buf.getvalue()
