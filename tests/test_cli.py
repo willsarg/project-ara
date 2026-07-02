@@ -1886,6 +1886,58 @@ def test_recommend_rejects_unknown_use_case(make_console, monkeypatch, set_platf
     assert "cooking" in buf.getvalue()
 
 
+def _wire_inversion_bench(monkeypatch, four_bit=0.098, eight_bit=0.061, n=50):
+    # Same base model, two quants, both measured here — a lower-precision upset.
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda con, mk: [
+        {"model_id": "org/Model-4bit", "use_case": "coding", "score": four_bit,
+         "source": "wmx probe", "sample_size": n, "refused_n": 0, "errored_n": 0},
+        {"model_id": "org/Model-8bit", "use_case": "coding", "score": eight_bit,
+         "source": "wmx probe", "sample_size": n, "refused_n": 0, "errored_n": 0}])
+
+
+def test_recommend_text_discloses_quant_inversion(make_console, monkeypatch, set_platform):
+    # A measured lower-precision upset is DISCLOSED inline on both rows (Rule #3), not reordered.
+    # Spec 2026-07-02-recommend-inversion-guard.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Model-4bit", weights_gb=4.0),
+                     _model_row("org/Model-8bit", weights_gb=4.0)])
+    _wire_inversion_bench(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert "[quant-inversion: outscores 8bit within noise]" in out
+    assert "[quant-inversion: outscored by 4bit within noise]" in out
+
+
+def test_recommend_json_carries_inversion_field(monkeypatch, set_platform, capsys):
+    # The JSON path serializes the new inversion field alongside the other Score fields.
+    # Spec 2026-07-02-recommend-inversion-guard.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Model-4bit", weights_gb=4.0),
+                     _model_row("org/Model-8bit", weights_gb=4.0)])
+    _wire_inversion_bench(monkeypatch)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    by_id = {r["model_id"]: r["score"] for r in payload}
+    assert by_id["org/Model-4bit"]["inversion"] == "outscores 8bit within noise"
+    assert by_id["org/Model-8bit"]["inversion"] == "outscored by 4bit within noise"
+
+
+def test_recommend_clean_pair_has_no_inversion_disclosure(monkeypatch, set_platform, capsys):
+    # A non-inverted pair (higher precision scores higher) shows no inversion — text or JSON.
+    # Spec 2026-07-02-recommend-inversion-guard.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Model-4bit", weights_gb=4.0),
+                     _model_row("org/Model-8bit", weights_gb=4.0)])
+    _wire_inversion_bench(monkeypatch, four_bit=0.30, eight_bit=0.90)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert all(r["score"]["inversion"] is None for r in payload)
+
+
 def test_main_recommend_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["recommend", "--json"])

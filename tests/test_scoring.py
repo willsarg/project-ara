@@ -145,3 +145,142 @@ def test_load_imported_ships_cited_normalised_scores():
         assert uc in scoring.USE_CASES
         assert "source" in entry and entry["source"]
         assert 0.0 <= entry["score"] <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# quant_bits — effective bit-width for ORDERING quant inversions
+# Spec 2026-07-02-recommend-inversion-guard
+# --------------------------------------------------------------------------- #
+def test_quant_bits_full_and_half_precision_labels():
+    # Float labels map to their nominal width; bf16 sits with the 16-bit family.
+    assert scoring.quant_bits("f32") == 32
+    assert scoring.quant_bits("fp32") == 32
+    assert scoring.quant_bits("f16") == 16
+    assert scoring.quant_bits("fp16") == 16
+    assert scoring.quant_bits("bf16") == 16
+
+
+def test_quant_bits_int_and_bit_families():
+    # int8/8bit/q8_* → 8; int4/4bit/awq/gptq → 4; generic <N>bit → N.
+    assert scoring.quant_bits("int8") == 8
+    assert scoring.quant_bits("8bit") == 8
+    assert scoring.quant_bits("q8_0") == 8
+    assert scoring.quant_bits("int4") == 4
+    assert scoring.quant_bits("4bit") == 4
+    assert scoring.quant_bits("awq") == 4
+    assert scoring.quant_bits("gptq") == 4
+    assert scoring.quant_bits("6bit") == 6
+
+
+def test_quant_bits_llama_cpp_q_and_iq_classes():
+    # llama.cpp q<N>_* / iq<N>_* take their N as the effective width.
+    assert scoring.quant_bits("q4_k_m") == 4
+    assert scoring.quant_bits("iq2_m") == 2
+
+
+def test_quant_bits_ternary_bpw():
+    # llama.cpp ternary quants carry a fractional bits-per-weight (not an integer N).
+    assert scoring.quant_bits("tq1_0") == 1.69
+    assert scoring.quant_bits("tq2_0") == 2.06
+
+
+def test_quant_bits_unknown_and_none():
+    # An unrecognised token or None → None (never a guessed width — Rule #3).
+    assert scoring.quant_bits("banana") is None
+    assert scoring.quant_bits(None) is None
+
+
+# --------------------------------------------------------------------------- #
+# flag_inversions — disclose (never silently rank on) lower-precision upsets
+# Spec 2026-07-02-recommend-inversion-guard
+# --------------------------------------------------------------------------- #
+def _inv_recs():
+    # Two quants of the SAME base model, both measured here on the same probe set.
+    return [{"model_id": "org/Model-4bit", "est_context": 8000},
+            {"model_id": "org/Model-8bit", "est_context": 8000}]
+
+
+def test_inversion_flagged_both_directions_within_noise():
+    # A lower-precision quant outscoring a higher one within statistical noise is DISCLOSED on
+    # both entries, naming the other quant — not reordered.
+    measured = {("org/Model-4bit", "coding"): {"score": 0.098, "source": "p", "sample_size": 50},
+                ("org/Model-8bit", "coding"): {"score": 0.061, "source": "p", "sample_size": 50}}
+    ranked = scoring.rank(_inv_recs(), "coding", measured=measured)
+    by_id = {r["model_id"]: r["score"] for r in ranked}
+    assert by_id["org/Model-4bit"].inversion == "outscores 8bit within noise"
+    assert by_id["org/Model-8bit"].inversion == "outscored by 4bit within noise"
+
+
+def test_inversion_outside_noise_drops_the_within_noise_wording():
+    # The same upset, but with large samples the gap clears the noise band → firmer wording.
+    measured = {("org/Model-4bit", "coding"): {"score": 0.098, "source": "p", "sample_size": 10000},
+                ("org/Model-8bit", "coding"): {"score": 0.061, "source": "p", "sample_size": 10000}}
+    ranked = scoring.rank(_inv_recs(), "coding", measured=measured)
+    by_id = {r["model_id"]: r["score"] for r in ranked}
+    assert by_id["org/Model-4bit"].inversion == "outscores 8bit"
+    assert by_id["org/Model-8bit"].inversion == "outscored by 4bit"
+
+
+def test_inversion_se_zero_is_within_noise():
+    # Degenerate variances (values at 0/1) give se == 0; that is treated as within noise.
+    measured = {("org/Model-4bit", "coding"): {"score": 1.0, "source": "p", "sample_size": 20},
+                ("org/Model-8bit", "coding"): {"score": 0.0, "source": "p", "sample_size": 20}}
+    ranked = scoring.rank(_inv_recs(), "coding", measured=measured)
+    by_id = {r["model_id"]: r["score"] for r in ranked}
+    assert by_id["org/Model-4bit"].inversion == "outscores 8bit within noise"
+    assert by_id["org/Model-8bit"].inversion == "outscored by 4bit within noise"
+
+
+def test_non_inverted_pair_not_flagged():
+    # The expected ordering (higher precision scores higher) is NOT an inversion.
+    measured = {("org/Model-4bit", "coding"): {"score": 0.30, "source": "p", "sample_size": 50},
+                ("org/Model-8bit", "coding"): {"score": 0.90, "source": "p", "sample_size": 50}}
+    ranked = scoring.rank(_inv_recs(), "coding", measured=measured)
+    for r in ranked:
+        assert r["score"].inversion is None
+
+
+def test_inversion_skips_unknown_quant_imported_and_missing_sample_size():
+    # Eligibility: only measured-tier entries with a known quant AND a sample_size participate.
+    recs = [{"model_id": "org/Model-4bit", "est_context": 8000},   # measured, no sample_size
+            {"model_id": "org/Model", "est_context": 8000},        # measured, unknown quant
+            {"model_id": "org/Model-8bit", "est_context": 8000}]   # imported tier
+    measured = {("org/Model-4bit", "coding"): {"score": 0.90, "source": "p"},         # sample None
+                ("org/Model", "coding"): {"score": 0.95, "source": "p", "sample_size": 50}}
+    imported = {"model": {"coding": {"score": 0.10, "source": "leaderboard"}}}
+    ranked = scoring.rank(recs, "coding", measured=measured, imported=imported)
+    for r in ranked:
+        assert r["score"].inversion is None
+
+
+def test_inversion_does_not_change_ranking_order():
+    # DISCLOSURE, not reordering: the (statistically dubious) 4bit-first order is preserved.
+    measured = {("org/Model-4bit", "coding"): {"score": 0.098, "source": "p", "sample_size": 50},
+                ("org/Model-8bit", "coding"): {"score": 0.061, "source": "p", "sample_size": 50}}
+    ranked = scoring.rank(_inv_recs(), "coding", measured=measured)
+    assert [r["model_id"] for r in ranked] == ["org/Model-4bit", "org/Model-8bit"]
+
+
+def test_inversion_ignores_same_bit_width_pair():
+    # Two quants of the same effective width (4bit vs int4) can't invert each other — skipped.
+    recs = [{"model_id": "org/Model-4bit", "est_context": 8000},
+            {"model_id": "org/Model-int4", "est_context": 8000}]
+    measured = {("org/Model-4bit", "coding"): {"score": 0.90, "source": "p", "sample_size": 50},
+                ("org/Model-int4", "coding"): {"score": 0.30, "source": "p", "sample_size": 50}}
+    ranked = scoring.rank(recs, "coding", measured=measured)
+    for r in ranked:
+        assert r["score"].inversion is None
+
+
+def test_inversion_keeps_first_when_entry_in_several():
+    # An entry inverting against two higher-precision siblings keeps the FIRST message only.
+    recs = [{"model_id": "org/Model-4bit", "est_context": 8000},
+            {"model_id": "org/Model-8bit", "est_context": 8000},
+            {"model_id": "org/Model-fp16", "est_context": 8000}]
+    measured = {("org/Model-4bit", "coding"): {"score": 0.90, "source": "p", "sample_size": 50},
+                ("org/Model-8bit", "coding"): {"score": 0.88, "source": "p", "sample_size": 50},
+                ("org/Model-fp16", "coding"): {"score": 0.85, "source": "p", "sample_size": 50}}
+    ranked = scoring.rank(recs, "coding", measured=measured)
+    by_id = {r["model_id"]: r["score"] for r in ranked}
+    # 4bit beats both 8bit and fp16; only the first pairing (vs 8bit) is recorded.
+    assert by_id["org/Model-4bit"].inversion == "outscores 8bit within noise"
