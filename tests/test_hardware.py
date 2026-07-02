@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
 import datetime as dt
+import logging
 import os
 import sys
 
@@ -76,6 +77,33 @@ def test_run_returns_stdout_on_success():
 def test_pwsh_json_empty_on_invalid_json(monkeypatch):
     monkeypatch.setattr(hw, "_run", lambda *a, **k: "not-json{{{")
     assert hw._pwsh_json(["x"]) == []
+
+
+def test_pwsh_json_warns_on_no_output(monkeypatch, caplog):
+    """No signal on failure is a bug: a warning must be emitted when powershell yields nothing,
+    and the return value stays [] (unchanged behavior) — Fix 1."""
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: None)
+    with caplog.at_level(logging.WARNING, logger="ara.hardware"):
+        result = hw._pwsh_json(["Get-CimInstance", "Win32_Processor"])
+    assert result == []
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "no output" in msg.lower()
+    assert "Get-CimInstance" in msg
+
+
+def test_pwsh_json_warns_on_invalid_json_with_truncated_snippet(monkeypatch, caplog):
+    """Decode failures must log a truncated snippet of the raw output so CLIXML/stderr noise
+    is diagnosable, without changing the [] return — Fix 1."""
+    noise = "X" * 500  # something far longer than the ~200-char snippet budget
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: noise)
+    with caplog.at_level(logging.WARNING, logger="ara.hardware"):
+        result = hw._pwsh_json(["Get-CimInstance", "Win32_Processor"])
+    assert result == []
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "X" * 50 in msg  # snippet of the raw text is present
+    assert len(msg) < len(noise) + 200  # snippet is truncated, not the full 500 chars
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +191,68 @@ def test_cpu_windows_falls_back_to_wmi_name_if_no_registry_brand():
     }
     c = hw._cpu_windows(proc, brand=None)
     assert c.brand == "AMD Ryzen 9 5900X 12-Core Processor"
+
+
+def test_cpu_windows_includes_simd_features_when_given():
+    proc = {
+        "Name": "AMD Ryzen 9 5900X 12-Core Processor            ",
+        "Manufacturer": "AuthenticAMD",
+        "NumberOfCores": 12,
+        "NumberOfLogicalProcessors": 24,
+        "MaxClockSpeed": 3701,
+        "L2CacheSize": 6144,
+        "L3CacheSize": 65536,
+    }
+    c = hw._cpu_windows(proc, brand="AMD Ryzen 9 5900X", features=["avx", "avx2"])
+    assert c.features == ["avx", "avx2"]
+
+
+def test_cpu_windows_features_default_to_empty_when_not_given():
+    """Backward compatible: omitting `features` still degrades cleanly to []."""
+    proc = {
+        "Name": "AMD Ryzen 9 5900X 12-Core Processor            ",
+        "Manufacturer": "AuthenticAMD",
+        "NumberOfCores": 12,
+        "NumberOfLogicalProcessors": 24,
+    }
+    c = hw._cpu_windows(proc, brand="AMD Ryzen 9 5900X")
+    assert c.features == []
+
+
+# --- Windows SIMD/CPU feature detection (AVX/AVX2 via IsProcessorFeaturePresent) ---
+
+def test_win_simd_features_from_probe_neither():
+    assert hw._win_simd_features_from_probe({"AVX": False, "AVX2": False}) == []
+
+
+def test_win_simd_features_from_probe_avx_only():
+    assert hw._win_simd_features_from_probe({"AVX": True, "AVX2": False}) == ["avx"]
+
+
+def test_win_simd_features_from_probe_both():
+    assert hw._win_simd_features_from_probe({"AVX": True, "AVX2": True}) == ["avx", "avx2"]
+
+
+def test_win_simd_features_from_probe_empty_dict():
+    # Honest gap: an empty/garbage probe result parses to no features, never guessed.
+    assert hw._win_simd_features_from_probe({}) == []
+
+
+def test_win_simd_features_probe_success(monkeypatch):
+    monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: [{"AVX": True, "AVX2": True}])
+    assert hw._win_simd_features() == ["avx", "avx2"]
+
+
+def test_win_simd_features_probe_avx_only(monkeypatch):
+    monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: [{"AVX": True, "AVX2": False}])
+    assert hw._win_simd_features() == ["avx"]
+
+
+def test_win_simd_features_probe_returns_empty_on_failure(monkeypatch):
+    """_pwsh_json degrades to [] on any subprocess/parse failure — the SIMD probe must
+    degrade cleanly to [] too, never fabricating a feature."""
+    monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: [])
+    assert hw._win_simd_features() == []
 
 
 # --- Linux parser ---
@@ -294,10 +384,32 @@ def test_cpu_info_dispatches_windows(monkeypatch):
     monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: wmi_proc)
     monkeypatch.setattr(hw, "_winreg_str", lambda *a, **k: "AMD Ryzen 9 5900X")
     monkeypatch.setattr(_platform, "processor", lambda: "AMD64 Family 25")
+    monkeypatch.setattr(hw, "_win_simd_features", lambda: [])
     c = hw.cpu_info()
     assert c.brand == "AMD Ryzen 9 5900X"
     assert c.physical == 12 and c.logical == 24
     assert c.features == []
+
+
+def test_cpu_info_dispatches_windows_with_simd_features(monkeypatch):
+    """cpu_info() wires the AVX/AVX2 probe into CpuInfo.features on Windows — Fix 2."""
+    import platform as _platform
+    monkeypatch.setattr(_platform, "system", lambda: "Windows")
+    wmi_proc = [{
+        "Name": "AMD Ryzen 9 5900X 12-Core Processor            ",
+        "Manufacturer": "AuthenticAMD",
+        "NumberOfCores": 12,
+        "NumberOfLogicalProcessors": 24,
+        "MaxClockSpeed": 3701,
+        "L2CacheSize": 6144,
+        "L3CacheSize": 65536,
+    }]
+    monkeypatch.setattr(hw, "_pwsh_json", lambda *a, **k: wmi_proc)
+    monkeypatch.setattr(hw, "_winreg_str", lambda *a, **k: "AMD Ryzen 9 5900X")
+    monkeypatch.setattr(_platform, "processor", lambda: "AMD64 Family 25")
+    monkeypatch.setattr(hw, "_win_simd_features", lambda: ["avx", "avx2"])
+    c = hw.cpu_info()
+    assert c.features == ["avx", "avx2"]
 
 
 def test_cpu_info_dispatches_linux(monkeypatch):
