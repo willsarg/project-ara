@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
 """Inventory of AI/ML applications installed on the machine — GUI apps in /Applications
-plus Homebrew packages on macOS, .desktop entries/Flatpak/Snap on Linux — matched against a
-curated catalog of known AI/ML software.
+plus Homebrew packages on macOS, .desktop entries/Flatpak/Snap on Linux, registry Uninstall
+keys on Windows — matched against a curated catalog of known AI/ML software.
 
 A different lens from ENGINES (what ARA can launch) and FRAMEWORKS (python libraries):
 this is "what AI software is installed here," organized by what it's for. Read-only.
@@ -28,6 +28,7 @@ CATEGORY_LABEL = {
     "coding": "AI coding",
 }
 _ORDER = list(CATEGORY_LABEL)
+_NO_MATCH = object()  # sentinel: distinguishes "no match" from "matched, version is None"
 
 # (label, category, [.app bundle names], [brew formula/cask tokens]). Curated — matched
 # exactly (case-insensitive), no keyword guessing, so a hit is always a real known app.
@@ -161,7 +162,9 @@ def scan() -> list[App]:
         return _scan_macos()
     if sys.platform.startswith("linux"):
         return _scan_linux()
-    return []          # Windows slice is a separate follow-up
+    if sys.platform == "win32":
+        return _scan_windows()
+    return []
 
 
 def _scan_macos() -> list[App]:
@@ -291,6 +294,82 @@ def _scan_linux() -> list[App]:
 
         out.append(App(label, category, in_app=False, cask=False, formula=False,
                        version=version, source_label=source_label, cask_token=None,
+                       installed_at=None))
+    out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
+    return out
+
+
+# (winreg hive attribute name, subkey path) — the three standard Uninstall locations that
+# together cover 64-bit, 32-bit-on-64-bit (WOW6432Node), and per-user installs.
+_WINDOWS_UNINSTALL_KEYS = (
+    ("HKEY_LOCAL_MACHINE", r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKEY_LOCAL_MACHINE", r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKEY_CURRENT_USER", r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+)
+
+
+def _windows_installed_programs() -> dict[str, str | None]:
+    """{DisplayName: DisplayVersion} scraped from the registry's Uninstall keys (HKLM,
+    HKLM\\WOW6432Node, and HKCU) — the canonical Windows "installed programs" list. Every
+    key/subkey/value read is individually guarded so a missing key or value degrades cleanly
+    rather than raising. Imports winreg lazily so this module stays importable — and this
+    function stays callable, returning {} — on non-Windows platforms."""
+    try:
+        import winreg  # noqa: PLC0415 — intentional lazy import, Windows-only module
+    except ImportError:
+        return {}
+
+    programs: dict[str, str | None] = {}
+    for hive_name, subkey_path in _WINDOWS_UNINSTALL_KEYS:
+        hive = getattr(winreg, hive_name)
+        try:
+            root = winreg.OpenKey(hive, subkey_path)
+        except OSError:
+            continue
+        with root:
+            index = 0
+            while True:
+                try:
+                    entry_name = winreg.EnumKey(root, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(root, entry_name) as entry:
+                        try:
+                            display_name, _ = winreg.QueryValueEx(entry, "DisplayName")
+                        except OSError:
+                            continue
+                        try:
+                            display_version, _ = winreg.QueryValueEx(entry, "DisplayVersion")
+                        except OSError:
+                            display_version = None
+                        programs[display_name] = display_version
+                except OSError:
+                    continue
+    return programs
+
+
+def _scan_windows() -> list[App]:
+    """Installed AI/ML apps on Windows, matched against the curated catalog by SUBSTRING
+    (case-insensitive) against registry DisplayNames — Windows DisplayNames routinely carry
+    version/edition suffixes ("Ollama version 0.23.0", "Cursor 0.45.11", "Cursor (User)"),
+    so an exact match (as macOS/Linux use) would miss real installs. A catalog entry that
+    substring-matches multiple DisplayNames (e.g. two Cursor installs) is still emitted once
+    — the first match wins. Ordered identically to _scan_macos/_scan_linux."""
+    programs_lower = {name.lower(): version for name, version in _windows_installed_programs().items()}
+
+    out: list[App] = []
+    for label, category, bundles, _tokens in CATALOG:
+        candidates_lower = [c.lower() for c in (label, *bundles)]
+        match = next(
+            (v for n, v in programs_lower.items() if any(c in n for c in candidates_lower)),
+            _NO_MATCH,
+        )
+        if match is _NO_MATCH:
+            continue
+        out.append(App(label, category, in_app=False, cask=False, formula=False,
+                       version=match, source_label="registry", cask_token=None,
                        installed_at=None))
     out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
     return out

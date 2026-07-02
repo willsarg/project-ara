@@ -3,6 +3,9 @@
 """apps.py — curated AI/ML app inventory + drift/duplicate classification."""
 from __future__ import annotations
 
+import sys
+import types
+
 from ara import apps
 from ara.apps import App
 
@@ -188,13 +191,19 @@ def _raise_oserror(self):
 # scan() dispatch
 # --------------------------------------------------------------------------- #
 def test_scan_dispatch_unknown_platform_returns_empty(monkeypatch):
-    monkeypatch.setattr(apps.sys, "platform", "win32")
+    monkeypatch.setattr(apps.sys, "platform", "aix")
     assert apps.scan() == []
 
 
 def test_scan_dispatch_linux_routes_to_scan_linux(monkeypatch):
     monkeypatch.setattr(apps.sys, "platform", "linux")
     monkeypatch.setattr(apps, "_scan_linux", lambda: ["sentinel"])
+    assert apps.scan() == ["sentinel"]
+
+
+def test_scan_dispatch_windows_routes_to_scan_windows(monkeypatch):
+    monkeypatch.setattr(apps.sys, "platform", "win32")
+    monkeypatch.setattr(apps, "_scan_windows", lambda: ["sentinel"])
     assert apps.scan() == ["sentinel"]
 
 
@@ -353,5 +362,124 @@ def test_scan_linux_via_scan_dispatch(monkeypatch):
     # confirms scan() itself routes to the real _scan_linux implementation on Linux.
     monkeypatch.setattr(apps.sys, "platform", "linux")
     _linux_discovery(monkeypatch, desktop=["Ollama"])
+    labels = [a.label for a in apps.scan()]
+    assert labels == ["Ollama"]
+
+
+# --------------------------------------------------------------------------- #
+# _windows_installed_programs — registry Uninstall-key walk (winreg is mocked
+# via sys.modules, same pattern as tests/test_hardware.py's _winreg_str tests)
+# --------------------------------------------------------------------------- #
+def test_windows_installed_programs_no_winreg_returns_empty(monkeypatch):
+    # Force `import winreg` to fail on EVERY platform (a None in sys.modules raises ImportError) —
+    # otherwise this passes trivially off-Windows but FAILS on real Windows, where winreg imports
+    # and reads the actual registry. Deterministically exercises the ImportError branch. Caught by
+    # live validation on willw11 (the test assumed winreg is always absent). Keep-branches-mockable.
+    monkeypatch.setitem(sys.modules, "winreg", None)
+    assert apps._windows_installed_programs() == {}
+
+
+def test_windows_installed_programs_walks_registry(monkeypatch):
+    class _FakeKey:
+        def __init__(self, name, subkeys=()):
+            self.name = name
+            self.subkeys = list(subkeys)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    values = {
+        "Sub1": {"DisplayName": "App One", "DisplayVersion": "1.0"},
+        "Sub2": {"DisplayName": "App Two"},   # no DisplayVersion → None
+        "Sub3": {},                           # no DisplayName → skipped entirely
+    }
+
+    def fake_open_key(parent, name):
+        if parent == "HKLM" and "WOW6432Node" in name:
+            return _FakeKey("root", ["Sub1", "Sub2", "Sub3", "Sub4"])
+        if parent in ("HKLM", "HKCU"):
+            raise OSError("key not present")     # covers hive-open failure
+        if name == "Sub4":
+            raise OSError("cannot open Sub4")    # covers subkey-open failure
+        return _FakeKey(name)
+
+    def fake_enum_key(key, index):
+        if index < len(key.subkeys):
+            return key.subkeys[index]
+        raise OSError("no more items")           # covers loop termination
+
+    def fake_query_value_ex(key, name):
+        vals = values.get(key.name, {})
+        if name in vals:
+            return vals[name], 1
+        raise OSError("value not found")
+
+    fake_winreg = types.ModuleType("winreg")
+    fake_winreg.HKEY_LOCAL_MACHINE = "HKLM"
+    fake_winreg.HKEY_CURRENT_USER = "HKCU"
+    fake_winreg.OpenKey = fake_open_key
+    fake_winreg.EnumKey = fake_enum_key
+    fake_winreg.QueryValueEx = fake_query_value_ex
+
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    assert apps._windows_installed_programs() == {"App One": "1.0", "App Two": None}
+
+
+# --------------------------------------------------------------------------- #
+# _scan_windows — catalog matching by substring against registry DisplayNames
+# --------------------------------------------------------------------------- #
+def test_scan_windows_substring_match_with_version_suffix(monkeypatch):
+    monkeypatch.setattr(apps, "_windows_installed_programs",
+                        lambda: {"Ollama version 0.23.0": "0.23.0"})
+    by = {a.label: a for a in apps._scan_windows()}
+    o = by["Ollama"]
+    assert o.version == "0.23.0"
+    assert o.source_label == "registry" and o.source == "registry"
+    assert not o.in_app and not o.cask and not o.formula and o.cask_token is None
+
+
+def test_scan_windows_dedup_multiple_matches_emits_once(monkeypatch):
+    monkeypatch.setattr(apps, "_windows_installed_programs", lambda: {
+        "Cursor 0.45.11": "0.45.11",
+        "Cursor (User)": None,
+    })
+    result = [a for a in apps._scan_windows() if a.label == "Cursor"]
+    assert len(result) == 1
+    assert result[0].version == "0.45.11"   # first match (dict/insertion order) wins
+
+
+def test_scan_windows_case_insensitive_matching(monkeypatch):
+    monkeypatch.setattr(apps, "_windows_installed_programs",
+                        lambda: {"MICROSOFT VISUAL STUDIO CODE... cursor edition": "1.0"})
+    labels = [a.label for a in apps._scan_windows()]
+    assert "Cursor" in labels
+
+
+def test_scan_windows_no_match_skipped(monkeypatch):
+    monkeypatch.setattr(apps, "_windows_installed_programs",
+                        lambda: {"Some Unrelated Program": "1.0"})
+    assert apps._scan_windows() == []
+
+
+def test_scan_windows_sort_order(monkeypatch):
+    monkeypatch.setattr(apps, "_windows_installed_programs", lambda: {
+        "Ollama version 0.23.0": "0.23.0",
+        "LM Studio": "0.3.0",
+        "Cursor 0.45.11": "0.45.11",
+    })
+    result = apps._scan_windows()
+    order = [(a.category, a.label) for a in result]
+    assert order.index(("runner", "LM Studio")) < order.index(("runner", "Ollama"))
+    assert order.index(("runner", "Ollama")) < order.index(("coding", "Cursor"))
+
+
+def test_scan_windows_via_scan_dispatch(monkeypatch):
+    # confirms scan() itself routes to the real _scan_windows implementation on Windows.
+    monkeypatch.setattr(apps.sys, "platform", "win32")
+    monkeypatch.setattr(apps, "_windows_installed_programs",
+                        lambda: {"Ollama version 0.23.0": "0.23.0"})
     labels = [a.label for a in apps.scan()]
     assert labels == ["Ollama"]
