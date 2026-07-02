@@ -48,6 +48,8 @@ def test_gib_converts_bytes_to_gib():
 
 
 def test_gb_dec_converts_bytes_to_decimal_gb():
+    # Disk sizes only — disks are marketed decimal ("1 TB" = 1000204886016 bytes). Memory
+    # (RAM/VRAM) uses _gib. Slug: 2026-07-02-analytic-units-gib
     assert hw._gb_dec(1_000_000_000) == 1.0
     assert hw._gb_dec(None) is None
     assert hw._gb_dec("bad") is None
@@ -1590,7 +1592,7 @@ def test_drm_gpu_amd_returns_none_integrated():
     g = hw._drm_gpu("0x1002", "0x15bf", 4294967296, "Phoenix1", cpu_vendor="AuthenticAMD")
     assert g.vendor == "amd"
     assert g.name == "Phoenix1"            # lspci name when available
-    assert g.vram_gb == 4.3               # 4294967296 / 1e9 rounded (decimal GB)
+    assert g.vram_gb == 4.0               # 4294967296 / 1024³ (binary GiB, like RAM)
     assert g.integrated is None           # resolved at list level in _gpus_linux, not here
     assert g.compute_runtime is None      # runtime filled in Task 3, not here
 
@@ -1683,18 +1685,19 @@ def test_video_controller_gpu_nvidia():
         "DriverVersion": "31.0.15.3623", "AdapterRAM": 4293918720})
     assert g.vendor == "nvidia" and g.name == "NVIDIA GeForce RTX 2070"
     assert g.driver_version == "31.0.15.3623"
-    assert g.vram_gb is None          # 4293918720 ≈ uint32 cap ⇒ unknown, not 4.3
+    assert g.vram_gb is None          # 4293918720 ≈ uint32 cap ⇒ unknown, not ~4
 
 
 def test_video_controller_gpu_amd_small_adapterram_under_cap():
-    # A sub-4GB AdapterRAM (here a 2GB integrated Radeon carveout) is BELOW the uint32 cap, so it's
-    # trusted: vram_gb = bytes/1e9. (A real RX 6600 is 8GB and would report the uint32-pinned cap →
-    # None, like the NVIDIA case above; don't pair a big-SKU name with a small reading.)
+    # A sub-4GB AdapterRAM (here a 2GB integrated Radeon carveout) is BELOW the uint32 cap, so
+    # it's trusted: vram_gb = bytes/1024³ (binary GiB). (A real RX 6600 is 8GB and would report
+    # the uint32-pinned cap → None, like the NVIDIA case above; don't pair a big-SKU name with a
+    # small reading.)
     from ara import hardware as hw
     g = hw._video_controller_gpu({
         "Name": "AMD Radeon(TM) Graphics", "AdapterCompatibility": "Advanced Micro Devices, Inc.",
         "DriverVersion": "31.0.21912.14", "AdapterRAM": 2147483648})
-    assert g.vendor == "amd" and g.vram_gb == 2.1   # 2147483648/1e9
+    assert g.vendor == "amd" and g.vram_gb == 2.0   # 2147483648/1024³
 
 
 def test_video_controller_gpu_invalid_ram():

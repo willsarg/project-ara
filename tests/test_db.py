@@ -36,6 +36,43 @@ def test_calibration_get_missing_is_none(store):
     assert db.get_calibration(store, "nope", "wmx") is None
 
 
+def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
+    """One-time data fix: wmx calibrations written before the GiB boundary conversion carry
+    decimal-GB walls (~7.4% high). A float can't reveal its own units, so the rows are deleted
+    (the next run re-calibrates honestly) — other engines' rows are untouched, and the purge
+    runs once (user_version gate), so fresh GiB rows survive later connects.
+
+    Slug: 2026-07-02-analytic-units-gib
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    raw = sqlite3.connect(path)                      # a pre-migration store: user_version == 0
+    raw.executescript(db.SCHEMA)
+    raw.execute("INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, "
+                "calibrated_at, wall_gb, safe_budget_gb) VALUES "
+                "('m', 'wmx', 1.1, 't0', 25.8, 22.8)")     # decimal-era apple row
+    raw.execute("INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, "
+                "calibrated_at, wall_gb, safe_budget_gb) VALUES "
+                "('m', 'wcx', 0.5, 't0', 7.6, 5.6)")       # wcx was always binary — keep
+    raw.commit()
+    raw.close()
+
+    con = db.connect()
+    assert db.get_calibration(con, "m", "wmx") is None           # purged
+    assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+
+    # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
+    db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
+                          wall_gb=24.0, safe_budget_gb=21.0)
+    con.close()
+    con2 = db.connect()
+    assert db.get_calibration(con2, "m", "wmx")["wall_gb"] == 24.0
+    con2.close()
+
+
 def test_calibration_upsert_replaces(store):
     db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=1.0, calibrated_at="t1")
     db.upsert_calibration(store, "m", "wcx", fixed_overhead_gb=2.0, calibrated_at="t2")

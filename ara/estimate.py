@@ -16,6 +16,11 @@ from ara.contracts import ramp
 MARGIN_GB = 2.0
 APPLE_WORKING_SET = 0.75
 
+# The analytic layer's unit contract is binary GiB (matching detect's RAM/VRAM and the KV slope).
+# Weight sizes arrive as DECIMAL GB (on-disk bytes / 1e9, the disk-space denomination) and are
+# converted at the model_fit boundary. Slug 2026-07-02-analytic-units-gib.
+GIB = 1024 ** 3
+
 
 def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> dict:
     """Analytic memory limits from detect facts — no engine, no model load.
@@ -82,17 +87,24 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     context — ``"context_window"`` (the budget covers the model's whole window) or ``"memory"``
     (the budget binds first) — or None when the slope can't be estimated. ``fits`` is False when
     the weights alone exceed the budget.
+
+    Units: *weights_gb* arrives in DECIMAL GB (on-disk bytes / 1e9 — the callers pass catalog /
+    Hub sizes) while the budget and KV slope are binary GiB, so the weights are converted here
+    before any comparison; the returned ``weights_gb`` is the converted GiB in-memory footprint.
+    Comparing the raw decimal figure against a GiB budget overstated the weights term ~7.4% and
+    skewed the decode ceiling. Slug 2026-07-02-analytic-units-gib.
     """
     budget = limits_dict["safe_budget_gb"]
-    fits = weights_gb is not None and budget is not None and weights_gb < budget
+    weights_gib = weights_gb * 1e9 / GIB if weights_gb is not None else None
+    fits = weights_gib is not None and budget is not None and weights_gib < budget
     slope = ramp.analytic_kv_slope_gb_per_k(meta.get("n_layers"), meta.get("kv_heads"),
                                             meta.get("head_dim"))
     est_context, binding = None, None
     if fits and slope:
         est_context, binding = ramp.decode_ceiling(
-            weights_gb, slope, budget, max_context=meta.get("max_context"))
+            weights_gib, slope, budget, max_context=meta.get("max_context"))
     return {
-        "weights_gb": weights_gb,
+        "weights_gb": weights_gib,
         "fits": fits,
         "est_context": est_context,
         "max_context": meta.get("max_context"),
