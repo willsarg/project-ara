@@ -258,3 +258,26 @@ def test_benchmark_refuses_individual_prompt_that_fills_ceiling(monkeypatch):
     assert out["results"][0]["refused"] is True and "ceiling 3" in out["results"][0]["reason"]
     assert out["results"][1]["completion"] == "<2>a"          # small prompt runs, clamped to 2
     assert _FakeLlama.instances == 1                          # still a single load
+
+
+def test_benchmark_captures_per_prompt_error_and_continues(monkeypatch):
+    """A mid-generation exception on one prompt is captured as {'error': ...} for that prompt and
+    the run continues — completed work is never lost, mirroring the wmx contract (Rule #3).
+    Spec 2026-07-02-benchmark-honesty-persistence."""
+    import sys as _sys
+    import types as _t
+
+    class _FlakyLlama(_FakeLlama):
+        def create_chat_completion(self, messages, max_tokens):
+            if "boom" in messages[0]["content"]:
+                raise RuntimeError("decode failed mid-generation")
+            return super().create_chat_completion(messages, max_tokens)
+
+    _patch_safe_bench(monkeypatch)
+    _FlakyLlama.instances = 0
+    monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_FlakyLlama))
+    out = w.benchmark("org/m", 2048, ["boom now", "fine"],
+                      margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
+    assert "decode failed" in out["results"][0]["error"]      # per-prompt error captured
+    assert out["results"][1]["completion"] == "<8>fine"        # run continued past the error
+    assert _FlakyLlama.instances == 1                          # still a single load

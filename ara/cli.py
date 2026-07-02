@@ -1340,7 +1340,10 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                      "characterized": row["model_id"] in best})
     if use_case is not None:
         rows = db.list_benchmark_results(con, profile.machine_key())
-        bench_measured = ({(r["model_id"], r["use_case"]): {"score": r["score"], "source": r["source"]}
+        bench_measured = ({(r["model_id"], r["use_case"]):
+                           {"score": r["score"], "source": r["source"],
+                            "sample_size": r.get("sample_size"),
+                            "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n")}
                            for r in rows} or None)
         recs = scoring.rank(recs, use_case, measured=bench_measured,
                             imported=scoring.load_imported())
@@ -1351,7 +1354,10 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         if use_case is not None:
             recs = [{**r, "score": (None if r["score"] is None else
                                     {"tier": r["score"].tier, "value": r["score"].value,
-                                     "source": r["score"].source})} for r in recs]
+                                     "source": r["score"].source,
+                                     "sample_size": r["score"].sample_size,
+                                     "refused_n": r["score"].refused_n,
+                                     "errored_n": r["score"].errored_n})} for r in recs]
         print(json.dumps(recs, indent=2))
         return 0
 
@@ -1376,8 +1382,22 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             tail += " (full window)"
         if use_case is not None:
             s = r.get("score")
-            tail = (("unknown (not measured or imported) · " if s is None
-                     else f"{use_case} {s.value * 100:.0f}% ({s.tier}) · ") + tail)
+            if s is None:
+                head = "unknown (not measured or imported)"
+            else:
+                head = f"{use_case} {s.value * 100:.0f}% ({s.tier})"
+                if s.tier == "measured":
+                    # Disclose a depressed / shaky measurement rather than ranking on it silently.
+                    if s.refused_n or s.errored_n:
+                        partial = []
+                        if s.refused_n:
+                            partial.append(f"{s.refused_n} refused")
+                        if s.errored_n:
+                            partial.append(f"{s.errored_n} errored")
+                        head += f" [partial: {', '.join(partial)}]"
+                    if s.sample_size is not None and s.sample_size < 100:
+                        head += f" [low-confidence n={s.sample_size}]"
+            tail = f"{head} · {tail}"
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
         c.emit("  " + c.style("metric", r["model_id"])
                + c.style("dim", f"  {r['modality'] or '?'}  →  ")
@@ -1467,14 +1487,17 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 
     results = result.get("results", [])
     refused_n = sum(1 for r in results if r.get("refused"))
-    if prompts and refused_n == len(prompts):
-        # Every prompt was refused by per-prompt governance (e.g. --ctx too small) — that's NOT a
-        # 0% capability measurement; refuse to store a misleading score (Rule #3).
-        return err("every prompt was refused by per-prompt governance (is --ctx too small?) — "
-                   "no measurement taken")
+    errored_n = sum(1 for r in results if r.get("error"))
+    if prompts and (refused_n + errored_n) == len(prompts):
+        # No prompt produced a completion (all refused by governance and/or errored mid-generation)
+        # — that's NOT a 0% capability measurement; refuse to store a misleading score (Rule #3).
+        return err("every prompt was refused or errored — no measurement taken")
     if refused_n:
         c.emit(c.style("warn", f"  note: {refused_n}/{len(prompts)} prompts were refused by "
                                f"governance and scored 0 — the result is depressed accordingly"))
+    if errored_n:
+        c.emit(c.style("warn", f"  note: {errored_n}/{len(prompts)} prompts errored (engine "
+                               f"exception) and scored 0 — the result is depressed accordingly"))
 
     completions = [""] * len(prompts)
     for r in results:
@@ -1487,10 +1510,16 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     source = f"{key} probe={n} ({model})"
     if low_confidence:
         source += f"; low_confidence n={n}"
+    # Record the quant the score was actually taken at (the quant×capability degradation an
+    # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
+    mrow = db.get_model(con, model)
+    quant = mrow.get("quant") if mrow else None
+    quant = quant or scoring.quant_key(model)
     db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
                              engine_key=key, backend=backend,
-                             base_model=scoring.base_key(model),
-                             benchmark_id=use_case, sample_size=n)
+                             base_model=scoring.base_key(model), quant=quant,
+                             benchmark_id=use_case, sample_size=n,
+                             refused_n=refused_n, errored_n=errored_n)
     con.commit()
 
     if as_json:
@@ -1498,11 +1527,23 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                          "sample_size": n, "engine": key, "stored": True}
         if low_confidence:
             payload["low_confidence"] = True
+        if refused_n or errored_n:
+            payload["refused"] = refused_n
+            payload["errored"] = errored_n
+        if quant:
+            payload["quant"] = quant
         print(json.dumps(payload))
         return 0
     score_line = (f"  {use_case}: {score * 100:.0f}% measured here  ({n} prompts, {model})")
     if low_confidence:
         score_line += f" (low-confidence: n={n})"
+    if refused_n or errored_n:
+        partial = []
+        if refused_n:
+            partial.append(f"{refused_n} refused")
+        if errored_n:
+            partial.append(f"{errored_n} errored")
+        score_line += f" (partial: {', '.join(partial)})"
     c.emit(c.style("good", score_line))
     c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
     if score == 0.0 or score == 1.0:

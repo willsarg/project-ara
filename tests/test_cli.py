@@ -4877,9 +4877,11 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     saved = {}
 
     def fake_save(con, mk, model, uc, *, score, source, engine_key=None, backend=None,
-                  base_model=None, benchmark_id=None, sample_size=None, **kw):
+                  base_model=None, benchmark_id=None, sample_size=None, quant=None,
+                  refused_n=None, errored_n=None, **kw):
         saved.update(model=model, use_case=uc, score=score,
-                     engine_key=engine_key, sample_size=sample_size)
+                     engine_key=engine_key, sample_size=sample_size, quant=quant,
+                     refused_n=refused_n, errored_n=errored_n)
 
     monkeypatch.setattr(cli.db, "save_benchmark_result", fake_save)
     monkeypatch.setattr(cli.benchmark, "load_probe", lambda uc: list(items))
@@ -5300,6 +5302,59 @@ def test_recommend_use_case_json_serializes_scores(monkeypatch, set_platform, ca
     assert by["org/Unscored"]["score"] is None
 
 
+# --------------------------------------------------------------------------- #
+# recommend: annotate measured scores from partial / low-confidence runs (Rule #3).
+# Spec 2026-07-02-benchmark-honesty-persistence.
+# --------------------------------------------------------------------------- #
+def test_recommend_measured_partial_refusal_and_low_confidence_annotated(make_console, monkeypatch, set_platform):
+    # A measured score from a partial run (refused prompts) at a small sample is flagged partial +
+    # low-confidence so the ranking discloses its shaky provenance.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.db, "list_benchmark_results",
+                        lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
+                                          "score": 0.4, "source": "wmx probe",
+                                          "sample_size": 30, "refused_n": 2, "errored_n": 0}])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert "[partial: 2 refused]" in out
+    assert "[low-confidence n=30]" in out
+
+
+def test_recommend_measured_errored_partial_no_low_confidence_at_threshold(make_console, monkeypatch, set_platform):
+    # errored-only partial annotation; sample_size == 100 (threshold) → NO low-confidence tag.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Err", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.db, "list_benchmark_results",
+                        lambda con, mk: [{"model_id": "org/Err", "use_case": "coding",
+                                          "score": 0.6, "source": "wcx probe",
+                                          "sample_size": 100, "refused_n": 0, "errored_n": 3}])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert "[partial: 3 errored]" in out
+    assert "low-confidence" not in out
+
+
+def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platform, capsys):
+    # --json surfaces sample_size + refusal/error counts for measured scores.
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.db, "list_benchmark_results",
+                        lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
+                                          "score": 0.4, "source": "wmx probe",
+                                          "sample_size": 30, "refused_n": 2, "errored_n": 1}])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True, use_case="coding") == 0
+    payload = json.loads(capsys.readouterr().out)
+    sc = payload[0]["score"]
+    assert sc["sample_size"] == 30 and sc["refused_n"] == 2 and sc["errored_n"] == 1
+
+
 def test_render_benchmark_rejects_nonpositive_ctx(make_console, monkeypatch):
     _wire_benchmark(monkeypatch)
     c, buf = make_console()
@@ -5352,6 +5407,113 @@ def test_render_benchmark_ignores_out_of_range_prompt_index(make_console, monkey
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark honesty persistence — refused/errored counts + quant (Rule #3).
+# Spec 2026-07-02-benchmark-honesty-persistence.
+# --------------------------------------------------------------------------- #
+
+def _bench_backend(monkeypatch, results):
+    """Override the wired backend with one that returns the given per-prompt result list."""
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context, "results": results},
+        calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+
+
+def test_render_benchmark_clean_run_stores_zero_counts(make_console, monkeypatch):
+    # A clean full run persists refused_n=0 / errored_n=0 (measured clean, NOT legacy NULL).
+    saved = _wire_benchmark(monkeypatch, score=0.75)
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert saved["refused_n"] == 0 and saved["errored_n"] == 0
+
+
+def test_render_benchmark_partial_refusal_stores_counts_and_annotates(make_console, monkeypatch):
+    # A partial refusal stores refused_n and appends the partial suffix to the score line.
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "refused": True, "reason": "x"},
+                                 {"prompt_index": 1, "completion": "ans"}])
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert saved["refused_n"] == 1 and saved["errored_n"] == 0
+    assert "(partial: 1 refused)" in buf.getvalue()
+
+
+def test_render_benchmark_some_prompts_errored_warns_and_depresses(make_console, monkeypatch):
+    # A mid-generation engine exception is captured per-prompt, scored 0, warned about, and the
+    # errored count is persisted — the depressed score is disclosed, never hidden (Rule #3).
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "error": "CUDA OOM mid-generation"},
+                                 {"prompt_index": 1, "completion": "ans"}])
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    out = buf.getvalue()
+    assert "1/2 prompts errored" in out and "engine exception" in out
+    assert saved["errored_n"] == 1 and saved["refused_n"] == 0
+    assert "(partial: 1 errored)" in out
+
+
+def test_render_benchmark_all_prompts_errored_stores_nothing(make_console, monkeypatch):
+    # Every prompt erroring is NOT a 0% measurement — refuse to store (Rule #3).
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    _bench_backend(monkeypatch, [{"prompt_index": i, "error": "boom"} for i in range(2)])
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "every prompt was refused or errored" in buf.getvalue()
+
+
+def test_render_benchmark_all_refused_or_errored_mixed_stores_nothing(make_console, monkeypatch):
+    # A mix that leaves no successful completion (some refused, some errored) also stores nothing.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "refused": True, "reason": "x"},
+                                 {"prompt_index": 1, "error": "boom"}])
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "no measurement taken" in buf.getvalue()
+
+
+def test_render_benchmark_quant_from_catalog(make_console, monkeypatch):
+    # Quant is taken from the models catalog when known (the actual measured quant).
+    saved = _wire_benchmark(monkeypatch, score=0.7)
+    monkeypatch.setattr(cli.db, "get_model", lambda con, m: {"quant": "q4_0"})
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert saved["quant"] == "q4_0"
+
+
+def test_render_benchmark_quant_falls_back_to_model_id_token(make_console, monkeypatch):
+    # No catalog quant → derive it from the model id's quant token.
+    saved = _wire_benchmark(monkeypatch, score=0.7)
+    monkeypatch.setattr(cli.db, "get_model", lambda con, m: None)
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/Model-4bit", use_case="reasoning", assume_yes=True) == 0
+    assert saved["quant"] == "4bit"
+
+
+def test_render_benchmark_quant_none_when_unknown(make_console, monkeypatch):
+    # Neither catalog nor model id reveals a quant → None (honest unknown, not a guess).
+    saved = _wire_benchmark(monkeypatch, score=0.7)
+    monkeypatch.setattr(cli.db, "get_model", lambda con, m: None)
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert saved["quant"] is None
+
+
+def test_render_benchmark_json_includes_partial_counts_and_quant(monkeypatch, capsys):
+    # --json surfaces the refusal/error counts (when nonzero) and the known quant.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    monkeypatch.setattr(cli.db, "get_model", lambda con, m: {"quant": "q4_0"})
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "error": "boom"},
+                                 {"prompt_index": 1, "completion": "ans"}])
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, as_json=True)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["refused"] == 0 and payload["errored"] == 1
+    assert payload["quant"] == "q4_0"
 
 
 # --- serve: MLX (wmx) governed-server path ---

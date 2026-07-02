@@ -38,6 +38,29 @@ def base_key(model_id: str) -> str:
         prev, name = name, _QUANT_RE.sub("", name)
     return name
 
+
+# Genuine quantization tokens only — bit-widths, llama.cpp quant classes (Q/IQ/TQ), and the
+# awq/gptq/float classes. The container FORMATS `gguf`/`mlx` (present in _QUANT_RE for base_key
+# stripping) are deliberately excluded: they describe packaging, not precision, so they're never
+# a quant (Rule #3).
+_QUANT_ONLY_RE = re.compile(
+    r"[qf]?\d+bit|[it]?q\d(?:_[a-z0-9]+)*|bf16|fp16|fp32|f16|f32|int[48]|awq|gptq", re.I)
+
+
+def quant_key(model_id: str) -> str | None:
+    """The first genuine quant token in *model_id* (lowercased), or None if none is present.
+
+    A capturing counterpart to :data:`_QUANT_RE`: it inspects each ``-``-delimited segment of the
+    model name (org dropped) and returns the first that is *entirely* a quant token — e.g.
+    ``4bit``, ``q4_k_m``, ``int8``, ``awq``, ``fp16``. Container formats (``gguf``/``mlx``) are
+    never returned. Used when the catalog doesn't record the quant, so a measured score can still
+    carry the precision it was taken at."""
+    name = model_id.rsplit("/", 1)[-1].lower()
+    for tok in name.split("-"):
+        if _QUANT_ONLY_RE.fullmatch(tok):
+            return tok
+    return None
+
 # The use cases v1 supports as `--use-case` values (design §2.1).
 USE_CASES = ("coding", "reasoning", "agentic", "extraction", "rag", "chat")
 
@@ -45,10 +68,17 @@ USE_CASES = ("coding", "reasoning", "agentic", "extraction", "rag", "chat")
 @dataclass(frozen=True)
 class Score:
     """One capability reading. ``value`` is normalised 0..1; ``source`` is the citation
-    (imported) or the run conditions (measured); ``tier`` is ``measured`` | ``imported``."""
+    (imported) or the run conditions (measured); ``tier`` is ``measured`` | ``imported``.
+
+    Measured readings also carry the run's honesty metadata so the caller can annotate a depressed
+    or shaky score (Rule #3): ``sample_size`` (probe count; <100 → low-confidence) and the
+    per-prompt ``refused_n`` / ``errored_n`` counts. All default None (unknown / not-measured)."""
     tier: str
     value: float
     source: str
+    sample_size: int | None = None
+    refused_n: int | None = None
+    errored_n: int | None = None
 
 
 def score_for(model_id: str, use_case: str, *,
@@ -61,7 +91,9 @@ def score_for(model_id: str, use_case: str, *,
     if measured:
         hit = measured.get((model_id, use_case))
         if hit is not None:
-            return Score("measured", hit["score"], hit["source"])
+            return Score("measured", hit["score"], hit["source"],
+                         sample_size=hit.get("sample_size"),
+                         refused_n=hit.get("refused_n"), errored_n=hit.get("errored_n"))
     if imported:
         bucket = imported.get(model_id) or imported.get(base_key(model_id))
         if bucket and use_case in bucket:

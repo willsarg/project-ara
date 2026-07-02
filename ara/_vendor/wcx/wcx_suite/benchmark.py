@@ -101,8 +101,13 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
         if model is None:                                   # refuse-before-load: only after a pass
             model = probe_worker._load_model(hf_id, torch, prefer_flash=prefer_flash,
                                              weight_quant=weight_quant)
-        completion = _generate_one(model, tokenizer, prompt, max_tokens, eff_kv_bits, chunk)
-        results.append({"prompt_index": i, "completion": completion})
+        # A per-prompt exception (decode failure, OOM) must NOT crash the whole run and lose the
+        # completed work — capture it as an error result and press on (Rule #3, mirrors wmx).
+        try:
+            completion = _generate_one(model, tokenizer, prompt, max_tokens, eff_kv_bits, chunk)
+            results.append({"prompt_index": i, "completion": completion})
+        except Exception as exc:
+            results.append({"prompt_index": i, "error": str(exc)})
     return {"context": ctx, "results": results}
 
 

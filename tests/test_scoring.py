@@ -72,6 +72,68 @@ def test_load_imported_keys_are_base_normalised():
         assert k == scoring.base_key(k)
 
 
+def test_quant_key_extracts_genuine_quant_token():
+    # quant_key returns the first genuine quant token, lowercased. Spec 2026-07-02-benchmark-honesty-persistence.
+    assert scoring.quant_key("mlx-community/Llama-3.2-3B-Instruct-4bit") == "4bit"
+    assert scoring.quant_key("org/Model-q4_k_m") == "q4_k_m"
+    assert scoring.quant_key("org/Model-INT8") == "int8"
+    assert scoring.quant_key("org/Model-AWQ") == "awq"
+    assert scoring.quant_key("org/Model-fp16") == "fp16"
+
+
+def test_quant_key_covers_gguf_iq_tq_and_f32_classes():
+    # llama.cpp's importance-matrix (IQ*) and ternary (TQ*) quants are real quants the fleet
+    # actually runs (IQ2_M, TQ1_0 — the 2026-06-29 campaign's top box reasoner was a TQ1_0),
+    # and F32 is a full-precision label alongside F16. Spec 2026-07-02-benchmark-honesty-persistence.
+    assert scoring.quant_key("org/DeepSeek-Coder-V2-Lite-IQ2_M") == "iq2_m"
+    assert scoring.quant_key("org/Qwen3-Coder-30B-A3B-TQ1_0") == "tq1_0"
+    assert scoring.quant_key("org/Model-F32") == "f32"
+
+
+def test_quant_key_ignores_container_formats_and_returns_none():
+    # gguf / mlx are container formats, NOT quants — never returned; no quant → None.
+    # Spec 2026-07-02-benchmark-honesty-persistence.
+    assert scoring.quant_key("mlx-community/Llama-3.2-3B-Instruct") is None
+    assert scoring.quant_key("org/Model-gguf") is None
+    assert scoring.quant_key("meta-llama/Llama-3.2-3B-Instruct") is None
+
+
+def test_quant_key_returns_quant_not_format_when_both_present():
+    # A model tagged with both a quant and a container format returns only the quant token.
+    # Spec 2026-07-02-benchmark-honesty-persistence.
+    assert scoring.quant_key("org/Model-q4_k_m-gguf") == "q4_k_m"
+
+
+def test_base_key_unchanged_by_quant_key_addition():
+    # quant_key must not perturb base_key's stripping behaviour (byte-identical).
+    assert scoring.base_key("mlx-community/Llama-3.2-3B-Instruct-4bit-gguf") == "llama-3.2-3b-instruct"
+
+
+def test_measured_score_carries_sample_size_and_partial_counts():
+    # A measured Score surfaces its sample size + refusal/error counts so recommend can annotate
+    # partial/low-confidence runs (Rule #3). Spec 2026-07-02-benchmark-honesty-persistence.
+    measured = {("m", "coding"): {"score": 0.4, "source": "wmx probe",
+                                  "sample_size": 30, "refused_n": 3, "errored_n": 2}}
+    s = scoring.score_for("m", "coding", measured=measured)
+    assert s.sample_size == 30 and s.refused_n == 3 and s.errored_n == 2
+
+
+def test_imported_score_has_none_partial_fields():
+    # An imported score carries no sample-size / partial-count metadata (defaults None).
+    # Spec 2026-07-02-benchmark-honesty-persistence.
+    imported = {"m": {"coding": {"score": 0.5, "source": "leaderboard"}}}
+    s = scoring.score_for("m", "coding", imported=imported)
+    assert s.sample_size is None and s.refused_n is None and s.errored_n is None
+
+
+def test_measured_score_missing_partial_fields_default_none():
+    # A legacy measured hit without the new keys yields None fields (no KeyError).
+    # Spec 2026-07-02-benchmark-honesty-persistence.
+    measured = {("m", "coding"): {"score": 0.6, "source": "wmx probe"}}
+    s = scoring.score_for("m", "coding", measured=measured)
+    assert s.sample_size is None and s.refused_n is None and s.errored_n is None
+
+
 def test_load_imported_ships_cited_normalised_scores():
     # The shipped imported-score table is non-empty and every leaf carries a citation + a
     # normalised 0..1 score — provenance is mandatory (never an unattributed number).
