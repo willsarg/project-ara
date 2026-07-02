@@ -59,12 +59,14 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # The default run is the fast, fully-mocked unit suite (the 100%-coverage gate). Real-engine
-# integration tests and the real-dependency contract's online half are excluded here and opted
-# into explicitly: `pytest -m integration --no-cov` / `pytest -m dep_contract --no-cov`.
-addopts = "-q --cov=ara --cov-report=term-missing -m 'not integration and not dep_contract'"
+# integration tests, the real-dependency contract's online half, and the cross-process e2e are
+# excluded here and opted into explicitly:
+#   `pytest -m integration --no-cov` / `-m dep_contract --no-cov` / `-m e2e --no-cov`.
+addopts = "-q --cov=ara --cov-report=term-missing -m 'not integration and not dep_contract and not e2e'"
 markers = [
     "integration: real-engine end-to-end (installs an engine env, may download a model); opt-in via `pytest -m integration --no-cov`",
     "dep_contract: real-dependency online contract (hits the real Hugging Face Hub); opt-in via `pytest -m dep_contract --no-cov`",
+    "e2e: cross-process phone-home loop against a containerized coordinator (needs docker); opt-in via `pytest -m e2e --no-cov`",
 ]
 
 [tool.coverage.run]
@@ -90,7 +92,22 @@ exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.mutmut]
 source_paths = ["ara"]
+# ara/_vendor/* is the vendored engine source (wmx_suite, wcx_suite) — shipped in the wheel but
+# never imported in ARA's process (see [tool.coverage.run] omit above) and outside ARA's own
+# gate; it has its own suites' tests, so it's never mutated here either.
+do_not_mutate = ["ara/_vendor/*"]
 # Clear the project's addopts so --cov / fail_under=100 don't make every mutant
-# run exit non-zero (which would corrupt kill/survive detection).
-pytest_add_cli_args = ["-o", "addopts=", "-p", "no:cacheprovider"]
-also_copy = ["tests", "pyproject.toml", "uv.lock"]
+# run exit non-zero (which would corrupt kill/survive detection). Fast, mocked, fail-fast: no
+# point paying for coverage instrumentation or a slow suite once per mutant.
+pytest_add_cli_args = [
+    "-o",
+    "addopts=-x -q -m 'not integration and not dep_contract'",
+    "-p",
+    "no:cacheprovider",
+]
+# "contracts" carries the wire-schema fixtures (tests/test_wire_contract.py,
+# tests/test_node_capabilities.py read them via a repo-root-relative path, not from "ara").
+also_copy = ["tests", "pyproject.toml", "uv.lock", "contracts"]
+# scripts/mutation_probe.sh appends a temporary `only_mutate` filter here for scoped (weekly
+# CI / on-demand) runs, then restores this file — a full unscoped sweep over ara/ (~4900
+# statements) reruns the suite per mutant and takes hours, so it's a manual/local long-run only.

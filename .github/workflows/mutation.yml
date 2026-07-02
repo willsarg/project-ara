@@ -1,0 +1,77 @@
+# Layer 8 of the testing architecture: mutation testing ("do our tests actually bite?").
+#
+# ARA's 100%-coverage gate (test.yml) proves every line *executes* under test — it says nothing
+# about whether the assertions around that line would actually catch a bug. mutmut answers that:
+# it perturbs ara/ one small change at a time (a "mutant" — e.g. `>` becomes `>=`, `and` becomes
+# `or`) and reruns the fast unit suite. A mutant the suite still passes against is a SURVIVOR — a
+# spot where the tests are weak despite the coverage gate being green.
+#
+# This is a PERIODIC HEALTH CHECK, not a blocking gate on every push:
+#   - It never runs on pull_request — a survivor is a finding to triage, not a regression to
+#     block on (mutation testing has known false positives — equivalent mutants, etc.).
+#   - A full sweep of ara/ (~4900 statements) reruns the suite once per mutant and takes HOURS —
+#     far past any CI budget (hence the 60-minute timeout below, generous but still bounded).
+#     scripts/mutation_probe.sh scopes each run to ara/*.py files that changed in the last 7 days
+#     (i.e. since the previous weekly run), which keeps a normal week's run well inside the
+#     timeout. A full, unscoped sweep is a manual/local long-run: `uv run mutmut run` left going
+#     for hours on a dev box, not something CI ever attempts.
+#
+# Triggers:
+#   - schedule:           weekly, Wednesdays 06:00 UTC — distinct from docker-scan.yml's Monday
+#                        06:00 and dep-contract.yml's Tuesday 06:00, so the three periodic jobs
+#                        don't pile up on the same day.
+#   - workflow_dispatch:  on demand from the Actions tab (optionally scoped to explicit files —
+#                        see scripts/mutation_probe.sh's usage comment).
+#
+# Hardening mirrors test.yml / dep-contract.yml: read-only token, actions pinned to commit SHAs,
+# checkout creds not persisted, locked install (`uv sync --frozen`).
+name: Mutation Testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 3"   # Wednesdays 06:00 UTC — distinct from docker-scan (Mon) and dep-contract (Tue)
+
+permissions:
+  contents: read
+
+jobs:
+  mutation-probe:
+    runs-on: ubuntu-latest
+    # Generous on purpose: this job is scoped precisely BECAUSE a full mutation sweep over ara/
+    # would blow well past any normal CI timeout (see header). 60 minutes covers a typical week's
+    # changed-file scope with headroom; it is not sized for a full sweep.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0          # scripts/mutation_probe.sh's default scope walks `git log` over
+                                  # the last week, and hatch-vcs derives the version from tags —
+                                  # both need real history, not a shallow clone.
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - name: Run the scoped mutation probe
+        run: scripts/mutation_probe.sh
+      - name: Surface survivors clearly in the job log
+        if: always()
+        run: |
+          echo "## Mutation probe results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          uv run mutmut results >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "A surviving mutant (🙁) is a finding to triage — a place the test suite wouldn't" >> "$GITHUB_STEP_SUMMARY"
+          echo "catch that specific code change — not a build failure. This job does not fail the" >> "$GITHUB_STEP_SUMMARY"
+          echo "build on survivors." >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutmut cache (survivor/killed detail, for local triage via `mutmut show <id>`)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 — same pin as publish.yml
+        with:
+          name: mutmut-cache
+          path: .mutmut-cache
+          if-no-files-found: ignore
+          retention-days: 14

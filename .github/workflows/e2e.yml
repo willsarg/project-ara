@@ -1,0 +1,35 @@
+# Cross-process phone-home end-to-end (the deepest layer): brings up the real coordinator image via
+# docker compose and drives the real Python node client through enroll -> approve -> work -> result
+# over HTTP (tests/test_e2e_phone_home.py). Proves the two languages actually talk at runtime, which
+# the mocked unit suite and the static wire fixtures can't.
+#
+# Heavy (docker build + a live loop), so it does NOT run on every PR — the per-PR container check is
+# the boot smoke in docker-scan.yml. This runs on demand and weekly as a liveness check.
+#
+# Hardening mirrors the other workflows: read-only token, actions SHA-pinned, creds not persisted,
+# locked install, generous timeout (the compose build dominates).
+name: E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 4"   # Thursdays 06:00 UTC — distinct from docker-scan (Mon), dep-contract (Tue), mutation (Wed)
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest   # docker + docker compose are preinstalled
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0        # hatch-vcs derives the version from tags during uv sync
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run pytest -m e2e --no-cov
