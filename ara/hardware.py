@@ -8,6 +8,7 @@ captured real output on any host. Read-only; engine-free; never escalates privil
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -18,6 +19,8 @@ from pathlib import Path
 
 GB = 1024 ** 3  # GiB — defined locally (NOT imported from detect) to avoid a circular import,
                 # since detect imports hardware. Matches detect.GB exactly.
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -140,13 +143,19 @@ def _run(cmd: list[str], timeout: float = 3, ignore_rc: bool = False) -> str | N
 
 def _pwsh_json(args: list[str]) -> list[dict]:
     """Run a PowerShell expr emitting ConvertTo-Json; ALWAYS return a list (handles the
-    single-object-vs-array quirk of PS 5.1). [] on any failure."""
+    single-object-vs-array quirk of PS 5.1). [] on any failure.
+
+    Failures are silent to callers (the [] is honest: "nothing found", not "nothing tried") but
+    NOT silent to diagnostics — each failure branch logs a warning so a bad `powershell` invocation
+    or CLIXML/stderr noise is visible instead of masquerading as an honest empty result."""
     raw = _run(["powershell", "-NoProfile", "-Command", *args])
     if not raw:
+        logger.warning("powershell returned no output for: %s", args)
         return []
     try:
         val = json.loads(raw)
     except Exception:
+        logger.warning("powershell output was not valid JSON for %s: %r", args, raw[:200])
         return []
     return val if isinstance(val, list) else [val]
 
@@ -246,9 +255,11 @@ def _cpu_macos(sysctl: dict[str, str]) -> "CpuInfo":
     )
 
 
-def _cpu_windows(proc: dict, brand: str | None) -> "CpuInfo":
+def _cpu_windows(proc: dict, brand: str | None, features: list[str] | None = None) -> "CpuInfo":
     """Parse Win32_Processor WMI dict → CpuInfo.
-    `brand` is the registry ProcessorNameString (preferred); falls back to _clean(proc['Name'])."""
+    `brand` is the registry ProcessorNameString (preferred); falls back to _clean(proc['Name']).
+    `features` is the AVX/AVX2 list from `_win_simd_features()` (WMI itself exposes no SIMD
+    flags); omitted/None degrades to [] — honest, not fabricated."""
     effective_brand = brand if brand is not None else _clean(proc.get("Name", ""))
     return CpuInfo(
         brand=effective_brand,
@@ -259,8 +270,46 @@ def _cpu_windows(proc: dict, brand: str | None) -> "CpuInfo":
         max_mhz=proc.get("MaxClockSpeed"),
         l2_kb=proc.get("L2CacheSize"),
         l3_kb=proc.get("L3CacheSize"),
-        features=[],  # WMI gap — honest, not fabricated
+        features=features or [],
     )
+
+
+# PF_AVX_INSTRUCTIONS_AVAILABLE / PF_AVX2_INSTRUCTIONS_AVAILABLE — Win32 IsProcessorFeaturePresent
+# codes (winnt.h). There is deliberately NO AVX-512 entry: IsProcessorFeaturePresent has no
+# PF_* code for AVX-512 at all, so Windows cannot answer that question through this API. Do not
+# guess it from brand strings or any other proxy — leave it an honest gap (features list simply
+# omits "avx512"), same spirit as the "WMI gap" comment this replaces.
+_PF_AVX = 39
+_PF_AVX2 = 40
+
+
+def _win_simd_features_from_probe(raw: dict) -> list[str]:
+    """Pure parser: {"AVX": bool, "AVX2": bool} → ["avx", "avx2"] (only present flags), in a
+    stable order. Fed by `_win_simd_features()`'s I/O; kept separate so it's testable without a
+    subprocess."""
+    features: list[str] = []
+    if raw.get("AVX"):
+        features.append("avx")
+    if raw.get("AVX2"):
+        features.append("avx2")
+    return features
+
+
+def _win_simd_features() -> list[str]:
+    """Probe AVX/AVX2 via the Win32 `IsProcessorFeaturePresent` API, invoked through a
+    PowerShell `Add-Type` P/Invoke block — the same `_run`/`_pwsh_json` subprocess pattern as
+    the rest of this module. Returns [] on any probe failure (honest empty; `_pwsh_json`
+    already logs the diagnostic on failure)."""
+    ps = (
+        "Add-Type -Namespace Ara -Name Native -MemberDefinition "
+        "'[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(uint f);'; "
+        f"[PSCustomObject]@{{ AVX = [Ara.Native]::IsProcessorFeaturePresent({_PF_AVX}); "
+        f"AVX2 = [Ara.Native]::IsProcessorFeaturePresent({_PF_AVX2}) }} | ConvertTo-Json -Compress"
+    )
+    rows = _pwsh_json([ps])
+    if not rows:
+        return []
+    return _win_simd_features_from_probe(rows[0])
 
 
 def _linux_cpu_caches() -> dict[str, int]:
@@ -1271,7 +1320,8 @@ def cpu_info() -> CpuInfo:
                 r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
                 "ProcessorNameString",
             )
-            return _cpu_windows(proc, brand=brand)
+            features = _win_simd_features()
+            return _cpu_windows(proc, brand=brand, features=features)
         if system == "Linux":
             import psutil
             cpuinfo = _run(["cat", "/proc/cpuinfo"]) or ""
