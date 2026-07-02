@@ -110,11 +110,8 @@ def advertised_capabilities() -> list[dict]:
     """The models this node has characterized (schema: ``capability.json``), one ``serve_model`` per
     row of ARA's ``characterizations`` store for this machine — evidence ``"characterized"`` (Rule
     #1: report only what we've empirically measured). Empty when nothing is characterized yet."""
-    con = db.connect()
-    try:
+    with db.connected() as con:
         rows = db.list_characterizations(con, profile.machine_key())
-    finally:
-        con.close()
     return [
         {"kind": "serve_model", "id": row["model_id"], "engine": row["engine"],
          "evidence": "characterized"}

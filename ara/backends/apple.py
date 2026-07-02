@@ -143,7 +143,8 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
     calibration for the wmx engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
-    stored = calibration.get_calibration(db.connect(), "wmx")
+    with db.connected() as con:
+        stored = calibration.get_calibration(con, "wmx")
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead

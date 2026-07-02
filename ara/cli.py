@@ -933,14 +933,14 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         else:
             c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
         return 1
-    con = db.connect()
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
     per_engine = {}                       # engine_key -> (safe_context, decode_context)
-    for key in engines.ENGINES:
-        row = db.get_characterization(con, mk, key, model_id)
-        if row is not None:
-            per_engine[key] = (row["safe_context"], row.get("decode_context"))
+    with db.connected() as con:
+        for key in engines.ENGINES:
+            row = db.get_characterization(con, mk, key, model_id)
+            if row is not None:
+                per_engine[key] = (row["safe_context"], row.get("decode_context"))
     best = max((sc for (sc, _) in per_engine.values() if sc is not None), default=None)
     # Pair decode_context with the engine that owns the best safe_context, so the two
     # top-level JSON scalars describe the same engine — not independent max() picks.
@@ -1133,36 +1133,36 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
-    cal_con = db.connect()
-    if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
-        c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
-        cal = bk.calibrate()
-        overhead = (cal or {}).get("overhead_gb")
-        wall = (cal or {}).get("wall_gb")
-        # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
-        # never let the conservative default masquerade as a measurement. The ramp still proceeds
-        # safely on the default overhead; we just don't hide that it's a fallback.
-        cal_err = (cal or {}).get("calibration_error")
-        if cal_err:
-            c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
-                                   " — using conservative default overhead"))
-        # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
-        # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
-        # wall regardless of overhead is what lets profile/recommend report reality on every engine,
-        # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
-        if overhead is not None or wall is not None:
-            calibration.save_calibration(
-                cal_con, sel.engine_key, fixed_overhead_gb=overhead,
-                wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
-        # Surface the measured wall right where it's measured — otherwise the user sees only the
-        # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
-        # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
-        if wall is not None:
-            budget = (cal or {}).get("safe_budget_gb")
-            line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
-            if budget is not None:
-                line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
-            c.emit(line)
+    with db.connected() as cal_con:
+        if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
+            c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+            cal = bk.calibrate()
+            overhead = (cal or {}).get("overhead_gb")
+            wall = (cal or {}).get("wall_gb")
+            # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
+            # never let the conservative default masquerade as a measurement. The ramp still proceeds
+            # safely on the default overhead; we just don't hide that it's a fallback.
+            cal_err = (cal or {}).get("calibration_error")
+            if cal_err:
+                c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
+                                       " — using conservative default overhead"))
+            # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
+            # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
+            # wall regardless of overhead is what lets profile/recommend report reality on every engine,
+            # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
+            if overhead is not None or wall is not None:
+                calibration.save_calibration(
+                    cal_con, sel.engine_key, fixed_overhead_gb=overhead,
+                    wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
+            # Surface the measured wall right where it's measured — otherwise the user sees only the
+            # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
+            # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
+            if wall is not None:
+                budget = (cal or {}).get("safe_budget_gb")
+                line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
+                if budget is not None:
+                    line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
+                c.emit(line)
     c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
@@ -1190,11 +1190,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 1
 
     ceiling = result["safe_context"]
-    con = db.connect()
-    db.save_characterization(con, profile.machine_key(), sel.engine_key,
-                             model, safe_context=ceiling, points=result["points"],
-                             decode_context=result.get("decode_context"))
-    catalog.remember(con, model)
+    with db.connected() as con:
+        db.save_characterization(con, profile.machine_key(), sel.engine_key,
+                                 model, safe_context=ceiling, points=result["points"],
+                                 decode_context=result.get("decode_context"))
+        catalog.remember(con, model)
 
     if as_json:
         out: dict = {"model": model, "safe_context": ceiling,
@@ -1276,10 +1276,10 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
 
 def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     """The model catalog: scan the HF cache, then list each model + its best safe ceiling here."""
-    con = db.connect()
-    catalog.scan(con)
-    models = catalog.all_models(con)
-    best = _best_ceilings(con)
+    with db.connected() as con:
+        catalog.scan(con)
+        models = catalog.all_models(con)
+        best = _best_ceilings(con)
 
     if as_json:
         print(json.dumps(
@@ -1328,39 +1328,39 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                f"{', '.join(scoring.USE_CASES)}")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    con = db.connect()
-    catalog.scan(con)                 # refresh the catalog from the local cache first
-    # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
-    default_engine = engines.for_backend(detect.backend_name())
-    measured = (calibration.get_calibration(con, default_engine)
-                if default_engine is not None else None)
-    lim = estimate.limits(detect.machine(), measured=measured)
-    best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
+    with db.connected() as con:
+        catalog.scan(con)                 # refresh the catalog from the local cache first
+        # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
+        default_engine = engines.for_backend(detect.backend_name())
+        measured = (calibration.get_calibration(con, default_engine)
+                    if default_engine is not None else None)
+        lim = estimate.limits(detect.machine(), measured=measured)
+        best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
 
-    recs = []
-    unrankable = 0                    # weights fit, but we can't read the arch to estimate context
-    for row in catalog.all_models(con):
-        fit = estimate.model_fit(lim, row, row.get("weights_gb"))
-        if not fit["fits"]:
-            continue
-        if fit["est_context"] is None:
-            unrankable += 1           # honest: count it rather than drop it silently
-            continue
-        recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
-                     "est_context": fit["est_context"], "max_context": fit["max_context"],
-                     "binding": fit["binding"], "fits": True,
-                     "characterized": row["model_id"] in best})
-    if use_case is not None:
-        rows = db.list_benchmark_results(con, profile.machine_key())
-        bench_measured = ({(r["model_id"], r["use_case"]):
-                           {"score": r["score"], "source": r["source"],
-                            "sample_size": r.get("sample_size"),
-                            "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n")}
-                           for r in rows} or None)
-        recs = scoring.rank(recs, use_case, measured=bench_measured,
-                            imported=scoring.load_imported())
-    else:
-        recs.sort(key=lambda r: r["est_context"], reverse=True)
+        recs = []
+        unrankable = 0                    # weights fit, but we can't read the arch to estimate context
+        for row in catalog.all_models(con):
+            fit = estimate.model_fit(lim, row, row.get("weights_gb"))
+            if not fit["fits"]:
+                continue
+            if fit["est_context"] is None:
+                unrankable += 1           # honest: count it rather than drop it silently
+                continue
+            recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
+                         "est_context": fit["est_context"], "max_context": fit["max_context"],
+                         "binding": fit["binding"], "fits": True,
+                         "characterized": row["model_id"] in best})
+        if use_case is not None:
+            rows = db.list_benchmark_results(con, profile.machine_key())
+            bench_measured = ({(r["model_id"], r["use_case"]):
+                               {"score": r["score"], "source": r["source"],
+                                "sample_size": r.get("sample_size"),
+                                "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n")}
+                               for r in rows} or None)
+            recs = scoring.rank(recs, use_case, measured=bench_measured,
+                                imported=scoring.load_imported())
+        else:
+            recs.sort(key=lambda r: r["est_context"], reverse=True)
 
     if as_json:
         if use_case is not None:
@@ -1459,21 +1459,21 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         be_name = backend or "none"
         return err(f"benchmark isn't supported on the {be_name} engine")
 
-    con = db.connect()
     mk = profile.machine_key()
-    if ctx is not None:
-        if ctx <= 0:
-            return err("--ctx must be a positive integer")
-        _row = db.get_characterization(con, mk, key, model)
-        if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
-            return err(msg)
-        safe = ctx
-    else:
-        row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
-        if not row or row.get("safe_context") is None:
-            return err(f"no measured ceiling for {model} — run: ara characterize {model} "
-                       f"(or pass --ctx N)")
-        safe = row["safe_context"]
+    with db.connected() as con:
+        if ctx is not None:
+            if ctx <= 0:
+                return err("--ctx must be a positive integer")
+            _row = db.get_characterization(con, mk, key, model)
+            if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+                return err(msg)
+            safe = ctx
+        else:
+            row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
+            if not row or row.get("safe_context") is None:
+                return err(f"no measured ceiling for {model} — run: ara characterize {model} "
+                           f"(or pass --ctx N)")
+            safe = row["safe_context"]
 
     items = benchmark.load_probe(use_case)
     n = len(items)
@@ -1539,15 +1539,16 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         source += f"; repeat={repeat} band={lo * 100:.0f}-{hi * 100:.0f}"
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
-    mrow = db.get_model(con, model)
-    quant = mrow.get("quant") if mrow else None
-    quant = quant or scoring.quant_key(model)
-    db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
-                             engine_key=key, backend=backend,
-                             base_model=scoring.base_key(model), quant=quant,
-                             benchmark_id=use_case, sample_size=n,
-                             refused_n=refused_n, errored_n=errored_n)
-    con.commit()
+    with db.connected() as con:
+        mrow = db.get_model(con, model)
+        quant = mrow.get("quant") if mrow else None
+        quant = quant or scoring.quant_key(model)
+        db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
+                                 engine_key=key, backend=backend,
+                                 base_model=scoring.base_key(model), quant=quant,
+                                 benchmark_id=use_case, sample_size=n,
+                                 refused_n=refused_n, errored_n=errored_n)
+        con.commit()
 
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
@@ -1626,53 +1627,53 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"invalid --weight-quant {weight_quant!r} — choose one of: "
                    f"{', '.join(_WEIGHT_QUANT_CHOICES)}")
 
-    con = db.connect()
     mk = profile.machine_key()
     suffix = "" if engine is None else f" --engine {sel.engine_key}"
 
-    if engine is not None:
-        # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
-        row = db.get_characterization(con, mk, sel.engine_key, model)
-        if row is None:
-            return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
-                       f"ara characterize {model}{suffix}")
-        if row.get("safe_context") is None:
-            return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
-                       f"too big for this machine")
-        engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
-    else:
-        # No --engine: scan every engine this model is characterized under on this machine and pick
-        # the largest measured ceiling whose backend can actually run (has `generate`). A model
-        # characterized on the CPU fallback runs there even when the detected backend differs.
-        # Mirror _best_ceilings' iteration: detected default first so ties favour it. The default
-        # is never None here — resolve_engine(None) above would have raised if the detected backend
-        # had no engine — so [default, *ENGINES] holds only real keys.
-        default = engines.for_backend(detect.backend_name())
-        per_engine = {}                  # engine_key -> (safe_context, backend, can_run)
-        for key in dict.fromkeys([default, *engines.ENGINES]):
-            row = db.get_characterization(con, mk, key, model)
+    with db.connected() as con:
+        if engine is not None:
+            # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
+            row = db.get_characterization(con, mk, sel.engine_key, model)
             if row is None:
-                continue
-            backend = engines.ENGINES[key]["backend"]
-            per_engine[key] = (row.get("safe_context"), backend,
-                               hasattr(get_backend(backend), "generate"))
-        if not per_engine:
-            return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
-                       f"ara characterize {model}")
-        fitted = {k: v for k, v in per_engine.items() if v[0] is not None}
-        if not fitted:
-            return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
-                       f"too big for this machine")
-        runnable = {k: v for k, v in fitted.items() if v[2]}
-        if not runnable:
-            # Characterized + fits, but only on engine(s) ARA can't run through yet (apple/cuda).
-            # Be honest about that — don't masquerade as uncharacterized.
-            where = ", ".join(fitted)
-            return err(f"{model} is characterized on {where}, but run isn't supported on "
-                       f"that engine yet")
-        # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
-        engine_key = max(runnable, key=lambda k: runnable[k][0])
-        safe, backend, _ = runnable[engine_key]
+                return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                           f"ara characterize {model}{suffix}")
+            if row.get("safe_context") is None:
+                return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
+                           f"too big for this machine")
+            engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
+        else:
+            # No --engine: scan every engine this model is characterized under on this machine and pick
+            # the largest measured ceiling whose backend can actually run (has `generate`). A model
+            # characterized on the CPU fallback runs there even when the detected backend differs.
+            # Mirror _best_ceilings' iteration: detected default first so ties favour it. The default
+            # is never None here — resolve_engine(None) above would have raised if the detected backend
+            # had no engine — so [default, *ENGINES] holds only real keys.
+            default = engines.for_backend(detect.backend_name())
+            per_engine = {}                  # engine_key -> (safe_context, backend, can_run)
+            for key in dict.fromkeys([default, *engines.ENGINES]):
+                row = db.get_characterization(con, mk, key, model)
+                if row is None:
+                    continue
+                backend = engines.ENGINES[key]["backend"]
+                per_engine[key] = (row.get("safe_context"), backend,
+                                   hasattr(get_backend(backend), "generate"))
+            if not per_engine:
+                return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                           f"ara characterize {model}")
+            fitted = {k: v for k, v in per_engine.items() if v[0] is not None}
+            if not fitted:
+                return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
+                           f"too big for this machine")
+            runnable = {k: v for k, v in fitted.items() if v[2]}
+            if not runnable:
+                # Characterized + fits, but only on engine(s) ARA can't run through yet (apple/cuda).
+                # Be honest about that — don't masquerade as uncharacterized.
+                where = ", ".join(fitted)
+                return err(f"{model} is characterized on {where}, but run isn't supported on "
+                           f"that engine yet")
+            # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
+            engine_key = max(runnable, key=lambda k: runnable[k][0])
+            safe, backend, _ = runnable[engine_key]
 
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
                                          flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
@@ -1774,21 +1775,21 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
-    con = db.connect()
     mk = profile.machine_key()
-    if ctx is not None:
-        if ctx <= 0:
-            return err("--ctx must be a positive integer")
-        _row = db.get_characterization(con, mk, engine_key, model)
-        if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
-            return err(msg)
-        safe, source = ctx, "requested"
-    else:
-        row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
-        if not row or row.get("safe_context") is None:
-            return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
-                       f"(or pass --ctx N).")
-        safe, source = row["safe_context"], "measured"
+    with db.connected() as con:
+        if ctx is not None:
+            if ctx <= 0:
+                return err("--ctx must be a positive integer")
+            _row = db.get_characterization(con, mk, engine_key, model)
+            if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+                return err(msg)
+            safe, source = ctx, "requested"
+        else:
+            row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
+            if not row or row.get("safe_context") is None:
+                return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
+                           f"(or pass --ctx N).")
+            safe, source = row["safe_context"], "measured"
 
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Serve {model} on MLX, governed at ≤{safe} ctx?"):
@@ -1872,12 +1873,14 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
             return err("--ctx must be a positive integer")
         # Rule #1 gate: an explicit --ctx must not exceed what was MEASURED for this model on
         # this machine (previously this path never consulted the measurement at all).
-        found = _ollama_safe_ceiling(db.connect(), profile.machine_key(), model)
+        with db.connected() as con:
+            found = _ollama_safe_ceiling(con, profile.machine_key(), model)
         if (msg := _ctx_gate_msg(ctx, found[0] if found else None, model)):
             return err(msg)
         safe, source = ctx, "requested"
     else:
-        found = _ollama_safe_ceiling(db.connect(), profile.machine_key(), model)
+        with db.connected() as con:
+            found = _ollama_safe_ceiling(con, profile.machine_key(), model)
         if found is None:
             return err(f"no measured safe ceiling for {model} — pass --ctx N, or characterize it "
                        f"first (Ollama runs llama.cpp; characterize on cpu/vulkan).")
@@ -1992,7 +1995,8 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     """Show models ARA has characterized on this machine + engine (from the store)."""
     if engine_key is None:
         return
-    rows = db.list_characterizations(db.connect(), profile.machine_key(), engine_key)
+    with db.connected() as con:
+        rows = db.list_characterizations(con, profile.machine_key(), engine_key)
     if not rows:
         return
     c.emit(c.section("  CHARACTERIZED MODELS"))
@@ -2021,8 +2025,8 @@ def _model_fit(lim: dict, model: str) -> dict | None:
     meta = catalog.describe(model)
     if meta is None:
         return None
-    con = db.connect()
-    row = catalog.get(con, model) or catalog.remember(con, model)
+    with db.connected() as con:
+        row = catalog.get(con, model) or catalog.remember(con, model)
     weights_gb = row.get("weights_gb") if row else None
     if weights_gb is None:
         weights_gb = acquire.repo_size_gb(model)
@@ -2075,11 +2079,13 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     # Ground the estimate in reality: if this engine has a measured wall stored from a prior
     # characterize, report the MEASURED budget (labelled), not the heuristic. Read-only — still
     # engine-free (no engine import/load). Spec 2026-06-23-capability-pipeline.
-    measured = calibration.get_calibration(db.connect(), sel.engine_key)
+    with db.connected() as con:
+        measured = calibration.get_calibration(con, sel.engine_key)
     lim = estimate.limits(m, measured=measured)
 
     # profile is the persister (detect stays ephemeral): record this analytic snapshot, history kept.
-    profile.capture(db.connect())
+    with db.connected() as con:
+        profile.capture(con)
 
     if as_json:
         payload = {**lim}

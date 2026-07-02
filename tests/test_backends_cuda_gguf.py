@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json as _json
 
+import contextlib
+
 import pytest
 
 from ara import catalog
@@ -208,7 +210,7 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_budget_params_uses_stored_calibration_for_both_margins(monkeypatch):
     monkeypatch.setattr(cuda_gguf, "db",
-                        type("D", (), {"connect": staticmethod(lambda: None)}))
+                        type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(cuda_gguf, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng: {"vram_margin_gb": 0.5, "ram_margin_gb": 3.0})}),
@@ -218,7 +220,7 @@ def test_budget_params_uses_stored_calibration_for_both_margins(monkeypatch):
 
 def test_budget_params_falls_back_to_defaults_when_no_calibration(monkeypatch):
     monkeypatch.setattr(cuda_gguf, "db",
-                        type("D", (), {"connect": staticmethod(lambda: None)}))
+                        type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(cuda_gguf, "calibration",
                         type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
                         raising=False)
