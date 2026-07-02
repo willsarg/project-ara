@@ -95,12 +95,17 @@ def register_turn_end_tokens(tokenizer) -> list[int]:
 # --------------------------------------------------------------------------- #
 
 def _pre_load_gate(hf_id: str, ceiling: int, *, margin_gb: float, overhead_gb: float,
-                   kv_bits: int | None = None) -> tuple[dict | None, int | None]:
+                   kv_bits: int | None = None,
+                   measured_slope_gb_per_k: float | None = None) -> tuple[dict | None, int | None]:
     """Validate model + run memory gate before any weight load.
 
     Returns ``(refusal_dict, None)`` on any failure; ``(None, effective_kv_bits)`` when safe.
     ``effective_kv_bits`` reflects :func:`measure_one._effective_kv_bits` — fp16 (None) for
     non-quantizable (RotatingKVCache) models regardless of what the caller passed.
+
+    ``measured_slope_gb_per_k`` (when ARA serves this model's own measured ceiling) makes the
+    gate predict with the measured ramp slope instead of the conservative a-priori one — see
+    :func:`measure_one.safety_gate`. Absent → a-priori (unchanged).
     """
     info = models.describe(hf_id)
     if info is None:
@@ -114,7 +119,8 @@ def _pre_load_gate(hf_id: str, ceiling: int, *, margin_gb: float, overhead_gb: f
     live_base = system.sample_settled_baseline()
     reason = measure_one.safety_gate(info, limits, ceiling, margin_gb=margin_gb,
                                      overhead_gb=overhead_gb, live_base=live_base,
-                                     kv_bits=effective_kv)
+                                     kv_bits=effective_kv,
+                                     measured_slope_gb_per_k=measured_slope_gb_per_k)
     if reason is not None:
         return ({"refused": True, "reason": reason}, None)
     return (None, effective_kv)
@@ -425,7 +431,8 @@ def _make_handler(model, tokenizer, ceiling: int, kv_bits: int | None, hf_id: st
 # --------------------------------------------------------------------------- #
 
 def serve(hf_id: str, ceiling: int, *, margin_gb: float, overhead_gb: float,
-          port: int, kv_bits: int | None = None) -> None:
+          port: int, kv_bits: int | None = None,
+          measured_slope_gb_per_k: float | None = None) -> None:
     """Gate, load, bind, handshake, serve. Exits 1 (never returns normally) on veto.
 
     Sequence:
@@ -436,7 +443,8 @@ def serve(hf_id: str, ceiling: int, *, margin_gb: float, overhead_gb: float,
     5. ``serve_forever()`` — runs until the process is killed.
     """
     refusal, effective_kv = _pre_load_gate(hf_id, ceiling, margin_gb=margin_gb,
-                                           overhead_gb=overhead_gb, kv_bits=kv_bits)
+                                           overhead_gb=overhead_gb, kv_bits=kv_bits,
+                                           measured_slope_gb_per_k=measured_slope_gb_per_k)
     if refusal is not None:
         print(json.dumps({"refused": True, "reason": refusal["reason"]}), flush=True)
         sys.exit(1)
@@ -487,9 +495,17 @@ def main(argv=None) -> None:
         help="KV-cache quantization bits (8 or 4); omit for fp16. "
              "Ignored for non-quantizable (RotatingKVCache) models.",
     )
+    ap.add_argument(
+        "--measured-slope", type=float, default=None,
+        help="Measured ramp slope (GB per 1k tokens) fit from this model's characterization on "
+             "this machine. When ARA serves the model's own measured ceiling it passes this so the "
+             "gate predicts with the real growth, not the conservative a-priori slope. Omit for "
+             "the a-priori gate (uncharacterized / --ctx serves).",
+    )
     args = ap.parse_args(argv)
     serve(args.hf_id, args.ctx_ceiling, margin_gb=args.margin, overhead_gb=args.overhead,
-          port=args.port, kv_bits=args.kv_bits)
+          port=args.port, kv_bits=args.kv_bits,
+          measured_slope_gb_per_k=args.measured_slope)
 
 
 if __name__ == "__main__":

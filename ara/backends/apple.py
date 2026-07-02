@@ -196,14 +196,19 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
 
 
 def serve(model: str, *, port: int, max_context: int,
-          kv_quant: str = "f16") -> tuple:
+          kv_quant: str = "f16", measured_slope_gb_per_k: float | None = None) -> tuple:
     """Start a governed MLX server for *model* via wmx_suite.serve, out-of-process.
 
     Spawns the isolated ``apple`` env's python running
     ``python -m wmx_suite.serve <model> <max_context> --margin G --overhead G --port N
-    [--kv-bits N]``. Reads stdout until the worker emits its ready JSON
+    [--kv-bits N] [--measured-slope S]``. Reads stdout until the worker emits its ready JSON
     (``{"ready": true, "url": "...", "context": N}``), then returns
     ``(proc, url, context)`` without waiting — the server keeps running.
+
+    ``measured_slope_gb_per_k`` (ARA fits it from this model's stored characterization when
+    serving the measured ceiling) makes the pre-load gate predict with the real ramp slope
+    instead of the conservative a-priori one — so a measured long-window serve isn't falsely
+    refused (slug 2026-07-02-wmx-serve-measured-provenance-gate). Omit for the a-priori gate.
 
     ARA never imports MLX in-process; all engine calls go through
     :func:`engine_env.start_worker_server`. The ceiling passed as *max_context* must
@@ -216,6 +221,8 @@ def serve(model: str, *, port: int, max_context: int,
     bits = _MLX_KV_BITS[kv_quant]
     if bits is not None:
         argv += ["--kv-bits", str(bits)]
+    if measured_slope_gb_per_k is not None:
+        argv += ["--measured-slope", str(measured_slope_gb_per_k)]
     proc, info = engine_env.start_worker_server("apple", argv)
     return proc, info["url"], info["context"]
 

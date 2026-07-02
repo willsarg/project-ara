@@ -36,14 +36,24 @@ def _effective_kv_bits(info, kv_bits: int | None) -> int | None:
 
 
 def safety_gate(info, limits, ctx: int, *, margin_gb: float, overhead_gb: float,
-                live_base: float, kv_bits: int | None = None) -> str | None:
+                live_base: float, kv_bits: int | None = None,
+                measured_slope_gb_per_k: float | None = None) -> str | None:
     """Return a refusal reason if probing (model, ctx) is unsafe, else None.
 
     Two independent refusals, both conservative (``>=`` — never round toward the wall):
     the base estimate must fit on its own (the model can load), and the predicted
-    footprint at *ctx* (live baseline + model base + a-priori slope) must stay under budget.
-    The slope reflects ``kv_bits`` (fp16 by default), so opting into a quantized cache
-    predicts the smaller growth it actually has.
+    footprint at *ctx* (live baseline + model base + slope) must stay under budget.
+
+    The growth slope is the *a-priori* estimate from architecture (reflecting ``kv_bits``,
+    fp16 by default) UNLESS ``measured_slope_gb_per_k`` is supplied — the ramp slope ARA fit
+    from a real characterization of this model on this machine. Measured provenance is used
+    only when ARA serves the model's own measured ceiling: the ramp already survived the real
+    prefill spike and certified that ceiling, so the a-priori conservatism (which exists for
+    UNcharacterized models) over-predicts and would refuse a safe serve. Crucially this only
+    swaps the slope — the base-load check and the *current* live baseline still apply, so a
+    busier machine at serve time still refuses honestly. Rule #1 is preserved: the ceiling was
+    empirically measured safe, and the L5 runtime watchdog remains the hard backstop.
+    Slug 2026-07-02-wmx-serve-measured-provenance-gate.
     """
     threshold = limits.safe_threshold_gb(margin_gb)
     est_base = probe.estimate_base_gb(info, limits, overhead_gb)
@@ -51,7 +61,8 @@ def safety_gate(info, limits, ctx: int, *, margin_gb: float, overhead_gb: float,
         return (f"base estimate {est_base:.2f}GB >= safe budget {threshold:.2f}GB — "
                 f"won't load")
     model_base = info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
-    slope = info.estimated_slope_gb_per_k(_effective_kv_bits(info, kv_bits))
+    slope = (measured_slope_gb_per_k if measured_slope_gb_per_k is not None
+             else info.estimated_slope_gb_per_k(_effective_kv_bits(info, kv_bits)))
     predicted = live_base + model_base + slope * (ctx / 1000)
     if predicted >= threshold:
         return (f"predicted {predicted:.2f}GB at {ctx} tok >= safe budget "

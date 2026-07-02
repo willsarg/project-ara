@@ -17,6 +17,7 @@ from pathlib import Path
 from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
                  hf_auth, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  staleness, status, versions)
+from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
@@ -940,6 +941,23 @@ def _stale_ceiling_note(c: Console, model: str, measured_at: str | None, *,
     return True
 
 
+def _measured_ramp_slope(row: dict | None) -> float | None:
+    """Fit the measured growth slope (GB per 1k tok) from a characterization row's stored ramp
+    points, or None when it can't (missing/too-few points, degenerate fit). The points are in the
+    engine's native units (wmx: decimal GB) — the SAME units the wmx serve gate predicts in — so
+    the slope passes straight through with no conversion. Lets ``serve`` gate a measured ceiling
+    with the real slope instead of the conservative a-priori one; None falls back to a-priori.
+    Slug 2026-07-02-wmx-serve-measured-provenance-gate."""
+    pts = [(p["context"], p["mem_gb"]) for p in (row or {}).get("points", [])
+           if p.get("context") is not None and p.get("mem_gb") is not None]
+    if len(pts) < 2:
+        return None
+    try:
+        return ramp.fit(pts).slope_gb_per_k
+    except ramp.RampError:
+        return None
+
+
 def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
     """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
     meta = catalog.describe(model_id)
@@ -1811,6 +1829,7 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
                 return err(msg)
             safe, source = ctx, "requested"
             ceiling_measured_at = None       # explicit --ctx, not a stored ceiling
+            measured_slope = None            # a-priori gate for an unmeasured override (Rule #1)
         else:
             row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
             if not row or row.get("safe_context") is None:
@@ -1818,6 +1837,10 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
                            f"(or pass --ctx N).")
             safe, source = row["safe_context"], "measured"
             ceiling_measured_at = row.get("measured_at")
+            # Serving the model's OWN measured ceiling: fit the real ramp slope so the pre-load gate
+            # predicts with it, not the conservative a-priori prior that would falsely refuse a
+            # long-window measured serve (slug 2026-07-02-wmx-serve-measured-provenance-gate).
+            measured_slope = _measured_ramp_slope(row)
 
     _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     if not as_json and not assume_yes and sys.stdin.isatty():
@@ -1828,7 +1851,8 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     port = _free_port()
     try:
         proc, url, served_ctx = get_backend("apple").serve(
-            model, port=port, max_context=safe, kv_quant=kv_quant)
+            model, port=port, max_context=safe, kv_quant=kv_quant,
+            measured_slope_gb_per_k=measured_slope)
     except Exception as exc:                       # gate refusal / engine not installed / etc.
         return err(f"couldn't start the MLX server: {exc}")
 

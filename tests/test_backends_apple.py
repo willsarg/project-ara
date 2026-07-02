@@ -481,6 +481,24 @@ def test_serve_omits_kv_bits_for_f16(monkeypatch):
     assert "--kv-bits" not in captured["argv"]
 
 
+def test_serve_appends_measured_slope_when_given(monkeypatch):
+    """A measured ramp slope → --measured-slope S appended, so the gate predicts with the real
+    growth instead of the a-priori prior (2026-07-02-wmx-serve-measured-provenance-gate)."""
+    _patch_budget(monkeypatch)
+    captured = _fake_start_server(monkeypatch)
+    apple.serve("org/m", port=8080, max_context=40960, measured_slope_gb_per_k=0.21)
+    argv = captured["argv"]
+    assert argv[argv.index("--measured-slope") + 1] == "0.21"
+
+
+def test_serve_omits_measured_slope_when_none(monkeypatch):
+    """No measured slope (uncharacterized / --ctx serve) → --measured-slope absent (a-priori gate)."""
+    _patch_budget(monkeypatch)
+    captured = _fake_start_server(monkeypatch)
+    apple.serve("org/m", port=8080, max_context=4096)
+    assert "--measured-slope" not in captured["argv"]
+
+
 def test_serve_returns_proc_url_context(monkeypatch):
     """serve() unpacks the ready signal into (proc, url, context)."""
     _patch_budget(monkeypatch)
