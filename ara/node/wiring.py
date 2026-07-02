@@ -10,8 +10,8 @@ node only translates a job's ``args`` dict into the right flags.
 
 :func:`_run_cli` is the single external boundary (the one subprocess call); tests monkeypatch it to
 drive providers/workers without spawning anything. A failed verb is returned as an ``{"error": ...}``
-dict rather than raised — read endpoints surface it as the body, and the JobRunner records it as the
-job's result (it already turns a raised exception into a failed job, so either way nothing is lost).
+dict rather than raised — the agent loop reports it back as the job's (failed) result, so either way
+nothing is lost.
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable
-from importlib import metadata
 
 
 def _run_cli(args: list[str]) -> dict:
@@ -55,10 +54,10 @@ def _safe(value: str, field: str) -> str:
     as a flag (argv flag-injection — e.g. a model named ``--exec-consent`` flipping a safety gate).
 
     ARA's CLI uses a hand-rolled parser with NO ``--`` end-of-options sentinel, so a ``--`` separator
-    wouldn't work (it'd become a stray positional); validation is the right defense. The /jobs caller
-    is token-authorized — and could already set these flags explicitly — so this is defense-in-depth +
-    correctness (a model id / engine / use-case starting with ``-`` is invalid anyway). Raising →
-    the JobRunner records it as a failed job."""
+    wouldn't work (it'd become a stray positional); validation is the right defense. A job's args come
+    from the token-authorized coordinator — which could already set these flags explicitly — so this is
+    defense-in-depth + correctness (a model id / engine / use-case starting with ``-`` is invalid
+    anyway). Raising → the agent loop reports it back as a failed job result."""
     if not isinstance(value, str) or value.startswith("-"):
         raise ValueError(f"invalid {field}: must be a string not starting with '-'")
     return value
@@ -117,22 +116,3 @@ def _benchmark(args: dict) -> dict:
 def default_workers() -> dict[str, Callable[[dict], dict]]:
     """The job workers: one per action verb, each translating a job ``args`` dict into CLI flags."""
     return {"characterize": _characterize, "run": _run, "serve": _serve, "benchmark": _benchmark}
-
-
-def _ara_version() -> str:
-    """The installed project-ara version, or ``"?"`` from an un-installed source tree."""
-    try:
-        return metadata.version("project-ara")
-    except metadata.PackageNotFoundError:
-        return "?"
-
-
-def build_app(version: str | None = None):
-    """Assemble the production node app: a JobRunner over the real workers + the real providers.
-
-    ``app``/``jobs`` are imported lazily so merely importing this module doesn't hard-require FastAPI
-    (an optional ``[node]`` extra) — same on-demand philosophy as the engines."""
-    from ara.node.app import create_app
-    from ara.node.jobs import JobRunner
-    runner = JobRunner(default_workers())
-    return create_app(runner, default_providers(), version=version or _ara_version())

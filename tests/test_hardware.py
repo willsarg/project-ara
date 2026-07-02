@@ -2316,3 +2316,95 @@ def test_gpus_linux_generic_name_tier(tmp_path, monkeypatch):
     gpus = hw._gpus_linux()
     assert len(gpus) == 1
     assert gpus[0].name == "AMD Radeon Graphics"
+
+
+# --------------------------------------------------------------------------- #
+# cgroup-honest memory wall (Rule #1): containerized RAM ceiling
+# --------------------------------------------------------------------------- #
+import pytest
+
+
+@pytest.fixture
+def cgroup_files(monkeypatch):
+    """Drive the single cgroup filesystem boundary from an in-memory {path: text} map."""
+    files: dict[str, str] = {}
+    monkeypatch.setattr(hw, "_read_cgroup_file", lambda path: files.get(path))
+    return files
+
+
+def test_read_cgroup_file_reads_existing_and_none_for_missing(tmp_path):
+    p = tmp_path / "memory.max"
+    p.write_text("123\n")
+    assert hw._read_cgroup_file(str(p)) == "123\n"
+    assert hw._read_cgroup_file(str(tmp_path / "nope")) is None       # OSError → None
+
+
+def test_cgroup_v2_real_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V2] = "2147483648\n"
+    assert hw.cgroup_memory_limit_bytes() == 2147483648
+
+
+def test_cgroup_v2_max_is_no_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V2] = "max\n"
+    assert hw.cgroup_memory_limit_bytes() is None
+
+
+def test_cgroup_v2_garbage_is_no_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V2] = "not-a-number"
+    assert hw.cgroup_memory_limit_bytes() is None
+
+
+def test_cgroup_v1_real_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V1] = "1073741824"
+    assert hw.cgroup_memory_limit_bytes() == 1073741824
+
+
+def test_cgroup_v1_sentinel_is_no_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V1] = str(hw._V1_UNLIMITED)
+    assert hw.cgroup_memory_limit_bytes() is None
+
+
+def test_cgroup_v1_garbage_is_no_limit(cgroup_files):
+    cgroup_files[hw._CGROUP_V1] = "nope"
+    assert hw.cgroup_memory_limit_bytes() is None
+
+
+def test_cgroup_missing_files_is_no_limit(cgroup_files):
+    assert hw.cgroup_memory_limit_bytes() is None                     # empty map → None reads
+
+
+def test_clamp_ram_to_cgroup_binds_below_physical(cgroup_files, monkeypatch):
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    cgroup_files[hw._CGROUP_V2] = str(4 * hw.GB)
+    assert hw.clamp_ram_to_cgroup(16 * hw.GB) == 4 * hw.GB
+
+
+def test_clamp_ram_to_cgroup_no_limit_stays_physical(cgroup_files, monkeypatch):
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    cgroup_files[hw._CGROUP_V2] = "max"
+    assert hw.clamp_ram_to_cgroup(16 * hw.GB) == 16 * hw.GB
+
+
+def test_clamp_ram_to_cgroup_limit_above_physical_stays_physical(cgroup_files, monkeypatch):
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    cgroup_files[hw._CGROUP_V2] = str(64 * hw.GB)
+    assert hw.clamp_ram_to_cgroup(16 * hw.GB) == 16 * hw.GB
+
+
+def test_clamp_ram_to_cgroup_ignores_cgroup_off_linux(cgroup_files, monkeypatch):
+    monkeypatch.setattr(hw.platform, "system", lambda: "Darwin")
+    cgroup_files[hw._CGROUP_V2] = str(4 * hw.GB)                      # would bind IF read
+    assert hw.clamp_ram_to_cgroup(16 * hw.GB) == 16 * hw.GB
+
+
+def test_psutil_totals_clamps_total_to_cgroup(cgroup_files, monkeypatch):
+    """The Rule #1 clamp lives at the source: _psutil_totals reports the cgroup wall, not host RAM."""
+    import psutil
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type("vm", (), {"total": 32 * hw.GB, "available": 20 * hw.GB})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    cgroup_files[hw._CGROUP_V2] = str(8 * hw.GB)                      # container capped at 8 GiB
+    total_gb, available_gb, _swap = hw._psutil_totals()
+    assert total_gb == 8.0                                            # clamped, not 32
+    assert available_gb == 20.0                                       # available is left untouched

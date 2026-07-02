@@ -142,6 +142,14 @@ def test_list_characterizations_for_machine_and_engine(store):
     assert rows[0]["points"] == [[1, 2.0]]   # JSON parsed back
 
 
+def test_list_characterizations_across_all_engines_when_engine_omitted(store):
+    db.save_characterization(store, "m", "wcx", "a", safe_context=1000, points=[])
+    db.save_characterization(store, "m", "wmx", "c", safe_context=3000, points=[])
+    db.save_characterization(store, "other", "wcx", "z", safe_context=1, points=[])  # other machine
+    rows = db.list_characterizations(store, "m")           # engine omitted → every engine
+    assert [(r["model_id"], r["engine"]) for r in rows] == [("a", "wcx"), ("c", "wmx")]
+
+
 # --- decode_context persistence ---
 def test_save_characterization_with_decode_context_round_trips(store):
     db.save_characterization(store, "m", "wcx", "org/model", safe_context=16000,

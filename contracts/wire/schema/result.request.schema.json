@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/result.request.json",
+  "title": "Job result (node → server)",
+  "description": "Sent to POST /api/work/{id}/result after the node runs a dispatched job. done requires result; failed requires error. Every result carries the environment it was measured in.",
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["done", "failed"] },
+    "result": { "type": ["object", "null"] },
+    "error": { "type": ["string", "null"] },
+    "measurement": {
+      "type": ["object", "null"],
+      "description": "Optional measured facts from the run (e.g. peak_mem_gb, ctx) — feeds evidence."
+    },
+    "environment": { "$ref": "https://ara.dev/wire/environment.json" }
+  },
+  "required": ["status", "environment"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "done" } } },
+      "then": { "required": ["result"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": { "required": ["error"] }
+    }
+  ]
+}

@@ -8,7 +8,7 @@ context-window limit against the estimated budget.
 """
 from __future__ import annotations
 
-from ara import estimate
+from ara import estimate, hardware
 from ara.detect import Accelerator, Machine
 
 
@@ -41,19 +41,89 @@ def test_limits_cpu_uses_full_ram():
     assert lim["safe_budget_gb"] == 32.0 - estimate.MARGIN_GB
 
 
-def test_limits_cuda_uses_total_vram():
+def test_limits_cuda_single_gpu_wall_is_vram():
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1))
+    lim = estimate.limits(m)
+    assert lim["total_gb"] == 24.0
+    assert lim["wall_gb"] == 24.0
+    assert lim["device"] == "RTX 4090"
+
+
+# --- CUDA multi-GPU: the analytic wall must match what the engine actually governs --------- #
+# The shipped wcx engine measures ONE device (nvml index 0) and does NOT shard a model across
+# GPUs. So on a multi-GPU box the analytic wall must be a *single* card's VRAM — otherwise
+# `profile` (basis="estimated") promises a budget `characterize` (basis="measured") will refuse,
+# violating Rule #3. `total_gb` still reports the true physical total across all cards; a future
+# sharding engine (tensor-parallel) opts back into the summed wall via `sharded=True`.
+def test_limits_cuda_multi_gpu_wall_is_single_device_by_default():
     m = _machine(backend="cuda",
                  accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2))
     lim = estimate.limits(m)
-    assert lim["total_gb"] == 48.0           # 24 GB × 2 GPUs
+    assert lim["total_gb"] == 48.0           # physical truth: 24 GB × 2 cards
+    assert lim["wall_gb"] == 24.0            # governable: one device (wcx measures index 0)
+    assert lim["safe_budget_gb"] == 24.0 - estimate.MARGIN_GB
+
+
+def test_limits_cuda_sharded_sums_across_gpus():
+    # A sharding engine spreads one model across all GPUs, so the wall IS the physical sum.
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2))
+    lim = estimate.limits(m, sharded=True)
+    assert lim["total_gb"] == 48.0
     assert lim["wall_gb"] == 48.0
-    assert lim["device"] == "RTX 4090"
+    assert lim["safe_budget_gb"] == 48.0 - estimate.MARGIN_GB
+
+
+def test_limits_cuda_single_gpu_sharded_is_noop():
+    # One GPU: single-device == sum, so `sharded` changes nothing (regression guard).
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=1))
+    assert estimate.limits(m)["wall_gb"] == 24.0
+    assert estimate.limits(m, sharded=True)["wall_gb"] == 24.0
 
 
 def test_limits_missing_ram_is_unknown():
     lim = estimate.limits(_machine(backend="cpu", ram_total_gb=None))
     assert lim["wall_gb"] is None
     assert lim["safe_budget_gb"] is None
+
+
+# --- the Rule #1 gate is cgroup-honest: the wall source is clamped for containers --------- #
+def _clamped_ram_total_gb(monkeypatch, *, system, phys_gb, cgroup_gb=None):
+    """Drive the core RAM-total source (hardware._psutil_totals) under a mocked host + cgroup, and
+    return the total the gate would see. This is the exact value detect feeds Machine.ram_total_gb."""
+    import psutil
+    monkeypatch.setattr(hardware.platform, "system", lambda: system)
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type("vm", (), {"total": int(phys_gb * hardware.GB),
+                                                "available": int(phys_gb * hardware.GB)})())
+    monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
+    files = {} if cgroup_gb is None else {hardware._CGROUP_V2: str(int(cgroup_gb * hardware.GB))}
+    monkeypatch.setattr(hardware, "_read_cgroup_file", lambda path: files.get(path))
+    total_gb, _avail, _swap = hardware._psutil_totals()
+    return total_gb
+
+
+def test_gate_wall_reflects_cgroup_limit_below_physical(monkeypatch):
+    # Container capped at 8 GiB on a 32 GiB host: the CPU gate must size against 8, not 32 (else OOM).
+    total = _clamped_ram_total_gb(monkeypatch, system="Linux", phys_gb=32.0, cgroup_gb=8.0)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["total_gb"] == 8.0
+    assert lim["wall_gb"] == 8.0
+    assert lim["safe_budget_gb"] == 8.0 - estimate.MARGIN_GB
+
+
+def test_gate_wall_is_physical_without_cgroup_limit(monkeypatch):
+    total = _clamped_ram_total_gb(monkeypatch, system="Linux", phys_gb=32.0, cgroup_gb=None)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["wall_gb"] == 32.0                                   # no limit binds → physical
+
+
+def test_gate_wall_is_physical_off_linux(monkeypatch):
+    total = _clamped_ram_total_gb(monkeypatch, system="Darwin", phys_gb=32.0, cgroup_gb=8.0)
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=total))
+    assert lim["wall_gb"] == 32.0                                   # no cgroup off Linux → physical
 
 
 # --- limits: prefer a measured wall when one is supplied ------------------ #

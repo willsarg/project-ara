@@ -78,18 +78,6 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     measured_at  TEXT NOT NULL,
     PRIMARY KEY (machine_key, model_id, use_case)
 );
-
-CREATE TABLE IF NOT EXISTS jobs (
-    id          TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,        -- characterize | run | serve | benchmark
-    args_json   TEXT NOT NULL,
-    status      TEXT NOT NULL,        -- queued | running | done | failed
-    result_json TEXT,
-    error       TEXT,
-    created_at  TEXT NOT NULL,
-    started_at  TEXT,
-    finished_at TEXT
-);
 """
 
 
@@ -198,11 +186,17 @@ def get_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
 
 
 def list_characterizations(con: sqlite3.Connection, machine_key: str,
-                           engine: str) -> list[dict]:
-    """Every model characterized on this machine + engine, newest fields parsed."""
-    rows = con.execute(
-        "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
-        (machine_key, engine)).fetchall()
+                           engine: str | None = None) -> list[dict]:
+    """Every model characterized on this machine, newest fields parsed. Scoped to one ``engine``
+    when given, else across every engine (ordered by model then engine so it's stable)."""
+    if engine is None:
+        rows = con.execute(
+            "SELECT * FROM characterizations WHERE machine_key=? ORDER BY model_id, engine",
+            (machine_key,)).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
+            (machine_key, engine)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -274,40 +268,3 @@ def list_benchmark_results(con: sqlite3.Connection, machine_key: str) -> list[di
         "SELECT * FROM benchmark_results WHERE machine_key=? ORDER BY model_id, use_case",
         (machine_key,)).fetchall()
     return [dict(r) for r in rows]
-
-
-# --- node job store (the `ara node` daemon's async jobs) ---
-def create_job(con: sqlite3.Connection, job_id: str, kind: str, args_json: str,
-               *, created_at: str | None = None) -> None:
-    """Record a new job in the ``queued`` state. ``created_at`` defaults to now (tests pin it)."""
-    con.execute(
-        "INSERT INTO jobs (id, kind, args_json, status, created_at) VALUES (?,?,?,?,?)",
-        (job_id, kind, args_json, "queued", created_at or _now()))
-    con.commit()
-
-
-def get_job(con: sqlite3.Connection, job_id: str) -> dict | None:
-    """The job row as a dict, or None if there's no such id."""
-    row = con.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def update_job(con: sqlite3.Connection, job_id: str, **fields) -> None:
-    """Patch a job's mutable fields (status/result_json/error/started_at/finished_at). Unknown ids
-    and fields are no-ops — only recognised columns are written, so a partial update never clobbers
-    the fields it doesn't mention."""
-    cols = [k for k in ("status", "result_json", "error", "started_at", "finished_at")
-            if k in fields]
-    if not cols:
-        return
-    con.execute(f"UPDATE jobs SET {', '.join(f'{c}=?' for c in cols)} WHERE id = ?",
-                (*(fields[c] for c in cols), job_id))
-    con.commit()
-
-
-def list_jobs(con: sqlite3.Connection, limit: int | None = None) -> list[dict]:
-    """All jobs, newest first (id breaks ties so same-timestamp order is stable)."""
-    sql = "SELECT * FROM jobs ORDER BY created_at DESC, id DESC"
-    if limit is not None:
-        sql += f" LIMIT {int(limit)}"
-    return [dict(r) for r in con.execute(sql).fetchall()]

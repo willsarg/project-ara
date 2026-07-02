@@ -1,0 +1,5 @@
+{
+  "status": "done",
+  "result": { "output": "x" },
+  "environment": { "platform": "linux", "accel": "cpu", "containerized": false, "wall_source": "guess" }
+}

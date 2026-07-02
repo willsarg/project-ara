@@ -1,0 +1,7 @@
+{
+  "machine_key": "rog-ubuntu-9f3a1c",
+  "identity": { "hostname": "rog-ubuntu", "os": "linux", "arch": "x86_64" },
+  "capabilities": [],
+  "environment": { "platform": "linux", "accel": "vulkan", "containerized": false, "wall_source": "physical" },
+  "sneaky_extra": true
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/enroll.request.json",
+  "title": "Enrollment request (node → server)",
+  "description": "Sent to POST /api/enroll, authed by the enrollment token. The node's self-description; lands PENDING until an admin approves.",
+  "type": "object",
+  "properties": {
+    "machine_key": { "type": "string", "minLength": 1 },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "hostname": { "type": "string", "minLength": 1 },
+        "os": { "type": "string" },
+        "arch": { "type": "string" }
+      },
+      "required": ["hostname"],
+      "additionalProperties": true
+    },
+    "profile_projection": {
+      "type": "object",
+      "description": "The durable profile projection (serialize.profile_record shape). Optional at enroll."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "https://ara.dev/wire/capability.json" }
+    },
+    "environment": { "$ref": "https://ara.dev/wire/environment.json" }
+  },
+  "required": ["machine_key", "identity", "capabilities", "environment"],
+  "additionalProperties": false
+}

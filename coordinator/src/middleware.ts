@@ -16,6 +16,7 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  // Protect everything except /login, the public health check, Next internals, and static files.
-  matcher: ["/((?!login|api/health|_next/static|_next/image|favicon.ico).*)"],
+  // Protect everything except /login, ALL of /api (the push channel — nodes auth per-route with a
+  // Bearer token in the Node runtime, not this edge cookie gate), Next internals, and static files.
+  matcher: ["/((?!login|api|_next/static|_next/image|favicon.ico).*)"],
 };

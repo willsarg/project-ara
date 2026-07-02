@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Run the node on boot (systemd --user) + the uvicorn launcher.
+"""Run the push-only node on boot (systemd --user).
 
-Two concerns live here. :func:`serve` is the foreground launcher — it builds the real app
-(:mod:`ara.node.wiring`) and hands it to uvicorn. The ``install``/``start``/``stop``/``status``/
-``uninstall`` functions manage a **user** systemd unit (``systemctl --user``, no root): the node
-comes back after a reboot or a crash without touching system-wide config, matching ARA's
-install-into-your-own-space philosophy.
+The ``install``/``start``/``stop``/``status``/``uninstall`` functions manage a **user** systemd unit
+(``systemctl --user``, no root): the node comes back after a reboot or a crash without touching
+system-wide config, matching ARA's install-into-your-own-space philosophy. ExecStart runs the
+phone-home work loop (``ara node run``) — the node is a pure client with no inbound socket.
 
 Linux first — systemd is the only init covered today; the other platforms raise a clear error via
 :func:`_require_linux` rather than silently no-op'ing (Rule #3). The one external boundary is
-:func:`_run` (every ``systemctl`` call), which tests stub; ``uvicorn`` is imported lazily so this
-module imports without the optional ``[node]`` extra present.
+:func:`_run` (every ``systemctl`` call), which tests stub.
 """
 from __future__ import annotations
 
@@ -54,10 +52,17 @@ def _unit_path() -> Path:
     return _unit_dir() / UNIT_NAME
 
 
-def _unit_text(host: str, port: int) -> str:
-    """The systemd unit. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
-    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv,
-    a conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there."""
+# Watchdog ceiling: systemd kills+restarts the node if it misses a WATCHDOG=1 beat this long. The
+# agent loop pets it every poll iteration (health.heartbeat), so 30s comfortably clears the cadence.
+WATCHDOG_SEC = 30
+
+
+def _unit_text() -> str:
+    """The systemd unit for the push-only node. ExecStart runs the phone-home agent loop
+    (``ara node run``) — the loop that pets systemd's watchdog via sd_notify, hence ``Type=notify``
+    and ``WatchdogSec``. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
+    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv, a
+    conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there."""
     return (
         "[Unit]\n"
         "Description=ARA node daemon\n"
@@ -65,8 +70,9 @@ def _unit_text(host: str, port: int) -> str:
         "Wants=network-online.target\n"
         "\n"
         "[Service]\n"
-        "Type=simple\n"
-        f"ExecStart={sys.executable} -m ara.cli node serve --host {host} --port {port}\n"
+        "Type=notify\n"
+        f"ExecStart={sys.executable} -m ara.cli node run\n"
+        f"WatchdogSec={WATCHDOG_SEC}\n"
         "Restart=on-failure\n"
         "\n"
         "[Install]\n"
@@ -74,12 +80,12 @@ def _unit_text(host: str, port: int) -> str:
     )
 
 
-def install(host: str, port: int) -> None:
+def install() -> None:
     """Write the unit, reload systemd, and enable+start it so the node survives reboots."""
     _require_linux()
     path = _unit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_unit_text(host, port))
+    path.write_text(_unit_text())
     _run(["systemctl", "--user", "daemon-reload"])
     _run(["systemctl", "--user", "enable", "--now", UNIT_NAME])
 
@@ -109,14 +115,3 @@ def uninstall() -> None:
     _run(["systemctl", "--user", "disable", "--now", UNIT_NAME])
     _unit_path().unlink(missing_ok=True)         # idempotent: fine if it was never installed
     _run(["systemctl", "--user", "daemon-reload"])
-
-
-def serve(host: str, port: int, *, version: str | None = None) -> None:
-    """Foreground launcher: build the real node app and run it under uvicorn.
-
-    ``uvicorn``/``wiring`` are imported lazily so this module imports without the optional ``[node]``
-    extra; tests monkeypatch ``uvicorn.run`` (and ``wiring.build_app``) to avoid binding a port."""
-    import uvicorn
-
-    from ara.node import wiring
-    uvicorn.run(wiring.build_app(version), host=host, port=port)

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/work.response.json",
+  "title": "Work dispatch (server → node)",
+  "description": "200 reply to GET /api/work?wait=N when a job is queued for this node. (A 204 with no body means no work within the poll window.)",
+  "type": "object",
+  "properties": {
+    "job": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["run", "characterize", "detect", "benchmark"] },
+        "args": { "type": "object" }
+      },
+      "required": ["id", "kind", "args"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["job"],
+  "additionalProperties": false
+}

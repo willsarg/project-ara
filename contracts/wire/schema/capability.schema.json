@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ara.dev/wire/capability.json",
+  "title": "Node capability advertisement",
+  "description": "v1: report-what-I-am, backed by measured evidence. NOT a matching/eligibility policy (that is deferred).",
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "enum": ["serve_model", "embeddings"] },
+    "id": { "type": "string", "minLength": 1 },
+    "engine": { "type": "string", "minLength": 1 },
+    "evidence": {
+      "type": "string",
+      "enum": ["characterized", "estimated", "none"],
+      "description": "characterized = empirically measured on this node (Rule #1); estimated = formula prior; none = advertised-only"
+    }
+  },
+  "required": ["kind", "id", "engine", "evidence"],
+  "additionalProperties": false
+}

@@ -7,7 +7,6 @@ import json
 import sys
 
 import pytest
-from importlib import metadata
 
 from ara.node import wiring
 
@@ -119,51 +118,6 @@ def test_benchmark_worker_minimal_no_exec_consent(monkeypatch):
 
 def test_default_workers_keys():
     assert set(wiring.default_workers()) == {"characterize", "run", "serve", "benchmark"}
-
-
-def test_ara_version_reads_metadata(monkeypatch):
-    monkeypatch.setattr(wiring.metadata, "version", lambda name: "1.2.3")
-    assert wiring._ara_version() == "1.2.3"
-
-
-def test_ara_version_falls_back_when_uninstalled(monkeypatch):
-    def boom(name):
-        raise metadata.PackageNotFoundError(name)
-
-    monkeypatch.setattr(wiring.metadata, "version", boom)
-    assert wiring._ara_version() == "?"
-
-
-def test_build_app_assembles_runner_and_providers(monkeypatch):
-    recorded = {}
-
-    def fake_create_app(runner, providers, *, version):
-        recorded["runner"] = runner
-        recorded["providers"] = providers
-        recorded["version"] = version
-        return "APP"
-
-    class FakeRunner:
-        def __init__(self, workers):
-            recorded["workers"] = workers
-
-    monkeypatch.setattr("ara.node.app.create_app", fake_create_app)
-    monkeypatch.setattr("ara.node.jobs.JobRunner", FakeRunner)
-
-    app = wiring.build_app(version="9.9")
-    assert app == "APP"
-    assert recorded["version"] == "9.9"
-    assert set(recorded["workers"]) == {"characterize", "run", "serve", "benchmark"}
-    assert set(recorded["providers"]) == {"status", "detect", "profile", "models"}
-    assert isinstance(recorded["runner"], FakeRunner)
-
-
-def test_build_app_defaults_version_to_ara_version(monkeypatch):
-    monkeypatch.setattr("ara.node.app.create_app",
-                        lambda runner, providers, *, version: version)
-    monkeypatch.setattr("ara.node.jobs.JobRunner", lambda workers: None)
-    monkeypatch.setattr(wiring, "_ara_version", lambda: "0.0.fake")
-    assert wiring.build_app() == "0.0.fake"
 
 
 # --- argv flag-injection guard (_safe): no job arg may be smuggled in as a CLI flag ---

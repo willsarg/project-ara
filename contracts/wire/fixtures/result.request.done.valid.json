@@ -1,0 +1,12 @@
+{
+  "status": "done",
+  "result": { "output": "Paris." },
+  "measurement": { "peak_mem_gb": 3.2, "ctx": 4096 },
+  "environment": {
+    "platform": "linux",
+    "accel": "vulkan",
+    "containerized": false,
+    "virtualization_layer": null,
+    "wall_source": "physical"
+  }
+}
