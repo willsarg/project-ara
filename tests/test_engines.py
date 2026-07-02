@@ -225,12 +225,68 @@ def test_install_unavailable_engine_is_coming_soon(monkeypatch):
 
 
 def test_install_already_present_is_noop(monkeypatch):
+    # Present AND current (stamp matches) → noop: don't rebuild.
     monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: engines._ara_version())
     created = []
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
     r = engines.install("wmx")
     assert r.status == "already"
-    assert created == []   # already there → don't rebuild
+    assert created == []   # already there + current → don't rebuild
+
+
+def test_install_stamps_env_with_current_version(monkeypatch):
+    # A fresh install stamps the env with the current ARA version (so the next install can tell
+    # whether it's stale). version= is threaded into engine_env.create.
+    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines, "_ara_version", lambda: "3.1.4")
+    seen = {}
+    monkeypatch.setattr(engines.engine_env, "create",
+                        lambda name, packages, *, python=None, version=None:
+                        seen.update(version=version))
+    assert engines.install("wmx").status == "installed"
+    assert seen["version"] == "3.1.4"
+
+
+def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
+    # Present but a DIFFERENT stamp (an older ARA wheel built this env) → tear down + reinstall,
+    # reported as "refreshed", stamped with the current version.
+    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "1.0.0")
+    removed, created = [], {}
+    monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
+    monkeypatch.setattr(engines.engine_env, "create",
+                        lambda name, packages, *, python=None, version=None:
+                        created.update(name=name, version=version))
+    r = engines.install("wmx")
+    assert r.status == "refreshed"
+    assert removed == ["apple"]                 # old env wiped first
+    assert created == {"name": "apple", "version": "2.0.0"}
+
+
+def test_install_reinstalls_on_missing_stamp(monkeypatch):
+    # Present but UNSTAMPED (a pre-stamp ARA built this env) → treated as stale → refreshed.
+    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: None)
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
+    monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: None)
+    assert engines.install("wmx").status == "refreshed"
+    assert removed == ["apple"]
+
+
+def test_install_refresh_forces_reinstall_even_when_current(monkeypatch):
+    # refresh=True: reinstall even though the stamp already matches the current version.
+    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "2.0.0")
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
+    monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: None)
+    assert engines.install("wmx", refresh=True).status == "refreshed"
+    assert removed == ["apple"]
 
 
 def test_install_creates_env_with_targets_and_python_pin(monkeypatch):

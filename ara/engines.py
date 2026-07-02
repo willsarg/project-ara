@@ -24,9 +24,21 @@ import platform
 import re
 import shutil
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 from ara import engine_env
+
+
+def _ara_version() -> str:
+    """The installed project-ara version (also behind ``ara --version``), or a sentinel when running
+    from an un-installed source tree with no distribution metadata. Stamped into an engine env at
+    install and compared on the next ``ara install`` to detect a stale vendored engine — a newer ARA
+    wheel carries newer ``ara/_vendor/*`` source that must reach a box that already has the env."""
+    try:
+        return metadata.version("project-ara")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"
 
 # Short, stable handles → how to install each. ``backend`` is both the adapter module name and
 # the isolated env name. ``available`` is False for engines whose suite isn't shippable yet.
@@ -198,7 +210,7 @@ def source_for(key: str) -> str:
 class InstallResult:
     """Outcome of an install/uninstall attempt — also the shape behind ``--json``."""
     key: str
-    status: str       # installed | already | coming_soon | unknown | failed | removed | absent
+    status: str       # installed | refreshed | already | coming_soon | unknown | failed | removed | absent
     detail: str = ""
 
 
@@ -256,22 +268,34 @@ def _install_targets(key: str) -> list[str]:
     return [*pip_args, target]
 
 
-def install(key: str) -> InstallResult:
+def install(key: str, *, refresh: bool = False) -> InstallResult:
     """Install engine *key* into its own isolated uv env. Idempotent and honest:
-    never creates an env for an unknown or not-yet-available engine."""
+    never creates an env for an unknown or not-yet-available engine.
+
+    Version-aware: an installed env is *stale* when its stamped ARA version differs from the
+    current one (a newer ARA wheel ships newer ``ara/_vendor/*`` engine source) or when it carries
+    no stamp at all (built by a pre-stamp ARA). A stale env is torn down and reinstalled so the
+    shipped engine code actually reaches the box — reported as ``refreshed``. ``refresh=True`` forces
+    that reinstall even when the stamp already matches. Every fresh/refresh install stamps the env
+    with the current version."""
     if key not in ENGINES:
         return InstallResult(key, "unknown")
     engine = ENGINES[key]
     if not engine["available"]:
         return InstallResult(key, "coming_soon", f"{engine['package']} isn't available yet")
-    if is_installed(key):
+    current = _ara_version()
+    installed = is_installed(key)
+    stale = installed and (refresh or engine_env.stamped_version(engine["backend"]) != current)
+    if installed and not stale:
         return InstallResult(key, "already")
+    if stale:                       # wipe the old env so the reinstall isn't itself a noop
+        engine_env.remove(engine["backend"])
     try:
         engine_env.create(engine["backend"], _install_targets(key),
-                          python=engine.get("python"))
+                          python=engine.get("python"), version=current)
     except engine_env.EngineEnvError as e:
         return InstallResult(key, "failed", str(e))
-    return InstallResult(key, "installed")
+    return InstallResult(key, "refreshed" if stale else "installed")
 
 
 def uninstall(key: str) -> InstallResult:

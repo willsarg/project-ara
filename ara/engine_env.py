@@ -69,6 +69,22 @@ def env_path(name: str) -> Path:
     return engines_root() / name
 
 
+def _stamp_path(name: str) -> Path:
+    """The version-stamp file inside engine *name*'s env (``.ara-version``): the ARA release that
+    installed it. Lets ``ara install`` tell a stale vendored engine (older ARA wheel) from a current
+    one, so a new wheel's ``ara/_vendor/*`` source actually reaches a box that already has the env."""
+    return env_path(name) / ".ara-version"
+
+
+def stamped_version(name: str) -> str | None:
+    """The ARA version stamped into engine *name*'s env at install, or None if unstamped — no
+    stamp file at all, or an env built by a pre-stamp ARA. Callers treat None as 'definitely stale'."""
+    try:
+        return _stamp_path(name).read_text().strip()
+    except OSError:                      # no stamp (missing dir/file) → unknown/stale
+        return None
+
+
 def _is_windows() -> bool:
     """Indirection so tests can flip the OS without monkeypatching ``os.name``
     globally (which would make pathlib try to build a WindowsPath on posix)."""
@@ -89,13 +105,18 @@ def exists(name: str) -> bool:
 
 
 def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE,
-           python: str | None = None) -> Path:
+           python: str | None = None, version: str | None = None) -> Path:
     """Create engine *name*'s isolated uv env and install *packages* into it.
 
     *python* pins the interpreter version (e.g. ``"3.12"``) — some engines require a floor
-    (wmx-suite needs ``>=3.12``); omit to take uv's default. Raises :class:`EngineEnvError`
-    if the venv or the install fails.
+    (wmx-suite needs ``>=3.12``); omit to take uv's default. *version*, when given, is stamped into
+    the env (``.ara-version``) after a successful install so a later ``ara install`` can detect a
+    stale vendored engine; omit it (existing callers) to write no stamp. Raises
+    :class:`EngineEnvError` if ``uv`` is missing, or if the venv or the install fails.
     """
+    if shutil.which("uv") is None:
+        raise EngineEnvError(
+            "uv not found on PATH — install uv (https://docs.astral.sh/uv/) and retry")
     path = env_path(name)
     engines_root().mkdir(parents=True, exist_ok=True)
     venv_cmd = ["uv", "venv", str(path)]
@@ -114,6 +135,10 @@ def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE
         # env down on install failure so `ara install` can be retried to actually repair it.
         shutil.rmtree(path, ignore_errors=True)
         raise EngineEnvError(f"installing into {name!r} failed: {err.strip()}")
+    if version is not None:               # record the ARA release that built this env (staleness stamp)
+        stamp = _stamp_path(name)
+        stamp.parent.mkdir(parents=True, exist_ok=True)   # uv made this in prod; be robust regardless
+        stamp.write_text(version)
     return path
 
 

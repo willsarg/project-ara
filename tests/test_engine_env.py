@@ -232,6 +232,42 @@ def test_create_tears_down_half_built_env_on_install_failure(engines_root, run_s
 
 
 # --------------------------------------------------------------------------- #
+# uv preflight — a missing uv is a friendly error, not a raw FileNotFoundError
+# --------------------------------------------------------------------------- #
+def test_create_raises_friendly_when_uv_missing(engines_root, run_spy, monkeypatch):
+    # No uv on PATH: create must fail up front with an actionable message and never spawn anything.
+    monkeypatch.setattr(engine_env.shutil, "which", lambda name: None)
+    with pytest.raises(engine_env.EngineEnvError, match="uv not found on PATH"):
+        engine_env.create("cpu", ["x"])
+    assert run_spy.calls == []            # bailed before touching the subprocess boundary
+
+
+# --------------------------------------------------------------------------- #
+# version stamp — tells a stale vendored engine from a current one
+# --------------------------------------------------------------------------- #
+def test_stamped_version_none_when_absent(engines_root):
+    assert engine_env.stamped_version("ghost") is None
+
+
+def test_stamped_version_reads_written_stamp(engines_root):
+    env = engine_env.env_path("apple")
+    env.mkdir(parents=True)
+    (env / ".ara-version").write_text("1.2.3\n")
+    assert engine_env.stamped_version("apple") == "1.2.3"
+
+
+def test_create_writes_stamp_when_version_given(engines_root, run_spy):
+    engine_env.create("cpu", ["x"], version="9.9.9")
+    assert engine_env.stamped_version("cpu") == "9.9.9"
+
+
+def test_create_omits_stamp_when_version_none(engines_root, run_spy):
+    # Existing callers pass no version → no stamp written (stamped_version stays None).
+    engine_env.create("cpu", ["x"])
+    assert engine_env.stamped_version("cpu") is None
+
+
+# --------------------------------------------------------------------------- #
 # remove
 # --------------------------------------------------------------------------- #
 def test_remove_deletes_existing_env(engines_root):

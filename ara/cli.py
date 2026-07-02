@@ -12,12 +12,13 @@ import json
 import os
 import sys
 from dataclasses import asdict
-from importlib import metadata
 from pathlib import Path
 
 from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
                  hf_auth, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  status, versions)
+from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
+from ara.engine_env import EngineEnvError
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -30,14 +31,6 @@ def _hf_hint(c: Console, as_json: bool) -> None:
         c.emit(c.style("dim", "  tip: run ") + c.style("accent", "ara hf login")
                + c.style("dim", " for higher rate limits + faster downloads"))
 
-
-def _ara_version() -> str:
-    """The installed project-ara version (for ``ara --version``), or a sentinel when running from an
-    un-installed source tree that has no distribution metadata."""
-    try:
-        return metadata.version("project-ara")
-    except metadata.PackageNotFoundError:
-        return "0+unknown"
 
 _CMD_W = 16
 
@@ -1928,9 +1921,16 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     return 0
 
 
-def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
+_INSTALL_OK = ("installed", "refreshed", "already")
+
+
+def render_install(c: Console, *, engine: str = "auto", refresh: bool = False,
+                   as_json: bool = False) -> int:
     """Install the matched engine. ``--engine`` is the consent; exit 0 once the
-    engine is present (installed or already), nonzero otherwise."""
+    engine is present (installed, refreshed, or already), nonzero otherwise.
+
+    ``--refresh`` forces a reinstall even when the engine is already present and current — used to
+    repair or re-pin an env after an ARA upgrade."""
     key = engines.resolve(engine)
     if key is None:
         if as_json:
@@ -1939,15 +1939,17 @@ def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -
             c.emit(c.style("warn", f"  no engine matches '{engine}' on this hardware"))
         return 1
 
-    result = engines.install(key)
+    result = engines.install(key, refresh=refresh)
     if as_json:
         print(json.dumps({"key": result.key, "status": result.status,
                           "detail": result.detail}))
-        return 0 if result.status in ("installed", "already") else 1
+        return 0 if result.status in _INSTALL_OK else 1
 
     pkg = engines.ENGINES[key]["package"]
     if result.status == "installed":
         c.emit(c.style("good", f"  installed {pkg}"))
+    elif result.status == "refreshed":
+        c.emit(c.style("good", f"  refreshed {pkg} to the current ARA release"))
     elif result.status == "already":
         c.emit(c.style("dim", f"  {pkg} already installed"))
     elif result.status == "coming_soon":
@@ -1955,7 +1957,7 @@ def render_install(c: Console, *, engine: str = "auto", as_json: bool = False) -
     else:  # failed
         c.emit(c.style("bad", f"  installing {pkg} failed:"))
         c.emit(c.style("dim", f"  {result.detail}"))
-    return 0 if result.status in ("installed", "already") else 1
+    return 0 if result.status in _INSTALL_OK else 1
 
 
 def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
@@ -2264,13 +2266,20 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
 def main() -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
-    can't parse. Without ``--json`` the exception propagates unchanged (friendlier front-door
-    diagnostics are a separate backlog item). KeyboardInterrupt / SystemExit are not caught."""
+    can't parse. Without ``--json``, an :class:`~ara.engine_env.EngineEnvError` (the common
+    engine-env failure — a broken/missing env, a dead worker) prints a friendly one-line diagnostic
+    instead of a raw traceback; any other exception still propagates. KeyboardInterrupt / SystemExit
+    are not caught."""
     try:
         return _main_impl()
-    except Exception as exc:   # noqa: BLE001 — deliberate front-door --json honesty guard
+    except Exception as exc:   # noqa: BLE001 — deliberate front-door honesty guard
         if "--json" in sys.argv[1:]:
             print(json.dumps({"error": f"ara failed: {exc}"}))
+            return 1
+        if isinstance(exc, EngineEnvError):
+            c = Console.from_env()
+            c.emit(c.style("bad", f"  engine env problem: {exc}"))
+            c.emit(c.style("dim", "  check the GPU driver / toolchain and retry: ara install"))
             return 1
         raise
 
@@ -2285,6 +2294,7 @@ def _main_impl() -> int:
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
     exec_consent = "--exec-consent" in argv      # explicit opt-in to model-code execution (benchmark)
+    refresh = "--refresh" in argv                 # `install --refresh`: force reinstall of a present engine
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
     chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
@@ -2400,7 +2410,7 @@ def _main_impl() -> int:
         if a.startswith("--exclude="):
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent",
+        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent", "--refresh",
                  "--no-flash-attn", "--flash-attn",
                  "--chunked-prefill", "-h", "--help"):
             continue
@@ -2500,7 +2510,7 @@ def _main_impl() -> int:
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
         return render_install(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
-                              as_json=as_json)
+                              refresh=refresh, as_json=as_json)
 
     if cmd == "uninstall":
         return render_uninstall(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
