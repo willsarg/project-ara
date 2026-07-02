@@ -237,6 +237,13 @@ def _candidates() -> dict[str, set[str]]:
                 continue  # drop python3-config, python3.13-config, python3-intel64, …
             if not (os.path.isfile(c) or os.path.islink(c)) or not _is_executable(c):
                 continue
+            # The Windows Store app-exec alias (…\WindowsApps\python.exe) is a 0-byte
+            # reparse-point stub: a real interpreter is never 0 bytes, and probing this one
+            # pops a Microsoft Store dialog + burns _probe()'s timeout. Exclude it here so it
+            # never reaches the probe. An OSError reading size is treated as unusable → skip
+            # (falls through to the outer except).
+            if os.path.getsize(c) == 0:
+                continue
             groups.setdefault(os.path.realpath(c), set()).add(c)
         except Exception:
             pass

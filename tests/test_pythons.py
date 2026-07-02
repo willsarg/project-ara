@@ -337,6 +337,28 @@ def test_candidates_filters_globs_and_skips(tmp_path, monkeypatch):
     assert all("config" not in p for grp in groups.values() for p in grp)
 
 
+def test_candidates_excludes_zero_byte_alias(tmp_path, monkeypatch):
+    # The Windows Store app-exec alias (…\WindowsApps\python.exe) is a 0-byte reparse-point stub.
+    # Probing it (pythons.py:251, timeout=8) pops a Microsoft Store dialog and burns the whole
+    # timeout. Exclude zero-byte candidates outright — a real interpreter is never 0 bytes.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    alias = bindir / "python3"          # 0-byte stub, executable-looking
+    alias.write_text("")
+    alias.chmod(0o755)
+    real = bindir / "python3.12"        # a normal, non-empty interpreter stays included
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.setattr(pythons, "_known_patterns", lambda: [])
+
+    groups = pythons._candidates()
+    reals = set(groups)
+    assert os.path.realpath(str(alias)) not in reals
+    assert os.path.realpath(str(real)) in reals
+
+
 def test_count_matches_candidate_groups(monkeypatch):
     monkeypatch.setattr(pythons, "_candidates", lambda: {"/a": {"/a"}, "/b": {"/b"}})
     assert pythons.count() == 2
