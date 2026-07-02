@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Multi-stage build for the ARA coordinator (Next.js standalone output).
 #
-# The base is pinned by digest (node:22-bookworm-slim@sha256:…) for reproducible, immutable builds.
-# Dependabot's docker ecosystem bumps the digest when the tag is re-published with patches (one PR,
-# gated by the Docker Image Scan workflow). Keep all three stages on the same digest.
+# The base is pinned by digest (node:<ver>-bookworm-slim@sha256:…) for reproducible, immutable builds.
+# Dependabot's docker ecosystem bumps the tag/digest together (major bumps and re-published patches
+# alike) in a single PR, gated by the Docker Image Scan workflow. Keep all three stages on the same
+# digest. (The example above is version-agnostic on purpose so it can't drift from the FROM lines.)
 
 # ---- deps: install node modules (incl. compiling better-sqlite3's native binding) -------------
 FROM node:26-bookworm-slim@sha256:b16ca7b4dcfb20184e1c70f9ee30c6a75ed1da669cfafd6d2add4761b123d79f AS deps
