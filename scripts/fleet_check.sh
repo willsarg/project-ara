@@ -248,24 +248,29 @@ check_posix_remote() {
         return
     fi
 
-    # SETUPTOOLS_SCM_PRETEND_VERSION on each remote uv call (git archive stripped .git; see the
-    # global). POSIX remote: `VAR='val' cmd` inline-env form.
-    local envp="SETUPTOOLS_SCM_PRETEND_VERSION='$PRETEND_VERSION'"
+    # Run each remote uv step in an explicit LOGIN shell (`bash -lc`). uv installs to ~/.local/bin,
+    # which is put on PATH by ~/.profile — sourced ONLY by a login shell. A plain `ssh host "cmd"`
+    # runs a non-interactive, non-login shell that sources neither ~/.profile (login-only) nor
+    # ~/.bashrc (Ubuntu's returns early when non-interactive), so `uv` isn't found (this exact bug
+    # was caught by a live fleet run). A login shell gives the remote the same PATH the operator has
+    # by hand. SETUPTOOLS_SCM_PRETEND_VERSION is pinned per call (git archive stripped .git; see the
+    # global). $remote_dir/$PRETEND_VERSION expand LOCALLY (baked in literal), and are double-quoted
+    # INSIDE the single-quoted login-shell arg for space-safety.
     log "$target: uv sync --frozen --group dev (version pinned)"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv sync --frozen --group dev" >&2; then
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "bash -lc 'cd \"$remote_dir\" && SETUPTOOLS_SCM_PRETEND_VERSION=\"$PRETEND_VERSION\" uv sync --frozen --group dev'" >&2; then
         record_result "$target" "FAIL" "uv sync failed"
         return
     fi
 
     log "$target: uv run pytest"
-    if ! ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv run pytest" >&2; then
+    if ! ssh "${SSH_OPTS[@]}" "$alias" "bash -lc 'cd \"$remote_dir\" && SETUPTOOLS_SCM_PRETEND_VERSION=\"$PRETEND_VERSION\" uv run pytest'" >&2; then
         record_result "$target" "FAIL" "pytest failed"
         return
     fi
 
     log "$target: uv run ara detect --json"
     local detect_json
-    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "cd '$remote_dir' && $envp uv run ara detect --json")"; then
+    if ! detect_json="$(ssh "${SSH_OPTS[@]}" "$alias" "bash -lc 'cd \"$remote_dir\" && SETUPTOOLS_SCM_PRETEND_VERSION=\"$PRETEND_VERSION\" uv run ara detect --json'")"; then
         record_result "$target" "FAIL" "ara detect --json exited non-zero"
         return
     fi
