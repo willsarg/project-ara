@@ -1,29 +1,31 @@
-# PR + main-push gate. Every pull request (including Dependabot's uv/npm/docker/actions bumps) must
-# pass BOTH suites before it can merge — so a dependency update is verified in the cloud, not by a
-# pull-to-local-and-test. The two suites are independent:
-#   - python:      reuses workflows/test.yml (the 3-OS matrix + 100% coverage gate, engine-free).
-#   - coordinator: the Next.js control plane — types, unit tests, and an edge-runtime build check
-#                  (the build step is what surfaces Node-API-in-Edge-Runtime problems).
+# CI for Dependabot's dependency-bump PRs (uv / npm / docker / github-actions). It runs the full
+# suite automatically so a bump can be reviewed and merged in the cloud instead of pulled to a local
+# box to test. It fires ONLY when the PR author is dependabot[bot] — a human's PR does not trigger it
+# (humans can run test.yml on demand via workflow_dispatch).
+#
+# This is CI only — nothing auto-merges. A maintainer still reviews and merges every bump by hand;
+# that manual step is the guard in case a bump (or the bot) is ever bad. Dependabot PR runs get a
+# read-only token and no repo secrets, so the jobs are sandboxed regardless.
 #
 # Hardening mirrors test.yml: read-only token, actions pinned to commit SHAs, checkout creds not
 # persisted, locked installs (`uv sync --frozen`, `npm ci`), per-job timeout.
-name: CI
+name: Dependabot CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  # The Python core, cross-OS. Delegated to the reusable workflow so release gating (publish.yml)
-  # and PR gating run the exact same suite.
+  # The Python core, cross-OS. Delegated to the reusable workflow so a bump is gated by the exact
+  # same suite the release pipeline runs.
   python:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     uses: ./.github/workflows/test.yml
 
   coordinator:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest      # the coordinator ships as a Linux container; Linux is the real target
     timeout-minutes: 15
     defaults:

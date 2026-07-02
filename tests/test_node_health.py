@@ -26,11 +26,15 @@ class FakeSock:
 
 @pytest.fixture
 def fake_socket(monkeypatch):
-    """Patch socket.socket to a recording FakeSock; assert it's built AF_UNIX/SOCK_DGRAM."""
+    """Patch socket.socket to a recording FakeSock; assert it's built AF_UNIX/SOCK_DGRAM.
+
+    Injects an AF_UNIX stand-in first so the Linux-only send path is exercised on every OS —
+    Windows has no socket.AF_UNIX, and health.py resolves it via getattr(socket, "AF_UNIX", None)."""
+    monkeypatch.setattr(health.socket, "AF_UNIX", getattr(socket, "AF_UNIX", 1), raising=False)
     created = {}
 
     def _factory(family, type_):
-        assert family == socket.AF_UNIX and type_ == socket.SOCK_DGRAM
+        assert family == health.socket.AF_UNIX and type_ == socket.SOCK_DGRAM
         created["sock"] = FakeSock()
         return created["sock"]
 
@@ -51,6 +55,17 @@ def test_sd_notify_sends_to_path_socket(monkeypatch, fake_socket):
     sock = fake_socket["sock"]
     assert sock.sent == (b"WATCHDOG=1", "/run/systemd/notify")
     assert sock.closed is True                             # released even on the happy path
+
+
+def test_sd_notify_noop_without_af_unix(monkeypatch):
+    """On a platform with no Unix-domain sockets (e.g. Windows, where socket.AF_UNIX is absent),
+    sd_notify no-ops even if NOTIFY_SOCKET is somehow set — the systemd protocol is Linux-only.
+    Simulated cross-OS by removing AF_UNIX so the guard is covered on every host."""
+    monkeypatch.setenv("NOTIFY_SOCKET", "/run/systemd/notify")
+    monkeypatch.delattr(health.socket, "AF_UNIX", raising=False)
+    monkeypatch.setattr(health.socket, "socket",
+                        lambda *a: pytest.fail("must not open a socket without AF_UNIX"))
+    assert health.sd_notify("WATCHDOG=1") is False
 
 
 def test_sd_notify_maps_abstract_namespace_prefix(monkeypatch, fake_socket):
