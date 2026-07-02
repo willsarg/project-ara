@@ -4879,7 +4879,7 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     def fake_save(con, mk, model, uc, *, score, source, engine_key=None, backend=None,
                   base_model=None, benchmark_id=None, sample_size=None, quant=None,
                   refused_n=None, errored_n=None, **kw):
-        saved.update(model=model, use_case=uc, score=score,
+        saved.update(model=model, use_case=uc, score=score, source=source,
                      engine_key=engine_key, sample_size=sample_size, quant=quant,
                      refused_n=refused_n, errored_n=errored_n)
 
@@ -5552,6 +5552,233 @@ def test_render_benchmark_json_includes_partial_counts_and_quant(monkeypatch, ca
     payload = json.loads(capsys.readouterr().out)
     assert payload["refused"] == 0 and payload["errored"] == 1
     assert payload["quant"] == "q4_0"
+
+
+# --------------------------------------------------------------------------- #
+# ara benchmark --repeat N: variance bands — store the MEAN + LO–HI band across
+# N runs instead of a single lucky roll (pass^k spirit; never report one roll as
+# THE number). Slug: 2026-07-02-benchmark-repeat-passk
+# --------------------------------------------------------------------------- #
+
+def test_render_benchmark_repeat_one_text_identical_to_default(make_console, monkeypatch):
+    # repeat=1 must reproduce today's single-run text output byte-for-byte (no band, no "mean of").
+    _wire_benchmark(monkeypatch, score=0.75)
+    c1, b1 = make_console()
+    assert cli.render_benchmark(c1, "org/m", use_case="reasoning", assume_yes=True) == 0
+    c2, b2 = make_console()
+    assert cli.render_benchmark(c2, "org/m", use_case="reasoning", assume_yes=True, repeat=1) == 0
+    assert b1.getvalue() == b2.getvalue()
+    assert "mean of" not in b1.getvalue() and "band" not in b1.getvalue()
+
+
+def test_render_benchmark_repeat_one_json_identical_to_default(monkeypatch, capsys):
+    # repeat=1 --json must be byte-identical to today (no runs/band/repeat keys).
+    _wire_benchmark(monkeypatch, score=0.6)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_benchmark(c, "org/m", use_case="agentic", assume_yes=True, as_json=True) == 0
+    default = capsys.readouterr().out
+    assert cli.render_benchmark(c, "org/m", use_case="agentic", assume_yes=True,
+                                as_json=True, repeat=1) == 0
+    with_flag = capsys.readouterr().out
+    assert default == with_flag
+    payload = json.loads(with_flag)
+    assert "runs" not in payload and "band" not in payload and "repeat" not in payload
+
+
+def test_render_benchmark_repeat_runs_backend_n_times(make_console, monkeypatch):
+    # N=3 loads + benchmarks the model three times (N separate model loads — acceptable v1).
+    _wire_benchmark(monkeypatch, score=0.5)
+    calls = {"n": 0}
+
+    def counting_bench(model, prompts, *, max_context, **kw):
+        calls["n"] += 1
+        return {"context": max_context,
+                "results": [{"prompt_index": i, "completion": f"a{i}"}
+                            for i in range(len(prompts))]}
+
+    bk = types.SimpleNamespace(benchmark=counting_bench, calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=3) == 0
+    assert calls["n"] == 3
+
+
+def test_render_benchmark_repeat_mean_and_band_text(make_console, monkeypatch):
+    # Three runs scoring 40/60/80% → stored MEAN 60%, band 40–80% shown; NOT the determinism note.
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    seq = iter([0.4, 0.6, 0.8])
+    monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda uc, its, comps: next(seq))
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=3) == 0
+    out = buf.getvalue()
+    assert "60% measured here" in out
+    assert "mean of 3 runs" in out
+    assert "band 40–80%" in out
+    assert "scored identically" not in out           # a real spread is NOT the determinism note
+    assert saved["score"] == pytest.approx(0.6)       # the mean, not any single roll
+    assert "repeat=3 band=40-80" in saved["source"]   # band stamped into the source string
+
+
+def test_render_benchmark_repeat_mean_and_band_json(monkeypatch, capsys):
+    # --json adds runs/band/repeat; the score field is the mean.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    seq = iter([0.4, 0.6, 0.8])
+    monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda uc, its, comps: next(seq))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True,
+                                as_json=True, repeat=3) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runs"] == [0.4, 0.6, 0.8]
+    assert payload["band"] == [0.4, 0.8]
+    assert payload["repeat"] == 3
+    assert payload["score"] == pytest.approx(0.6)
+
+
+def test_render_benchmark_repeat_identical_scores_emits_determinism_note(make_console, monkeypatch):
+    # Zero variance under greedy decoding is determinism, not measured robustness — say so honestly.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.75)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=3) == 0
+    out = buf.getvalue()
+    assert "all 3 runs scored identically" in out
+    assert "deterministic" in out and "not evidence of stability" in out
+    assert "band 75–75%" in out                        # the (equal) LO–HI still renders
+
+
+def test_render_benchmark_repeat_sums_refused_across_runs(make_console, monkeypatch):
+    # Per-run refusals are summed into the stored total; denominator = total generations attempted.
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context,
+            "results": [{"prompt_index": 0, "refused": True, "reason": "x"},
+                        {"prompt_index": 1, "completion": "ans"}]},
+        calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=3) == 0
+    assert saved["refused_n"] == 3 and saved["errored_n"] == 0   # 1 refusal × 3 runs
+    assert "3/6 prompts were refused" in buf.getvalue()          # 2 prompts × 3 runs = 6 attempts
+
+
+def test_render_benchmark_repeat_sums_errored_across_runs(make_console, monkeypatch):
+    # Per-run engine errors are summed across runs too.
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context,
+            "results": [{"prompt_index": 0, "error": "boom"},
+                        {"prompt_index": 1, "completion": "ans"}]},
+        calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=2) == 0
+    assert saved["errored_n"] == 2 and saved["refused_n"] == 0
+    assert "2/4 prompts errored" in buf.getvalue()
+
+
+def test_render_benchmark_repeat_all_failed_across_all_runs_stores_nothing(make_console, monkeypatch):
+    # Every generation across every run refused/errored → no measurement; refuse to store (Rule #3).
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    bk = types.SimpleNamespace(
+        benchmark=lambda model, prompts, *, max_context, **kw: {
+            "context": max_context,
+            "results": [{"prompt_index": i, "refused": True, "reason": "x"} for i in range(2)]},
+        calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=2) == 1
+    assert "no measurement taken" in buf.getvalue()
+
+
+def test_render_benchmark_repeat_whole_run_refusal_on_later_run_aborts(make_console, monkeypatch):
+    # A whole-run refusal on ANY run (here the 2nd) aborts — no partial band from a failed load.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    calls = {"n": 0}
+
+    def flaky(model, prompts, *, max_context, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return {"context": max_context, "refused": True, "reason": "OOM on reload"}
+        return {"context": max_context,
+                "results": [{"prompt_index": i, "completion": f"a{i}"}
+                            for i in range(len(prompts))]}
+
+    bk = types.SimpleNamespace(benchmark=flaky, calibration_model_cached=lambda m: True)
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=3) == 1
+    assert "OOM on reload" in buf.getvalue()
+    assert calls["n"] == 2                    # aborted at the failing run; never ran the 3rd
+
+
+def test_render_benchmark_rejects_repeat_zero(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=0) == 1
+    assert "--repeat must be a positive integer" in buf.getvalue()
+
+
+def test_render_benchmark_rejects_repeat_negative(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, repeat=-2) == 1
+    assert "positive integer" in buf.getvalue()
+
+
+def test_render_benchmark_confirm_prompt_mentions_runs_when_repeated(make_console, monkeypatch):
+    # The interactive confirm should disclose the run count when N > 1.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    seen = {}
+    monkeypatch.setattr("builtins.input", lambda prompt="": seen.update(prompt=prompt) or "n")
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=False, repeat=3) == 0
+    assert "2 prompts × 3 runs" in seen["prompt"]
+
+
+def test_render_benchmark_confirm_prompt_omits_runs_when_single(make_console, monkeypatch):
+    # N == 1 keeps today's "(N prompts)" wording — no "× runs" suffix.
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    seen = {}
+    monkeypatch.setattr("builtins.input", lambda prompt="": seen.update(prompt=prompt) or "n")
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=False, repeat=1) == 0
+    assert "2 prompts)" in seen["prompt"] and "runs" not in seen["prompt"]
+
+
+def test_main_benchmark_default_repeat_is_one(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "coding"])
+    assert rec["benchmark"]["repeat"] == 1
+
+
+def test_main_benchmark_parses_repeat(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--repeat", "3"])
+    assert rec["benchmark"]["repeat"] == 3
+
+
+def test_main_benchmark_parses_repeat_equals_form(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--repeat=5"])
+    assert rec["benchmark"]["repeat"] == 5
+
+
+def test_main_benchmark_noninteger_repeat_folds_to_invalid(monkeypatch):
+    # A non-integer --repeat parses to 0, which render_benchmark rejects (positive-integer gate).
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
+    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--repeat", "lots"])
+    assert rec["benchmark"]["repeat"] == 0
 
 
 # --- serve: MLX (wmx) governed-server path ---
