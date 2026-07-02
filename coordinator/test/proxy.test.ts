@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// The admin auth gate itself (src/middleware.ts) — layer-2 integration per the testing-architecture
+// The admin auth gate itself (src/proxy.ts) — layer-2 integration per the testing-architecture
 // spec: an unauthenticated request is BLOCKED (redirected to /login), a valid session passes, and
 // the matcher exempts exactly the intended paths. The session primitives (auth.test.ts) prove
 // sign/verify; THIS file proves the gate uses them to actually gate requests.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { NextRequest } from "next/server";
-import { middleware, config } from "@/middleware";
+import { proxy, config } from "@/proxy";
 import { createSession, SESSION_COOKIE } from "@/lib/auth";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -20,7 +20,7 @@ function req(path: string, cookie?: string): NextRequest {
 describe("admin auth gate (middleware)", () => {
   it("redirects an unauthenticated request to /login and strips the query", async () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "s3cret");
-    const res = await middleware(req("/nodes?tab=pending"));
+    const res = await proxy(req("/nodes?tab=pending"));
     expect(res.status).toBe(307);
     const dest = new URL(res.headers.get("location")!);
     expect(dest.pathname).toBe("/login");
@@ -29,7 +29,7 @@ describe("admin auth gate (middleware)", () => {
 
   it("passes a request carrying a valid session cookie", async () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "s3cret");
-    const res = await middleware(req("/nodes", await createSession()));
+    const res = await proxy(req("/nodes", await createSession()));
     expect(res.status).toBe(200); // NextResponse.next()
     expect(res.headers.get("location")).toBeNull();
   });
@@ -38,7 +38,7 @@ describe("admin auth gate (middleware)", () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "s3cret");
     const forged = (await createSession()) + "x";
     for (const bad of [forged, "not.a.token", ""]) {
-      const res = await middleware(req("/", bad));
+      const res = await proxy(req("/", bad));
       expect(res.status).toBe(307);
       expect(new URL(res.headers.get("location")!).pathname).toBe("/login");
     }
@@ -48,14 +48,14 @@ describe("admin auth gate (middleware)", () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "secret-A");
     const stolen = await createSession();
     vi.stubEnv("ARA_COORDINATOR_SECRET", "secret-B");
-    const res = await middleware(req("/nodes", stolen));
+    const res = await proxy(req("/nodes", stolen));
     expect(res.status).toBe(307);
   });
 
   it("fails CLOSED when no secret is configured — requests are blocked, not admitted", async () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "");
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "");
-    const res = await middleware(req("/", "anything"));
+    const res = await proxy(req("/", "anything"));
     expect(res.status).toBe(307); // verifySession → false → redirect; never next()
   });
 });

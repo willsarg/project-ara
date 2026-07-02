@@ -7,14 +7,20 @@ import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
-const DB_PATH = process.env.ARA_COORDINATOR_DB || "./data/coordinator.db";
+// Statically scoped to cwd/data so Turbopack's Node File Trace (for the standalone build output)
+// can see this resolves under the project root and doesn't fall back to tracing the whole project.
+// ARA_COORDINATOR_DB still overrides it — that value is only ever consumed at RUNTIME (below), never
+// at build time, so the override can't influence what NFT decides to include.
+const DB_PATH = process.env.ARA_COORDINATOR_DB || path.join(process.cwd(), "data", "coordinator.db");
 
 let _db: Database.Database | null = null;
 
 function open(): Database.Database {
   if (_db) return _db;
-  // Ensure the parent dir exists (e.g. ./data on a fresh checkout or empty volume).
-  mkdirSync(path.dirname(path.resolve(DB_PATH)), { recursive: true });
+  // Ensure the parent dir exists (e.g. ./data on a fresh checkout or empty volume). The resolved
+  // path is only known at runtime (ARA_COORDINATOR_DB may override it), so tell the build-time
+  // tracer not to try to statically follow it — see the comment on DB_PATH above.
+  mkdirSync(path.dirname(path.resolve(/* turbopackIgnore: true */ DB_PATH)), { recursive: true });
   const db = new Database(DB_PATH);
   db.pragma("journal_mode = WAL");
   db.exec(`
