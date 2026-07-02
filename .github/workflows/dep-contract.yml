@@ -1,0 +1,53 @@
+# Layer 4 of the testing architecture: the huggingface_hub dependency contract.
+#
+# ARA's unit suite mocks huggingface_hub everywhere (deliberately — hermetic + offline). That
+# means a huggingface_hub version bump can pass the whole 100%-coverage gate without the REAL
+# library ever being exercised. tests/test_dep_contract_hf.py's `dep_contract`-marked half hits
+# the real Hugging Face Hub (a tiny, stable public repo) to prove the behavior ARA depends on —
+# not just the signatures the offline half already checks inside the default gate — still holds.
+#
+# This workflow runs that online half exactly when it matters:
+#   - pull_request:      pyproject.toml / uv.lock changes — i.e. exactly when a dependency
+#                        (huggingface_hub included) might have moved. Dependabot-only, same
+#                        pattern as docker-scan.yml / dependabot-ci.yml: a human's dep bump PR
+#                        can still trigger this by hand via workflow_dispatch.
+#   - schedule:           weekly, independent of any PR — catches drift on the Hub side itself
+#                        (a field renamed, an error class's shape changed) even when ARA's own
+#                        lockfile hasn't moved.
+#   - workflow_dispatch:  on demand from the Actions tab.
+#
+# Hardening mirrors test.yml / docker-scan.yml: read-only token, actions pinned to commit SHAs,
+# checkout creds not persisted, locked install (`uv sync --frozen`), per-job timeout.
+name: Dependency Contract (huggingface_hub)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 2"   # Tuesdays 06:00 UTC — distinct from docker-scan's Monday 06:00
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  dep-contract:
+    # schedule + manual always run; on a PR, only Dependabot's (matches the dedicated-flow model
+    # used by docker-scan.yml / dependabot-ci.yml).
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0          # hatch-vcs derives the version from git tags during `uv sync` —
+                                  # a shallow clone has no tags and the editable install would fail
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run pytest -m dep_contract --no-cov
