@@ -4885,15 +4885,18 @@ def test_find_loaded_matches_exact_tagged_and_none():
 
 
 def test_ollama_safe_ceiling_first_engine_largest(monkeypatch):
-    chars = {"cpu": {"safe_context": 8000}, "vulkan": {"safe_context": 5000}}
+    # measured_at is carried through so the caller can flag a stale ceiling.
+    chars = {"cpu": {"safe_context": 8000, "measured_at": "2026-06-01T00:00:00+00:00"},
+             "vulkan": {"safe_context": 5000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured")
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (
+        8000, "measured", "2026-06-01T00:00:00+00:00")
 
 
 def test_ollama_safe_ceiling_second_engine_larger(monkeypatch):
     chars = {"cpu": {"safe_context": 5000}, "vulkan": {"safe_context": 8000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured")
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured", None)
 
 
 def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
@@ -4908,7 +4911,31 @@ def test_ollama_safe_ceiling_cuda_gguf_wins(monkeypatch):
     chars = {"cpu": {"safe_context": 4000}, "vulkan": {"safe_context": 5000},
              "cuda-gguf": {"safe_context": 12000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured")
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured", None)
+
+
+# --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #
+def test_stale_ceiling_note_warns_in_text_mode(make_console, monkeypatch):
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda m, ts: True)
+    c, buf = make_console()
+    assert cli._stale_ceiling_note(c, "org/m", "2020-01-01T00:00:00+00:00",
+                                   as_json=False) is True
+    out = buf.getvalue()
+    assert "stale" in out and "org/m" in out and "ara characterize org/m" in out
+
+
+def test_stale_ceiling_note_silent_but_flags_in_json_mode(make_console, monkeypatch):
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda m, ts: True)
+    c, buf = make_console()
+    assert cli._stale_ceiling_note(c, "org/m", "x", as_json=True) is True   # flag, no print
+    assert buf.getvalue() == ""
+
+
+def test_stale_ceiling_note_false_and_silent_when_fresh(make_console, monkeypatch):
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda m, ts: False)
+    c, buf = make_console()
+    assert cli._stale_ceiling_note(c, "org/m", "x", as_json=False) is False
+    assert buf.getvalue() == ""
 
 
 # serve dispatch (main argv parsing)
@@ -5047,6 +5074,16 @@ def test_render_benchmark_coding_json_mode_does_not_bypass_consent(monkeypatch):
     c = cli.Console(color=False, stream=sys.stderr)
     rc = cli.render_benchmark(c, "org/m", use_case="coding", as_json=True)
     assert rc == 1
+
+
+def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
+    # A stored ceiling measured against since-changed cache files is flagged, not silently trusted.
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda m, ts: True)
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_benchmark(c, "org/m", use_case="extraction", as_json=True, assume_yes=True)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
 
 
 def test_render_benchmark_rejects_unknown_use_case(make_console, monkeypatch):

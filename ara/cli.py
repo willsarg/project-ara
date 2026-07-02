@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
                  hf_auth, mlx, ollama, profile, calibration, pythons, scoring, serialize,
-                 status, versions)
+                 staleness, status, versions)
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
@@ -924,6 +924,22 @@ def _ctx_gate_msg(ctx: int, measured: int | None, model: str) -> str | None:
     return None
 
 
+def _stale_ceiling_note(c: Console, model: str, measured_at: str | None, *,
+                        as_json: bool) -> bool:
+    """Warn (Rule #3) when a stored ceiling predates the model's current cache files — the number
+    was measured against a since-changed model. Advisory, never a block: the measured ceiling is
+    still the best on record until ``ara characterize`` re-measures. Returns True when stale, so a
+    ``--json`` caller can carry a ``stale_ceiling`` flag rather than print. Slug
+    2026-07-02-ara-ceiling-staleness."""
+    if not staleness.ceiling_is_stale(model, measured_at):
+        return False
+    if not as_json:
+        c.emit(c.style("warn", f"  ⚠ measured ceiling may be stale — {model}'s cache files changed "
+                               f"since it was characterized ({measured_at}); re-run: "
+                               f"ara characterize {model}"))
+    return True
+
+
 def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
     """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
     meta = catalog.describe(model_id)
@@ -1468,13 +1484,16 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
                 return err(msg)
             safe = ctx
+            ceiling_measured_at = None       # explicit --ctx, not a stored ceiling — nothing to age
         else:
             row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
             if not row or row.get("safe_context") is None:
                 return err(f"no measured ceiling for {model} — run: ara characterize {model} "
                            f"(or pass --ctx N)")
             safe = row["safe_context"]
+            ceiling_measured_at = row.get("measured_at")
 
+    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     items = benchmark.load_probe(use_case)
     n = len(items)
     if not as_json and not assume_yes and sys.stdin.isatty():
@@ -1553,6 +1572,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if stale_ceiling:
+            payload["stale_ceiling"] = True
         if repeat > 1:
             payload["runs"] = run_scores
             payload["band"] = [lo, hi]
@@ -1641,6 +1662,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
                            f"too big for this machine")
             engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
+            ceiling_measured_at = row.get("measured_at")
         else:
             # No --engine: scan every engine this model is characterized under on this machine and pick
             # the largest measured ceiling whose backend can actually run (has `generate`). A model
@@ -1656,7 +1678,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                     continue
                 backend = engines.ENGINES[key]["backend"]
                 per_engine[key] = (row.get("safe_context"), backend,
-                                   hasattr(get_backend(backend), "generate"))
+                                   hasattr(get_backend(backend), "generate"),
+                                   row.get("measured_at"))
             if not per_engine:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
                            f"ara characterize {model}")
@@ -1673,8 +1696,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                            f"that engine yet")
             # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
             engine_key = max(runnable, key=lambda k: runnable[k][0])
-            safe, backend, _ = runnable[engine_key]
+            safe, backend, _, ceiling_measured_at = runnable[engine_key]
 
+    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
                                          flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
                                          prefill_chunk=prefill_chunk)
@@ -1713,7 +1737,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     completion = result.get("completion", "")
     if as_json:
         print(json.dumps({"model": model, "engine": engine_key,
-                          "safe_context": safe, "completion": completion}, indent=2))
+                          "safe_context": safe, "stale_ceiling": stale_ceiling,
+                          "completion": completion}, indent=2))
         return 0
     c.emit()
     c.emit(completion)
@@ -1732,13 +1757,14 @@ _OLLAMA_CEILING_ENGINES = ("cpu", "vulkan", "cuda-gguf")
 
 def _ollama_safe_ceiling(con, mk: str, model: str):
     """The largest *measured* llama.cpp-class safe ceiling for *model* on this machine, as
-    ``(safe_context, "measured")``, or ``None`` if none is recorded."""
+    ``(safe_context, "measured", measured_at)``, or ``None`` if none is recorded. ``measured_at``
+    lets the caller flag a stale ceiling (cache changed since it was measured)."""
     best = None
     for key in _OLLAMA_CEILING_ENGINES:
         row = db.get_characterization(con, mk, key, model)
         if (row and row.get("safe_context") is not None
                 and (best is None or row["safe_context"] > best[0])):
-            best = (row["safe_context"], "measured")
+            best = (row["safe_context"], "measured", row.get("measured_at"))
     return best
 
 
@@ -1784,13 +1810,16 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
             if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
                 return err(msg)
             safe, source = ctx, "requested"
+            ceiling_measured_at = None       # explicit --ctx, not a stored ceiling
         else:
             row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
             if not row or row.get("safe_context") is None:
                 return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
                            f"(or pass --ctx N).")
             safe, source = row["safe_context"], "measured"
+            ceiling_measured_at = row.get("measured_at")
 
+    _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Serve {model} on MLX, governed at ≤{safe} ctx?"):
             c.emit(c.style("dim", "  skipped."))
@@ -1878,14 +1907,16 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
         if (msg := _ctx_gate_msg(ctx, found[0] if found else None, model)):
             return err(msg)
         safe, source = ctx, "requested"
+        ceiling_measured_at = None           # explicit --ctx, not a stored ceiling
     else:
         with db.connected() as con:
             found = _ollama_safe_ceiling(con, profile.machine_key(), model)
         if found is None:
             return err(f"no measured safe ceiling for {model} — pass --ctx N, or characterize it "
                        f"first (Ollama runs llama.cpp; characterize on cpu/vulkan).")
-        safe, source = found
+        safe, source, ceiling_measured_at = found
 
+    _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     # consent — serve creates + holds a model in memory
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Stand up {model} on Ollama, governed at ≤{safe} ctx?"):
