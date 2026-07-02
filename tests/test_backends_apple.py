@@ -22,10 +22,13 @@ def _fake_worker(monkeypatch, fn):
 
 
 # The engine facts the wmx `device limits` worker returns (ARA overlays its own fields).
+# wmx denominates memory in DECIMAL GB (bytes / 1e9) except swap (already binary GiB);
+# apple.safe_limits converts to ARA's binary-GiB contract at this boundary.
 _LIMITS_FACTS = {
     "device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
     "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0,
 }
+_DEC = 1e9 / (1024 ** 3)     # decimal-GB value × _DEC = the same bytes in binary GiB
 
 
 def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
@@ -39,13 +42,30 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
     m = apple.safe_limits()
     assert calls == [("apple", ["-m", "wmx_suite.device", "limits"])]
     assert m["device"] == "Apple M4 Pro"
-    assert m["total_gb"] == 48.0 and m["wall_gb"] == 40.0
-    assert m["safe_budget_gb"] == 36.0 and m["margin_gb"] == 4.0
-    assert m["headroom_gb"] == 28.0 and m["swap_free_gb"] == 2.0
+    assert m["total_gb"] == pytest.approx(48.0 * _DEC)
+    assert m["wall_gb"] == pytest.approx(40.0 * _DEC)
+    assert m["swap_free_gb"] == 2.0        # wmx reports swap in GiB already — passes through
     # no stored calibration in the engine — ARA overlays it from its own store
     assert m["calibrated"] is False
     assert m["overhead_gb"] is None
     assert m["calibrated_at"] is None
+
+
+def test_safe_limits_converts_wmx_decimal_to_gib_preserving_margin(monkeypatch):
+    """wmx's wall/budget are decimal GB (bytes/1e9); ARA's contract is binary GiB. The boundary
+    conversion must NOT scale the absolute safety margin (a blind × factor would shrink it ~7%,
+    an unsafe direction): safe_budget is re-derived as converted wall − margin, and headroom as
+    safe_budget − converted wired footprint.
+
+    Slug: 2026-07-02-analytic-units-gib
+    """
+    _fake_worker(monkeypatch, lambda name, argv: dict(_LIMITS_FACTS))
+    m = apple.safe_limits()
+    wall = 40.0 * _DEC
+    assert m["margin_gb"] == 4.0                                  # policy constant, not scaled
+    assert m["safe_budget_gb"] == pytest.approx(wall - 4.0)       # margin preserved exactly
+    wired = (36.0 - 28.0) * _DEC                                  # wmx wired = safe − headroom
+    assert m["headroom_gb"] == pytest.approx((wall - 4.0) - wired)
 
 
 def test_calibration_model_cached_true(monkeypatch):
@@ -138,9 +158,12 @@ def test_calibrate_surfaces_effective_overhead(monkeypatch):
     }, calls)
     m = apple.calibrate("org/calib-model")
     assert m["device"] == "Apple M4 Pro"               # carries fresh limits …
-    assert m["overhead_gb"] == 6.0                      # effective = max(default 6, measured 5)
+    # effective = max(default 6, measured 5), converted from wmx decimal GB to binary GiB
+    # (it is subtracted from the GiB wall, so it must share the wall's units).
+    # Slug: 2026-07-02-analytic-units-gib
+    assert m["overhead_gb"] == pytest.approx(6.0 * _DEC)
     assert m["calibrated"] is True
-    assert m["calibration"]["n_points"] == 4           # … plus what it measured
+    assert m["calibration"]["n_points"] == 4           # … plus what it measured (engine-raw)
     assert ["-m", "wmx_suite.device", "calibrate", "org/calib-model"] in calls
 
 

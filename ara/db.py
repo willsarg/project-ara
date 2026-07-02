@@ -106,6 +106,14 @@ def connect() -> sqlite3.Connection:
         con.execute("ALTER TABLE calibrations ADD COLUMN wall_gb REAL")
     if "safe_budget_gb" not in cal_cols:
         con.execute("ALTER TABLE calibrations ADD COLUMN safe_budget_gb REAL")
+    # One-time data fix (user_version 0→1): wmx calibrations stored before 2026-07-02 carry
+    # decimal-GB walls (~7.4% high vs ARA's binary-GiB contract — the apple boundary now
+    # converts). A float can't reveal its own units, so honest re-measurement beats arithmetic
+    # repair: drop the rows and the next run re-calibrates. Slug 2026-07-02-analytic-units-gib.
+    if con.execute("PRAGMA user_version").fetchone()[0] < 1:
+        con.execute("DELETE FROM calibrations WHERE engine='wmx'")
+        con.execute("PRAGMA user_version = 1")
+        con.commit()
     return con
 
 

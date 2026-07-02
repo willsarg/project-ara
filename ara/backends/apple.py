@@ -24,14 +24,44 @@ DEVICE_MODULE = "wmx_suite.device"
 # fixed memory overhead, so a tiny instruct model is plenty.
 CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
+# wmx denominates memory in DECIMAL GB (bytes / 1e9) — except swap, which it reports in binary
+# GiB already. ARA's contract is binary GiB throughout (matching detect, the workers, and wcx),
+# so wmx facts are converted at this boundary. Slug 2026-07-02-analytic-units-gib.
+_GIB = 1024 ** 3
+_DEC_TO_GIB = 1e9 / _GIB
+
+
+def _facts_to_gib(facts: dict) -> dict:
+    """Convert wmx's decimal-GB limit facts to ARA's binary-GiB contract.
+
+    The margin-bearing fields are RE-DERIVED rather than scaled: ``margin_gb`` is an absolute
+    policy cushion, and multiplying it by the ≈0.93 conversion factor would silently shrink it
+    ~7% (an unsafe direction). So: wall/total convert directly; ``safe_budget_gb`` becomes the
+    converted wall minus the unchanged margin; ``headroom_gb`` (= safe − wired) is rebuilt from
+    the converted wired footprint. ``swap_free_gb`` is already GiB and passes through.
+    """
+    wall = facts["wall_gb"] * _DEC_TO_GIB
+    margin = facts["margin_gb"]
+    safe = wall - margin
+    # wmx's headroom = its (decimal) safe budget − wired-now; recover wired, convert, re-derive.
+    wired = (facts["safe_budget_gb"] - facts["headroom_gb"]) * _DEC_TO_GIB
+    return {
+        **facts,
+        "total_gb": facts["total_gb"] * _DEC_TO_GIB,
+        "wall_gb": wall,
+        "safe_budget_gb": safe,
+        "headroom_gb": safe - wired,
+    }
+
 
 def safe_limits() -> dict:
     """Read this machine's safe memory limits via the wmx worker. Pure read — no model.
 
     Stateless: returns the budget with no stored overhead (``calibrated=False``). ARA overlays
     a previously-measured overhead from its own store — the engine no longer reads a database.
+    Facts arrive in wmx's decimal GB and leave here in ARA's binary GiB (see ``_facts_to_gib``).
     """
-    facts = engine_env.run_worker("apple", ["-m", DEVICE_MODULE, "limits"])
+    facts = _facts_to_gib(engine_env.run_worker("apple", ["-m", DEVICE_MODULE, "limits"]))
     return {
         **facts,
         "overhead_gb": None,        # ARA owns the stored calibration now
@@ -91,8 +121,11 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
         )
         limits["calibration"] = result
         return limits
-    overheads = [v for v in (result.get("measured_overhead_gb"),
-                             result.get("default_overhead_gb")) if v is not None]
+    # Overheads are wmx-measured (decimal GB) and get subtracted from the GiB wall later —
+    # convert them to the wall's units here (Slug 2026-07-02-analytic-units-gib). The raw
+    # engine numbers stay visible unconverted in the "calibration" sub-dict.
+    overheads = [v * _DEC_TO_GIB for v in (result.get("measured_overhead_gb"),
+                                           result.get("default_overhead_gb")) if v is not None]
     limits["overhead_gb"] = max(overheads) if overheads else None
     limits["calibrated"] = True
     limits["calibration"] = result

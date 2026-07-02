@@ -8,6 +8,8 @@ context-window limit against the estimated budget.
 """
 from __future__ import annotations
 
+import pytest
+
 from ara import estimate, hardware
 from ara.detect import Accelerator, Machine
 
@@ -198,7 +200,7 @@ def test_model_fit_full_window_when_budget_covers_it():
 
 
 def test_model_fit_context_limited_by_memory():
-    lim = {"safe_budget_gb": 5.0}             # tight: budget binds before the window
+    lim = {"safe_budget_gb": 4.5}             # tight: budget binds before the window
     fit = estimate.model_fit(lim, _META, weights_gb=4.0)
     assert fit["fits"] is True
     assert fit["binding"] == "memory"
@@ -214,10 +216,44 @@ def test_model_fit_weights_exceed_budget():
 
 def test_model_fit_weights_equal_budget_does_not_fit():
     # Strict `<`: weights leave zero headroom for KV cache/activations, so an exact match does
-    # NOT fit. (A `<=` mutant would say True here.)
-    lim = {"safe_budget_gb": 5.0}
+    # NOT fit. (A `<=` mutant would say True here.) The budget is set to the fit's own reported
+    # (GiB-converted) weights so the equality is exact regardless of float rounding.
+    probe = estimate.model_fit({"safe_budget_gb": 60.0}, _META, weights_gb=5.0)
+    lim = {"safe_budget_gb": probe["weights_gb"]}
     fit = estimate.model_fit(lim, _META, weights_gb=5.0)
     assert fit["fits"] is False
+
+
+def test_model_fit_converts_decimal_weights_to_gib():
+    """Weights arrive as decimal GB (on-disk size / 1e9) but budgets are binary GiB — model_fit
+    must convert before comparing, or a model that actually fits is refused (and the reported
+    footprint is ~7.4% overstated against the wall).
+
+    Slug: 2026-07-02-analytic-units-gib
+    """
+    # 7.8 decimal GB = 7.264… GiB: fits a 7.5 GiB budget only after conversion.
+    fit = estimate.model_fit({"safe_budget_gb": 7.5}, _META, weights_gb=7.8)
+    assert fit["fits"] is True
+    assert fit["weights_gb"] == pytest.approx(7.8 * 1e9 / estimate.GIB)
+
+
+def test_model_fit_est_context_uses_gib_weights():
+    """The decode-ceiling intercept must be the GiB-converted weights, not the decimal figure.
+
+    Slug: 2026-07-02-analytic-units-gib
+    """
+    from ara.contracts import ramp
+
+    lim = {"safe_budget_gb": 4.5}
+    fit = estimate.model_fit(lim, _META, weights_gb=4.0)
+    slope = ramp.analytic_kv_slope_gb_per_k(_META["n_layers"], _META["kv_heads"],
+                                            _META["head_dim"])
+    expected, _ = ramp.decode_ceiling(4.0 * 1e9 / estimate.GIB, slope, 4.5,
+                                      max_context=_META["max_context"])
+    assert fit["est_context"] == expected
+    # And it must NOT equal the unconverted solve (guards against reverting the conversion).
+    wrong, _ = ramp.decode_ceiling(4.0, slope, 4.5, max_context=_META["max_context"])
+    assert fit["est_context"] != wrong
 
 
 def test_model_fit_unknown_dims_gives_no_context_estimate():

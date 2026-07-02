@@ -216,11 +216,13 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
 
     In binary GiB per 1000 tokens (``GIB``), matching budget/baseline/intercept — see the GIB note.
 
-    NOTE 2026-06-28: an audit flagged this as a GiB/GB mismatch (wmx-suite + hardware.py convert
-    memory with /1e9, so the analytic slope may be ~7.4% inconsistent → decode ceiling over-claimed).
-    A deliberate prior test (test_analytic_kv_slope_uses_binary_gib_not_decimal_gb) asserts binary
-    is correct. UNRESOLVED — needs a units-trace of intercept_gb/budget_gb at the decode_ceiling
-    call site before changing. Left as-is pending that.
+    RESOLVED 2026-07-02 (was flagged 2026-06-28 as a possible ~7.4% GiB/GB mismatch): the units
+    trace confirmed binary GiB is correct here. At the sole ``decode_ceiling`` call site
+    (estimate.model_fit), the budget is binary GiB on every backend — RAM is ``vm.total/1024³``
+    and CUDA VRAM is nvidia-smi MiB ``/1024`` — and the two decimal leaks feeding it (the
+    weights intercept, on-disk bytes/1e9; wmx's measured wall) are now converted at their
+    boundaries (estimate.model_fit; backends/apple). test_analytic_kv_slope_uses_binary_gib_
+    not_decimal_gb pins this. Slug 2026-07-02-analytic-units-gib.
     """
     if not (n_layers and kv_heads and head_dim):
         return None

@@ -118,6 +118,9 @@ def _gib(n) -> float | None:
 
 
 def _gb_dec(n) -> float | None:
+    """Decimal GB (bytes / 1e9) — for DISK sizes only, which are marketed and sold decimal
+    (a "1 TB" SSD is 1000204886016 bytes). Memory quantities (RAM/VRAM) are binary — use
+    ``_gib``. Slug 2026-07-02-analytic-units-gib."""
     try:
         return round(int(n) / 1e9, 1)
     except (TypeError, ValueError):
@@ -1038,7 +1041,7 @@ def _drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor):
         # AMD and unknown: integrated is resolved at the list level in _gpus_linux
         # (APU-vs-discrete heuristic requires knowing the full GPU list)
         integrated = None
-    return GpuInfo(vendor=vendor, name=resolved_name, vram_gb=_gb_dec(vram_bytes),
+    return GpuInfo(vendor=vendor, name=resolved_name, vram_gb=_gib(vram_bytes),
                    integrated=integrated)
 
 
@@ -1085,7 +1088,7 @@ def _video_controller_gpu(row: dict) -> "GpuInfo":
         ram_i = int(ram)
         # AdapterRAM is uint32; any value >= 4 GB decimal is at or near the 32-bit overflow
         # ceiling and cannot reliably represent actual VRAM (e.g. 0xFFC00000 for an 8 GB card).
-        vram = _gb_dec(ram_i) if 0 < ram_i < 4_000_000_000 else None
+        vram = _gib(ram_i) if 0 < ram_i < 4_000_000_000 else None
     except (TypeError, ValueError):
         vram = None
     return GpuInfo(
