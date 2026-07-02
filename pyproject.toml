@@ -98,10 +98,13 @@ source_paths = ["ara"]
 do_not_mutate = ["ara/_vendor/*"]
 # Clear the project's addopts so --cov / fail_under=100 don't make every mutant
 # run exit non-zero (which would corrupt kill/survive detection). Fast, mocked, fail-fast: no
-# point paying for coverage instrumentation or a slow suite once per mutant.
+# point paying for coverage instrumentation or a slow suite once per mutant. The marker filter
+# MUST exclude every non-hermetic suite (integration/dep_contract/e2e) — mutmut runs this as its
+# baseline, and a docker/network test erroring here aborts the whole run (-x) and leaves every
+# mutant "not checked". Keep this in sync with [tool.pytest.ini_options] addopts.
 pytest_add_cli_args = [
     "-o",
-    "addopts=-x -q -m 'not integration and not dep_contract'",
+    "addopts=-x -q -m 'not integration and not dep_contract and not e2e'",
     "-p",
     "no:cacheprovider",
 ]

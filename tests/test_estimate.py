@@ -27,18 +27,24 @@ def _machine(**over) -> Machine:
 # --- limits: mirror the wall, engine-free --------------------------------- #
 def test_limits_apple_mirrors_working_set():
     # Apple unified memory: the safe working set is a fraction of total RAM.
-    lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0))
+    lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0, chip="Apple M4 Pro"))
     assert lim["total_gb"] == 48.0
     assert lim["wall_gb"] == 48.0 * estimate.APPLE_WORKING_SET
     assert lim["safe_budget_gb"] == lim["wall_gb"] - estimate.MARGIN_GB
     assert lim["basis"] == "estimated"
     assert lim["calibrated"] is False
+    assert lim["device"] == "Apple M4 Pro"        # non-CUDA branch: device is the chip, not None
+    # These are the exact key names of the output contract — a renamed/misrouted key breaks
+    # every caller silently unless pinned here.
+    assert lim["headroom_gb"] is None             # a live quantity; estimate never fills it
+    assert lim["calibrated_at"] is None            # uncalibrated: no measurement timestamp
 
 
 def test_limits_cpu_uses_full_ram():
-    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=32.0))
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=32.0, chip="Intel i9-13900K"))
     assert lim["wall_gb"] == 32.0
     assert lim["safe_budget_gb"] == 32.0 - estimate.MARGIN_GB
+    assert lim["device"] == "Intel i9-13900K"     # non-CUDA branch: device is the chip, not None
 
 
 def test_limits_cuda_single_gpu_wall_is_vram():
@@ -48,6 +54,16 @@ def test_limits_cuda_single_gpu_wall_is_vram():
     assert lim["total_gb"] == 24.0
     assert lim["wall_gb"] == 24.0
     assert lim["device"] == "RTX 4090"
+
+
+def test_limits_cuda_falsy_count_defaults_to_one_device():
+    # `count` can arrive falsy (None/0) from detect facts; the wall must still be a SINGLE
+    # device's VRAM (24.0), not multiplied — a falsy count is not "0 devices" or "2 devices".
+    m = _machine(backend="cuda",
+                 accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=None))
+    lim = estimate.limits(m)
+    assert lim["total_gb"] == 24.0
+    assert lim["wall_gb"] == 24.0
 
 
 # --- CUDA multi-GPU: the analytic wall must match what the engine actually governs --------- #
@@ -130,7 +146,7 @@ def test_gate_wall_is_physical_off_linux(monkeypatch):
 def test_limits_uses_measured_wall_when_supplied():
     # Once ARA has a measured wall for this machine + engine, profile reports the measurement
     # (clearly labelled), not the heuristic. Spec 2026-06-23-capability-pipeline.
-    measured = {"wall_gb": 41.3, "safe_budget_gb": 39.3}
+    measured = {"wall_gb": 41.3, "safe_budget_gb": 39.3, "calibrated_at": "2026-07-01T00:00:00Z"}
     lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0), measured=measured)
     assert lim["wall_gb"] == 41.3
     assert lim["safe_budget_gb"] == 39.3
@@ -138,6 +154,9 @@ def test_limits_uses_measured_wall_when_supplied():
     assert lim["calibrated"] is True
     # The device/total still come from detect facts; only the wall/budget are the measurement.
     assert lim["total_gb"] == 48.0
+    # The calibration timestamp must propagate from `measured` into the result verbatim — not be
+    # dropped, nulled, or read from the wrong source key.
+    assert lim["calibrated_at"] == "2026-07-01T00:00:00Z"
 
 
 def test_limits_records_what_the_heuristic_would_have_said():
@@ -191,6 +210,14 @@ def test_model_fit_weights_exceed_budget():
     fit = estimate.model_fit(lim, _META, weights_gb=8.0)
     assert fit["fits"] is False
     assert fit["est_context"] is None
+
+
+def test_model_fit_weights_equal_budget_does_not_fit():
+    # Strict `<`: weights leave zero headroom for KV cache/activations, so an exact match does
+    # NOT fit. (A `<=` mutant would say True here.)
+    lim = {"safe_budget_gb": 5.0}
+    fit = estimate.model_fit(lim, _META, weights_gb=5.0)
+    assert fit["fits"] is False
 
 
 def test_model_fit_unknown_dims_gives_no_context_estimate():

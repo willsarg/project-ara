@@ -70,7 +70,10 @@ printf '  %s\n' "${FILES[@]}"
 
 # mutmut's own exit code reflects infra failures (e.g. the clean test run itself failing), not
 # survivor counts — survivors are a finding, not a probe failure, so don't fail the job on them.
-uv run mutmut run || true
+# Default to --max-children 1: mutmut's parallel workers share pytest tmp dirs and hit a cleanup
+# race that leaves mutants "not checked" (verified). Serial is reliable; override for a faster
+# local sweep with MUTMUT_MAX_CHILDREN=N if your box tolerates it.
+uv run mutmut run --max-children "${MUTMUT_MAX_CHILDREN:-1}" || true
 
 echo ""
 echo "=== mutation_probe results ==="
