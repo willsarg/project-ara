@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Coordinator for the phone-home end-to-end test (tests/test_e2e_phone_home.py, layer 6/e2e of the
+# testing architecture). Brings up the REAL production image; the test drives the REAL Python node
+# client against it over HTTP. Admin state (enrollment token, approval, work) is seeded by exec-ing
+# the coordinator's OWN better-sqlite3 inside the container — no host bind-mount, so there's no
+# uid/permission skew between the container user (ara, 1001) and the CI runner.
+services:
+  coordinator:
+    build: ./coordinator
+    environment:
+      # Boot secret so instrumentation's fail-closed guard is satisfied; throwaway, e2e-only.
+      ARA_COORDINATOR_SECRET: e2e-secret
+    ports:
+      - "34714:3000"
+    # `docker compose up --wait` blocks on this (the image's HEALTHCHECK hits /api/health).
