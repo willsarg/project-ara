@@ -81,6 +81,15 @@ def test_quant_key_extracts_genuine_quant_token():
     assert scoring.quant_key("org/Model-fp16") == "fp16"
 
 
+def test_quant_key_covers_gguf_iq_tq_and_f32_classes():
+    # llama.cpp's importance-matrix (IQ*) and ternary (TQ*) quants are real quants the fleet
+    # actually runs (IQ2_M, TQ1_0 — the 2026-06-29 campaign's top box reasoner was a TQ1_0),
+    # and F32 is a full-precision label alongside F16. Spec 2026-07-02-benchmark-honesty-persistence.
+    assert scoring.quant_key("org/DeepSeek-Coder-V2-Lite-IQ2_M") == "iq2_m"
+    assert scoring.quant_key("org/Qwen3-Coder-30B-A3B-TQ1_0") == "tq1_0"
+    assert scoring.quant_key("org/Model-F32") == "f32"
+
+
 def test_quant_key_ignores_container_formats_and_returns_none():
     # gguf / mlx are container formats, NOT quants — never returned; no quant → None.
     # Spec 2026-07-02-benchmark-honesty-persistence.

@@ -39,11 +39,12 @@ def base_key(model_id: str) -> str:
     return name
 
 
-# Genuine quantization tokens only — bit-widths, k-quants, and the awq/gptq/float classes. The
-# container FORMATS `gguf`/`mlx` (present in _QUANT_RE for base_key stripping) are deliberately
-# excluded: they describe packaging, not precision, so they're never a quant (Rule #3).
+# Genuine quantization tokens only — bit-widths, llama.cpp quant classes (Q/IQ/TQ), and the
+# awq/gptq/float classes. The container FORMATS `gguf`/`mlx` (present in _QUANT_RE for base_key
+# stripping) are deliberately excluded: they describe packaging, not precision, so they're never
+# a quant (Rule #3).
 _QUANT_ONLY_RE = re.compile(
-    r"[qf]?\d+bit|q\d(?:_[a-z0-9]+)*|bf16|fp16|fp32|f16|int[48]|awq|gptq", re.I)
+    r"[qf]?\d+bit|[it]?q\d(?:_[a-z0-9]+)*|bf16|fp16|fp32|f16|f32|int[48]|awq|gptq", re.I)
 
 
 def quant_key(model_id: str) -> str | None:
