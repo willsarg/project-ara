@@ -1996,7 +1996,7 @@ def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_p
         def wait(self):
             captured["waited"] = True
 
-    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
+    def _fake_serve(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
         captured.update(model=model, port=port, max_context=max_context)
         return _Proc(), f"http://127.0.0.1:{port}", max_context
 
@@ -2018,6 +2018,53 @@ def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, s
     c, buf = make_console()
     assert cli.render_serve(c, "org/Uncharacterized", engine="wmx", assume_yes=True) == 1
     assert "characterize" in buf.getvalue()
+
+
+# --- measured-provenance slope (2026-07-02-wmx-serve-measured-provenance-gate) -- #
+def test_measured_ramp_slope_fits_and_skips_incomplete_points():
+    row = {"points": [{"context": 2000, "mem_gb": 1.5},
+                      {"context": None, "mem_gb": 9.9},      # incomplete → skipped
+                      {"context": 16000, "mem_gb": 4.5}]}
+    slope = cli._measured_ramp_slope(row)
+    assert slope is not None and abs(slope - 3.0 / 14) < 1e-6      # (4.5-1.5)/((16000-2000)/1000)
+
+
+def test_measured_ramp_slope_none_when_too_few_points():
+    assert cli._measured_ramp_slope({"points": [{"context": 2000, "mem_gb": 1.5}]}) is None
+    assert cli._measured_ramp_slope({"points": []}) is None
+    assert cli._measured_ramp_slope(None) is None
+
+
+def test_measured_ramp_slope_none_on_degenerate_fit():
+    # two measurements at the SAME context can't fit a slope (RampError) → None, not a crash
+    row = {"points": [{"context": 4000, "mem_gb": 1.5}, {"context": 4000, "mem_gb": 2.5}]}
+    assert cli._measured_ramp_slope(row) is None
+
+
+def test_serve_mlx_passes_measured_slope_from_points(make_console, monkeypatch, set_platform):
+    # Serving the measured ceiling fits the real ramp slope and hands it to the engine gate, so a
+    # long-window measured serve isn't falsely refused by the a-priori prior.
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    row = {"safe_context": 40960,
+           "points": [{"context": 2000, "mem_gb": 1.535}, {"context": 16000, "mem_gb": 4.48}]}
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: row if e == "wmx" else None)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+    captured = {}
+
+    class _Proc:
+        def wait(self):
+            captured["waited"] = True
+
+    def _fake_serve(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
+        captured["slope"] = measured_slope_gb_per_k
+        return _Proc(), f"http://127.0.0.1:{port}", max_context
+
+    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
+    c, _ = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 0
+    assert captured["slope"] is not None and abs(captured["slope"] - (4.48 - 1.535) / 14) < 1e-6
 
 
 # --------------------------------------------------------------------------- #
@@ -5402,7 +5449,7 @@ def test_serve_mlx_allows_ctx_under_measured_ceiling(make_console, monkeypatch, 
     class _Proc:
         def wait(self): pass
 
-    def _fake_serve(model, *, port, max_context, kv_quant="f16"):
+    def _fake_serve(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
         return _Proc(), f"http://127.0.0.1:{port}", max_context
 
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
@@ -5948,7 +5995,7 @@ def test_serve_mlx_confirm_declined_skips(make_console, monkeypatch, set_platfor
 
 
 def test_serve_mlx_handles_serve_failure(make_console, monkeypatch, set_platform):
-    def boom(model, *, port, max_context, kv_quant="f16"):
+    def boom(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
         raise RuntimeError("gate refused")
     _wire_serve_mlx(monkeypatch, set_platform, serve=boom)
     c, buf = make_console()
@@ -5962,7 +6009,7 @@ def test_serve_mlx_json_output(make_console, monkeypatch, set_platform, capsys):
         def wait(self):
             pass
     _wire_serve_mlx(monkeypatch, set_platform, ceiling=8000,
-                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    serve=lambda model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None:
                     (_Proc(), f"http://127.0.0.1:{port}", max_context))
     c, _ = make_console()
     assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True, as_json=True) == 0
@@ -5983,7 +6030,7 @@ def test_serve_mlx_sigterm_handler_terminates_child(make_console, monkeypatch, s
             pass
 
     _wire_serve_mlx(monkeypatch, set_platform,
-                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    serve=lambda model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None:
                     (_Proc(), f"http://127.0.0.1:{port}", max_context))
     captured = {}
 
@@ -6034,7 +6081,7 @@ def test_serve_mlx_confirm_accepted_proceeds(make_console, monkeypatch, set_plat
         def wait(self):
             pass
     _wire_serve_mlx(monkeypatch, set_platform,
-                    serve=lambda model, *, port, max_context, kv_quant="f16":
+                    serve=lambda model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None:
                     (_Proc(), f"http://127.0.0.1:{port}", max_context))
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr(cli, "_confirm", lambda q: True)
