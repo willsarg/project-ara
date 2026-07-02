@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
 """Inventory of AI/ML applications installed on the machine — GUI apps in /Applications
-plus Homebrew packages — matched against a curated catalog of known AI/ML software.
+plus Homebrew packages on macOS, .desktop entries/Flatpak/Snap on Linux — matched against a
+curated catalog of known AI/ML software.
 
 A different lens from ENGINES (what ARA can launch) and FRAMEWORKS (python libraries):
 this is "what AI software is installed here," organized by what it's for. Read-only.
-macOS-focused (scans /Applications + Homebrew); degrades to whatever it can find elsewhere.
+scan() dispatches on sys.platform; degrades to [] on platforms without a scanner yet.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +93,7 @@ class App:
     brew_recorded: str | None = None     # Homebrew's receipt version, when it manages this
     cask_token: str | None = None        # the matched brew cask token (for drift remediation)
     installed_at: float | None = None    # epoch mtime/birthtime, for "recently installed"
+    source_label: str | None = None      # non-Homebrew provenance (e.g. a Linux packaging system)
 
     @property
     def homebrew(self) -> bool:
@@ -111,6 +116,8 @@ class App:
 
     @property
     def source(self) -> str:
+        if self.source_label is not None:
+            return self.source_label
         if self.cask and self.formula:
             return "Homebrew (cask + formula)"
         if self.cask:
@@ -148,7 +155,16 @@ def _install_time(bundles: list[str], tokens: list[str], in_app: bool) -> float 
 
 
 def scan() -> list[App]:
-    """Installed AI/ML apps from the curated catalog, ordered by category then name."""
+    """Installed AI/ML apps from the curated catalog, ordered by category then name.
+    Dispatches on sys.platform so it stays mockable in tests."""
+    if sys.platform == "darwin":
+        return _scan_macos()
+    if sys.platform.startswith("linux"):
+        return _scan_linux()
+    return []          # Windows slice is a separate follow-up
+
+
+def _scan_macos() -> list[App]:
     formulae, casks = versions.brew_formulae(), versions.brew_casks()
     out: list[App] = []
     for label, category, bundles, tokens in CATALOG:
@@ -172,5 +188,109 @@ def scan() -> list[App]:
         out.append(App(label, category, in_app=in_app, cask=cask, formula=formula,
                        version=version, brew_recorded=brew_recorded, cask_token=cask_token,
                        installed_at=_install_time(bundles, tokens, in_app)))
+    out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
+    return out
+
+
+_LINUX_DESKTOP_DIRS = (
+    Path("/usr/share/applications"),
+    Path.home() / ".local" / "share" / "applications",
+    Path("/var/lib/flatpak/exports/share/applications"),
+)
+
+
+def _linux_desktop_names() -> list[str]:
+    """Display names (the `Name=` field) of every *.desktop entry found in the standard
+    Linux application directories. Missing/unreadable dirs and files degrade to nothing —
+    never raise."""
+    names: list[str] = []
+    for base in _LINUX_DESKTOP_DIRS:
+        try:
+            entries = list(base.glob("*.desktop"))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                text = entry.read_text(errors="ignore")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if line.startswith("Name="):
+                    names.append(line[len("Name="):].strip())
+                    break
+    return names
+
+
+def _flatpak_apps() -> dict[str, str | None]:
+    """{app name: version} for installed Flatpaks, keyed by their display name. Empty if
+    flatpak isn't installed or the call fails."""
+    if not shutil.which("flatpak"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["flatpak", "list", "--columns=application,name,version"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, str | None] = {}
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            name = parts[1].strip()
+            version = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else None
+            if name:
+                result[name] = version
+    return result
+
+
+def _snap_apps() -> dict[str, str | None]:
+    """{snap name: version} for installed Snaps. Empty if snap isn't installed or the call
+    fails."""
+    if not shutil.which("snap"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["snap", "list"], capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, str | None] = {}
+    for line in (out or "").splitlines()[1:]:  # skip the header row
+        parts = line.split()
+        if len(parts) >= 2:
+            result[parts[0]] = parts[1]
+    return result
+
+
+def _scan_linux() -> list[App]:
+    """Installed AI/ML apps on Linux, matched against the curated catalog by label and
+    bundle-name (which double as display names) against .desktop entries, Flatpaks, and
+    Snaps. Ordered identically to _scan_macos."""
+    desktop_names = {n.lower() for n in _linux_desktop_names()}
+    flatpaks_lower = {n.lower(): v for n, v in _flatpak_apps().items()}
+    snaps_lower = {n.lower(): v for n, v in _snap_apps().items()}
+
+    out: list[App] = []
+    for label, category, bundles, _tokens in CATALOG:
+        candidates_lower = [c.lower() for c in (label, *bundles)]
+
+        match_desktop = any(c in desktop_names for c in candidates_lower)
+        flatpak_match = next((c for c in candidates_lower if c in flatpaks_lower), None)
+        snap_match = next((c for c in candidates_lower if c in snaps_lower), None)
+
+        if not (match_desktop or flatpak_match or snap_match):
+            continue
+
+        if flatpak_match is not None:
+            source_label, version = "Flatpak", flatpaks_lower[flatpak_match]
+        elif snap_match is not None:
+            source_label, version = "Snap", snaps_lower[snap_match]
+        else:
+            source_label, version = "app (.desktop)", None
+
+        out.append(App(label, category, in_app=False, cask=False, formula=False,
+                       version=version, source_label=source_label, cask_token=None,
+                       installed_at=None))
     out.sort(key=lambda a: (_ORDER.index(a.category), a.label.lower()))
     return out

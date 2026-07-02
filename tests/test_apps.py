@@ -31,6 +31,13 @@ def test_source_variants():
     assert _app(in_app=True).source == "app (not via Homebrew)"
 
 
+def test_source_label_overrides_homebrew_logic():
+    # source_label set → returned verbatim, bypassing the cask/formula/in_app logic entirely.
+    assert _app(source_label="Flatpak", cask=True, formula=True).source == "Flatpak"
+    # source_label unset (the default) → existing Homebrew logic still applies unchanged.
+    assert _app(cask=True).source == "Homebrew (cask)"
+
+
 # --------------------------------------------------------------------------- #
 # drift (cask GUI self-updated past brew's frozen receipt)
 # --------------------------------------------------------------------------- #
@@ -107,6 +114,7 @@ def test_install_time_none_when_nothing_found(tmp_path, monkeypatch):
 def test_scan_assembles_cask_formula_and_handapp(monkeypatch):
     # LM Studio: cask whose .app self-updated past brew → drift.
     # llama.cpp: formula CLI (no app). Draw Things: hand-installed .app (no brew).
+    monkeypatch.setattr(apps.sys, "platform", "darwin")
     monkeypatch.setattr(apps.versions, "brew_formulae", lambda: {"llama.cpp": "4567"})
     monkeypatch.setattr(apps.versions, "brew_casks", lambda: {"lm-studio": "0.3.0"})
 
@@ -136,6 +144,7 @@ def test_scan_assembles_cask_formula_and_handapp(monkeypatch):
 
 
 def test_scan_skips_absent_and_orders_by_category(monkeypatch):
+    monkeypatch.setattr(apps.sys, "platform", "darwin")
     monkeypatch.setattr(apps.versions, "brew_formulae", lambda: {})
     monkeypatch.setattr(apps.versions, "brew_casks", lambda: {"cursor": "2.0"})
     monkeypatch.setattr(apps.versions, "find_app",
@@ -173,3 +182,176 @@ def test_install_time_brew_dir_iterdir_error_is_none(tmp_path, monkeypatch):
 
 def _raise_oserror(self):
     raise OSError("iterdir blew up")
+
+
+# --------------------------------------------------------------------------- #
+# scan() dispatch
+# --------------------------------------------------------------------------- #
+def test_scan_dispatch_unknown_platform_returns_empty(monkeypatch):
+    monkeypatch.setattr(apps.sys, "platform", "win32")
+    assert apps.scan() == []
+
+
+def test_scan_dispatch_linux_routes_to_scan_linux(monkeypatch):
+    monkeypatch.setattr(apps.sys, "platform", "linux")
+    monkeypatch.setattr(apps, "_scan_linux", lambda: ["sentinel"])
+    assert apps.scan() == ["sentinel"]
+
+
+# --------------------------------------------------------------------------- #
+# _linux_desktop_names
+# --------------------------------------------------------------------------- #
+def test_linux_desktop_names_reads_name_field(tmp_path, monkeypatch):
+    present = tmp_path / "apps1"
+    present.mkdir()
+    (present / "ollama.desktop").write_text("[Desktop Entry]\nName=Ollama\nExec=ollama\n")
+    # no Name= line at all — the inner loop must run to completion without breaking.
+    (present / "noname.desktop").write_text("[Desktop Entry]\nExec=mystery\n")
+    absent = tmp_path / "does-not-exist"       # never created — glob just finds nothing
+    monkeypatch.setattr(apps, "_LINUX_DESKTOP_DIRS", (present, absent))
+    assert apps._linux_desktop_names() == ["Ollama"]
+
+
+def test_linux_desktop_names_dir_glob_oserror_skipped(monkeypatch):
+    class _RaisingDir:
+        def glob(self, pattern):
+            raise OSError("boom")
+
+    monkeypatch.setattr(apps, "_LINUX_DESKTOP_DIRS", (_RaisingDir(),))
+    assert apps._linux_desktop_names() == []
+
+
+def test_linux_desktop_names_file_read_oserror_skipped(tmp_path, monkeypatch):
+    d = tmp_path / "apps"
+    d.mkdir()
+    (d / "bad.desktop").write_text("Name=Bad\n")
+    monkeypatch.setattr(apps, "_LINUX_DESKTOP_DIRS", (d,))
+    monkeypatch.setattr(apps.Path, "read_text", lambda self, **k: (_ for _ in ()).throw(OSError("nope")))
+    assert apps._linux_desktop_names() == []
+
+
+# --------------------------------------------------------------------------- #
+# _flatpak_apps
+# --------------------------------------------------------------------------- #
+def test_flatpak_apps_absent_tool(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: None)
+    assert apps._flatpak_apps() == {}
+
+
+def test_flatpak_apps_parses_output(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: "/usr/bin/flatpak")
+
+    class FakeResult:
+        stdout = (
+            "com.ollama.Ollama\tOllama\t0.5.0\n"
+            "org.x.NoVersion\tNoVersion\t\n"
+            "malformed-line-no-tabs\n"
+            "org.x.NoName\t\t1.0\n"
+        )
+
+    monkeypatch.setattr(apps.subprocess, "run", lambda *a, **k: FakeResult())
+    assert apps._flatpak_apps() == {"Ollama": "0.5.0", "NoVersion": None}
+
+
+def test_flatpak_apps_subprocess_error(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: "/usr/bin/flatpak")
+
+    def raise_err(*a, **k):
+        raise OSError("boom")
+
+    monkeypatch.setattr(apps.subprocess, "run", raise_err)
+    assert apps._flatpak_apps() == {}
+
+
+# --------------------------------------------------------------------------- #
+# _snap_apps
+# --------------------------------------------------------------------------- #
+def test_snap_apps_absent_tool(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: None)
+    assert apps._snap_apps() == {}
+
+
+def test_snap_apps_parses_output(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: "/usr/bin/snap")
+
+    class FakeResult:
+        stdout = (
+            "Name    Version  Rev  Tracking       Publisher  Notes\n"
+            "ollama  0.5.0    123  latest/stable  ollama     -\n"
+            "\n"
+        )
+
+    monkeypatch.setattr(apps.subprocess, "run", lambda *a, **k: FakeResult())
+    assert apps._snap_apps() == {"ollama": "0.5.0"}
+
+
+def test_snap_apps_subprocess_error(monkeypatch):
+    monkeypatch.setattr(apps.shutil, "which", lambda name: "/usr/bin/snap")
+
+    def raise_err(*a, **k):
+        raise OSError("boom")
+
+    monkeypatch.setattr(apps.subprocess, "run", raise_err)
+    assert apps._snap_apps() == {}
+
+
+# --------------------------------------------------------------------------- #
+# _scan_linux — catalog matching against .desktop / Flatpak / Snap
+# --------------------------------------------------------------------------- #
+def _linux_discovery(monkeypatch, desktop=(), flatpak=None, snap=None):
+    monkeypatch.setattr(apps, "_linux_desktop_names", lambda: list(desktop))
+    monkeypatch.setattr(apps, "_flatpak_apps", lambda: dict(flatpak or {}))
+    monkeypatch.setattr(apps, "_snap_apps", lambda: dict(snap or {}))
+
+
+def test_scan_linux_desktop_match(monkeypatch):
+    _linux_discovery(monkeypatch, desktop=["LM Studio"])
+    by = {a.label: a for a in apps._scan_linux()}
+    lms = by["LM Studio"]
+    assert lms.source_label == "app (.desktop)"
+    assert lms.source == "app (.desktop)"
+    assert lms.version is None
+
+
+def test_scan_linux_flatpak_match_with_version(monkeypatch):
+    _linux_discovery(monkeypatch, flatpak={"Ollama": "0.5.1"})
+    by = {a.label: a for a in apps._scan_linux()}
+    o = by["Ollama"]
+    assert o.source_label == "Flatpak" and o.source == "Flatpak"
+    assert o.version == "0.5.1"
+
+
+def test_scan_linux_snap_match_with_version(monkeypatch):
+    _linux_discovery(monkeypatch, snap={"cursor": "1.2.3"})
+    by = {a.label: a for a in apps._scan_linux()}
+    c = by["Cursor"]
+    assert c.source_label == "Snap" and c.source == "Snap"
+    assert c.version == "1.2.3"
+
+
+def test_scan_linux_case_insensitive_matching(monkeypatch):
+    _linux_discovery(monkeypatch, desktop=["chatgpt"])   # catalog label is "ChatGPT"
+    labels = [a.label for a in apps._scan_linux()]
+    assert "ChatGPT" in labels
+
+
+def test_scan_linux_no_match_skipped(monkeypatch):
+    _linux_discovery(monkeypatch)   # nothing installed anywhere
+    assert apps._scan_linux() == []
+
+
+def test_scan_linux_sort_order(monkeypatch):
+    _linux_discovery(monkeypatch, desktop=["Ollama", "LM Studio", "Cursor"])
+    result = apps._scan_linux()
+    order = [(a.category, a.label) for a in result]
+    # runner category before coding, and alphabetical within a category
+    assert order.index(("runner", "LM Studio")) < order.index(("runner", "Ollama"))
+    assert order.index(("runner", "Ollama")) < order.index(("coding", "Cursor"))
+
+
+def test_scan_linux_via_scan_dispatch(monkeypatch):
+    # confirms scan() itself routes to the real _scan_linux implementation on Linux.
+    monkeypatch.setattr(apps.sys, "platform", "linux")
+    _linux_discovery(monkeypatch, desktop=["Ollama"])
+    labels = [a.label for a in apps.scan()]
+    assert labels == ["Ollama"]
