@@ -352,6 +352,11 @@ def test_candidates_excludes_zero_byte_alias(tmp_path, monkeypatch):
 
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.setattr(pythons, "_known_patterns", lambda: [])
+    # Neutralise the executability gate so this test isolates the 0-byte filter cross-OS:
+    # on Windows _is_executable() keys off a PATHEXT extension, and these POSIX-style
+    # extension-less names ("python3", "python3.12") would be rejected there before the
+    # size check — excluding the real interpreter and never exercising the branch we test.
+    monkeypatch.setattr(pythons, "_is_executable", lambda p: True)
 
     groups = pythons._candidates()
     reals = set(groups)
