@@ -30,9 +30,34 @@ import argparse
 import json
 import sys
 
+from .generate import _render_and_count
 from .serve import _pre_load_gate, governed_max_tokens, register_turn_end_tokens
 
 DEFAULT_MAX_TOKENS = 256
+
+
+def _max_effective_ctx(hf_id: str, prompts: list[str], *, max_tokens: int,
+                       ceiling: int) -> int:
+    """Worst-case context this batch can actually reach, capped at *ceiling* — no weights.
+
+    MLX grows its KV cache dynamically, so a batch of prompts only ever reaches
+    ``longest_rendered_prompt + max_tokens`` of context — the honest target for the pre-load
+    memory gate. Gating the raw ceiling instead over-predicts and refuses runs that
+    ``characterize`` already certified safe (the same rationale as ``generate.run``'s
+    ``effective_ctx``; the llama.cpp-family workers rightly gate the raw ceiling because
+    llama.cpp allocates the full KV at ``n_ctx`` up front — MLX does not).
+
+    Counts the RENDERED prompt (chat template applied) with one tokenizer-only load —
+    ``AutoTokenizer.from_pretrained`` never touches weight tensors, preserving
+    refuse-before-load (Rule #1).
+    """
+    longest = 0
+    if prompts:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(hf_id)
+        longest = max(_render_and_count(tok, p)[1] for p in prompts)
+    return min(ceiling, longest + max_tokens)
 
 
 def _run_prompts(prompts: list[str], tokenizer, *, max_tokens: int, ceiling: int,
@@ -84,10 +109,19 @@ def benchmark(hf_id: str, ceiling: int, *, prompts: list[str], margin_gb: float,
     """Gate then (if safe) load once + generate for each prompt; return the result dict.
 
     Refuses before loading if the model is unknown/non-causal or the memory gate vetoes.
+    The gate runs at the batch's EFFECTIVE context (see :func:`_max_effective_ctx`), not the
+    raw ceiling — a short-prompt batch under a large measured window-bound ceiling must not be
+    refused by the uncharacterized-model spike prior for memory it will never touch. If the
+    tokenizer-only count fails (model not cached, template error), it degrades CONSERVATIVELY
+    to gating the raw ceiling, so ``_pre_load_gate`` still reports those cases cleanly.
     The model and tokenizer load once; all prompts are generated in that session.
     Per-prompt governance enforces the ceiling for each prompt individually.
     """
-    refusal, effective_kv = _pre_load_gate(hf_id, ceiling, margin_gb=margin_gb,
+    try:
+        gate_ctx = _max_effective_ctx(hf_id, prompts, max_tokens=max_tokens, ceiling=ceiling)
+    except Exception:
+        gate_ctx = ceiling
+    refusal, effective_kv = _pre_load_gate(hf_id, gate_ctx, margin_gb=margin_gb,
                                            overhead_gb=overhead_gb, kv_bits=kv_bits)
     if refusal is not None:
         return {"context": ceiling, "refused": True, "reason": refusal["reason"]}

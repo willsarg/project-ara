@@ -50,7 +50,15 @@ def _prepare_prompt(hf_id: str, prompt: str):
         return prompt, 0
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(hf_id)
+    return _render_and_count(AutoTokenizer.from_pretrained(hf_id), prompt)
+
+
+def _render_and_count(tok, prompt: str):
+    """The render-to-ids + count core of :func:`_prepare_prompt`, on an already-loaded
+    tokenizer — shared with ``benchmark._max_effective_ctx`` so a batch counts every prompt
+    with ONE tokenizer load. Returns ``(prompt_input, token_count)``; empty prompt → 0."""
+    if not prompt:
+        return prompt, 0
     if getattr(tok, "chat_template", None):
         # Render to STRING, then encode with add_special_tokens=False -> a flat list[int] with a
         # SINGLE <bos> (the template's own), no double-<bos> (#107). Going via tokenize=True here
