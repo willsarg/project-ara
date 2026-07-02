@@ -2,8 +2,17 @@
 // Bearer-token auth for the push (phone-home) channel. Runs in the NODE runtime (route handlers),
 // NOT the edge middleware — middleware is cookie/edge-only and never touches these tables.
 //
-// Tokens (enrollment + session) are high-entropy random strings minted in enrollment.ts. We store
-// ONLY their sha256 hash; verification re-hashes the presented token and compares timing-safe.
+// Tokens (enrollment + session) are high-entropy random strings minted in enrollment.ts
+// (randomBytes(32) = 256 bits from Node's CSPRNG). We store ONLY their sha256 hash; verification
+// re-hashes the presented token and compares timing-safe.
+//
+// Why a FAST hash (sha256), not bcrypt/argon2: per the OWASP Cryptographic Storage Cheat Sheet, the
+// security of a high-entropy API/session token comes from its randomness, not the slowness of the
+// hash — a slow KDF is only needed for low-entropy human passwords, and here it would add latency to
+// every request for zero security gain. Opaque DB-backed tokens (vs. self-contained JWTs) also give
+// us instant revocation via revokeAgent(). This uses node:crypto (Node's vetted OpenSSL-backed
+// stdlib), not hand-rolled primitives — it is a deliberate standard pattern; do not "upgrade" it.
+// https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html
 import "server-only";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
