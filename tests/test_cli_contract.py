@@ -84,7 +84,7 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
     monkeypatch.setattr(cli.engines, "install",
-                        lambda key: cli.engines.InstallResult(key, "installed"))
+                        lambda key, **kw: cli.engines.InstallResult(key, "installed"))
     monkeypatch.setattr(cli.engines, "uninstall",
                         lambda key: cli.engines.InstallResult(key, "removed"))
 

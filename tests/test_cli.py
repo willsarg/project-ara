@@ -254,9 +254,10 @@ def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
 
 
 def test_ara_version_falls_back_when_not_installed(monkeypatch):
+    # _ara_version now lives in engines.py (it also stamps engine envs); cli re-exports it.
     def _missing(name):
-        raise cli.metadata.PackageNotFoundError(name)
-    monkeypatch.setattr(cli.metadata, "version", _missing)
+        raise cli.engines.metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(cli.engines.metadata, "version", _missing)
     assert cli._ara_version() == "0+unknown"
 
 
@@ -1453,7 +1454,7 @@ def test_render_mlx_unmanaged_interp_with_all_packages(make_console, monkeypatch
 def test_render_install_installs_resolved_engine(make_console, monkeypatch):
     monkeypatch.setattr(cli.engines, "resolve", lambda v: "wmx")
     monkeypatch.setattr(cli.engines, "install",
-                        lambda k: cli.engines.InstallResult("wmx", "installed", "ok"))
+                        lambda k, **kw: cli.engines.InstallResult("wmx", "installed", "ok"))
     c, buf = make_console()
     rc = cli.render_install(c, engine="auto")
     assert rc == 0
@@ -1464,7 +1465,7 @@ def test_render_install_installs_resolved_engine(make_console, monkeypatch):
 def _stub_install(monkeypatch, key, status, detail=""):
     monkeypatch.setattr(cli.engines, "resolve", lambda v: key)
     monkeypatch.setattr(cli.engines, "install",
-                        lambda k: cli.engines.InstallResult(k, status, detail))
+                        lambda k, **kw: cli.engines.InstallResult(k, status, detail))
 
 
 def test_render_install_already_present_is_success(make_console, monkeypatch):
@@ -1472,6 +1473,32 @@ def test_render_install_already_present_is_success(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_install(c, engine="wmx") == 0
     assert "already" in buf.getvalue().lower()
+
+
+def test_render_install_refreshed_is_success(make_console, monkeypatch):
+    _stub_install(monkeypatch, "wmx", "refreshed")
+    c, buf = make_console()
+    assert cli.render_install(c, engine="wmx") == 0
+    assert "refreshed" in buf.getvalue().lower()
+
+
+def test_render_install_threads_refresh_to_engines(make_console, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: "wmx")
+    monkeypatch.setattr(cli.engines, "install",
+                        lambda k, *, refresh=False:
+                        seen.update(refresh=refresh) or cli.engines.InstallResult(k, "refreshed"))
+    c, _ = make_console()
+    assert cli.render_install(c, engine="wmx", refresh=True) == 0
+    assert seen == {"refresh": True}
+
+
+def test_render_install_refreshed_json_is_success(monkeypatch, capsys):
+    _stub_install(monkeypatch, "wmx", "refreshed")
+    c = cli.Console(color=False, stream=sys.stderr)
+    rc = cli.render_install(c, engine="wmx", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "refreshed" and rc == 0
 
 
 def test_render_install_coming_soon_exits_nonzero(make_console, monkeypatch):
@@ -1548,7 +1575,7 @@ def test_render_uninstall_json(monkeypatch, capsys):
 def test_main_install_defaults_to_auto(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["install"]) == 0
-    assert rec["install"] == {"engine": "auto", "as_json": False}
+    assert rec["install"] == {"engine": "auto", "refresh": False, "as_json": False}
 
 
 def test_main_install_with_engine_flag(monkeypatch):
@@ -1560,7 +1587,13 @@ def test_main_install_with_engine_flag(monkeypatch):
 def test_main_install_engine_equals_form(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["install", "--engine=wcx", "--json"])
-    assert rec["install"] == {"engine": "wcx", "as_json": True}
+    assert rec["install"] == {"engine": "wcx", "refresh": False, "as_json": True}
+
+
+def test_main_install_refresh_flag_forwarded(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["install", "wmx", "--refresh"])
+    assert rec["install"]["engine"] == "wmx" and rec["install"]["refresh"] is True
 
 
 def test_main_uninstall_with_engine_flag(monkeypatch):
@@ -2556,11 +2589,33 @@ def test_main_uncaught_exception_json_emits_error(monkeypatch, capsys):
 
 
 def test_main_uncaught_exception_without_json_propagates(monkeypatch):
-    # Without --json, behaviour is unchanged: the exception propagates (the friendly-diagnostics
-    # work is a separate backlog item; this guard is scoped to --json honesty only).
+    # Without --json, a NON-EngineEnvError still propagates unchanged (the friendly branch is
+    # scoped to EngineEnvError; anything else surfaces its traceback).
     monkeypatch.setattr(cli, "render_detect", _raise_engine_env)
     with pytest.raises(RuntimeError, match="worker crashed"):
         _run_main(monkeypatch, ["detect"])
+
+
+def _raise_engine_env_error(*a, **k):
+    raise cli.EngineEnvError("cuda env is broken")
+
+
+def test_main_engine_env_error_without_json_is_friendly(monkeypatch, capsys):
+    # An EngineEnvError escaping a command WITHOUT --json prints a friendly one-line diagnostic
+    # (no raw traceback) and exits 1 — the non-json front-door honesty branch (Rule #3).
+    monkeypatch.setattr(cli, "render_detect", _raise_engine_env_error)
+    assert _run_main(monkeypatch, ["detect"]) == 1
+    out = capsys.readouterr().out
+    assert "engine env problem: cuda env is broken" in out
+    assert "ara install" in out
+    assert "Traceback" not in out
+
+
+def test_main_engine_env_error_with_json_is_structured(monkeypatch, capsys):
+    # Under --json the EngineEnvError still becomes a structured {"error": ...} (json branch wins).
+    monkeypatch.setattr(cli, "render_detect", _raise_engine_env_error)
+    assert _run_main(monkeypatch, ["detect", "--json"]) == 1
+    assert "cuda env is broken" in json.loads(capsys.readouterr().out)["error"]
 
 
 # --------------------------------------------------------------------------- #
