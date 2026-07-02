@@ -20,11 +20,16 @@ from ara import db
 
 
 def _read_config(model_id: str) -> dict | None:
-    """Fetch and parse a model's ``config.json`` from the HF cache/hub, or None on failure."""
+    """Parse a model's ``config.json`` from the local HF cache, or None on failure.
+
+    ``local_files_only=True`` — this runs inside ``catalog.scan``, a bulk *local* recon sweep
+    over already-cached models, and recon must never touch the network (hard rule). A model
+    that isn't cached simply falls through to the except below, same as any other failure.
+    """
     from huggingface_hub import hf_hub_download
 
     try:
-        path = hf_hub_download(model_id, "config.json")
+        path = hf_hub_download(model_id, "config.json", local_files_only=True)
         with open(path) as fh:
             return json.load(fh)
     except Exception:

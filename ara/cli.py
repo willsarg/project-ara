@@ -614,9 +614,11 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
 # --------------------------------------------------------------------------- #
 def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
     inventory = apps.scan()
-    # auto_updates lookup (one batched brew call) lives here, in the dedicated command —
+    # auto_updates lookup (one batched brew call, scoped to the casks actually in the
+    # scanned inventory — not every installed cask) lives here, in the dedicated command —
     # never in the detect summary. True = brew defers, so drift is expected, not a conflict.
-    defers = versions.cask_auto_updates()
+    tokens = sorted({a.cask_token for a in inventory if a.cask_token})
+    defers = versions.cask_auto_updates(tokens)
     if as_json:
         print(json.dumps([{
             "label": a.label, "category": a.category, "version": a.version,
@@ -724,8 +726,7 @@ def _emit_apps(c: Console, apps_) -> None:
 
 
 def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
-    procs = status.scan()
-    apps_ = status.scan_apps()
+    procs, apps_ = status._scan_all()  # one process_iter pass feeds both sections
 
     if as_json:
         print(json.dumps({"workloads": [asdict(p) for p in procs],

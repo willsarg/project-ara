@@ -23,7 +23,7 @@ from ara.ui import Console
 @pytest.fixture(autouse=True)
 def _clear_version_caches():
     from ara import versions
-    cached = (versions.brew_formulae, versions.brew_casks, versions.cask_auto_updates)
+    cached = (versions.brew_formulae, versions.brew_casks, versions._cask_auto_updates_cached)
     for f in cached:
         f.cache_clear()
     yield

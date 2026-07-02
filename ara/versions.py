@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import plistlib
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 _APP_DIRS = (Path("/Applications"), Path.home() / "Applications")
@@ -56,17 +58,25 @@ def brew_version(*tokens: str) -> str | None:
     return None
 
 
+def cask_auto_updates(tokens: Iterable[str]) -> dict[str, bool]:
+    """{cask token: auto_updates} for the given cask *tokens* — True when the cask declares
+    that the app updates itself, so brew defers version management (drift is expected, not a
+    conflict). One batched `brew info` call scoped to *tokens* (never the full installed-cask
+    list — that's the caller's job, e.g. the tokens actually present in the scanned AI/ML app
+    inventory) so this can't balloon into a full-catalog fetch. Tokens lowercased, @version
+    stripped."""
+    key = tuple(sorted({t.lower().split("@", 1)[0] for t in tokens if t}))
+    return _cask_auto_updates_cached(key)
+
+
 @functools.lru_cache(maxsize=1)
-def cask_auto_updates() -> dict[str, bool]:
-    """{cask token: auto_updates} for installed casks — True when the cask declares that the
-    app updates itself, so brew defers version management (drift is expected, not a conflict).
-    One batched `brew info` call. Tokens lowercased, @version stripped."""
-    casks = list(brew_casks())
-    if not casks:
+def _cask_auto_updates_cached(tokens: tuple[str, ...]) -> dict[str, bool]:
+    if not tokens:
         return {}
     try:
-        out = subprocess.run(["brew", "info", "--json=v2", "--cask", *casks],
-                             capture_output=True, text=True, timeout=30).stdout
+        env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"}
+        out = subprocess.run(["brew", "info", "--json=v2", "--cask", *tokens],
+                             capture_output=True, text=True, timeout=30, env=env).stdout
         data = json.loads(out)
     except Exception:
         return {}

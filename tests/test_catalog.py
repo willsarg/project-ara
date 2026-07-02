@@ -340,14 +340,21 @@ def test_all_models(store, monkeypatch):
 
 
 def test_read_config_loads_json(tmp_path, monkeypatch):
+    # Recon (catalog.scan) is read-only per the hard rule — hf_hub_download must be called
+    # with local_files_only=True so a cached model never triggers a network etag round-trip.
     cfg = tmp_path / "config.json"
     cfg.write_text('{"num_hidden_layers": 2}')
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda m, f: str(cfg))
+
+    def fake_hf_hub_download(m, f, **kwargs):
+        assert kwargs.get("local_files_only") is True
+        return str(cfg)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_hub_download)
     assert catalog._read_config("m") == {"num_hidden_layers": 2}
 
 
 def test_read_config_none_on_error(monkeypatch):
-    def boom(m, f):
+    def boom(m, f, **kwargs):
         raise RuntimeError("no network")
     monkeypatch.setattr("huggingface_hub.hf_hub_download", boom)
     assert catalog._read_config("m") is None
