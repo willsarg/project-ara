@@ -156,7 +156,8 @@ _COMMAND_HELP = {
     "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
               "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
     "benchmark": ("ara benchmark <model> --use-case <coding|reasoning|agentic|extraction|rag> "
-                  "[--engine E] [--ctx N] [--max-tokens N] [--yes] [--json] — run a capability "
+                  "[--engine E] [--ctx N] [--max-tokens N] [--repeat N] [--yes] [--json] — run a "
+                  "capability "
                   "probe set and store the measured score"),
     "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
 }
@@ -1432,7 +1433,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
 
 def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
                      ctx: int | None = None, max_tokens: int | None = None,
-                     assume_yes: bool = False,
+                     repeat: int = 1, assume_yes: bool = False,
                      exec_consent: bool = False, as_json: bool = False) -> int:
     """Run a capability probe set against *model* and store the score as a measured tier result.
 
@@ -1447,6 +1448,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                    f"{', '.join(benchmark.USE_CASES)}")
     if max_tokens is not None and max_tokens <= 0:
         return err("--max-tokens must be a positive integer")
+    if repeat < 1:
+        return err("--repeat must be a positive integer")
 
     # Hard gate on code execution — un-bypassable by --json/--yes/non-tty (those only suppress the
     # interactive prompt). The coding benchmark runs model-generated Python with full user
@@ -1484,7 +1487,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         if use_case == "coding":
             c.emit(c.style("warn", "  warning: the coding benchmark EXECUTES model-generated "
                                    "Python in a subprocess (NOT a security sandbox)"))
-        if not _confirm(f"Benchmark {model} on {use_case} ({n} prompts)? "
+        scope = f"{n} prompts" if repeat == 1 else f"{n} prompts × {repeat} runs"
+        if not _confirm(f"Benchmark {model} on {use_case} ({scope})? "
                         f"loads the model at ≤{safe} ctx"):
             c.emit(c.style("dim", "  skipped."))
             return 0
@@ -1498,35 +1502,47 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     progress = (not as_json) and sys.stderr.isatty()
     if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
         return rc
-    result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
-    if result.get("refused"):
-        return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+    # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
+    # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
+    # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
+    run_scores: list[float] = []
+    refused_n = 0
+    errored_n = 0
+    for _ in range(repeat):
+        result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+        if result.get("refused"):
+            # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
+            return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+        results = result.get("results", [])
+        refused_n += sum(1 for r in results if r.get("refused"))
+        errored_n += sum(1 for r in results if r.get("error"))
+        completions = [""] * len(prompts)
+        for r in results:
+            idx = r.get("prompt_index")
+            if isinstance(idx, int) and 0 <= idx < len(completions):
+                completions[idx] = r.get("completion", "")
+        run_scores.append(benchmark.score_probe_set(use_case, items, completions))
 
-    results = result.get("results", [])
-    refused_n = sum(1 for r in results if r.get("refused"))
-    errored_n = sum(1 for r in results if r.get("error"))
-    if prompts and (refused_n + errored_n) == len(prompts):
-        # No prompt produced a completion (all refused by governance and/or errored mid-generation)
-        # — that's NOT a 0% capability measurement; refuse to store a misleading score (Rule #3).
+    total = n * repeat                       # total generations attempted across every run
+    if prompts and (refused_n + errored_n) == total:
+        # No generation anywhere produced a completion (all refused by governance and/or errored
+        # mid-generation) — NOT a 0% capability measurement; refuse to store a misleading score.
         return err("every prompt was refused or errored — no measurement taken")
     if refused_n:
-        c.emit(c.style("warn", f"  note: {refused_n}/{len(prompts)} prompts were refused by "
+        c.emit(c.style("warn", f"  note: {refused_n}/{total} prompts were refused by "
                                f"governance and scored 0 — the result is depressed accordingly"))
     if errored_n:
-        c.emit(c.style("warn", f"  note: {errored_n}/{len(prompts)} prompts errored (engine "
+        c.emit(c.style("warn", f"  note: {errored_n}/{total} prompts errored (engine "
                                f"exception) and scored 0 — the result is depressed accordingly"))
 
-    completions = [""] * len(prompts)
-    for r in results:
-        idx = r.get("prompt_index")
-        if isinstance(idx, int) and 0 <= idx < len(completions):
-            completions[idx] = r.get("completion", "")
-
-    score = benchmark.score_probe_set(use_case, items, completions)
+    score = sum(run_scores) / repeat         # MEAN across runs — a better estimate than any one roll
+    lo, hi = min(run_scores), max(run_scores)
     low_confidence = n < 100
     source = f"{key} probe={n} ({model})"
     if low_confidence:
         source += f"; low_confidence n={n}"
+    if repeat > 1:
+        source += f"; repeat={repeat} band={lo * 100:.0f}-{hi * 100:.0f}"
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
     mrow = db.get_model(con, model)
@@ -1542,6 +1558,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if repeat > 1:
+            payload["runs"] = run_scores
+            payload["band"] = [lo, hi]
+            payload["repeat"] = repeat
         if low_confidence:
             payload["low_confidence"] = True
         if refused_n or errored_n:
@@ -1551,7 +1571,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             payload["quant"] = quant
         print(json.dumps(payload))
         return 0
-    score_line = (f"  {use_case}: {score * 100:.0f}% measured here  ({n} prompts, {model})")
+    if repeat > 1:
+        score_line = (f"  {use_case}: {score * 100:.0f}% measured here  "
+                      f"(mean of {repeat} runs, band {lo * 100:.0f}–{hi * 100:.0f}%, "
+                      f"{n} prompts, {model})")
+    else:
+        score_line = (f"  {use_case}: {score * 100:.0f}% measured here  ({n} prompts, {model})")
     if low_confidence:
         score_line += f" (low-confidence: n={n})"
     if refused_n or errored_n:
@@ -1563,6 +1588,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         score_line += f" (partial: {', '.join(partial)})"
     c.emit(c.style("good", score_line))
     c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
+    if repeat > 1 and lo == hi:
+        # Zero variance under greedy decoding is determinism, not measured robustness — say so
+        # honestly rather than let an identical-across-runs band read as evidence of stability.
+        c.emit(c.style("warn", f"  note: all {repeat} runs scored identically — decoding is "
+                               f"deterministic on this engine; the band is not evidence of "
+                               f"stability"))
     if score == 0.0 or score == 1.0:
         c.emit(c.style("warn", "  note: a flat 0%/100% often means a broken probe or "
                                "misconfig — verify before trusting"))
@@ -2269,6 +2300,7 @@ def _main_impl() -> int:
     serve_name: str | None = None                # `serve --name X`: derived served-model name
     use_case: str | None = None                  # `recommend --use-case X`: capability dimension
     max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
+    repeat_val: int = 1                          # `benchmark --repeat N`: runs for the variance band
     include: list[str] = []
     exclude: list[str] = []
     rest: list[str] = []
@@ -2332,6 +2364,16 @@ def _main_impl() -> int:
             continue
         if a.startswith("--max-tokens="):
             max_tokens_val = _int_or_none(a.split("=", 1)[1])
+            continue
+        if a == "--repeat":
+            # Bad/non-integer value → 0, which render_benchmark rejects (the positive-integer gate).
+            p = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
+            repeat_val = p if p is not None else 0
+            skip = True
+            continue
+        if a.startswith("--repeat="):
+            p = _int_or_none(a.split("=", 1)[1])
+            repeat_val = p if p is not None else 0
             continue
         if a == "--name":
             serve_name = argv[i + 1] if i + 1 < len(argv) else None
@@ -2451,7 +2493,8 @@ def _main_impl() -> int:
             return _arg_err("usage: ara benchmark <model> "
                             "--use-case <coding|reasoning|agentic|extraction|rag>")
         return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
-                                max_tokens=max_tokens_val, assume_yes=assume_yes,
+                                max_tokens=max_tokens_val, repeat=repeat_val,
+                                assume_yes=assume_yes,
                                 exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
