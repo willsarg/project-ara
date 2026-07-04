@@ -217,3 +217,76 @@ def test_load_generates_empty_prompt_with_keepalive(monkeypatch):
     assert seen["payload"]["model"] == "x-ara"
     assert seen["payload"]["keep_alive"] == -1
     assert seen["payload"]["prompt"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# pull — fetch a missing model (serve's get-out-of-the-way step)
+# Spec 2026-07-04-ara-serve-one-command-estimated-ceiling.
+# --------------------------------------------------------------------------- #
+def test_pull_success_sends_model_and_returns_true(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload)
+        return {"status": "success"}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+    assert ollama.pull("qwen3:0.6b") is True
+    assert seen["path"] == "/api/pull"
+    assert seen["payload"] == {"model": "qwen3:0.6b", "stream": False}
+
+
+def test_pull_false_when_unreachable(monkeypatch):
+    monkeypatch.setattr(ollama, "_post_json", lambda p, pl, t: None)
+    assert ollama.pull("qwen3:0.6b") is False
+
+
+def test_pull_false_on_non_success_status(monkeypatch):
+    monkeypatch.setattr(ollama, "_post_json", lambda p, pl, t: {"status": "error"})
+    assert ollama.pull("qwen3:0.6b") is False
+
+
+# --------------------------------------------------------------------------- #
+# show — architecture detail for the engine-free estimated ceiling
+# --------------------------------------------------------------------------- #
+def test_show_returns_detail_dict(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload)
+        return {"model_info": {"general.architecture": "qwen3"}}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+    assert ollama.show("qwen3:0.6b") == {"model_info": {"general.architecture": "qwen3"}}
+    assert seen["path"] == "/api/show"
+    assert seen["payload"] == {"model": "qwen3:0.6b"}
+
+
+def test_show_none_when_unreachable(monkeypatch):
+    monkeypatch.setattr(ollama, "_post_json", lambda p, pl, t: None)
+    assert ollama.show("qwen3:0.6b") is None
+
+
+# --------------------------------------------------------------------------- #
+# size_bytes — on-disk weights footprint proxy from /api/tags
+# --------------------------------------------------------------------------- #
+def test_size_bytes_finds_matching_entry(monkeypatch):
+    rows = [{"name": "other:1", "size": 111}, {"name": "qwen3:0.6b", "size": 522_000_000}]
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": rows})
+    assert ollama.size_bytes("qwen3:0.6b") == 522_000_000
+
+
+def test_size_bytes_none_when_absent(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [{"name": "other:1", "size": 1}]})
+    assert ollama.size_bytes("qwen3:0.6b") is None
+
+
+def test_size_bytes_none_when_unreachable(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: None)
+    assert ollama.size_bytes("qwen3:0.6b") is None
+
+
+def test_size_bytes_none_when_size_not_int(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json",
+                        lambda p, t: {"models": [{"name": "qwen3:0.6b", "size": "big"}]})
+    assert ollama.size_bytes("qwen3:0.6b") is None

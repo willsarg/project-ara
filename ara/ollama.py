@@ -92,6 +92,36 @@ def ps(timeout: float = 2.0) -> list[dict] | None:
     return [m for m in models if isinstance(m, dict)]
 
 
+def pull(name: str, timeout: float = 600.0) -> bool:
+    """Fetch *name* into the local Ollama store via ``POST /api/pull`` (non-streamed). ``True`` on
+    success. This is ``serve``'s get-out-of-the-way step — an uninstalled model is pulled rather
+    than refused, so ``ara serve <model>`` is one command. (Streamed progress is a follow-up.)"""
+    data = _post_json("/api/pull", {"model": name, "stream": False}, timeout)
+    return bool(data and data.get("status") == "success")
+
+
+def show(name: str, timeout: float = 30.0) -> dict | None:
+    """Model detail via ``POST /api/show`` — carries ``model_info`` (architecture: ``block_count``,
+    ``head_count_kv``, ``key_length``, ``context_length``), read locally from the model with no
+    network. Feeds the engine-free *estimated* ceiling for a model ARA hasn't measured — the honest
+    source for an Ollama-native model that HF can't describe. ``None`` on failure."""
+    return _post_json("/api/show", {"model": name}, timeout)
+
+
+def size_bytes(name: str, timeout: float = 2.0) -> int | None:
+    """On-disk size (bytes) of installed model *name* from ``GET /api/tags``, or ``None`` when the
+    server is unreachable / the model isn't listed / the size is malformed. The weights-footprint
+    proxy for the analytic estimate (decimal bytes — what the estimator expects)."""
+    data = _get_json("/api/tags", timeout)
+    if not data or not isinstance(data.get("models"), list):
+        return None
+    for m in data["models"]:
+        if isinstance(m, dict) and m.get("name") == name:
+            s = m.get("size")
+            return s if isinstance(s, int) else None
+    return None
+
+
 def create(name: str, from_model: str, num_ctx: int, timeout: float = 300.0) -> bool:
     """Create a derived model ``name`` from ``from_model`` with ``num_ctx`` **baked in** as a
     default parameter, via ``POST /api/create``. Baking the ceiling into the model is what makes

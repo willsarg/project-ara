@@ -1786,6 +1786,37 @@ def _ollama_safe_ceiling(con, mk: str, model: str):
     return best
 
 
+def _ollama_estimated_ceiling(model: str):
+    """The engine-free *estimated* safe ceiling for *model*, as ``(est_context, "estimated", None)``,
+    or ``None`` when the architecture can't be read or the model doesn't fit.
+
+    Reads the model's architecture from Ollama's own ``/api/show`` (llama.cpp-class, local, no
+    network — the honest source for an Ollama-native model HF can't describe) and runs it through
+    the analytic estimator (``ara profile``'s math). The result is conservative (wall − margin) and
+    labelled ``estimated`` — never reported as measured (Rule #3). This is the fallback that lets
+    ``ara serve`` stand a not-yet-characterized model up safely in one command; ``ara characterize``
+    tightens it to ``measured`` later. Spec 2026-07-04-ara-serve-one-command-estimated-ceiling."""
+    detail = ollama.show(model)
+    if not detail:
+        return None
+    info = detail.get("model_info") or {}
+    arch = info.get("general.architecture")
+    if not isinstance(arch, str):
+        return None
+    meta = {
+        "n_layers": info.get(f"{arch}.block_count"),
+        "kv_heads": info.get(f"{arch}.attention.head_count_kv"),
+        "head_dim": info.get(f"{arch}.attention.key_length"),
+        "max_context": info.get(f"{arch}.context_length"),
+    }
+    size = ollama.size_bytes(model)
+    weights_gb = size / 1e9 if size else None            # decimal GB — the estimator's unit
+    lim = estimate.limits(detect.machine())              # heuristic wall: an estimate stays an estimate
+    fit = estimate.model_fit(lim, meta, weights_gb)
+    ec = fit.get("est_context")
+    return (ec, "estimated", None) if ec else None
+
+
 def _governed_name(model: str) -> str:
     """A valid derived Ollama model name carrying the governed ceiling — e.g.
     ``qwen3:0.6b`` → ``qwen3-0.6b-ara``. Anything outside ``[a-z0-9._-]`` becomes ``-``."""
@@ -1895,10 +1926,13 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     The ceiling is **baked into a derived model** (``<model>-ara``): a plain ``/v1`` request reloads
     the base model at its *default* context, blowing past the safe wall (measured 2026-06-26), so
     governing per-request isn't enough. The ceiling is *measured* (a llama.cpp-class
-    characterization) or *explicit* (``--ctx``) — never a silent guess (Rule #1/#3). After load it
-    verifies the ceiling actually took before returning an endpoint. Spec
-    2026-06-26-ara-serve-governed-endpoint. ``--engine wmx`` routes to the governed MLX server
-    instead (spec 2026-06-28); the Ollama path below is unchanged."""
+    characterization), *explicit* (``--ctx``), or — when nothing is measured — a conservative
+    engine-free *estimate* from the model's own ``/api/show`` architecture, always labelled by its
+    true source and never a silent guess (Rule #1/#3). A missing model is pulled rather than refused,
+    so a fresh model serves in one command. After load it verifies the ceiling actually took before
+    returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
+    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine wmx`` routes to the governed MLX
+    server instead (spec 2026-06-28); the Ollama path below is unchanged."""
     if engine is not None:
         key = engines.resolve(engine)
         if key and engines.ENGINES.get(key, {}).get("backend") == "apple":
@@ -1913,12 +1947,17 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     if ollama.version() is None:
         return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
 
-    # 2. the base model must already be in Ollama's store (pull is a later slice)
+    # 2. ensure the base model is in Ollama's store — pull it if missing (get out of the way)
     names = ollama.tags()
     if names is None:
         return err("couldn't list Ollama models — is the server reachable?")
     if model not in names:
-        return err(f"{model} isn't pulled in Ollama — run: ollama pull {model}")
+        if not as_json:
+            c.emit(c.style("dim", f"  pulling {model} …"))
+        if not ollama.pull(model):
+            return err(f"couldn't pull {model} into Ollama — check the model name.")
+        if not as_json:
+            c.emit(c.style("dim", "  pulled."))
 
     # 3. resolve the safe ceiling — measured, or explicit; never guessed
     if ctx is not None:
@@ -1935,10 +1974,18 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     else:
         with db.connected() as con:
             found = _ollama_safe_ceiling(con, profile.machine_key(), model)
+        # No measurement yet → fall back to a conservative engine-free ESTIMATE (labelled as such,
+        # never as measured — Rule #3), so a fresh model still serves safely in one command.
         if found is None:
-            return err(f"no measured safe ceiling for {model} — pass --ctx N, or characterize it "
-                       f"first (Ollama runs llama.cpp; characterize on cpu/vulkan).")
+            found = _ollama_estimated_ceiling(model)
+        if found is None:
+            return err(f"couldn't determine a safe ceiling for {model} — pass --ctx N, or run "
+                       f"`ara characterize {model}` to measure one.")
         safe, source, ceiling_measured_at = found
+        if source == "estimated" and not as_json:
+            c.emit(c.style("dim", "  ceiling ") + c.style("accent", "estimated")
+                   + c.style("dim", " — run ") + c.style("accent", f"ara characterize {model}")
+                   + c.style("dim", " for a measured one"))
 
     _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     # consent — serve creates + holds a model in memory

@@ -4779,9 +4779,14 @@ _SERVE_LOADED = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
 
 
 def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create_ok=True,
-                ps_rows=None, characterization=None, isatty=False):
+                ps_rows=None, characterization=None, isatty=False, pull_ok=True,
+                show=None, size=None):
     """Wire render_serve's Ollama + db seams. ``names=None`` ⇒ tags() unreachable;
-    ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches)."""
+    ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches).
+    ``pull_ok`` is ollama.pull's result; ``show``/``size`` feed the estimated-ceiling fallback."""
+    monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pull_ok)
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: show)
+    monkeypatch.setattr(cli.ollama, "size_bytes", lambda n, timeout=2.0: size)
     monkeypatch.setattr(cli.ollama, "version", lambda timeout=0.5: version)
     monkeypatch.setattr(cli.ollama, "tags",
                         lambda timeout=2.0: (None if names is None else list(names)))
@@ -4809,12 +4814,33 @@ def test_serve_refuses_when_tags_unreachable(make_console, monkeypatch):
     assert "couldn't list Ollama models" in buf.getvalue()
 
 
-def test_serve_refuses_when_model_not_pulled(make_console, monkeypatch):
-    _wire_serve(monkeypatch, names=("other:1",))
+def test_serve_pulls_missing_model_then_serves(make_console, monkeypatch):
+    pulled = []
+    _wire_serve(monkeypatch, names=("other:1",), characterization={"safe_context": 8192},
+                ps_rows=_SERVE_LOADED)
+    monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pulled.append(n) or True)
     c, buf = make_console()
-    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
-    out = buf.getvalue()
-    assert "isn't pulled" in out and "ollama pull qwen3:0.6b" in out
+    assert cli.render_serve(c, "qwen3:0.6b") == 0     # no --ctx: serves at the measured ceiling
+    assert pulled == ["qwen3:0.6b"]
+    assert "pulling qwen3:0.6b" in buf.getvalue()
+
+
+def test_serve_pulls_missing_model_json_is_quiet(make_console, monkeypatch, capsys):
+    # JSON mode: pull still happens, but the "pulling…"/"pulled." lines stay off stdout so the
+    # payload is clean (covers the as_json branches of the pull block).
+    _wire_serve(monkeypatch, names=("other:1",), characterization={"safe_context": 8192},
+                ps_rows=_SERVE_LOADED)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["base_model"] == "qwen3:0.6b" and payload["ceiling_source"] == "measured"
+
+
+def test_serve_refuses_when_pull_fails(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",), pull_ok=False)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 1
+    assert "couldn't pull" in buf.getvalue()
 
 
 def test_serve_rejects_nonpositive_ctx(make_console, monkeypatch):
@@ -4824,11 +4850,35 @@ def test_serve_rejects_nonpositive_ctx(make_console, monkeypatch):
     assert "positive integer" in buf.getvalue()
 
 
-def test_serve_refuses_without_measured_ceiling(make_console, monkeypatch):
-    _wire_serve(monkeypatch, characterization=None)
+def test_serve_uses_estimated_ceiling_when_unmeasured(make_console, monkeypatch, capsys):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)   # nothing measured
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m: (8192, "estimated", None))
     c, buf = make_console()
-    assert cli.render_serve(c, "qwen3:0.6b") == 1          # no --ctx, nothing measured
-    assert "no measured safe ceiling" in buf.getvalue()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["served_context"] == 8192 and payload["ceiling_source"] == "estimated"
+
+
+def test_serve_estimated_ceiling_nudges_to_characterize(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m: (8192, "estimated", None))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    out = buf.getvalue()
+    assert "estimated" in out and "ara characterize qwen3:0.6b" in out
+
+
+def test_serve_refuses_when_neither_measured_nor_estimable(make_console, monkeypatch):
+    _wire_serve(monkeypatch, characterization=None, show=None)   # unmeasured + arch unreadable
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 1               # no --ctx, no guess
+    assert "couldn't determine a safe ceiling" in buf.getvalue()
 
 
 def test_serve_uses_measured_ceiling(make_console, monkeypatch, capsys):
@@ -4959,6 +5009,49 @@ def test_ollama_safe_ceiling_cuda_gguf_wins(monkeypatch):
              "cuda-gguf": {"safe_context": 12000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
     assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured", None)
+
+
+# _ollama_estimated_ceiling — engine-free fallback via Ollama's own /api/show
+# Spec 2026-07-04-ara-serve-one-command-estimated-ceiling.
+_SHOW_QWEN3 = {"model_info": {"general.architecture": "qwen3", "qwen3.block_count": 28,
+               "qwen3.attention.head_count_kv": 8, "qwen3.attention.key_length": 128,
+               "qwen3.context_length": 40960}}
+
+
+def test_ollama_estimated_ceiling_maps_meta_and_delegates(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: _SHOW_QWEN3)
+    monkeypatch.setattr(cli.ollama, "size_bytes", lambda n, timeout=2.0: 500_000_000)
+    monkeypatch.setattr(cli.detect, "machine", lambda: object())
+    monkeypatch.setattr(cli.estimate, "limits", lambda m: {"safe_budget_gb": 10.0})
+    monkeypatch.setattr(cli.estimate, "model_fit",
+                        lambda lim, meta, w: captured.update(meta=meta, w=w, lim=lim)
+                        or {"est_context": 12345})
+    assert cli._ollama_estimated_ceiling("qwen3:0.6b") == (12345, "estimated", None)
+    # /api/show model_info → estimator meta, weights in DECIMAL GB (bytes / 1e9)
+    assert captured["meta"] == {"n_layers": 28, "kv_heads": 8, "head_dim": 128,
+                                "max_context": 40960}
+    assert captured["w"] == 0.5
+    assert captured["lim"] == {"safe_budget_gb": 10.0}
+
+
+def test_ollama_estimated_ceiling_none_when_show_unavailable(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: None)
+    assert cli._ollama_estimated_ceiling("m") is None
+
+
+def test_ollama_estimated_ceiling_none_when_arch_missing(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: {"model_info": {}})
+    assert cli._ollama_estimated_ceiling("m") is None
+
+
+def test_ollama_estimated_ceiling_none_when_estimator_cannot(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: _SHOW_QWEN3)
+    monkeypatch.setattr(cli.ollama, "size_bytes", lambda n, timeout=2.0: None)
+    monkeypatch.setattr(cli.detect, "machine", lambda: object())
+    monkeypatch.setattr(cli.estimate, "limits", lambda m: {"safe_budget_gb": 10.0})
+    monkeypatch.setattr(cli.estimate, "model_fit", lambda lim, meta, w: {"est_context": None})
+    assert cli._ollama_estimated_ceiling("m") is None
 
 
 # --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #
