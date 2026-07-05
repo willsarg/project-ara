@@ -11,16 +11,39 @@ import types
 from ara import db, detect, profile, serialize
 
 
-def test_machine_key_is_composite_and_stable(monkeypatch):
-    monkeypatch.setattr(profile.detect, "chip_name", lambda: "TestCPU")
+def _pin_machine(monkeypatch, *, total: int, chip="TestCPU", accel="TestGPU", os_="Linux"):
+    monkeypatch.setattr(profile.detect, "chip_name", lambda: chip)
     monkeypatch.setattr(profile.detect, "accelerator",
-                        lambda chip: types.SimpleNamespace(name="TestGPU"))
+                        lambda c: types.SimpleNamespace(name=accel))
     monkeypatch.setattr(profile.psutil, "virtual_memory",
-                        lambda: types.SimpleNamespace(total=34359738368))
-    monkeypatch.setattr(profile.platform, "system", lambda: "Linux")
+                        lambda: types.SimpleNamespace(total=total))
+    monkeypatch.setattr(profile.platform, "system", lambda: os_)
+
+
+def test_machine_key_is_versioned_gib_rounded_and_stable(monkeypatch):
+    _pin_machine(monkeypatch, total=34359738368)          # 32 * 2**30 exactly
     k = profile.machine_key()
-    assert k == "TestCPU|TestGPU|34359738368|Linux"
-    assert profile.machine_key() == k          # stable across calls
+    assert k == "ara1|TestCPU|TestGPU|32|Linux"           # versioned + GiB-rounded, not byte-exact
+    assert profile.machine_key() == k                     # stable across calls
+
+
+def test_machine_key_absorbs_reboot_ram_drift(monkeypatch):
+    """A few-MB reboot-to-reboot RAM drift must NOT change the key (the Rule #1 data-loss bug)."""
+    _pin_machine(monkeypatch, total=34359738368)
+    k1 = profile.machine_key()
+    _pin_machine(monkeypatch, total=34359738368 - 8_000_000)   # ~8 MB lower after a reboot
+    assert profile.machine_key() == k1
+
+
+def test_rekey_legacy_key_transforms_and_guards():
+    # legacy 4-field byte-exact key -> versioned GiB-rounded key
+    assert (profile.rekey_legacy_key("TestCPU|TestGPU|34359738368|Linux")
+            == "ara1|TestCPU|TestGPU|32|Linux")
+    # already versioned -> None (nothing to do)
+    assert profile.rekey_legacy_key("ara1|TestCPU|TestGPU|32|Linux") is None
+    # not exactly 4 fields, or non-int RAM -> None (can't transform safely, never corrupt)
+    assert profile.rekey_legacy_key("TestCPU|TestGPU|Linux") is None
+    assert profile.rekey_legacy_key("TestCPU|TestGPU|notanint|Linux") is None
 
 
 def test_capture_persists_machine_and_projection(store, monkeypatch):

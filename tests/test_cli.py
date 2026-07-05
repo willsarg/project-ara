@@ -111,6 +111,9 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_node",
                         lambda c, rest, token=None, as_json=False:
                         (rec.update(node=rest[1:], node_token=token) or 0))
+    monkeypatch.setattr(cli, "render_doctor",
+                        lambda c, rekey=False, as_json=False:
+                        (rec.update(doctor=True, doctor_rekey=rekey, doctor_json=as_json) or 0))
     return rec
 
 
@@ -129,6 +132,74 @@ def test_main_node_enroll_threads_token(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["node", "enroll", "https://c.example", "--token", "ENR"]) == 0
     assert rec["node"] == ["enroll", "https://c.example"] and rec["node_token"] == "ENR"
+
+
+def test_main_doctor_routes(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["doctor"]) == 0
+    assert rec["doctor"] and rec["doctor_rekey"] is False
+
+
+def test_main_doctor_rekey_flag(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["doctor", "--rekey", "--json"]) == 0
+    assert rec["doctor_rekey"] is True and rec["doctor_json"] is True
+
+
+def test_render_doctor_json_reports_key_and_counts(store, monkeypatch, capsys):
+    from ara import db, profile
+    monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    db.save_characterization(store, "ara1|C|G|32|Linux", "cpu", "m1", safe_context=8, points=[])
+    db.save_characterization(store, "someoneelse|X", "cpu", "m2", safe_context=8, points=[])
+    c = cli.Console.from_env()
+    assert cli.render_doctor(c, as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["machine_key"] == "ara1|C|G|32|Linux"
+    assert out["counts"]["characterizations"] == 1      # only this machine's rows
+    assert out["other_keys_rows"] >= 1                    # foreign/legacy rows counted separately
+
+
+def test_render_doctor_rekey_reports_migrated_count(store, monkeypatch, capsys):
+    from ara import db, profile
+    monkeypatch.setattr(profile, "machine_key", lambda: "ara1|TestCPU|TestGPU|32|Linux")
+    db.save_characterization(store, "TestCPU|TestGPU|34359738368|Linux", "cpu", "m1",
+                             safe_context=8, points=[])
+    c = cli.Console.from_env()
+    assert cli.render_doctor(c, rekey=True, as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["rekeyed_rows"] == 1
+
+
+def test_render_doctor_text_variants(store, monkeypatch, make_console):
+    from ara import db, profile
+    monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    db.save_characterization(store, "someoneelse|X", "cpu", "m2", safe_context=8, points=[])
+
+    # rekey=False with foreign rows present → no rekey line, "other machine keys" line shown
+    c, buf = make_console()
+    assert cli.render_doctor(c, rekey=False) == 0
+    text = buf.getvalue()
+    assert "rekeyed" not in text and "ara1|C|G|32|Linux" in text
+    assert "other machine keys" in text and "characterizations" in text
+
+    # rekey=True that migrates a legacy row → "rekeyed 1" line (good style)
+    db.save_characterization(store, "C|G|34359738368|Linux", "cpu", "m1", safe_context=8, points=[])
+    c, buf = make_console()
+    assert cli.render_doctor(c, rekey=True) == 0
+    assert "rekeyed 1 legacy row" in buf.getvalue()
+
+    # rekey=True with nothing legacy left → "rekeyed 0" line (dim style); drop the foreign row so
+    # the "other machine keys" line is skipped too
+    db.save_characterization(store, "C|G|34359738368|Linux", "cpu", "m1", safe_context=8, points=[])
+    with db.connected() as con:
+        con.execute("DELETE FROM characterizations WHERE machine_key='someoneelse|X'")
+        con.commit()
+    # first call migrates the just-added legacy row; second finds nothing to rekey
+    cli.render_doctor(make_console()[0], rekey=True)
+    c, buf = make_console()
+    assert cli.render_doctor(c, rekey=True) == 0
+    out = buf.getvalue()
+    assert "rekeyed 0 legacy row" in out and "other machine keys" not in out
 
 
 def test_main_no_args_shows_landing(monkeypatch):

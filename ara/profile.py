@@ -17,13 +17,41 @@ import psutil
 
 from ara import db, detect, serialize
 
+KEY_VERSION = "ara1"          # machine_key format tag; bump when the key composition changes
+_GIB = 1 << 30
+
 
 def machine_key() -> str:
-    """Stable identity for this machine: chip · accelerator · total RAM · OS."""
+    """Stable identity for this machine: version · chip · accelerator · RAM (GiB) · OS.
+
+    RAM is rounded to the nearest binary GiB, NOT byte-exact: total-RAM readings drift by a few MB
+    across reboots (kernel updates, BIOS reserve, cgroup limits), and a byte-exact key would mint a
+    fresh identity each time — silently orphaning every stored measurement (a Rule #1 data-loss).
+    The ``ara1`` prefix versions the format so a legacy byte-exact key is mechanically detectable and
+    migratable. Spec 2026-07-04-machine-key-stabilization."""
     chip = detect.chip_name()
     accel = detect.accelerator(chip)
-    ram_bytes = psutil.virtual_memory().total
-    return "|".join([chip, accel.name, str(ram_bytes), platform.system()])
+    ram_gib = round(psutil.virtual_memory().total / _GIB)
+    return "|".join([KEY_VERSION, chip, accel.name, str(ram_gib), platform.system()])
+
+
+def rekey_legacy_key(old: str) -> str | None:
+    """The versioned, GiB-rounded form of a *legacy* ``chip|accel|ram_bytes|os`` machine_key, or
+    ``None`` when *old* is already versioned, isn't exactly four ``|`` fields, or its RAM field
+    isn't an integer (can't transform safely → leave it untouched, never corrupt). Pure string
+    transform: deterministic and machine-independent, so the migration is correct even for a DB
+    copied between machines."""
+    if old.startswith(KEY_VERSION + "|"):
+        return None
+    parts = old.split("|")
+    if len(parts) != 4:
+        return None
+    chip, accel, ram, os_ = parts
+    try:
+        ram_gib = round(int(ram) / _GIB)
+    except ValueError:
+        return None
+    return "|".join([KEY_VERSION, chip, accel, str(ram_gib), os_])
 
 
 def capture(con) -> dict:

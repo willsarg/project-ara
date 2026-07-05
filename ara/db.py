@@ -124,7 +124,68 @@ def connect() -> sqlite3.Connection:
         con.execute("DELETE FROM calibrations WHERE engine='wmx'")
         con.execute("PRAGMA user_version = 1")
         con.commit()
+    # One-time rekey (user_version 1→2): legacy byte-exact machine_keys → the versioned
+    # GiB-rounded format, rescuing measurements orphaned by reboot RAM drift (Rule #1 data-loss).
+    # Idempotent + data-preserving. Slug 2026-07-04-machine-key-stabilization.
+    if con.execute("PRAGMA user_version").fetchone()[0] < 2:
+        _rekey_legacy(con)
+        con.execute("PRAGMA user_version = 2")
+        con.commit()
     return con
+
+
+# Tables keyed on machine_key that have a composite PRIMARY KEY (so a rekey can collide): the
+# remaining machine_key columns plus the timestamp used to pick the survivor on a merge.
+_REKEY_PK_TABLES = (
+    ("calibrations", ("engine",), "calibrated_at"),
+    ("characterizations", ("engine", "model_id"), "measured_at"),
+    ("benchmark_results", ("model_id", "use_case"), "measured_at"),
+)
+
+
+def _rekey_pk_table(con: sqlite3.Connection, table: str, pk_rest: tuple[str, ...],
+                    ts: str) -> int:
+    """Rewrite legacy machine_keys in one composite-PK *table* to their versioned form, merging
+    collisions (two legacy keys collapsing to one) by keeping the row with the newest *ts*. Returns
+    the number of legacy rows rekeyed."""
+    from ara import profile
+    rows = [dict(r) for r in con.execute(f"SELECT rowid, * FROM {table}")]  # noqa: S608 — fixed table
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        new_key = profile.rekey_legacy_key(r["machine_key"]) or r["machine_key"]
+        groups.setdefault((new_key, *(r[c] for c in pk_rest)), []).append(r)
+    rekeyed = 0
+    for (new_key, *_), grp in groups.items():
+        legacy_n = sum(1 for r in grp if profile.rekey_legacy_key(r["machine_key"]))
+        if not legacy_n:                       # pure non-legacy group — leave untouched
+            continue
+        winner = max(grp, key=lambda r: ((r[ts] or ""), r["rowid"]))
+        cols = [c for c in winner if c != "rowid"]
+        for r in grp:                          # clear the whole colliding group, then reinsert one
+            con.execute(f"DELETE FROM {table} WHERE rowid=?", (r["rowid"],))  # noqa: S608
+        vals = [new_key if c == "machine_key" else winner[c] for c in cols]
+        con.execute(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                    vals)                       # noqa: S608 — cols are DB-derived identifiers
+        rekeyed += legacy_n
+    return rekeyed
+
+
+def _rekey_legacy(con: sqlite3.Connection) -> int:
+    """Migrate every legacy (byte-exact) machine_key to the versioned GiB-rounded form across all
+    four keyed tables. Idempotent (no legacy keys → 0, no writes) and data-preserving. Returns the
+    number of DB rows rekeyed. See ``profile.rekey_legacy_key`` and Spec
+    2026-07-04-machine-key-stabilization."""
+    from ara import profile
+    n = 0
+    for r in con.execute("SELECT rowid, machine_key FROM profiles").fetchall():
+        new_key = profile.rekey_legacy_key(r["machine_key"])   # append-only: no PK, no collision
+        if new_key:
+            con.execute("UPDATE profiles SET machine_key=? WHERE rowid=?", (new_key, r["rowid"]))
+            n += 1
+    for table, pk_rest, ts in _REKEY_PK_TABLES:
+        n += _rekey_pk_table(con, table, pk_rest, ts)
+    con.commit()
+    return n
 
 
 @contextmanager

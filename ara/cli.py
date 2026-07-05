@@ -2443,6 +2443,40 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
                      "usage: ara node {enroll|run|install|start|stop|status|uninstall}")
 
 
+_DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
+
+
+def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> int:
+    """``ara doctor``: this machine's identity (``machine_key``) and the count of stored records
+    keyed to it, so a user can see at a glance whether ARA still recognises the box. With
+    ``--rekey``, first migrate any lingering legacy (byte-exact) machine_keys to the versioned
+    GiB-rounded form and report how many rows moved (the manual counterpart to the automatic
+    one-time migration). Rows under *other* keys are counted separately, never folded in (Rule #3).
+    Spec 2026-07-04-machine-key-stabilization."""
+    mk = profile.machine_key()
+    with db.connected() as con:
+        rekeyed = db._rekey_legacy(con) if rekey else None
+        counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key=?",  # noqa: S608
+                                 (mk,)).fetchone()[0] for t in _DOCTOR_TABLES}
+        other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
+                                (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
+    if as_json:
+        out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other}
+        if rekey:
+            out["rekeyed_rows"] = rekeyed
+        print(json.dumps(out))
+        return 0
+    if rekey:
+        c.emit(c.style("good" if rekeyed else "dim",
+                       f"  rekeyed {rekeyed} legacy row(s) to the versioned machine_key format"))
+    c.emit(c.style("accent", "  machine  ") + c.style("dim", mk))
+    for name, n in counts.items():
+        c.emit(f"    {name:<18} {n}")
+    if other:
+        c.emit(c.style("dim", f"    ({other} row(s) under other machine keys — not this box)"))
+    return 0
+
+
 def main() -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
@@ -2475,6 +2509,7 @@ def _main_impl() -> int:
     assume_yes = "--yes" in argv or "-y" in argv
     exec_consent = "--exec-consent" in argv      # explicit opt-in to model-code execution (benchmark)
     refresh = "--refresh" in argv                 # `install --refresh`: force reinstall of a present engine
+    rekey = "--rekey" in argv                     # `doctor --rekey`: migrate legacy machine_keys
     flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
     chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
@@ -2591,7 +2626,7 @@ def _main_impl() -> int:
             exclude.extend(_csv(a.split("=", 1)[1]))
             continue
         if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent", "--refresh",
-                 "--no-flash-attn", "--flash-attn",
+                 "--rekey", "--no-flash-attn", "--flash-attn",
                  "--chunked-prefill", "-h", "--help"):
             continue
         rest.append(a)
@@ -2700,6 +2735,9 @@ def _main_impl() -> int:
 
     if cmd == "node":
         return render_node(c, rest, token=token, as_json=as_json)
+
+    if cmd == "doctor":
+        return render_doctor(c, rekey=rekey, as_json=as_json)
 
     if as_json:
         return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")

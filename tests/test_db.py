@@ -40,6 +40,65 @@ def test_connected_closes_on_exception(tmp_path, monkeypatch):
         captured["con"].execute("SELECT 1")   # still closed despite the error
 
 
+_LEGACY = "TestCPU|TestGPU|34359738368|Linux"   # byte-exact 32-GiB legacy key
+_NEW = "ara1|TestCPU|TestGPU|32|Linux"           # its versioned GiB-rounded form
+
+
+def _make_legacy_db(tmp_path, monkeypatch, name="legacy.db"):
+    """A store holding rows under a legacy machine_key, with user_version forced below the
+    rekey migration so a reconnect triggers the one-time auto-migration."""
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / name))
+    con = db.connect()
+    db.save_characterization(con, _LEGACY, "cpu", "m1", safe_context=4096, points=[])
+    db.upsert_calibration(con, _LEGACY, "cpu", fixed_overhead_gb=1.0, calibrated_at="t")
+    db.save_benchmark_result(con, _LEGACY, "m1", "coding", score=1.0, source="s")
+    db.save_profile(con, _LEGACY, "{}")
+    con.execute("PRAGMA user_version = 1")   # simulate a pre-rekey DB
+    con.commit()
+    con.close()
+
+
+def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
+    _make_legacy_db(tmp_path, monkeypatch)
+    con = db.connect()                       # reconnect → one-time auto-migration
+    assert db.get_characterization(con, _NEW, "cpu", "m1")["safe_context"] == 4096
+    assert db.get_calibration(con, _NEW, "cpu") is not None
+    assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
+    assert db.get_latest_profile(con, _NEW) is not None
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
+
+
+def test_rekey_merges_colliding_legacy_keys_keeping_newest(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "collide.db"))
+    a = "TestCPU|TestGPU|34359738368|Linux"       # 32 GiB exact
+    b = "TestCPU|TestGPU|34359730000|Linux"       # a few KB less → same 32-GiB bucket
+    con = db.connect()
+    db.save_characterization(con, a, "cpu", "m1", safe_context=1000, points=[],
+                             measured_at="2026-01-01T00:00:00+00:00")
+    db.save_characterization(con, b, "cpu", "m1", safe_context=2000, points=[],
+                             measured_at="2026-06-01T00:00:00+00:00")
+    con.execute("PRAGMA user_version = 1")
+    con.commit()
+    con.close()
+    con = db.connect()
+    row = db.get_characterization(con, _NEW, "cpu", "m1")
+    assert row is not None and row["safe_context"] == 2000     # newer measured_at wins
+    n = con.execute("SELECT COUNT(*) FROM characterizations WHERE machine_key=?",
+                    (_NEW,)).fetchone()[0]
+    assert n == 1
+
+
+def test_rekey_legacy_returns_rowcount_and_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "manual.db"))
+    con = db.connect()                       # fresh DB: no legacy keys
+    assert db._rekey_legacy(con) == 0        # idempotent no-op on a clean store
+    db.save_characterization(con, _LEGACY, "cpu", "m1", safe_context=1, points=[])
+    db.save_profile(con, _LEGACY, "{}")
+    assert db._rekey_legacy(con) == 2        # 1 characterization + 1 profile row rekeyed
+    assert db._rekey_legacy(con) == 0        # second call finds nothing
+
+
 def test_db_path_uses_override(tmp_path, monkeypatch):
     monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "custom.db"))
     assert db._db_path() == tmp_path / "custom.db"
@@ -88,7 +147,9 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     con = db.connect()
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+    # the migration chain now ends at 2 (wmx purge = v1, then the machine_key rekey = v2); the
+    # single-field key 'm' isn't a legacy 4-field key, so the rekey leaves these rows in place.
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
