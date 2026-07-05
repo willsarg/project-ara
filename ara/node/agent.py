@@ -11,12 +11,14 @@ subprocess, or a wall-clock wait.
 """
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
-from ara.node import capabilities, enroll, health, wiring
+from ara.node import capabilities, config as config_mod, enroll, health, wiring
 from ara.node.client import NodeClient
 
 
@@ -58,6 +60,61 @@ def _reauth(config) -> NodeClient:
     return NodeClient(config.server_url, config.session_token)
 
 
+def _results_dir() -> Path:
+    """Where finished-but-unacknowledged results are spooled (under the node's state dir)."""
+    return config_mod.node_dir() / "results"
+
+
+def _spool_path(job_id: str) -> Path:
+    return _results_dir() / f"{job_id}.json"
+
+
+def _spool_result(job_id: str, payload: dict) -> None:
+    """Persist a finished result to disk BEFORE any network attempt, so a report failure or a crash
+    can never lose completed work (Rule #1). Same job → same outcome, so overwrite is fine."""
+    _results_dir().mkdir(parents=True, exist_ok=True)
+    _spool_path(job_id).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _try_post(client: NodeClient, config, job_id: str, payload: dict):
+    """POST one result. On a 401 (revoked token) re-enroll once and retry with the fresh client.
+    Returns ``(delivered, client)`` and NEVER raises on a report failure — the caller keeps the
+    result spooled for a later retry instead of crashing or discarding it."""
+    try:
+        client.post_result(job_id, payload)
+        return True, client
+    except httpx.HTTPStatusError as exc:
+        if not _is_unauthorized(exc):
+            return False, client
+        client = _reauth(config)                    # token revoked → refresh, then retry once
+    except httpx.HTTPError:
+        return False, client
+    try:
+        client.post_result(job_id, payload)
+        return True, client
+    except httpx.HTTPError:
+        return False, client
+
+
+def _flush_spool(client: NodeClient, config) -> NodeClient:
+    """Re-deliver any durably-spooled results (left by an earlier failure or a crash), removing each
+    on success — so finished work survives a restart. A corrupt spool file is dropped, not retried
+    forever or crashed on."""
+    d = _results_dir()
+    if not d.exists():
+        return client
+    for f in sorted(d.glob("*.json")):
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            f.unlink(missing_ok=True)
+            continue
+        delivered, client = _try_post(client, config, f.stem, payload)
+        if delivered:
+            f.unlink(missing_ok=True)
+    return client
+
+
 def run_loop(config, *, client: NodeClient | None = None,
              runner: Callable[[str, dict], dict] | None = None, wait: float = 20.0,
              max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0,
@@ -82,6 +139,7 @@ def run_loop(config, *, client: NodeClient | None = None,
         count += 1
         health.heartbeat()
         health.status(f"polling for work (iteration {count})")
+        client = _flush_spool(client, config)   # first, deliver anything left by a prior failure/crash
         try:
             job = client.get_work(wait)
         except httpx.HTTPStatusError as exc:
@@ -98,12 +156,12 @@ def run_loop(config, *, client: NodeClient | None = None,
         except Exception as exc:  # noqa: BLE001 — any run failure becomes a reported failed result
             payload = {"status": "failed", "error": f"{type(exc).__name__}: {exc}",
                        "environment": capabilities.environment()}
-        try:
-            client.post_result(job["id"], payload)
-        except httpx.HTTPStatusError as exc:
-            if _is_unauthorized(exc):
-                client = _reauth(config)
-                sleep(reauth_backoff)          # backoff: a persistent 401 mustn't busy-loop
-                continue
-            raise
+        # Durable BEFORE the network: spool the finished result, then post. Only remove it once the
+        # server has acknowledged it — so a 401/5xx/crash retries later instead of losing the work.
+        _spool_result(job["id"], payload)
+        delivered, client = _try_post(client, config, job["id"], payload)
+        if delivered:
+            _spool_path(job["id"]).unlink(missing_ok=True)
+        else:
+            sleep(reauth_backoff)              # bounded backoff; the result stays spooled for retry
     return count

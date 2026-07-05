@@ -3,6 +3,8 @@
 """The node agent loop — dispatch a job to ARA's wiring, report done/failed, bounded iteration."""
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -20,6 +22,17 @@ def _stub_env(monkeypatch):
     monkeypatch.setattr(agent.health, "ready", lambda: None)
     monkeypatch.setattr(agent.health, "heartbeat", lambda: None)
     monkeypatch.setattr(agent.health, "status", lambda msg: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_node_dir(tmp_path, monkeypatch):
+    """The durable result spool lives under node_dir(); point it at a throwaway dir for every test."""
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
+
+
+def _spool_files(tmp_path):
+    d = tmp_path / "node" / "results"
+    return sorted(d.glob("*.json")) if d.exists() else []
 
 
 def _status_error(code: int) -> httpx.HTTPStatusError:
@@ -184,20 +197,96 @@ def test_get_work_non_401_error_propagates():
                        sleep=lambda s: None)
 
 
-def test_post_result_401_reenrolls_and_continues(monkeypatch):
+def test_post_result_401_reenrolls_and_delivers(monkeypatch, tmp_path):
+    """A 401 on report means the token was revoked — re-enroll and DELIVER the result to the fresh
+    client. It must never be silently dropped (the old bug: `continue` discarded finished work)."""
     reenrolled = []
     monkeypatch.setattr(agent.enroll, "enroll_flow", lambda cfg: reenrolled.append(cfg))
-    monkeypatch.setattr(agent, "NodeClient", lambda url, token: FakeClient([None]))
+    fresh = FakeClient([None])
+    monkeypatch.setattr(agent, "NodeClient", lambda url, token: fresh)
     client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
                            post_error=_status_error(401))
     n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
                        sleep=lambda s: None)
-    assert n == 1 and reenrolled                            # revoked-on-report → re-enroll, don't crash
+    assert n == 1 and reenrolled                            # re-enrolled after the 401
+    assert fresh.posted and fresh.posted[0][0] == "j1"      # result delivered, NOT discarded
+    assert _spool_files(tmp_path) == []                     # spool cleaned up on success
 
 
-def test_post_result_non_401_error_propagates():
+def test_post_result_non_401_error_spools_and_does_not_crash(tmp_path):
+    """A non-401 report failure (5xx / network) must NOT crash the agent or lose the finished
+    result — the result stays durably spooled for a later retry (the old bug: it raised)."""
     client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
                            post_error=_status_error(503))
-    with pytest.raises(httpx.HTTPStatusError):
-        agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
+    slept = []
+    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
+                       sleep=lambda s: slept.append(s), reauth_backoff=5.0)
+    assert n == 1                                           # loop survived, no exception
+    spooled = _spool_files(tmp_path)
+    assert len(spooled) == 1 and spooled[0].stem == "j1"   # finished work kept on disk
+    assert 5.0 in slept                                     # bounded backoff after the failure
+
+
+def test_finished_result_spool_is_cleaned_up_on_successful_post(tmp_path):
+    client = FakeClient([{"id": "j1", "kind": "run", "args": {}}, None])
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=2,
+                   sleep=lambda s: None)
+    assert client.posted and client.posted[0][0] == "j1"
+    assert _spool_files(tmp_path) == []                     # delivered → no leftover spool
+
+
+def test_spooled_result_from_prior_crash_is_flushed(tmp_path):
+    """A result left on disk by an earlier crash/failure is re-POSTed on the next loop, then removed
+    — so finished work is delivered even across a restart (crash-safety)."""
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "old.json").write_text(json.dumps({"status": "done", "result": {"x": 1}}))
+    client = FakeClient([None])                             # no new work this iteration
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                   sleep=lambda s: None)
+    assert client.posted == [("old", {"status": "done", "result": {"x": 1}})]   # flushed
+    assert _spool_files(tmp_path) == []                     # removed after delivery
+
+
+def test_post_401_then_reauth_client_also_fails_keeps_spool(tmp_path, monkeypatch):
+    """Token refreshed on 401 but the server is still erroring — the retry fails too; the result
+    must stay spooled (not lost, not crashed on)."""
+    monkeypatch.setattr(agent.enroll, "enroll_flow", lambda cfg: None)
+    monkeypatch.setattr(agent, "NodeClient",
+                        lambda url, token: RaisingClient(post_error=_status_error(503)))
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=_status_error(401))
+    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
                        sleep=lambda s: None)
+    assert n == 1 and len(_spool_files(tmp_path)) == 1      # kept for a later retry
+
+
+def test_post_network_error_spools_and_does_not_crash(tmp_path):
+    """A transport error (not an HTTP status) on report must also spool + survive, not crash."""
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=httpx.ConnectError("connection refused"))
+    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
+                       sleep=lambda s: None)
+    assert n == 1 and len(_spool_files(tmp_path)) == 1
+
+
+def test_flush_keeps_result_when_post_still_fails(tmp_path):
+    """A spooled result whose re-POST still fails stays on disk for the next attempt (not dropped)."""
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "old.json").write_text(json.dumps({"status": "done", "result": {"x": 1}}))
+    client = RaisingClient(post_error=_status_error(503))   # flush post fails; get_work → None
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                   sleep=lambda s: None)
+    assert len(_spool_files(tmp_path)) == 1                 # still spooled
+
+
+def test_flush_skips_and_drops_corrupt_spool_file(tmp_path):
+    """A corrupt spool file can't be delivered — it's dropped, not retried forever or crashed on."""
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "bad.json").write_text("{not json")
+    client = FakeClient([None])
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                   sleep=lambda s: None)
+    assert client.posted == [] and _spool_files(tmp_path) == []
