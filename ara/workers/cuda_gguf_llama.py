@@ -248,7 +248,8 @@ def _vram_total_used_gb() -> tuple[float, float]:
 
 
 def _resolve_gguf(model: str) -> str:
-    """Resolve *model* to a local GGUF path, downloading from HF if needed (smallest .gguf)."""
+    """Resolve *model* to a local GGUF path, downloading from HF if needed (smallest non-mmproj
+    .gguf weight; vision projectors excluded, choice disclosed on stderr)."""
     if model.endswith(".gguf") and os.path.exists(model):
         return model
     from huggingface_hub import HfApi, hf_hub_download
@@ -258,9 +259,15 @@ def _resolve_gguf(model: str) -> str:
         repo = model
         files = [s for s in HfApi().model_info(repo, files_metadata=True).siblings
                  if s.rfilename.endswith(".gguf")]
-        if not files:
-            raise FileNotFoundError(f"no .gguf in {repo}")
-        fname = min(files, key=lambda s: s.size or 1 << 62).rfilename
+        # mmproj-*.gguf is a vision-projector companion, never the LM to load — drop it so a bare
+        # repo id can't silently resolve to the tiny projector (or the most-crushed quant) and
+        # confound whatever runs next. Smallest of the remaining weights, and disclose the pick.
+        weights = [s for s in files
+                   if not os.path.basename(s.rfilename).lower().startswith("mmproj")]
+        if not weights:
+            raise FileNotFoundError(f"no loadable .gguf in {repo}")
+        fname = min(weights, key=lambda s: s.size or 1 << 62).rfilename
+        print(f"ara: selected {fname} from {repo}", file=sys.stderr)
     return hf_hub_download(repo, fname)
 
 
