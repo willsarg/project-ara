@@ -35,23 +35,42 @@ function secretKey(): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
-/** Mint a signed session token. Payload carries only the standard exp claim — no secrets. */
+// A stateless JWT can't be un-signed — "logout" that only deletes the cookie leaves any COPY of the
+// token (stolen, cached, replayed) valid until it expires on its own, up to 7 days later. We fix
+// that with the smallest server-side state that makes logout real: an in-process epoch counter.
+// Every session is minted carrying the CURRENT epoch; verification requires an EXACT match against
+// the current epoch, and logout bumps it — instantly dead-ending every token minted before the bump,
+// with no DB/denylist needed. Trade-off (deliberate, and consistent with this coordinator's existing
+// in-process-only bits like the long-poll dispatcher): the epoch lives in memory, so a process
+// restart resets it to 0 and revives any cookie that was invalidated-but-not-yet-expired. For a
+// single admin-facing Node process that's an acceptable residual risk; a persisted (DB-backed) epoch
+// would close it if that ever matters.
+let sessionEpoch = 0;
+
+/** Invalidate every session minted so far — this IS logout. */
+export function invalidateSessions(): void {
+  sessionEpoch += 1;
+}
+
+/** Mint a signed session token. Payload carries the current epoch (for logout revocation) and the
+ *  standard exp claim — no secrets. */
 export async function createSession(): Promise<string> {
-  return new SignJWT({})
+  return new SignJWT({ ep: sessionEpoch })
     .setProtectedHeader({ alg: ALG })
     .setIssuedAt()
     .setExpirationTime(`${SESSION_TTL_S}s`)
     .sign(secretKey());
 }
 
-/** True iff the token's signature is valid and it has not expired. jose enforces `exp` and — via the
- *  pinned `algorithms` — rejects alg-confusion (e.g. a forged `none`/RS256 header). Any failure
- *  (tamper, garbage, expiry, or no configured secret) resolves to false; never throws. */
+/** True iff the token's signature is valid, it has not expired, AND it was minted under the CURRENT
+ *  epoch (i.e. no logout has happened since). jose enforces `exp` and — via the pinned `algorithms`
+ *  — rejects alg-confusion (e.g. a forged `none`/RS256 header). Any failure (tamper, garbage, expiry,
+ *  stale epoch, or no configured secret) resolves to false; never throws. */
 export async function verifySession(token: string | undefined): Promise<boolean> {
   if (!token) return false;
   try {
-    await jwtVerify(token, secretKey(), { algorithms: [ALG] });
-    return true;
+    const { payload } = await jwtVerify(token, secretKey(), { algorithms: [ALG] });
+    return payload.ep === sessionEpoch;
   } catch {
     return false;
   }
