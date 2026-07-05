@@ -336,7 +336,7 @@ def test_main_profile_passes_json(monkeypatch):
 def test_main_unknown_command_returns_1(monkeypatch, capsys):
     _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["frobnicate"]) == 1
-    assert "isn't built yet" in capsys.readouterr().out
+    assert "isn't a known ARA command" in capsys.readouterr().out
 
 
 def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
@@ -2972,7 +2972,7 @@ def test_main_usage_errors_json(monkeypatch, capsys):
 
 def test_main_unknown_command_json(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["bogus", "--json"]) == 1
-    assert "isn't built yet" in json.loads(capsys.readouterr().out)["error"]
+    assert "isn't a known ARA command" in json.loads(capsys.readouterr().out)["error"]
 
 
 def _raise_engine_env(*a, **k):

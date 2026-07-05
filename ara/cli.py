@@ -2,9 +2,10 @@
 # Copyright 2026 Will Sarg
 """ARA command-line front door.
 
-``ara`` with no arguments renders the landing screen (mirrors wmx-suite's feel).
-``ara detect`` renders read-only machine recon. Subcommands beyond detect aren't
-built yet — this is an early scaffold.
+``ara`` with no arguments renders the landing screen. The full command roster —
+detect/status/apps/python/mlx recon, models/search, profile/characterize/recommend,
+governed run/serve, benchmark, install/uninstall, hf auth, node (fleet), doctor — is
+dispatched below; an unrecognized command falls through to a clear error.
 """
 from __future__ import annotations
 
@@ -2858,8 +2859,8 @@ def _main_impl() -> int:
         return render_doctor(c, rekey=rekey, as_json=as_json)
 
     if as_json:
-        return _arg_err(f"'{rest[0]}' isn't built yet — ARA is an early scaffold.")
-    c.emit(c.style("warn", f"  '{rest[0]}' isn't built yet — ARA is an early scaffold."))
+        return _arg_err(f"'{rest[0]}' isn't a known ARA command — run `ara` for the command list.")
+    c.emit(c.style("warn", f"  '{rest[0]}' isn't a known ARA command — run `ara` for the command list."))
     c.emit(
         c.style("dim", "  run ") + c.style("accent", "ara")
         + c.style("dim", " with no arguments to see the planned commands.")
