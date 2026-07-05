@@ -1817,6 +1817,21 @@ def _ollama_estimated_ceiling(model: str):
     return (ec, "estimated", None) if ec else None
 
 
+def _ollama_pick_best(names: list[str]) -> str | None:
+    """Zero-arg ``ara serve`` selection: of the models already in the Ollama store, the one whose
+    safe ceiling is largest — measured if we have it, else the conservative estimate — so a bare
+    ``ara serve`` stands up the model that gives this machine the most usable context. ``None`` when
+    nothing in the store fits/estimates. Recommend applied to what you already have; no HF round-trip."""
+    mk = profile.machine_key()
+    best_name, best_ceiling = None, -1
+    with db.connected() as con:
+        for n in names:
+            found = _ollama_safe_ceiling(con, mk, n) or _ollama_estimated_ceiling(n)
+            if found and found[0] is not None and found[0] > best_ceiling:
+                best_name, best_ceiling = n, found[0]
+    return best_name
+
+
 def _governed_name(model: str) -> str:
     """A valid derived Ollama model name carrying the governed ceiling — e.g.
     ``qwen3:0.6b`` → ``qwen3-0.6b-ara``. Anything outside ``[a-z0-9._-]`` becomes ``-``."""
@@ -1917,8 +1932,8 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     return 0
 
 
-def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | None = None,
-                 engine: str | None = None,
+def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None,
+                 name: str | None = None, engine: str | None = None,
                  assume_yes: bool = False, as_json: bool = False) -> int:
     """Stand *model* up as a **governed** OpenAI-compatible endpoint on a local Ollama, capped at a
     safe context ceiling, and hand back the connection — then get out of the way (BYO consumer).
@@ -1933,7 +1948,8 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
     2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine wmx`` routes to the governed MLX
     server instead (spec 2026-06-28); the Ollama path below is unchanged."""
-    if engine is not None:
+    auto_selected = model is None    # bare `ara serve` → pick the best-fitting model in the store
+    if engine is not None and model is not None:
         key = engines.resolve(engine)
         if key and engines.ENGINES.get(key, {}).get("backend") == "apple":
             return _render_serve_mlx(c, model, engine_key=key, ctx=ctx,
@@ -1943,14 +1959,32 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
+    if engine is not None and model is None:
+        return err("`ara serve` with no model picks from the Ollama store — pass a model to use "
+                   "--engine.")
+
     # 1. liveness — honest about a server that isn't there (Rule #3)
     if ollama.version() is None:
         return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
 
-    # 2. ensure the base model is in Ollama's store — pull it if missing (get out of the way)
     names = ollama.tags()
     if names is None:
         return err("couldn't list Ollama models — is the server reachable?")
+
+    # 2a. zero-arg: recommend among what's already pulled, then serve the best fit
+    if model is None:
+        if not names:
+            return err("no models in Ollama — pull one (`ollama pull <model>`), or name one: "
+                       "`ara serve <model>`.")
+        model = _ollama_pick_best(names)
+        if model is None:
+            return err("no model in Ollama fits this machine — pull a smaller / more-quantized "
+                       "one, or name one explicitly.")
+        if not as_json:
+            c.emit(c.style("dim", "  auto-selected ") + c.style("accent", model)
+                   + c.style("dim", " (best fit in your Ollama store)"))
+
+    # 2b. named model: ensure it's in the store — pull it if missing (get out of the way)
     if model not in names:
         if not as_json:
             c.emit(c.style("dim", f"  pulling {model} …"))
@@ -2015,7 +2049,7 @@ def render_serve(c: Console, model: str, *, ctx: int | None = None, name: str | 
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
-                          "openai_base_url": endpoint}, indent=2))
+                          "auto_selected": auto_selected, "openai_base_url": endpoint}, indent=2))
         return 0
     c.emit()
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
@@ -2602,10 +2636,9 @@ def _main_impl() -> int:
                           prefill_chunk=prefill_chunk)
 
     if cmd == "serve":
-        if len(rest) < 2:
-            return _arg_err("usage: ara serve <model> [--ctx N] [--name NAME]")
-        return render_serve(c, rest[1], ctx=serve_ctx, name=serve_name, engine=engine,
-                            assume_yes=assume_yes, as_json=as_json)
+        # no model → zero-arg: recommend among the Ollama store, then serve the best fit
+        return render_serve(c, rest[1] if len(rest) >= 2 else None, ctx=serve_ctx,
+                            name=serve_name, engine=engine, assume_yes=assume_yes, as_json=as_json)
 
     if cmd == "benchmark":
         if len(rest) < 2 or use_case is None:

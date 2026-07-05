@@ -5054,6 +5054,81 @@ def test_ollama_estimated_ceiling_none_when_estimator_cannot(monkeypatch):
     assert cli._ollama_estimated_ceiling("m") is None
 
 
+# _ollama_pick_best — zero-arg `ara serve` selection: best-fitting model in the Ollama store
+# Spec 2026-07-04-ara-serve-zero-arg-recommend-then-serve.
+def _wire_pick(monkeypatch):
+    monkeypatch.setattr(cli.db, "connect", lambda: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
+
+
+def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
+    _wire_pick(monkeypatch)
+    ceils = {"a:1": (4000, "estimated", None), "b:1": (9000, "estimated", None),
+             "c:1": (6000, "estimated", None)}
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m: None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: ceils.get(m))
+    assert cli._ollama_pick_best(["a:1", "b:1", "c:1"]) == "b:1"
+
+
+def test_ollama_pick_best_uses_measured_when_present(monkeypatch):
+    _wire_pick(monkeypatch)
+    # a has a measured ceiling; b only an estimate — each model uses its own best source, then
+    # we rank by value (b's 9000 estimate legitimately beats a's 5000 measured).
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling",
+                        lambda con, mk, m: (5000, "measured", None) if m == "a:1" else None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m: (9000, "estimated", None) if m == "b:1" else None)
+    assert cli._ollama_pick_best(["a:1", "b:1"]) == "b:1"
+
+
+def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
+    _wire_pick(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m: None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: None)
+    assert cli._ollama_pick_best(["a:1", "b:1"]) is None
+
+
+def test_serve_zero_arg_selects_and_serves_json(make_console, monkeypatch, capsys):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b",), characterization={"safe_context": 8192},
+                ps_rows=_SERVE_LOADED)
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: "qwen3:0.6b")
+    c, _ = make_console()
+    assert cli.render_serve(c, None, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["base_model"] == "qwen3:0.6b" and payload["auto_selected"] is True
+
+
+def test_serve_zero_arg_text_announces_pick(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b",), characterization={"safe_context": 8192},
+                ps_rows=_SERVE_LOADED)
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: "qwen3:0.6b")
+    c, buf = make_console()
+    assert cli.render_serve(c, None) == 0
+    assert "auto-selected qwen3:0.6b" in buf.getvalue()
+
+
+def test_serve_zero_arg_refuses_when_nothing_fits(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b",))
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: None)
+    c, buf = make_console()
+    assert cli.render_serve(c, None) == 1
+    assert "no model in Ollama fits" in buf.getvalue()
+
+
+def test_serve_zero_arg_refuses_when_store_empty(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=())
+    c, buf = make_console()
+    assert cli.render_serve(c, None) == 1
+    assert "no models in Ollama" in buf.getvalue()
+
+
+def test_serve_zero_arg_with_engine_refuses(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_serve(c, None, engine="wmx") == 1   # can't pick + honor --engine at once
+    assert "pass a model to use --engine" in buf.getvalue()
+
+
 # --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #
 def test_stale_ceiling_note_warns_in_text_mode(make_console, monkeypatch):
     monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda m, ts: True)
@@ -5079,9 +5154,12 @@ def test_stale_ceiling_note_false_and_silent_when_fresh(make_console, monkeypatc
 
 
 # serve dispatch (main argv parsing)
-def test_main_serve_usage_without_model(monkeypatch):
-    _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["serve"]) == 1
+def test_main_serve_no_model_dispatches_zero_arg(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: rec.update(serve={"model": model, **kw}) or 0)
+    assert _run_main(monkeypatch, ["serve"]) == 0     # no model → zero-arg select-then-serve
+    assert rec["serve"]["model"] is None
 
 
 def test_main_serve_dispatches_with_ctx_and_name(monkeypatch):
