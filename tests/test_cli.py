@@ -4797,6 +4797,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     monkeypatch.setattr(cli.db, "connect", lambda: types.SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
+    monkeypatch.setattr(cli.db, "save_characterization", lambda *a, **k: None)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
 
 
@@ -5127,6 +5128,65 @@ def test_serve_zero_arg_with_engine_refuses(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_serve(c, None, engine="wmx") == 1   # can't pick + honor --engine at once
     assert "pass a model to use --engine" in buf.getvalue()
+
+
+# self-healing ceiling: an estimated serve that loads cleanly (no spill) records a `measured`
+# ceiling so the next serve skips the estimate. Spec 2026-07-04-ara-serve-self-healing-ceiling.
+def _wire_save_recorder(monkeypatch):
+    saved = []
+    monkeypatch.setattr(cli.db, "save_characterization",
+                        lambda con, mk, e, m, **kw: saved.append({"engine": e, "model": m, **kw}))
+    return saved
+
+
+def test_serve_estimated_heals_to_measured(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 100, "size_vram": 100}]                # no spill
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    saved = _wire_save_recorder(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    assert saved == [{"engine": "ollama", "model": "qwen3:0.6b", "safe_context": 8192,
+                      "points": [{"context": 8192, "fit": True}], "measured_at": None}]
+    assert "recorded a measured ceiling" in buf.getvalue()
+
+
+def test_serve_estimated_does_not_heal_on_spill(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 200, "size_vram": 100}]                # spilled — no clean evidence
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    saved = _wire_save_recorder(monkeypatch)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    assert saved == []                                      # never record an uncertain ceiling
+
+
+def test_serve_measured_does_not_reheal(make_console, monkeypatch):
+    _wire_serve(monkeypatch, characterization={"safe_context": 8192}, ps_rows=_SERVE_LOADED)
+    saved = _wire_save_recorder(monkeypatch)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    assert saved == []                                      # already measured — nothing to heal
+
+
+def test_serve_estimated_heal_json_flag(make_console, monkeypatch, capsys):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    _wire_save_recorder(monkeypatch)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["recorded_measured"] is True
+
+
+def test_ollama_safe_ceiling_includes_ollama_engine(monkeypatch):
+    # a ceiling measured through Ollama (engine "ollama") is picked up as measured on later serves.
+    chars = {"ollama": {"safe_context": 7777}}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (7777, "measured", None)
 
 
 # --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #

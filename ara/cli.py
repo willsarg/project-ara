@@ -1770,7 +1770,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # --------------------------------------------------------------------------- #
 # Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
 # engines transfers; the MLX (wmx) ceiling does NOT (different allocation model — the seam mismatch).
-_OLLAMA_CEILING_ENGINES = ("cpu", "vulkan", "cuda-gguf")
+_OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "vulkan", "cuda-gguf")
 
 
 def _ollama_safe_ceiling(con, mk: str, model: str):
@@ -2044,12 +2044,27 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     size, vram = entry.get("size"), entry.get("size_vram")
     spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
 
+    # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
+    # that is an empirical measurement, not a guess. Record it (engine "ollama") so the next serve
+    # reads a `measured` ceiling and skips the estimate. Only ever persist observed-good evidence:
+    # never a higher untested ceiling (Rule #1), never a measurement we already had (source
+    # "estimated" only), never on spill (no clean evidence). Rule #3: labelled measured because we
+    # measured it fits.
+    recorded_measured = False
+    if source == "estimated" and not spilled:
+        with db.connected() as con:
+            db.save_characterization(con, profile.machine_key(), "ollama", model,
+                                     safe_context=safe, points=[{"context": safe, "fit": True}],
+                                     measured_at=None)
+        recorded_measured = True
+
     # 6. the handoff — connection info, then ARA exits (the model stays served)
     endpoint = ollama.base_url() + "/v1"
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
-                          "auto_selected": auto_selected, "openai_base_url": endpoint}, indent=2))
+                          "auto_selected": auto_selected, "recorded_measured": recorded_measured,
+                          "openai_base_url": endpoint}, indent=2))
         return 0
     c.emit()
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
@@ -2057,6 +2072,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
     if spilled:
         c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
+    elif recorded_measured:
+        c.emit(c.style("dim", "  recorded a measured ceiling — future serves skip the estimate."))
     c.emit()
     return 0
 
