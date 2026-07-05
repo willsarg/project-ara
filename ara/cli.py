@@ -1380,10 +1380,13 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             if fit["est_context"] is None:
                 unrankable += 1           # honest: count it rather than drop it silently
                 continue
+            quant = row.get("quant") or scoring.quant_key(row["model_id"])
             recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
                          "est_context": fit["est_context"], "max_context": fit["max_context"],
                          "binding": fit["binding"], "fits": True,
-                         "characterized": row["model_id"] in best})
+                         "characterized": row["model_id"] in best,
+                         "quant": quant, "quant_bits": scoring.quant_bits(quant),
+                         "base": scoring.base_key(row["model_id"])})
         if use_case is not None:
             rows = db.list_benchmark_results(con, profile.machine_key())
             bench_measured = ({(r["model_id"], r["use_case"]):
@@ -1448,12 +1451,29 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                         head += f" [quant-inversion: {s.inversion}]"
             tail = f"{head} · {tail}"
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
-        c.emit("  " + c.style("metric", r["model_id"])
+        quant_tag = c.style("dim", f" [{r['quant']}]") if r["quant"] else ""
+        c.emit("  " + c.style("metric", r["model_id"]) + quant_tag
                + c.style("dim", f"  {r['modality'] or '?'}  →  ")
                + c.style("accent", tail) + mark)
     n_char = sum(1 for r in recs if r["characterized"])
     c.emit()
     c.emit(c.style("dim", f"  {len(recs)} fit · {n_char} characterized here"))
+    by_base: dict[str, dict[str, dict]] = {}
+    for r in recs:
+        if r["quant"] is None:
+            continue
+        by_base.setdefault(r["base"], {})[r["quant"]] = r
+    tradeoffs = {base: variants for base, variants in by_base.items() if len(variants) > 1}
+    if tradeoffs:
+        c.emit(c.style("dim", "  tradeoff — same base at multiple quants (fewer bits → more "
+                              "context; more bits → closer to the original weights):"))
+        for base, variants in tradeoffs.items():
+            # bits desc, but a quant whose bit-width we can't map (quant_bits None) sorts last
+            # rather than crashing the comparison (Rule #2 — recommend never blows up).
+            ordered = sorted(variants.values(),
+                             key=lambda r: (r["quant_bits"] is None, -(r["quant_bits"] or 0.0)))
+            parts = ", ".join(f"{r['quant']}(~{r['est_context']} tok)" for r in ordered)
+            c.emit(c.style("dim", f"    {base}: {parts}"))
     _unrankable_note()
     c.emit()
     return 0

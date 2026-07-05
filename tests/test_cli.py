@@ -1965,6 +1965,77 @@ def test_recommend_clean_pair_has_no_inversion_disclosure(monkeypatch, set_platf
     assert all(r["score"]["inversion"] is None for r in payload)
 
 
+# quant-aware recommend: surface each rec's quant + effective bit-width and base, and disclose the
+# precision↔context tradeoff when one base fits at multiple quants.
+# Spec 2026-07-04-recommend-quant-aware.
+def test_recommend_json_carries_quant_fields(monkeypatch, set_platform, capsys):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Llama-3.2-3B-Instruct-4bit", quant="4bit",
+                                weights_gb=2.0, max_context=131072)])
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True) == 0
+    r = json.loads(capsys.readouterr().out)[0]
+    assert r["quant"] == "4bit" and r["quant_bits"] == 4.0
+    assert r["base"] == "llama-3.2-3b-instruct"
+
+
+def test_recommend_quant_falls_back_to_id_when_catalog_has_none(monkeypatch, set_platform, capsys):
+    # Catalog didn't record a quant, but the id carries one → parse it (don't drop the fact).
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Qwen3-8B-Q4_K_M", quant=None, weights_gb=5.0)])
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True) == 0
+    r = json.loads(capsys.readouterr().out)[0]
+    assert r["quant"] == "q4_k_m" and r["quant_bits"] == 4.0
+
+
+def test_recommend_text_shows_quant(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Model-4bit", quant="4bit", weights_gb=4.0)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "4bit" in buf.getvalue()
+
+
+def test_recommend_surfaces_quant_tradeoff(make_console, monkeypatch, set_platform):
+    # Same base at two quants both fit → a tradeoff note names both quants (fewer bits = more ctx).
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Llama-3.2-3B-Instruct-4bit", quant="4bit",
+                                weights_gb=2.0, max_context=131072),
+                     _model_row("org/Llama-3.2-3B-Instruct-8bit", quant="8bit",
+                                weights_gb=4.0, max_context=131072)],
+                    machine=_machine(backend="apple", ram_total_gb=10.0))   # memory-bound → ctx differs
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "tradeoff" in out.lower()
+    note = out[out.lower().index("tradeoff"):]
+    assert "4bit" in note and "8bit" in note
+    assert "llama-3.2-3b-instruct" in note
+
+
+def test_recommend_no_tradeoff_note_for_distinct_bases(make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Llama-3B-4bit", quant="4bit", weights_gb=2.0),
+                     _model_row("org/Qwen-7B-4bit", quant="4bit", weights_gb=4.0)])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "tradeoff" not in buf.getvalue().lower()
+
+
+def test_recommend_quant_tradeoff_survives_unmappable_bits(make_console, monkeypatch, set_platform):
+    # A quant token quant_key recognises but quant_bits can't map (e.g. "q8bit") must NOT crash the
+    # tradeoff sort — it's ordered last, never a TypeError comparing None to a float (Rule #2).
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Foo-q8bit", quant="q8bit", weights_gb=2.0, max_context=131072),
+                     _model_row("org/Foo-4bit", quant="4bit", weights_gb=2.0, max_context=131072)],
+                    machine=_machine(backend="apple", ram_total_gb=10.0))
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0                    # no crash
+    note = buf.getvalue().lower()
+    assert "tradeoff" in note and "q8bit" in note and "4bit" in note
+
+
 def test_main_recommend_dispatch(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["recommend", "--json"])
