@@ -158,6 +158,12 @@ def _pwsh_json(args: list[str]) -> list[dict]:
     except Exception:
         logger.warning("powershell output was not valid JSON for %s: %r", args, raw[:200])
         return []
+    if val is None:
+        # ConvertTo-Json of zero objects emits the literal `null` (e.g. Win32_PhysicalMemory /
+        # BaseBoard enumerate nothing on many VMs). Return [] — NOT [None], which would make every
+        # `rows[0].get(...)` caller crash and discard even psutil-known totals. Warn: it's honest.
+        logger.warning("powershell returned a null payload (no objects) for: %s", args)
+        return []
     return val if isinstance(val, list) else [val]
 
 

@@ -79,6 +79,16 @@ def test_pwsh_json_empty_on_invalid_json(monkeypatch):
     assert hw._pwsh_json(["x"]) == []
 
 
+def test_pwsh_json_empty_on_literal_null(monkeypatch, caplog):
+    """ConvertTo-Json of zero CIM rows (common on VMs where Win32_PhysicalMemory/BaseBoard
+    enumerate nothing) emits the literal ``null``. That must yield [], not [None] — otherwise
+    every caller's ``rows[0].get(...)`` hits None and discards even psutil-known totals."""
+    monkeypatch.setattr(hw, "_run", lambda *a, **k: "null")
+    with caplog.at_level("WARNING"):
+        assert hw._pwsh_json(["Get-CimInstance", "Win32_PhysicalMemory"]) == []
+    assert any("null" in r.getMessage().lower() for r in caplog.records)
+
+
 def test_pwsh_json_warns_on_no_output(monkeypatch, caplog):
     """No signal on failure is a bug: a warning must be emitted when powershell yields nothing,
     and the return value stays [] (unchanged behavior) — Fix 1."""

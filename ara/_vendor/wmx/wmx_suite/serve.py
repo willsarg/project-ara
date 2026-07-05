@@ -371,6 +371,13 @@ def _make_handler(model, tokenizer, ceiling: int, kv_bits: int | None, hf_id: st
     """Return a BaseHTTPRequestHandler subclass closed over the loaded model + config."""
 
     class _Handler(BaseHTTPRequestHandler):
+        # Bound the per-request socket read. This server is single-threaded on purpose, so a client
+        # that sends a valid Content-Length then stalls the body would otherwise hang rfile.read()
+        # forever and wedge the endpoint for every other caller (a slowloris — the same failure
+        # class as the negative-Content-Length hang, via a valid-looking header). With a timeout the
+        # stalled read raises socket.timeout, caught by do_POST's body try/except → a clean HTTP 400.
+        timeout = 30.0
+
         def log_message(self, fmt, *args):  # noqa: N802
             log.debug(fmt, *args)
 

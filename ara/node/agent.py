@@ -52,11 +52,17 @@ def _is_unauthorized(exc: httpx.HTTPStatusError) -> bool:
     return exc.response.status_code == 401
 
 
-def _reauth(config) -> NodeClient:
+def _reauth(config) -> NodeClient | None:
     """Session token rejected (401): drop it, re-run the enroll handshake for a fresh one, and
-    rebuild the client around it."""
+    rebuild the client around it. Returns ``None`` when re-enrollment itself fails — most importantly
+    when the enrollment token was already consumed/revoked (it's single-use, so the coordinator 4xxs
+    the reuse). Absorbing that here is the contract: callers keep the work spooled and back off,
+    rather than the enroll error crashing the agent into a systemd restart loop."""
     config.session_token = None
-    enroll.enroll_flow(config)
+    try:
+        enroll.enroll_flow(config)
+    except httpx.HTTPError:
+        return None
     return NodeClient(config.server_url, config.session_token)
 
 
@@ -86,7 +92,10 @@ def _try_post(client: NodeClient, config, job_id: str, payload: dict):
     except httpx.HTTPStatusError as exc:
         if not _is_unauthorized(exc):
             return False, client
-        client = _reauth(config)                    # token revoked → refresh, then retry once
+        refreshed = _reauth(config)                 # token revoked → refresh, then retry once
+        if refreshed is None:                       # re-enroll failed → keep spooled, retry later
+            return False, client
+        client = refreshed
     except httpx.HTTPError:
         return False, client
     try:
@@ -144,7 +153,9 @@ def run_loop(config, *, client: NodeClient | None = None,
             job = client.get_work(wait)
         except httpx.HTTPStatusError as exc:
             if _is_unauthorized(exc):
-                client = _reauth(config)
+                refreshed = _reauth(config)    # None → re-enroll failed (e.g. consumed token)
+                if refreshed is not None:      # keep the old (dead) client otherwise; it 401s again
+                    client = refreshed         # → we simply back off again, bounded, never crash
                 sleep(reauth_backoff)          # backoff: a persistent 401 mustn't busy-loop
                 continue
             raise

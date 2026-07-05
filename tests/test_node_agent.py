@@ -227,6 +227,46 @@ def test_post_result_non_401_error_spools_and_does_not_crash(tmp_path):
     assert 5.0 in slept                                     # bounded backoff after the failure
 
 
+def test_reauth_returns_none_when_enrollment_token_already_consumed(monkeypatch):
+    """The enrollment token is single-use — re-running enroll_flow after the coordinator burned it
+    (the exact situation on a session revoke) raises. `_reauth` must ABSORB that and return None so
+    callers keep work spooled + back off, instead of letting it crash the agent — Fix #1."""
+    def _raise(cfg):
+        raise _status_error(401)
+    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
+    assert agent._reauth(_cfg()) is None
+
+
+def test_get_work_401_survives_failed_reauth(monkeypatch):
+    """Revoked session + already-consumed enrollment token → enroll_flow raises. The loop must back
+    off and keep running, never crash — otherwise systemd `Restart=on-failure` crash-loops it (the
+    bug: `_reauth` propagated the enroll HTTPStatusError straight out of run_loop) — Fix #1."""
+    def _raise(cfg):
+        raise _status_error(401)
+    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
+    slept = []
+    client = RaisingClient(get_work_error=_status_error(401))
+    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                       sleep=lambda s: slept.append(s), reauth_backoff=5.0)
+    assert n == 1                                          # survived, no exception
+    assert 5.0 in slept                                    # bounded backoff, no busy-loop
+
+
+def test_post_401_failed_reauth_keeps_spool_and_survives(tmp_path, monkeypatch):
+    """Report 401 → reauth, but enroll_flow raises (consumed token). `_try_post` must report
+    not-delivered so the finished result stays spooled for a later retry — never raise/lose it — Fix #1."""
+    def _raise(cfg):
+        raise _status_error(401)
+    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=_status_error(401))
+    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
+                       sleep=lambda s: None)
+    assert n == 1                                          # loop survived
+    spooled = _spool_files(tmp_path)
+    assert len(spooled) == 1 and spooled[0].stem == "j1"   # finished work kept, not lost
+
+
 def test_finished_result_spool_is_cleaned_up_on_successful_post(tmp_path):
     client = FakeClient([{"id": "j1", "kind": "run", "args": {}}, None])
     agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=2,

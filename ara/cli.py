@@ -2018,7 +2018,7 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
             # long-window measured serve (slug 2026-07-02-wmx-serve-measured-provenance-gate).
             measured_slope = _measured_ramp_slope(row)
 
-    _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
+    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Serve {model} on MLX, governed at ≤{safe} ctx?"):
             c.emit(c.style("dim", "  skipped."))
@@ -2036,7 +2036,7 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": model, "served_context": served_ctx,
                           "ceiling_source": source, "openai_base_url": endpoint,
-                          "runtime": "mlx"}, indent=2))
+                          "runtime": "mlx", "stale_ceiling": stale_ceiling}, indent=2))
     else:
         c.emit()
         c.emit(c.field("serving", f"{model}  (MLX @ {served_ctx} ctx, {source})"))
@@ -2151,7 +2151,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                    + c.style("dim", " — run ") + c.style("accent", f"ara characterize {model}")
                    + c.style("dim", " for a measured one"))
 
-    _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
+    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     # consent — serve creates + holds a model in memory
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Stand up {model} on Ollama, governed at ≤{safe} ctx?"):
@@ -2194,7 +2194,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
                           "auto_selected": auto_selected, "recorded_measured": recorded_measured,
-                          "openai_base_url": endpoint}, indent=2))
+                          "stale_ceiling": stale_ceiling, "openai_base_url": endpoint}, indent=2))
         return 0
     c.emit()
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))

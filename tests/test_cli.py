@@ -2202,6 +2202,26 @@ def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_p
     assert "OPENAI_BASE_URL=http://127.0.0.1:12399/v1" in buf.getvalue()
 
 
+def test_serve_mlx_json_carries_stale_ceiling_flag(make_console, monkeypatch, set_platform, capsys):
+    """MLX serve --json must also carry the stale flag (mirrors the Ollama path) — Fix #4."""
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, m: ({"safe_context": 8000,
+                                                "measured_at": "2026-01-01T00:00:00+00:00"}
+                                               if e == "wmx" else None))
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
+    monkeypatch.setattr(cli, "_free_port", lambda: 12399)
+
+    def _fake_serve(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
+        return types.SimpleNamespace(wait=lambda: None), f"http://127.0.0.1:{port}", max_context
+
+    monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
+    c, _ = make_console()
+    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True, as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
+
+
 def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, set_platform):
     # No measured MLX ceiling + no --ctx → refuse, point at characterize (never a guessed ceiling).
     set_platform("Darwin", "arm64")
@@ -5203,6 +5223,17 @@ def test_serve_pulls_missing_model_json_is_quiet(make_console, monkeypatch, caps
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["base_model"] == "qwen3:0.6b" and payload["ceiling_source"] == "measured"
+
+
+def test_serve_ollama_json_carries_stale_ceiling_flag(make_console, monkeypatch, capsys):
+    """Rule #3: a `serve --json` consumer must learn the ceiling it's handed is stale, exactly as
+    the text path warns. Regression for the dropped `_stale_ceiling_note` return (Fix #4)."""
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED,
+                characterization={"safe_context": 8192, "measured_at": "2026-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
 
 
 def test_serve_refuses_when_pull_fails(make_console, monkeypatch):
