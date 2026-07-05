@@ -21,7 +21,9 @@ def enroll_flow(config: config_mod.NodeConfig, *, client: NodeClient | None = No
                 max_polls: int = 30) -> config_mod.NodeConfig:
     """Enroll *config*'s node and block until approved, then persist its session token.
 
-    Raises ``TimeoutError`` if approval doesn't arrive within ``max_polls`` polls."""
+    Raises ``TimeoutError`` if approval doesn't arrive within ``max_polls`` polls, or ``ValueError``
+    up front if the coordinator URL isn't secure (never send a token over cleartext http)."""
+    config_mod.require_secure_url(config.server_url)
     client = client or NodeClient(config.server_url, config.enrollment_token)
     response = client.enroll(capabilities.self_description())
     enrollment_id = response["enrollment_id"]

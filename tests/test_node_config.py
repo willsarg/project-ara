@@ -27,6 +27,20 @@ def test_node_dir_defaults_to_os_data_dir(monkeypatch):
     assert d.name == "node" and d.parent.name == "ara"   # platformdirs user_data_dir("ara")/node
 
 
+def test_require_secure_url_accepts_https_and_local_http():
+    config.require_secure_url("https://c.example")            # TLS → fine
+    config.require_secure_url("http://localhost:8000")        # loopback dev → allowed
+    config.require_secure_url("http://127.0.0.1:8000")
+    config.require_secure_url("http://[::1]:8000")
+
+
+@pytest.mark.parametrize("bad", ["http://coordinator.example", "http://10.0.0.5:8000",
+                                 "ftp://x", "coordinator.example"])
+def test_require_secure_url_rejects_insecure(bad):
+    with pytest.raises(ValueError):
+        config.require_secure_url(bad)
+
+
 def test_load_is_none_when_absent():
     assert config.load() is None
 

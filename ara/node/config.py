@@ -15,8 +15,24 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import platformdirs
+
+_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+
+def require_secure_url(url: str) -> None:
+    """Fail closed unless *url* is https, or http to a loopback host (localhost/127.0.0.1/[::1]) for
+    local dev. A node's enrollment and session tokens ride this URL as bearer credentials, so plain
+    http to a remote coordinator would leak them across the network in cleartext (Rule #1)."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" or (parsed.scheme == "http" and host in _LOOPBACK):
+        return
+    raise ValueError(
+        f"insecure coordinator URL {url!r} — use https:// (http:// is allowed only for localhost). "
+        f"A node's tokens would otherwise cross the network in cleartext.")
 
 
 def node_dir() -> Path:

@@ -37,6 +37,16 @@ def _cfg():
     return config.NodeConfig(server_url="https://c.example", enrollment_token="ENR")
 
 
+def test_enroll_flow_refuses_insecure_url_before_sending_token():
+    """A bearer token would cross the network in cleartext over http:// — enroll must fail closed
+    BEFORE the first request, never handing the enrollment token to an insecure coordinator."""
+    fake = FakeClient([])
+    cfg = config.NodeConfig(server_url="http://coordinator.example", enrollment_token="ENR")
+    with pytest.raises(ValueError):
+        enroll.enroll_flow(cfg, client=fake)
+    assert fake.enrolled_with is None            # token was never sent
+
+
 def test_active_immediately_stores_and_saves_session_token():
     slept = []
     fake = FakeClient([{"status": "active", "session_token": "SES"}])
