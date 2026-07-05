@@ -61,7 +61,8 @@ def test_caution_none_when_unmanaged():
 # --------------------------------------------------------------------------- #
 # origin classification
 # --------------------------------------------------------------------------- #
-def test_origin_classification():
+def test_origin_classification(monkeypatch):
+    monkeypatch.setattr(pythons.platform, "system", lambda: "Darwin")  # /usr/bin here is macOS
     home = os.path.expanduser("~")
     cases = {
         f"{home}/.pyenv/versions/3.12.0/bin/python3": "pyenv",
@@ -74,6 +75,24 @@ def test_origin_classification():
     }
     for real, expected in cases.items():
         assert pythons._origin(real, [real]) == expected, real
+
+
+def test_origin_usr_bin_is_os_aware(monkeypatch):
+    """/usr/bin/python3 is the OS-managed interpreter on BOTH macOS and Linux — it must be labelled
+    by the ACTUAL host, not always 'macOS system' (the bug: a Linux distro python read as macOS)."""
+    monkeypatch.setattr(pythons.platform, "system", lambda: "Linux")
+    assert pythons._origin("/usr/bin/python3", ["/usr/bin/python3"]) == "Linux system"
+    monkeypatch.setattr(pythons.platform, "system", lambda: "Darwin")
+    assert pythons._origin("/usr/bin/python3", ["/usr/bin/python3"]) == "macOS system"
+    # unambiguously-Apple paths stay macOS regardless of host
+    monkeypatch.setattr(pythons.platform, "system", lambda: "Linux")
+    assert pythons._origin("/usr/libexec/python3", ["x"]) == "macOS system"
+
+
+def test_caution_linux_system_externally_managed():
+    i = Interpreter("/usr/bin/python3", "/usr/bin/python3", "Linux system", externally_managed=True)
+    assert i.caution == pythons._CAUTION["Linux system"]
+    assert pythons.manager_of("Linux system", True) == "the distro"
 
 
 def test_origin_classification_windows_paths():

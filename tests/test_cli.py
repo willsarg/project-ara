@@ -359,6 +359,13 @@ def test_render_help_known_command_prints_usage(make_console):
     assert "usage" in out and "ara install" in out
 
 
+def test_render_help_benchmark_lists_exec_consent(make_console):
+    """The coding benchmark REQUIRES --exec-consent; its usage line must advertise it."""
+    c, buf = make_console()
+    assert cli.render_help(c, "benchmark") == 0
+    assert "--exec-consent" in buf.getvalue()
+
+
 def test_render_help_no_or_unknown_command_falls_back_to_landing(monkeypatch, make_console):
     c, _ = make_console()
     seen = {}
@@ -1021,7 +1028,9 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pytho
     cli.render_detect(c)
     out = buf.getvalue()
     assert "Mystery GPU" in out and "VRAM" not in out    # nvidia, but no detail bits
-    assert "none detected" in out                         # no engines present, non-verbose
+    # no third-party launchers, non-verbose: the note must NOT read as a bare "none" that
+    # contradicts the ARA section's own-engine readiness — it points there instead (bug fix).
+    assert "own engine" in out and "ENGINES" in out
     assert "has no AI frameworks" in out                  # default python is bare
     assert "ARA's env (no separate user python)" in out   # framework_python is None
     assert "None found in any interpreter" in out         # discover surfaced nothing

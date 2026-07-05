@@ -16,6 +16,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -33,7 +34,7 @@ _PY_NAME = re.compile(r"^python(3(\.\d+)?)?(\.exe)?$", re.IGNORECASE)
 # Render order: freely-usable / user-managed first, then the tool-managed and
 # system interpreters you shouldn't install into (uv, Homebrew, macOS) clustered last.
 _ORIGIN_ORDER = ["python.org", "pyenv", "conda", "asdf", "venv", "other",
-                 "uv", "Homebrew", "macOS system"]
+                 "uv", "Homebrew", "macOS system", "Linux system"]
 
 
 def _ver_desc(v: str | None) -> tuple[int, ...]:
@@ -72,6 +73,7 @@ class Interpreter:
 # All share one rule — "use a venv, not here" — with a truthful per-manager tail.
 _CAUTION = {
     "macOS system": "managed by Apple — use a venv, never here; don't upgrade it",
+    "Linux system": "managed by your distro — use a venv, not here; install via the OS package manager",
     "Homebrew": "managed by Homebrew — use a venv or pipx, not here; upgrade via brew",
     "uv": "managed by uv — packages go in a venv (uv add), not here; uv may replace it",
 }
@@ -88,7 +90,8 @@ def caution_for(origin: str, externally_managed: bool) -> str | None:
     return None
 
 
-_MANAGER = {"macOS system": "Apple", "Homebrew": "Homebrew", "uv": "uv"}
+_MANAGER = {"macOS system": "Apple", "Linux system": "the distro", "Homebrew": "Homebrew",
+            "uv": "uv"}
 
 
 def manager_of(origin: str, externally_managed: bool) -> str | None:
@@ -185,9 +188,13 @@ def _origin(real: str, invocations: list[str]) -> str:
         return "python.org"
     if has("/opt/homebrew/", "/usr/local/cellar", "/homebrew/"):
         return "Homebrew"
-    if real.startswith("/usr/bin/") or has("/commandlinetools/", "/usr/libexec/",
-                                           "/system/library/frameworks/python.framework"):
-        return "macOS system"
+    if has("/commandlinetools/", "/usr/libexec/",
+           "/system/library/frameworks/python.framework"):
+        return "macOS system"                 # unambiguously Apple paths
+    if real.startswith("/usr/bin/"):
+        # /usr/bin/python3 is the OS-managed system interpreter on BOTH macOS and Linux — label it
+        # by the ACTUAL host so a Linux distro python isn't mislabeled "macOS system" (the bug).
+        return "macOS system" if platform.system() == "Darwin" else "Linux system"
     if _is_venv(real):
         return "venv"
     return "other"

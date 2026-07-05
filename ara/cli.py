@@ -150,9 +150,9 @@ _COMMAND_HELP = {
     "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
               "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
     "benchmark": ("ara benchmark <model> --use-case <coding|reasoning|agentic|extraction|rag> "
-                  "[--engine E] [--ctx N] [--max-tokens N] [--repeat N] [--yes] [--json] — run a "
-                  "capability "
-                  "probe set and store the measured score"),
+                  "[--exec-consent] [--engine E] [--ctx N] [--max-tokens N] [--repeat N] [--yes] "
+                  "[--json] — run a capability probe set and store the measured score "
+                  "(--exec-consent is REQUIRED for the coding probe, which runs model-written code)"),
     "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
 }
 
@@ -458,7 +458,7 @@ def _det_board(c: Console, m) -> None:
 
 def _det_engines(c: Console, m) -> None:
     engines = [rt for rt in m.runtimes if rt.kind == "engine"]
-    c.emit(c.section("  ENGINES") + c.style("dim", "  (what ARA can launch models through)"))
+    c.emit(c.section("  ENGINES") + c.style("dim", "  (third-party launchers found on this system)"))
     for rt in engines:
         if rt.present:
             val = f"{rt.name} {rt.version}" if rt.version else rt.name
@@ -474,7 +474,8 @@ def _det_engines(c: Console, m) -> None:
         elif c.verbose:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
     if not any(rt.present for rt in engines) and not c.verbose:
-        c.emit(c.style("dim", "  none detected"))
+        # NOT a bare "none" — that read as contradicting the ARA section's own-engine readiness.
+        c.emit(c.style("dim", "  none found — ARA runs models through its own engine (see ARA below)"))
     c.emit()
 
 
