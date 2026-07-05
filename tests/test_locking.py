@@ -51,3 +51,31 @@ def test_windows_busy_maps_oserror_to_measurement_busy(tmp_path, monkeypatch):
     with pytest.raises(locking.MeasurementBusy):
         with locking.measurement_lock():
             pass
+
+
+def _fake_fcntl(flock_fn):
+    return types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, flock=flock_fn)
+
+
+def test_posix_branch_locks_and_unlocks_via_fcntl(tmp_path, monkeypatch):
+    # Mirror of the msvcrt test so the POSIX fcntl branch is covered by MOCKS on every host — on a
+    # real Windows runner the branch is otherwise unreachable (fcntl is POSIX-only), leaving it
+    # uncovered and breaking the 100% gate cross-OS.
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "ara.db"))
+    ops = []
+    monkeypatch.setitem(sys.modules, "fcntl", _fake_fcntl(lambda fd, op: ops.append(op)))
+    monkeypatch.setattr(locking, "_is_windows", lambda: False)
+    with locking.measurement_lock():
+        pass
+    assert ops == [2 | 4, 8]                        # LOCK_EX|LOCK_NB to acquire, LOCK_UN to release
+
+
+def test_posix_busy_maps_oserror_to_measurement_busy(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "ara.db"))
+    def boom(fd, op):
+        raise OSError("locked")
+    monkeypatch.setitem(sys.modules, "fcntl", _fake_fcntl(boom))
+    monkeypatch.setattr(locking, "_is_windows", lambda: False)
+    with pytest.raises(locking.MeasurementBusy):
+        with locking.measurement_lock():
+            pass

@@ -400,6 +400,10 @@ def test_discover_assembles_and_orders(monkeypatch):
     }
     monkeypatch.setattr(pythons, "_candidates", lambda: groups)
     monkeypatch.setattr(pythons, "_user_default_real", lambda: "/opt/homebrew/bin/python3.12")
+    # These are macOS-path fixtures, so pin the host: /usr/bin/python3's origin is host-aware
+    # ("macOS system" on Darwin, "Linux system" elsewhere) — without this the assert below flips
+    # on Linux/Windows CI runners.
+    monkeypatch.setattr(pythons.platform, "system", lambda: "Darwin")
 
     probes = {
         "/usr/bin/python3": ("3.9.6", {"torch": None}, False),
