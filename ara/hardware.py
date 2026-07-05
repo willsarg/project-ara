@@ -87,6 +87,7 @@ class GpuInfo:
     vendor: str = "unknown"          # "nvidia" | "amd" | "intel" | "apple" | "unknown"
     name: str | None = None
     vram_gb: float | None = None     # dedicated/carveout VRAM; None = unified/unknown
+    gtt_gb: float | None = None      # GTT (shared system-memory the GPU can use); the real APU pool
     integrated: bool | None = None   # True iGPU/APU/Apple, False discrete, None unknown
     driver_version: str | None = None
     compute_runtime: str | None = None   # "Vulkan 1.4 · RADV · coopmat" / "CUDA 13.1" / "Metal"
@@ -1074,11 +1075,13 @@ def _lspci_names() -> dict[str, str]:
     return names
 
 
-def _drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor):
+def _drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor, gtt_bytes=None):
     """Build a GpuInfo from DRM sysfs fields.
 
     *name* is a fully-resolved display name (marketing → vulkan → lspci tier, applied in
-    _gpus_linux before this call). Falls back to a generic name only if name is None.
+    _gpus_linux before this call). Falls back to a generic name only if name is None. *gtt_bytes*
+    is the amdgpu GTT (shared system-memory) pool — on an APU this, not the tiny VRAM carveout, is
+    the memory the GPU can actually use.
     """
     vendor = _gpu_vendor(vendor_raw)
     resolved_name = name or _GENERIC_GPU_NAME.get(vendor)
@@ -1091,7 +1094,7 @@ def _drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor):
         # (APU-vs-discrete heuristic requires knowing the full GPU list)
         integrated = None
     return GpuInfo(vendor=vendor, name=resolved_name, vram_gb=_gib(vram_bytes),
-                   integrated=integrated)
+                   gtt_gb=_gib(gtt_bytes), integrated=integrated)
 
 
 def _gpus_linux() -> list["GpuInfo"]:
@@ -1108,6 +1111,8 @@ def _gpus_linux() -> list["GpuInfo"]:
         device_raw = _read_text(f"{card}/device/device")
         vram = _read_text(f"{card}/device/mem_info_vram_total")
         vram_bytes = int(vram) if vram and vram.isdigit() else None
+        gtt = _read_text(f"{card}/device/mem_info_gtt_total")   # amdgpu shared pool (APUs)
+        gtt_bytes = int(gtt) if gtt and gtt.isdigit() else None
         vendor = _gpu_vendor(vendor_raw)
         # Name priority: curated marketing map → vulkan device name → lspci name → generic
         # (generic fallback is applied inside _drm_gpu when name is None).
@@ -1117,7 +1122,8 @@ def _gpus_linux() -> list["GpuInfo"]:
             or lspci_name_map.get((device_raw or "").lower())
             or None
         )
-        gpus.append(_drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor))
+        gpus.append(_drm_gpu(vendor_raw, device_raw, vram_bytes, name, cpu_vendor,
+                             gtt_bytes=gtt_bytes))
 
     # APU-vs-discrete heuristic: AMD integrated=True only when the AMD GPU is the sole GPU
     # enumerated AND the CPU vendor is AMD (the common APU/ROG Ally case). When multiple GPUs

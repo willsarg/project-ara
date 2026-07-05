@@ -341,8 +341,15 @@ def _int_or_none(s: str) -> int | None:
 def _gpu_line(c: Console, g) -> None:
     """Render one GpuInfo entry: a name·VRAM line, then a hint sub-line."""
     parts = [g.name or g.vendor.upper()]
+    apu_gtt = g.gtt_gb is not None and g.integrated
     if g.vram_gb is not None:
-        parts.append(f"{g.vram_gb:.0f} GB" + (" (shared)" if g.integrated else ""))
+        # On an APU the vram figure is a small carveout, not the usable pool — say so and show GTT.
+        if apu_gtt:
+            parts.append(f"{g.vram_gb:.0f} GB VRAM carveout")
+        else:
+            parts.append(f"{g.vram_gb:.0f} GB" + (" (shared)" if g.integrated else ""))
+    if apu_gtt:
+        parts.append(f"{g.gtt_gb:.0f} GB shared (GTT)")
     if g.integrated:
         parts.append("integrated")
     c.emit(c.field("gpu", parts[0], " · ".join(parts[1:]) or None))

@@ -1742,6 +1742,37 @@ def test_gpus_linux_reads_sysfs(tmp_path, monkeypatch):
     assert len(gpus) == 1 and gpus[0].name == "Phoenix1" and gpus[0].vendor == "amd"
 
 
+def test_drm_gpu_reads_gtt_shared_pool():
+    from ara import hardware as hw
+    # APU: a tiny VRAM carveout but a large GTT (shared system-memory) pool the GPU can use.
+    g = hw._drm_gpu("0x1002", "0x15bf", 536870912, "Phoenix1",
+                    cpu_vendor="AuthenticAMD", gtt_bytes=25769803776)
+    assert g.vram_gb == hw._gib(536870912)
+    assert g.gtt_gb == hw._gib(25769803776)          # the shared pool, previously dropped
+
+
+def test_drm_gpu_gtt_none_when_absent():
+    from ara import hardware as hw
+    g = hw._drm_gpu("0x10de", "0x2484", 8589934592, "RTX 3070", cpu_vendor="GenuineIntel")
+    assert g.gtt_gb is None                            # discrete card: no GTT reported → None
+
+
+def test_gpus_linux_reads_gtt_total(tmp_path, monkeypatch):
+    from ara import hardware as hw
+    dev = tmp_path / "card1" / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x1002\n")
+    (dev / "device").write_text("0x15bf\n")
+    (dev / "mem_info_vram_total").write_text("536870912\n")     # 0.5 GiB carveout
+    (dev / "mem_info_gtt_total").write_text("25769803776\n")    # 24 GiB shared
+    monkeypatch.setattr(hw, "_DRM_GLOB", str(tmp_path / "card*"))
+    monkeypatch.setattr(hw, "_lspci_names", lambda: {"0x15bf": "Phoenix1"})
+    monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
+    monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
+    gpus = hw._gpus_linux()
+    assert gpus[0].gtt_gb == hw._gib(25769803776) and gpus[0].integrated is True
+
+
 def test_gpus_linux_skips_cards_without_vendor(tmp_path, monkeypatch):
     from ara import hardware as hw
     (tmp_path / "card0" / "device").mkdir(parents=True)   # no vendor file

@@ -1008,6 +1008,26 @@ def test_render_detect_verbose_and_cpu_fallback(monkeypatch, make_console, stub_
     assert out.count("not found") >= 2
 
 
+def test_gpu_line_shows_gtt_shared_pool_for_apu(make_console):
+    """An APU's tiny VRAM carveout must not be shown as its whole GPU memory — surface the GTT
+    shared pool too (Rule #3: reading only mem_info_vram_total under-sold APUs ~2.4x)."""
+    from ara.hardware import GpuInfo
+    g = GpuInfo(vendor="amd", name="Phoenix1", vram_gb=0.5, gtt_gb=24.0, integrated=True)
+    c, buf = make_console()
+    cli._gpu_line(c, g)
+    out = buf.getvalue()
+    assert "carveout" in out and "GTT" in out and "24 GB" in out
+
+
+def test_gpu_line_discrete_gpu_shows_no_gtt(make_console):
+    from ara.hardware import GpuInfo
+    g = GpuInfo(vendor="nvidia", name="RTX 3070", vram_gb=8.0, integrated=False)
+    c, buf = make_console()
+    cli._gpu_line(c, g)
+    out = buf.getvalue()
+    assert "8 GB" in out and "GTT" not in out and "carveout" not in out
+
+
 def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pythons):
     # Drive every "skip the optional line" branch: missing cpu/features, no available
     # RAM, no swap, an nvidia GPU with none of its detail bits, empty/absent stores,
