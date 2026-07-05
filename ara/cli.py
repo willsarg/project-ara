@@ -15,11 +15,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
-                 hf_auth, mlx, ollama, profile, calibration, pythons, scoring, serialize,
+                 hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  staleness, status, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
+from ara.locking import MeasurementBusy
 from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
 from ara.ui import Console
 
@@ -2596,6 +2597,10 @@ def main() -> int:
     try:
         return _main_impl()
     except Exception as exc:   # noqa: BLE001 — deliberate front-door honesty guard
+        if isinstance(exc, MeasurementBusy):   # a concurrent measurement holds the lock — say so
+            print(json.dumps({"error": str(exc)})) if "--json" in sys.argv[1:] \
+                else Console.from_env().emit(Console.from_env().style("warn", f"  {exc}"))
+            return 1
         if "--json" in sys.argv[1:]:
             print(json.dumps({"error": f"ara failed: {exc}"}))
             return 1
@@ -2796,10 +2801,13 @@ def _main_impl() -> int:
     if cmd == "characterize":
         if len(rest) < 2:
             return _arg_err("usage: ara characterize <model>")
-        return render_characterize(c, rest[1], engine=engine, as_json=as_json,
-                                   flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                                   kv_quant=kv_quant, weight_quant=weight_quant,
-                                   prefill_chunk=prefill_chunk)
+        # Hold the machine's measurement lock: a concurrent characterize/benchmark would read this
+        # one's memory footprint into its own reading and store a corrupted ceiling (Rule #1, G9).
+        with locking.measurement_lock():
+            return render_characterize(c, rest[1], engine=engine, as_json=as_json,
+                                       flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                                       kv_quant=kv_quant, weight_quant=weight_quant,
+                                       prefill_chunk=prefill_chunk)
 
     if cmd == "profile":
         return render_profile(c, as_json=as_json, model=model, engine=engine)
@@ -2825,10 +2833,11 @@ def _main_impl() -> int:
         if len(rest) < 2 or use_case is None:
             return _arg_err("usage: ara benchmark <model> "
                             "--use-case <coding|reasoning|agentic|extraction|rag>")
-        return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
-                                max_tokens=max_tokens_val, repeat=repeat_val,
-                                assume_yes=assume_yes,
-                                exec_consent=exec_consent, as_json=as_json)
+        with locking.measurement_lock():        # same measurement lock as characterize (Rule #1, G9)
+            return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
+                                    max_tokens=max_tokens_val, repeat=repeat_val,
+                                    assume_yes=assume_yes,
+                                    exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.

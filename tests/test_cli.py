@@ -3,6 +3,7 @@
 """cli.py — formatters, arg parsing/dispatch, and the render_* surfaces."""
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import types
@@ -246,6 +247,26 @@ def test_main_run_no_flash_attn_disables_and_is_not_in_prompt(monkeypatch):
     _run_main(monkeypatch, ["run", "org/m", "hello", "--no-flash-attn"])
     assert rec["run"]["flash_attn"] is False
     assert rec["run"]["prompt"] == "hello"   # the flag is filtered out of the positional prompt
+
+
+@contextlib.contextmanager
+def _busy_lock():
+    raise cli.MeasurementBusy("another ARA measurement is already running on this machine")
+    yield  # pragma: no cover — unreachable; makes this a generator for @contextmanager
+
+
+def test_characterize_refused_when_a_measurement_is_running_json(monkeypatch, capsys):
+    """A concurrent measurement holds the lock → refuse with a clear message, don't corrupt the
+    reading (Rule #1, G9). Routed through main() so the front-door guard formats it."""
+    monkeypatch.setattr(cli.locking, "measurement_lock", _busy_lock)
+    assert _run_main(monkeypatch, ["characterize", "org/m", "--json"]) == 1
+    assert "already running" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_benchmark_refused_when_a_measurement_is_running_text(monkeypatch, capsys):
+    monkeypatch.setattr(cli.locking, "measurement_lock", _busy_lock)
+    assert _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "coding"]) == 1
+    assert "already running" in capsys.readouterr().out
 
 
 def test_main_characterize_no_flash_attn(monkeypatch):
