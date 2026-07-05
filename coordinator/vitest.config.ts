@@ -22,6 +22,7 @@ export default defineConfig({
         "src/app/actions.ts",
         "src/instrumentation.ts",
         "src/instrumentation-node.ts",
+        "next.config.ts",
       ],
       exclude: ["**/*.tsx"],
       thresholds: {
