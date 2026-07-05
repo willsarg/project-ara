@@ -2,7 +2,7 @@
 // Manage the push channel: issue an enrollment token, approve/deny pending agents, and dispatch work
 // to (or revoke) active ones. Server Component. Agent secrets (session tokens) live only in SQLite
 // as hashes and are never rendered into this page.
-import { listActive, listPending } from "@/lib/enrollment";
+import { listActive, listPending, summarizeAgent } from "@/lib/enrollment";
 import {
   approveAgentAction,
   denyAgentAction,
@@ -97,15 +97,25 @@ export default function NodesPage() {
                 <tr>
                   <th>machine key</th>
                   <th>last seen</th>
+                  <th>serves</th>
                   <th>run a job</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
-                {active.map((a) => (
+                {active.map((a) => {
+                  const { serve_models } = summarizeAgent(a);
+                  return (
                   <tr key={a.id}>
                     <td>{a.machine_key || "—"}</td>
                     <td>{a.last_seen ?? "never"}</td>
+                    <td>
+                      {serve_models.length === 0 ? (
+                        <span className="offline-note">none yet</span>
+                      ) : (
+                        serve_models.map((m) => `${m.id} (${m.engine})`).join(", ")
+                      )}
+                    </td>
                     <td>
                       <form action={submitJobAction} className="rowacts">
                         <input type="hidden" name="agentId" value={a.id} />
@@ -125,7 +135,8 @@ export default function NodesPage() {
                       </form>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}

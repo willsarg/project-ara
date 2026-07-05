@@ -119,18 +119,29 @@ export interface AgentSummary {
   status: string;
   last_seen: string | null;
   caps_count: number;
+  serve_models: { id: string; engine: string }[];
 }
 
 /** Count an agent's advertised capabilities from its stored caps_json (a JSON array), 0 if absent
- *  or malformed. Never throws — a bad blob just yields 0. */
+ *  or malformed, and extract the `serve_model` entries (the models this node can serve). Never
+ *  throws — a bad blob just yields 0 / []. */
 export function summarizeAgent(a: AgentRow): AgentSummary {
   let caps_count = 0;
+  let serve_models: { id: string; engine: string }[] = [];
   if (a.caps_json) {
     try {
       const parsed = JSON.parse(a.caps_json);
-      if (Array.isArray(parsed)) caps_count = parsed.length;
+      if (Array.isArray(parsed)) {
+        caps_count = parsed.length;
+        serve_models = parsed
+          .filter(
+            (c): c is { kind: unknown; id: string; engine?: unknown } =>
+              typeof c === "object" && c !== null && c.kind === "serve_model" && typeof c.id === "string",
+          )
+          .map((c) => ({ id: c.id, engine: typeof c.engine === "string" ? c.engine : "?" }));
+      }
     } catch {
-      /* malformed caps_json → 0 */
+      /* malformed caps_json → 0 / [] */
     }
   }
   return {
@@ -139,6 +150,7 @@ export function summarizeAgent(a: AgentRow): AgentSummary {
     status: a.status,
     last_seen: a.last_seen,
     caps_count,
+    serve_models,
   };
 }
 

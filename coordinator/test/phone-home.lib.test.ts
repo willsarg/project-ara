@@ -299,6 +299,65 @@ describe("dashboard agent-listing helper", () => {
       enroll.summarizeAgent({ ...base, caps_json: '[{"a":1},{"b":2}]' } as never).caps_count,
     ).toBe(2);
   });
+
+  it("summarizeAgent extracts serve_model entries into serve_models: {id, engine}", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    const caps = JSON.stringify([
+      { kind: "serve_model", id: "qwen3:0.6b", engine: "ollama", evidence: "characterized" },
+      { kind: "serve_model", id: "llama3:8b", engine: "wcx", evidence: "characterized" },
+    ]);
+    expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
+      { id: "qwen3:0.6b", engine: "ollama" },
+      { id: "llama3:8b", engine: "wcx" },
+    ]);
+  });
+
+  it("summarizeAgent keeps only serve_model entries out of a mixed capabilities list", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    const caps = JSON.stringify([
+      { kind: "serve_model", id: "qwen3:0.6b", engine: "ollama" },
+      { kind: "quantize", id: "q4_k_m" },
+    ]);
+    expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
+      { id: "qwen3:0.6b", engine: "ollama" },
+    ]);
+  });
+
+  it("summarizeAgent defaults engine to '?' when missing or non-string", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    const caps = JSON.stringify([
+      { kind: "serve_model", id: "qwen3:0.6b" },
+      { kind: "serve_model", id: "llama3:8b", engine: 42 },
+    ]);
+    expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
+      { id: "qwen3:0.6b", engine: "?" },
+      { id: "llama3:8b", engine: "?" },
+    ]);
+  });
+
+  it("summarizeAgent skips non-object entries and entries with a missing/non-string id", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    const caps = JSON.stringify([
+      "not-an-object",
+      42,
+      null,
+      { kind: "serve_model" },
+      { kind: "serve_model", id: 123 },
+      { kind: "serve_model", id: "ok-model", engine: "ollama" },
+    ]);
+    expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
+      { id: "ok-model", engine: "ollama" },
+    ]);
+  });
+
+  it("summarizeAgent yields serve_models [] for absent or malformed caps_json (never throws)", () => {
+    const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    expect(enroll.summarizeAgent({ ...base, caps_json: null } as never).serve_models).toEqual([]);
+    expect(
+      enroll.summarizeAgent({ ...base, caps_json: "not json" } as never).serve_models,
+    ).toEqual([]);
+    expect(enroll.summarizeAgent({ ...base, caps_json: "{}" } as never).serve_models).toEqual([]);
+  });
 });
 
 describe("work queue", () => {
