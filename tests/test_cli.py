@@ -2575,6 +2575,152 @@ def test_weight_quant_hw_error_fp8():
     assert cli._weight_quant_hw_error(object(), "cpu", "fp8") is None       # non-cuda never reaches
 
 
+# --------------------------------------------------------------------------- #
+# characterize --engine ollama: residency ramp → measured ceiling (Slice 2)
+# Spec 2026-07-04-characterize-through-ollama-ramp
+# --------------------------------------------------------------------------- #
+def test_ollama_ramp_contexts_schedule():
+    assert cli._ollama_ramp_contexts(8192) == [2048, 4096, 8192]
+    assert cli._ollama_ramp_contexts(3000) == [2048, 3000]
+    assert cli._ollama_ramp_contexts(1000) == [1000]        # below the floor → just the max
+
+
+def test_ollama_measure_ceiling_finds_the_wall(monkeypatch):
+    st = {"ctx": 0}
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: (st.update(ctx=ctx), True)[1])
+    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "ps",  # spill (size_vram < size) once ctx reaches 8192
+                        lambda: [{"name": "pr", "context_length": st["ctx"],
+                                  "size": 1000, "size_vram": 500 if st["ctx"] >= 8192 else 1000}])
+    best, points = cli._ollama_measure_ceiling("m", 8192, "pr")
+    assert best == 4096                                     # largest no-spill rung
+    assert [p["fit"] for p in points] == [True, True, False]
+
+
+def test_ollama_measure_ceiling_all_rungs_fit(monkeypatch):
+    st = {"ctx": 0}
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: (st.update(ctx=ctx), True)[1])
+    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "ps",   # never spills → ramp runs to the top rung
+                        lambda: [{"name": "pr", "context_length": st["ctx"],
+                                  "size": 1000, "size_vram": 1000}])
+    best, points = cli._ollama_measure_ceiling("m", 8192, "pr")
+    assert best == 8192 and all(p["fit"] for p in points)
+
+
+def test_ollama_measure_ceiling_none_when_floor_spills(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
+    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "ps",
+                        lambda: [{"name": "pr", "context_length": 2048,
+                                  "size": 1000, "size_vram": 400}])
+    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    assert best is None and points[0]["fit"] is False
+
+
+def test_ollama_measure_ceiling_stops_on_create_fail(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: False)
+    best, points = cli._ollama_measure_ceiling("m", 4096, "pr")
+    assert best is None and points == []
+
+
+def test_ollama_measure_ceiling_stops_when_governance_not_taken(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
+    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [])       # nothing loaded → entry None
+    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    assert best is None and points[0]["fit"] is False
+
+
+def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
+    monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
+    monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
+    monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
+
+
+def test_characterize_ollama_measures_records_and_cleans_up(store, monkeypatch, capsys):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    deleted = {}
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.update(n=name) or True)
+    c = cli.Console.from_env()
+    # a bare Ollama name (colon) must NOT be rejected as an invalid HF ref — the ollama path
+    # branches before valid_model_ref.
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama", as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["safe_context"] == 4096 and out["source"] == "measured" and out["engine"] == "ollama"
+    assert deleted["n"].endswith("-probe")                 # probe model cleaned up
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")["safe_context"] == 4096
+
+
+def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
+    out = buf.getvalue()
+    assert "measured ceiling" in out and "4096" in out
+
+
+def test_characterize_ollama_records_none_when_it_spills(store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda model, mc, probe: (None, [{"context": 2048, "fit": False}]))
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
+    assert "no no-spill ceiling" in buf.getvalue()
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")["safe_context"] is None
+
+
+def test_characterize_ollama_not_serving(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "Ollama isn't serving" in buf.getvalue()
+
+
+def test_characterize_ollama_tags_unreachable(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
+    monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "couldn't list Ollama models" in buf.getvalue()
+
+
+def test_characterize_ollama_not_in_store(make_console, monkeypatch):
+    _wire_char_ollama(monkeypatch, in_store=False)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "isn't in Ollama" in buf.getvalue()
+
+
+def test_characterize_ollama_no_max_context(make_console, monkeypatch):
+    _wire_char_ollama(monkeypatch, max_ctx=None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "context length" in buf.getvalue()
+
+
+def test_ollama_max_context_reads_arch(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "show", lambda m: {"model_info": {
+        "general.architecture": "qwen3", "qwen3.context_length": 32768}})
+    assert cli._ollama_max_context("qwen3:0.6b") == 32768
+    monkeypatch.setattr(cli.ollama, "show", lambda m: None)
+    assert cli._ollama_max_context("x") is None
+    monkeypatch.setattr(cli.ollama, "show", lambda m: {"model_info": {"general.architecture": 5}})
+    assert cli._ollama_max_context("x") is None
+    monkeypatch.setattr(cli.ollama, "show", lambda m: {"model_info": {
+        "general.architecture": "llama", "llama.context_length": 0}})
+    assert cli._ollama_max_context("x") is None
+
+
 def test_render_characterize_rejects_invalid_weight_quant(make_console, monkeypatch):
     _wire_characterize(monkeypatch, backend="cuda")
     c, buf = make_console()

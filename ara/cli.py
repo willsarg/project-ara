@@ -1126,7 +1126,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
     backend (e.g. the CPU fallback on a GPU box). ARA owns the result, so it shows up in
-    `ara models` regardless of which engine measured it."""
+    `ara models` regardless of which engine measured it.
+
+    ``--engine ollama`` routes to a dedicated residency-ramp path (Slice 2): Ollama isn't a registry
+    engine, and its model names (``qwen3:0.6b``) aren't HF refs — so it branches before both
+    ``resolve_engine`` and ``valid_model_ref``. Spec 2026-07-04-characterize-through-ollama-ramp."""
+    if engine == "ollama":
+        return _render_characterize_ollama(c, model, as_json=as_json)
     try:
         sel = resolve_engine(engine)
     except UnknownEngine:
@@ -1840,6 +1846,97 @@ def _ollama_estimated_ceiling(model: str):
     fit = estimate.model_fit(lim, meta, weights_gb)
     ec = fit.get("est_context")
     return (ec, "estimated", None) if ec else None
+
+
+def _ollama_max_context(model: str) -> int | None:
+    """The model's advertised max context from Ollama's own ``/api/show`` architecture metadata, or
+    ``None`` when it can't be read — the hard upper bound for the characterization ramp."""
+    detail = ollama.show(model)
+    if not detail:
+        return None
+    info = detail.get("model_info") or {}
+    arch = info.get("general.architecture")
+    if not isinstance(arch, str):
+        return None
+    mc = info.get(f"{arch}.context_length")
+    return mc if isinstance(mc, int) and mc > 0 else None
+
+
+def _ollama_ramp_contexts(max_ctx: int) -> list[int]:
+    """Ascending probe rungs for the residency ramp: 2048 doubling up to *max_ctx*, plus *max_ctx*
+    itself (deduped, sorted). A *max_ctx* below the 2048 floor yields just ``[max_ctx]``."""
+    rungs = set()
+    n = 2048
+    while n < max_ctx:
+        rungs.add(n)
+        n *= 2
+    rungs.add(max_ctx)
+    return sorted(rungs)
+
+
+def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
+    """Ramp Ollama residency to the largest context *model* loads with NO spill. For each rung
+    (ascending), bake a *probe* derived model at that ctx, load it, and read ``/api/ps``: it counts
+    only when governance took (``context_length`` == ctx) AND it's fully resident
+    (``size_vram >= size``). KV grows monotonically, so the first spill/failure ends the ramp.
+    Returns ``(best_ctx | None, points)``. Spec 2026-07-04-characterize-through-ollama-ramp."""
+    best, points = None, []
+    for ctx in _ollama_ramp_contexts(max_ctx):
+        if not ollama.create(probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
+            break
+        ollama.load(probe)
+        entry = _find_loaded(ollama.ps() or [], probe)
+        if entry is None or entry.get("context_length") != ctx:   # didn't load / governance slipped
+            points.append({"context": ctx, "fit": False})
+            break
+        size, vram = entry.get("size"), entry.get("size_vram")
+        spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+        points.append({"context": ctx, "fit": not spilled, "size": size, "size_vram": vram})
+        if spilled:                                   # hit the wall — a higher rung can't recover
+            break
+        best = ctx
+    return best, points
+
+
+def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int:
+    """``ara characterize <model> --engine ollama``: ramp the model's residency through Ollama to
+    find and record its true measured safe ceiling (engine ``"ollama"``), instead of relying on
+    serve's self-heal which only ever records the one context it served at. Serve stays fast; this
+    is where the slow, thorough measurement lives (Will, 2026-07-04). Spec
+    2026-07-04-characterize-through-ollama-ramp."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if ollama.version() is None:
+        return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
+    names = ollama.tags()
+    if names is None:
+        return err("couldn't list Ollama models — is the server reachable?")
+    if model not in names:
+        return err(f"{model} isn't in Ollama — pull it first: ollama pull {model}")
+    max_ctx = _ollama_max_context(model)
+    if not max_ctx:
+        return err(f"couldn't read {model}'s context length from Ollama — can't bound the ramp.")
+
+    probe = _governed_name(model) + "-probe"
+    try:
+        best, points = _ollama_measure_ceiling(model, max_ctx, probe)
+    finally:
+        ollama.delete(probe)                          # never leave the throwaway probe behind
+    with db.connected() as con:
+        db.save_characterization(con, profile.machine_key(), "ollama", model,
+                                 safe_context=best, points=points, measured_at=None)
+    if as_json:
+        print(json.dumps({"model": model, "engine": "ollama", "safe_context": best,
+                          "source": "measured", "max_context": max_ctx}))
+        return 0
+    if best is None:
+        c.emit(c.style("warn", f"  no no-spill ceiling for {model} on this box — it spills even at "
+                               f"the smallest tested context (recorded)."))
+    else:
+        c.emit(c.field("measured ceiling", f"~{best} tokens  (ollama, fully resident)"))
+    return 0
 
 
 def _ollama_pick_best(names: list[str]) -> str | None:

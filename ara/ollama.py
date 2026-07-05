@@ -133,6 +133,20 @@ def create(name: str, from_model: str, num_ctx: int, timeout: float = 300.0) -> 
     return bool(data and data.get("status") == "success")
 
 
+def delete(name: str, timeout: float = 30.0) -> bool:
+    """Remove model *name* from the local store via ``DELETE /api/delete``. ``True`` on a 2xx.
+    Used to clean up the throwaway probe models a characterization ramp bakes. Defensive: any
+    transport failure returns ``False`` rather than raising."""
+    try:
+        req = urllib.request.Request(
+            base_url() + "/api/delete", data=json.dumps({"model": name}).encode(),
+            headers={"Content-Type": "application/json"}, method="DELETE")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError, ValueError, TypeError):
+        return False
+
+
 def load(name: str, keep_alive: int = -1, timeout: float = 300.0) -> dict | None:
     """Warm-load ``name`` into memory via an empty-prompt ``POST /api/generate`` (so it appears
     in ``ps`` for verification) and hold it with ``keep_alive`` (``-1`` = until stopped).

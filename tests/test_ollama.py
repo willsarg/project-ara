@@ -290,3 +290,44 @@ def test_size_bytes_none_when_size_not_int(monkeypatch):
     monkeypatch.setattr(ollama, "_get_json",
                         lambda p, t: {"models": [{"name": "qwen3:0.6b", "size": "big"}]})
     assert ollama.size_bytes("qwen3:0.6b") is None
+
+
+# --------------------------------------------------------------------------- #
+# delete — DELETE /api/delete (probe-model cleanup for the characterize ramp)
+# --------------------------------------------------------------------------- #
+class _StatusResp:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_delete_true_on_2xx(monkeypatch):
+    captured = {}
+
+    def fake(req, timeout):
+        captured["method"] = req.get_method()
+        captured["url"] = req.full_url
+        return _StatusResp(200)
+
+    monkeypatch.setattr(ollama.urllib.request, "urlopen", fake)
+    assert ollama.delete("m-ara-probe") is True
+    assert captured["method"] == "DELETE"
+    assert captured["url"].endswith("/api/delete")
+
+
+def test_delete_false_on_error(monkeypatch):
+    def boom(req, timeout):
+        raise ollama.urllib.error.URLError("refused")
+    monkeypatch.setattr(ollama.urllib.request, "urlopen", boom)
+    assert ollama.delete("m-ara-probe") is False
+
+
+def test_delete_false_on_non_2xx(monkeypatch):
+    monkeypatch.setattr(ollama.urllib.request, "urlopen",
+                        lambda req, timeout: _StatusResp(404))
+    assert ollama.delete("missing") is False
