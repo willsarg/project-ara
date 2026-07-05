@@ -8,7 +8,11 @@ import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
 process.env.ARA_COORDINATOR_DB = ":memory:";
 
 const cookieStore = { set: vi.fn(), delete: vi.fn() };
-vi.mock("next/headers", () => ({ cookies: vi.fn(async () => cookieStore) }));
+// No X-Forwarded-For by default -> loginAction's clientKey() falls back to the shared "unknown"
+// bucket. Individual rate-limit tests override this per-call with mockResolvedValueOnce to get
+// their OWN bucket, so they can safely exhaust it without perturbing other tests in this file.
+const headersMock = vi.fn(async () => new Headers());
+vi.mock("next/headers", () => ({ cookies: vi.fn(async () => cookieStore), headers: () => headersMock() }));
 
 const redirectMock = vi.fn((url: string) => {
   throw new Error(`NEXT_REDIRECT:${url}`);
@@ -35,6 +39,7 @@ afterEach(() => {
   cookieStore.delete.mockClear();
   redirectMock.mockClear();
   revalidatePathMock.mockClear();
+  headersMock.mockClear();
   vi.unstubAllEnvs();
 });
 
@@ -79,6 +84,38 @@ describe("loginAction — env ARA_COORDINATOR_PASSWORD (direct-compare) path", (
 
 // Runs BEFORE the loginAction generated-password tests below so the admin password hash does not
 // yet exist — ensureAdminPassword's "generate + log once" branch only fires on the FIRST call.
+describe("loginAction — per-client rate limiting", () => {
+  it("limits repeated attempts from the SAME client, and reports a wait time (not a crash)", async () => {
+    headersMock.mockResolvedValue(new Headers({ "x-forwarded-for": "198.51.100.7" }));
+    vi.stubEnv("ARA_COORDINATOR_PASSWORD", "hunter2");
+
+    const form = new FormData();
+    form.set("password", "wrong-every-time");
+
+    let sawIncorrect = false;
+    let sawRateLimited = false;
+    for (let i = 0; i < 20 && !sawRateLimited; i++) {
+      const result = await actions.loginAction(undefined, form);
+      if (result.error === "Incorrect password.") sawIncorrect = true;
+      if (/^Too many attempts\. Try again in \d+s\.$/.test(result.error ?? "")) sawRateLimited = true;
+    }
+    expect(sawIncorrect).toBe(true); // under-the-cap calls still ran the real password check
+    expect(sawRateLimited).toBe(true); // the cap was hit within 20 attempts
+  });
+
+  it("a DIFFERENT client (different X-Forwarded-For) has its own, unexhausted bucket", async () => {
+    headersMock.mockResolvedValue(new Headers({ "x-forwarded-for": "198.51.100.9" }));
+    vi.stubEnv("ARA_COORDINATOR_PASSWORD", "hunter2");
+    const form = new FormData();
+    form.set("password", "still-wrong");
+    for (let i = 0; i < 15; i++) await actions.loginAction(undefined, form); // exhaust THIS client's cap
+
+    headersMock.mockResolvedValue(new Headers({ "x-forwarded-for": "198.51.100.10" }));
+    const result = await actions.loginAction(undefined, form);
+    expect(result).toEqual({ error: "Incorrect password." }); // not rate-limited — different key
+  });
+});
+
 describe("db.ensureAdminPassword / verifyAdminPassword — generated-password lifecycle", () => {
   it("generates a password once (logged), is idempotent on re-run, verifies correctly", () => {
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "");
@@ -141,6 +178,17 @@ describe("logoutAction", () => {
   it("deletes the session cookie and redirects to /login", async () => {
     await expect(actions.logoutAction()).rejects.toThrow("NEXT_REDIRECT:/login");
     expect(cookieStore.delete).toHaveBeenCalledWith("ara_coord_session");
+  });
+
+  it("invalidates the session server-side — a copied cookie can't be replayed after logout", async () => {
+    vi.stubEnv("ARA_COORDINATOR_SECRET", "s3cret-for-logout-test");
+    const auth = await import("@/lib/auth");
+    const token = await auth.createSession();
+    expect(await auth.verifySession(token)).toBe(true);
+
+    await expect(actions.logoutAction()).rejects.toThrow("NEXT_REDIRECT:/login");
+
+    expect(await auth.verifySession(token)).toBe(false); // stateless JWT alone would still verify here
   });
 });
 

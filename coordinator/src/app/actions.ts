@@ -2,17 +2,38 @@
 "use server";
 // Server Actions — login/logout and push-channel admin mutations. All run server-side; agent
 // secrets minted here go straight into SQLite (as hashes) and are never returned to the caller.
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { SESSION_COOKIE, createSession } from "@/lib/auth";
+import { SESSION_COOKIE, createSession, invalidateSessions } from "@/lib/auth";
 import { verifyAdminPassword } from "@/lib/db";
 import { approveAgent, denyAgent, issueEnrollmentToken, revoke } from "@/lib/enrollment";
 import { enqueue } from "@/lib/work";
+import { rateLimit } from "@/lib/rate-limit";
 
 const SESSION_TTL_S = 60 * 60 * 24 * 7;
 
+// Login attempts are rate-limited per client (see clientKey below). Server Actions have no HTTP
+// status of their own to set (Next always answers the action's POST with 200 and an RSC payload,
+// even on a thrown error) — so unlike /api/enroll's real 429, the limit here surfaces through the
+// SAME { error } shape the form already renders.
+const LOGIN_MAX = 10;
+const LOGIN_WINDOW_MS = 60_000;
+
+/** Best-effort client identity for rate-limiting: the first hop of X-Forwarded-For, or a single
+ *  shared "unknown" bucket when there's no reverse proxy in front of the coordinator (degrades to a
+ *  global — not per-IP — limit in that case, which still blunts a single-source burst). */
+function clientKey(h: Headers): string {
+  const fwd = h.get("x-forwarded-for");
+  return fwd ? fwd.split(",")[0].trim() : "unknown";
+}
+
 export async function loginAction(_prev: { error?: string } | undefined, form: FormData) {
+  const rl = rateLimit(`login:${clientKey(await headers())}`, LOGIN_MAX, LOGIN_WINDOW_MS);
+  if (rl.limited) {
+    return { error: `Too many attempts. Try again in ${rl.retryAfterS}s.` };
+  }
+
   const password = String(form.get("password") ?? "");
   if (!verifyAdminPassword(password)) {        // constant-time; compares against the stored hash
     return { error: "Incorrect password." };
@@ -29,6 +50,7 @@ export async function loginAction(_prev: { error?: string } | undefined, form: F
 }
 
 export async function logoutAction() {
+  invalidateSessions(); // stateless JWTs can't be un-signed — kill them server-side, not just the cookie
   (await cookies()).delete(SESSION_COOKIE);
   redirect("/login");
 }

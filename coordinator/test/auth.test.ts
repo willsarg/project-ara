@@ -2,7 +2,7 @@
 // The admin session cookie: sign/verify roundtrip, tamper/expiry rejection, and — the security
 // fix — that with NO secret configured we fail closed (never sign with a default/forgeable key).
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { createSession, verifySession } from "@/lib/auth";
+import { createSession, verifySession, invalidateSessions } from "@/lib/auth";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -40,5 +40,17 @@ describe("admin session cookie", () => {
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "");
     await expect(createSession()).rejects.toThrow(/no session secret/i);
     expect(await verifySession("anything")).toBe(false); // never trusts a token without a secret
+  });
+
+  it("invalidateSessions() revokes every previously issued token (real logout, not just cookie-clear)", async () => {
+    vi.stubEnv("ARA_COORDINATOR_SECRET", "s3cret");
+    const before = await createSession();
+    expect(await verifySession(before)).toBe(true);
+
+    invalidateSessions();
+    expect(await verifySession(before)).toBe(false); // a copied/stolen cookie can no longer be replayed
+
+    const after = await createSession(); // freshly minted AFTER the invalidation still works
+    expect(await verifySession(after)).toBe(true);
   });
 });

@@ -4,11 +4,33 @@
 import { NextResponse } from "next/server";
 import { bearerToken, verifyEnrollmentToken } from "@/lib/node-auth";
 import { enroll, type SelfDescription } from "@/lib/enrollment";
+import { rateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Per-IP fixed window: generous enough for a legitimate fleet's enroll traffic, tight enough to
+// blunt a token-guessing/DoS burst against this (bearer-token-guarded) endpoint.
+const ENROLL_MAX = 30;
+const ENROLL_WINDOW_MS = 60_000;
+
+/** Best-effort client identity for rate-limiting: the first hop of X-Forwarded-For, or a single
+ *  shared "unknown" bucket when there's no reverse proxy in front of the coordinator (degrades to a
+ *  global — not per-IP — limit in that case, which still blunts a single-source burst). */
+function clientKey(req: Request): string {
+  const fwd = req.headers.get("x-forwarded-for");
+  return fwd ? fwd.split(",")[0].trim() : "unknown";
+}
+
 export async function POST(req: Request) {
+  const rl = rateLimit(`enroll:${clientKey(req)}`, ENROLL_MAX, ENROLL_WINDOW_MS);
+  if (rl.limited) {
+    return NextResponse.json(
+      { error: "too many requests" },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterS) } },
+    );
+  }
+
   const token = bearerToken(req);
   if (!verifyEnrollmentToken(token)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
