@@ -115,13 +115,21 @@ def estimate_base_gb(info: models.ModelInfo, limits: SystemLimits, overhead_gb: 
     return os_baseline + info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
 
 
-def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None) -> dict:
+def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None,
+                timeout: float = 600) -> dict:
     cmd = [py, "-m", "wmx_suite.probe_worker", hf_id, str(ctx)]
     if kv_bits is not None:
         cmd += ["--kv-bits", str(kv_bits)]
     if abort_wired_gb is not None:
         cmd += ["--abort-wired-gb", str(abort_wired_gb)]
-    out = subprocess.run(cmd, capture_output=True, text=True)
+    # Bound the subprocess (parity with wcx probe.py) so a wedged worker — a stalled HF load or a
+    # GPU/driver hang before the L5 wired-mem watchdog can trip — can't block the ramp forever. A
+    # timeout is reported as a dead worker (no JSON line), the caller's existing load_error path.
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"status": "load_error",
+                "note": f"probe worker timed out after {timeout:.0f}s (hung load?)"}
     line = next((l for l in out.stdout.splitlines() if l.startswith("{")), None)
     if not line:
         # No JSON line -> the worker died (usually a model-load error). Return a
