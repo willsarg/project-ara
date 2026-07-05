@@ -2855,6 +2855,36 @@ def test_model_detail_json(monkeypatch, capsys):
     assert data["decode_context"] is None
 
 
+def test_model_detail_flags_stale_ceiling_text(make_console, monkeypatch):
+    """`ara models <id>` must not present a stored ceiling as authoritative when the model's cache
+    changed since it was measured — flag it inline (Rule #3), same honesty serve/run already give."""
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": None,
+                                                 "measured_at": "2026-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    out = buf.getvalue()
+    assert "16000" in out and "stale" in out.lower()
+
+
+def test_model_detail_json_stale_flag(monkeypatch, capsys):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": None,
+                                                 "measured_at": "2026-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/A", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["stale_ceiling"] is True
+
+
 def test_model_detail_measured_no_ceiling(make_console, monkeypatch):
     """`ara models <id>` for a measured-but-unfit model reads 'no safe ceiling',
     not 'not characterized' — consistent with `ara models` and `ara profile`."""

@@ -969,24 +969,26 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         return 1
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
-    per_engine = {}                       # engine_key -> (safe_context, decode_context)
+    per_engine = {}                       # engine_key -> (safe_context, decode_context, measured_at)
     with db.connected() as con:
         for key in engines.ENGINES:
             row = db.get_characterization(con, mk, key, model_id)
             if row is not None:
-                per_engine[key] = (row["safe_context"], row.get("decode_context"))
-    best = max((sc for (sc, _) in per_engine.values() if sc is not None), default=None)
-    # Pair decode_context with the engine that owns the best safe_context, so the two
-    # top-level JSON scalars describe the same engine — not independent max() picks.
-    best_engine_pair = max(
-        ((sc, dc) for (sc, dc) in per_engine.values() if sc is not None),
-        key=lambda t: t[0], default=None,
-    )
-    best_decode = best_engine_pair[1] if best_engine_pair is not None else None
+                per_engine[key] = (row["safe_context"], row.get("decode_context"),
+                                   row.get("measured_at"))
+    # Best (largest) ceiling, carrying its decode_context AND measured_at so the top-level scalars
+    # and the staleness flag all describe the SAME engine — not independent max() picks.
+    best_triple = max(((sc, dc, at) for (sc, dc, at) in per_engine.values() if sc is not None),
+                      key=lambda t: t[0], default=None)
+    best = best_triple[0] if best_triple else None
+    best_decode = best_triple[1] if best_triple else None
+    # Rule #3: a stored ceiling whose cache changed since it was measured isn't authoritative —
+    # flag it here just as serve/run do, so no command shows a stale number unqualified.
+    best_stale = best_triple is not None and staleness.ceiling_is_stale(model_id, best_triple[2])
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
-                          "decode_context": best_decode,
-                          "engines": {k: sc for k, (sc, _) in per_engine.items()},
+                          "decode_context": best_decode, "stale_ceiling": best_stale,
+                          "engines": {k: sc for k, (sc, _, _) in per_engine.items()},
                           "characterized": bool(per_engine)}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
@@ -998,10 +1000,12 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
     if per_engine:                        # one ceiling line per engine that measured it
-        for key, (sc, dc) in per_engine.items():
+        for key, (sc, dc, at) in per_engine.items():
             ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
             if sc and dc and dc > sc:
                 ceiling_str += f"  · ~{dc} stream-only (est.)"
+            if sc and staleness.ceiling_is_stale(model_id, at):
+                ceiling_str += "  · ⚠ stale — re-characterize"
             c.emit(c.field(f"{key} ceiling", ceiling_str))
     else:
         c.emit(c.field("ceiling", "not characterized"))
