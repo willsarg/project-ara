@@ -228,6 +228,42 @@ def test_main_detect_json(monkeypatch):
     assert rec["detect"] is True
 
 
+def test_main_detect_python_facet_routes_to_render_python(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--python"])
+    assert "python" in rec and "detect" not in rec
+
+
+def test_main_detect_apps_facet_routes_to_render_apps(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--apps"])
+    assert "apps" in rec and "detect" not in rec
+
+
+def test_main_detect_runtime_facet_routes_to_render_mlx(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--runtime"])
+    assert "mlx" in rec and "detect" not in rec
+
+
+def test_main_detect_models_facet_routes_to_render_models(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--models"])
+    assert "models" in rec and "detect" not in rec
+
+
+def test_main_detect_bare_routes_to_render_detect_only(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect"])
+    assert "detect" in rec and "python" not in rec and "apps" not in rec
+
+
+def test_main_detect_models_facet_threads_json(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--models", "--json"])
+    assert rec["models"] is True
+
+
 def test_main_status(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["status"])
@@ -465,29 +501,56 @@ def test_main_verbose_flag_sets_console(monkeypatch):
 # --------------------------------------------------------------------------- #
 # render_landing
 # --------------------------------------------------------------------------- #
+def test_landing_hardware_apple_shows_unified_memory_and_gpu_cores():
+    # Apple: memory is the unified pool ARA governs; GPU shown by core count.
+    assert cli._landing_hardware("Apple M4 Pro", "apple", 24.0, 16, None) == [
+        "Apple M4 Pro", "24 GB unified memory", "16-core GPU"]
+
+
+def test_landing_hardware_cpu_shows_plain_ram_no_gpu():
+    assert cli._landing_hardware("Intel i7", "cpu", 32.0, None, None) == [
+        "Intel i7", "32 GB RAM"]
+
+
+def test_landing_hardware_cuda_names_the_discrete_gpu():
+    assert cli._landing_hardware("Ryzen 9", "cuda", 32.0, None, "NVIDIA RTX 4090") == [
+        "Ryzen 9", "32 GB RAM", "NVIDIA RTX 4090"]
+
+
+def test_landing_hardware_omits_memory_when_unknown():
+    assert cli._landing_hardware("Apple M1", "apple", None, None, None) == ["Apple M1"]
+
+
 def test_render_landing_supported(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli.detect, "_memory_gb", lambda: (24.0, 5.0))
+    monkeypatch.setattr(cli.detect, "accelerator",
+                        lambda chip: cli.detect.Accelerator("apple", f"{chip} GPU", None, "Metal", cores=16))
     c, buf = make_console()
     cli.render_landing(c)
     out = buf.getvalue()
     assert "ara" in out and "Apple M4 Pro" in out
+    assert "24 GB unified memory" in out and "16-core GPU" in out   # hardware, in plain terms
+    assert "wmx-suite" not in out and "backend apple" not in out    # no internal jargon on the line
     assert "GETTING STARTED" in out
     assert "detect" in out and "status" in out and "profile" in out
-    assert "mlx" in out                       # MLX view shown on Apple
+    assert "--python" in out and "--runtime" in out   # detect facet hint (python/apps/mlx collapsed in)
     assert "CPU fallback" not in out
 
 
 def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Intel i7")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "llama.cpp"))
+    monkeypatch.setattr(cli.detect, "_memory_gb", lambda: (32.0, 8.0))
+    monkeypatch.setattr(cli.detect, "accelerator",
+                        lambda chip: cli.detect.Accelerator("none", "CPU", None, None))
     c, buf = make_console()
     cli.render_landing(c)
     out = buf.getvalue()
+    assert "32 GB RAM" in out                  # plain 'RAM' label off Apple
     assert "no GPU backend detected" in out and "ara install --engine cpu" in out
-    assert "mlx" not in out                    # MLX view is Apple-only
+    assert "mlx" not in out                    # no stray internal jargon on a non-Apple box
 
 
 def test_cmd_long_name_keeps_gap_before_gloss(make_console):

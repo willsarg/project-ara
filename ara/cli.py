@@ -92,6 +92,10 @@ _SECTION_ALIASES = {
     "runners": "runner", "toolkits": "toolkit", "assistants": "assistant",
     "models-runner": "runner",
 }
+# `ara detect --<flag>` facets — read-only inspection views collapsed under the one recon
+# command; each maps to the render_* that used to be its own top-level command (still dispatched
+# below as hidden back-compat aliases). "runtime" is the user-facing rename of the old "mlx" facet.
+_FACET_FLAGS = {"--python": "python", "--apps": "apps", "--runtime": "runtime", "--models": "models"}
 
 
 def _csv(value: str) -> list[str]:
@@ -134,7 +138,7 @@ def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console, 
 # help (per-subcommand usage for `ara <cmd> --help` / `-h`)
 # --------------------------------------------------------------------------- #
 _COMMAND_HELP = {
-    "detect": "ara detect [--json] [--include S] [--exclude S] — read-only machine recon",
+    "detect": "ara detect [--python|--apps|--runtime|--models] [--json] — system report for this machine",
     "status": "ara status [--json] — AI/ML processes running right now",
     "python": "ara python [--json] — interpreters + their AI libraries",
     "apps": "ara apps [--json] — installed AI/ML apps",
@@ -175,37 +179,48 @@ def render_help(c: Console, cmd: str | None, *, as_json: bool = False) -> int:
 # --------------------------------------------------------------------------- #
 # landing
 # --------------------------------------------------------------------------- #
+def _landing_hardware(chip: str, backend: str, mem_gb: float | None,
+                      gpu_cores: int | None, gpu_name: str | None) -> list[str]:
+    """The 'this machine:' tokens — chip, memory, GPU — in plain user terms only (never an
+    internal backend/engine key). Memory is the *unified* pool on Apple (the shared wall ARA
+    governs) and plain 'RAM' elsewhere; the GPU is shown by core count on Apple, or by name for a
+    discrete card. Ordered: chip first, then whatever hardware we could read."""
+    tokens = [chip]
+    if mem_gb:
+        tokens.append(f"{mem_gb:.0f} GB {'unified memory' if backend == 'apple' else 'RAM'}")
+    if backend == "apple" and gpu_cores:
+        tokens.append(f"{gpu_cores}-core GPU")
+    elif gpu_name:
+        tokens.append(gpu_name)
+    return tokens
+
+
 def render_landing(c: Console) -> None:
     chip = detect.chip_name()
     backend = detect.backend_name()
-    engine_ok, engine = engine_status()
-
     accelerated = backend in ("apple", "cuda")
-    backend_role = "good" if accelerated else "metric"   # cpu is a real backend, just not GPU
-    engine_role = "good" if engine_ok else "warn"
-    engine_str = f"{engine} ready" if engine_ok else f"{engine} not installed"
+
+    acc = detect.accelerator(chip)
+    tokens = _landing_hardware(
+        chip, backend, detect._memory_gb()[0],
+        acc.cores if backend == "apple" else None,
+        acc.name if backend in ("cuda", "vulkan") else None,
+    )
 
     c.emit(
         "  " + c.style("accent", "ara")
         + c.style("dim", "  —  AI Runs Anywhere: run local models on whatever hardware you've got")
     )
     c.emit()
-    c.emit(
-        c.style("dim", "  this machine: ")
-        + c.style("metric", chip)
-        + c.style("dim", " · backend ")
-        + c.style(backend_role, backend)
-        + c.style("dim", " · engine ")
-        + c.style(engine_role, engine_str)
-    )
+    line = c.style("dim", "  this machine: ") + c.style("metric", tokens[0])
+    for tok in tokens[1:]:
+        line += c.style("dim", " · ") + c.style("metric", tok)
+    c.emit(line)
     c.emit()
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
+    c.emit(c.style("dim", "                  --python · --apps · --runtime · --models · --json"))
     c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
-    c.emit(_cmd(c, "python", "list every Python interpreter + its AI libraries"))
-    c.emit(_cmd(c, "apps", "list installed AI/ML apps + versions"))
-    if backend == "apple":  # MLX ecosystem view is Apple-Silicon only
-        c.emit(_cmd(c, "mlx", "inspect the MLX ecosystem — libraries + readiness"))
     c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
     c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
@@ -2742,9 +2757,13 @@ def _main_impl() -> int:
             continue
         if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent", "--refresh",
                  "--rekey", "--no-flash-attn", "--flash-attn",
-                 "--chunked-prefill", "-h", "--help"):
+                 "--chunked-prefill", "-h", "--help",
+                 "--python", "--apps", "--runtime", "--models"):
             continue
         rest.append(a)
+
+    # `ara detect --<flag>` facet routing — first matching flag wins; None → the bare full report.
+    detect_facet = next((_FACET_FLAGS[a] for a in argv if a in _FACET_FLAGS), None)
     c = Console.from_env(verbose=verbose)
 
     # Resolve the chunked-prefill lever: an explicit size wins; a bare --chunked-prefill uses the
@@ -2769,7 +2788,16 @@ def _main_impl() -> int:
             if (include or exclude) else None)
 
     if cmd == "detect":
-        render_detect(c, as_json=as_json, want=want)
+        if detect_facet == "python":
+            render_python(c, as_json=as_json, want=want)
+        elif detect_facet == "apps":
+            render_apps(c, as_json=as_json, want=want)
+        elif detect_facet == "runtime":
+            render_mlx(c, as_json=as_json, want=want)
+        elif detect_facet == "models":
+            render_models(c, as_json=as_json, want=want)
+        else:
+            render_detect(c, as_json=as_json, want=want)
         return 0
 
     if cmd == "status":
