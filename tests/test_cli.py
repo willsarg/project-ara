@@ -2438,11 +2438,12 @@ def test_run_engine_not_installed_json_uses_complete_label(monkeypatch, capsys):
 
 
 def test_run_unsupported_engine(make_console, monkeypatch):
-    # A backend with no generate method (apple/cuda until their repos add the verb).
+    # A backend with no generate method reports its complete public engine label once.
     _wire_run(monkeypatch, characterization=_CHAR, generate=None)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "CUDA engine"))
     c, buf = make_console()
-    assert cli.render_run(c, "org/m", prompt="hi") == 1
-    assert "isn't supported" in buf.getvalue()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cuda") == 1
+    assert buf.getvalue() == "  run isn't supported on the CUDA engine yet\n"
 
 
 def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
@@ -2492,9 +2493,10 @@ def test_run_confirm_accepted_runs(make_console, monkeypatch):
 def test_run_worker_refused(make_console, monkeypatch):
     _wire_run(monkeypatch, characterization=_CHAR,
               generate=lambda *a, **k: {"refused": True, "reason": "memory pressure"})
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "CUDA engine"))
     c, buf = make_console()
-    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
-    assert "memory pressure" in buf.getvalue()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cuda", assume_yes=True) == 1
+    assert buf.getvalue().splitlines()[-1] == "  the CUDA engine refused: memory pressure"
 
 
 def test_run_failure(make_console, monkeypatch):
