@@ -40,6 +40,11 @@ def _validate(instance: dict, schema_id: str) -> None:
     assert not errors, [e.message for e in errors]
 
 
+def test_capability_schema_describes_canonical_ara_engine_identity():
+    schema = _REGISTRY.contents("https://ara.dev/wire/capability.json")
+    assert schema["properties"]["engine"]["description"] == "Canonical ARA engine identity."
+
+
 @pytest.fixture
 def env_io(monkeypatch):
     """Deterministic host I/O for the env probes: bare-metal Linux, 32 GiB, no cgroup, no container.
@@ -210,17 +215,17 @@ def test_advertised_capabilities_empty_when_none(monkeypatch):
 def test_advertised_capabilities_from_characterizations(monkeypatch):
     monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
     con = capabilities.db.connect()
-    capabilities.db.save_characterization(con, "m", "wcx", "org/model-a",
+    capabilities.db.save_characterization(con, "m", "cuda", "org/model-a",
                                           safe_context=4096, points=[])
-    capabilities.db.save_characterization(con, "m", "cpu", "org/model-b",
+    capabilities.db.save_characterization(con, "m", "mlx", "org/model-b",
                                           safe_context=2048, points=[])
-    capabilities.db.save_characterization(con, "other", "wcx", "org/model-z",
+    capabilities.db.save_characterization(con, "other", "cuda", "org/model-z",
                                           safe_context=1, points=[])       # other machine → excluded
     con.close()
     caps = capabilities.advertised_capabilities()
     assert caps == [
         {"kind": "serve_model", "id": "org/model-a", "engine": "cuda", "evidence": "characterized"},
-        {"kind": "serve_model", "id": "org/model-b", "engine": "cpu", "evidence": "characterized"},
+        {"kind": "serve_model", "id": "org/model-b", "engine": "mlx", "evidence": "characterized"},
     ]
     for cap in caps:
         _validate(cap, "https://ara.dev/wire/capability.json")
@@ -245,7 +250,7 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
     monkeypatch.setattr(capabilities.platform, "node", lambda: "test-box")
     monkeypatch.setattr(capabilities.platform, "machine", lambda: "x86_64")
     con = capabilities.db.connect()
-    capabilities.db.save_characterization(con, "chip|GPU|16|Linux", "wcx", "org/m",
+    capabilities.db.save_characterization(con, "chip|GPU|16|Linux", "cuda", "org/m",
                                           safe_context=8192, points=[])
     con.close()
     desc = capabilities.self_description()

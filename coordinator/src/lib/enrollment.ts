@@ -122,6 +122,9 @@ export interface AgentSummary {
   serve_models: { id: string; engine: string }[];
 }
 
+const canonicalEngine = (engine: string) =>
+  engine === "wmx" ? "mlx" : engine === "wcx" ? "cuda" : engine;
+
 /** Count an agent's advertised capabilities from its stored caps_json (a JSON array), 0 if absent
  *  or malformed, and extract the `serve_model` entries (the models this node can serve). Never
  *  throws — a bad blob just yields 0 / []. */
@@ -138,7 +141,10 @@ export function summarizeAgent(a: AgentRow): AgentSummary {
             (c): c is { kind: unknown; id: string; engine?: unknown } =>
               typeof c === "object" && c !== null && c.kind === "serve_model" && typeof c.id === "string",
           )
-          .map((c) => ({ id: c.id, engine: typeof c.engine === "string" ? c.engine : "?" }));
+          .map((c) => ({
+            id: c.id,
+            engine: canonicalEngine(typeof c.engine === "string" ? c.engine : "?"),
+          }));
       }
     } catch {
       /* malformed caps_json → 0 / [] */

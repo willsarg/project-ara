@@ -7,7 +7,11 @@
   "properties": {
     "kind": { "type": "string", "enum": ["serve_model", "embeddings"] },
     "id": { "type": "string", "minLength": 1 },
-    "engine": { "type": "string", "minLength": 1 },
+    "engine": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical ARA engine identity."
+    },
     "evidence": {
       "type": "string",
       "enum": ["characterized", "estimated", "none"],
