@@ -10,6 +10,7 @@ env is created here; a separate smoke test exercises the real thing.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -315,11 +316,31 @@ def test_create_verifies_expected_import_package_before_stamping(engines_root, r
 
     verify = run_spy.calls[2]
     assert verify[0] == str(engine_env.python_path("apple"))
-    assert verify[1] == "-c"
-    assert "find_spec" in verify[2]
-    assert verify[3] == "ara_engine_mlx"
+    assert verify[1:3] == ["-I", "-c"]
+    assert "find_spec" in verify[3]
+    assert verify[4] == "ara_engine_mlx"
     assert engine_env.stamped_version("apple") == "2.0.0"
     assert engine_env.stamped_schema("apple") == "ara-engine-mlx:ara_engine_mlx:v1"
+
+
+def test_python_isolated_mode_ignores_hostile_cwd_and_pythonpath(tmp_path, monkeypatch):
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "hostile_engine.py").write_text("SPOOFED = True\n")
+    monkeypatch.chdir(hostile)
+    monkeypatch.setenv("PYTHONPATH", str(hostile))
+    script = (
+        "import importlib.util, sys; "
+        "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)"
+    )
+
+    normal, _out, _err = engine_env._run(
+        [sys.executable, "-c", script, "hostile_engine"])
+    isolated, _out, _err = engine_env._run(
+        [sys.executable, "-I", "-c", script, "hostile_engine"])
+
+    assert normal == 0
+    assert isolated == 1
 
 
 def test_create_rejects_legacy_source_without_expected_import_and_removes_env(

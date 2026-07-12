@@ -153,6 +153,7 @@ def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE
     if expected_import is not None:
         rc, _out, _err = _run([
             str(python_path(name)),
+            "-I",
             "-c",
             "import importlib.util, sys; "
             "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)",
