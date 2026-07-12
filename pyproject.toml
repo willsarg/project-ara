@@ -43,6 +43,11 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["ara"]
 
+[tool.hatch.build.targets.sdist]
+# Hatch reads the repository-root build configuration, not the coordinator's nested .gitignore.
+# Keep local JavaScript installs/build output out of PyPI source archives.
+exclude = ["/coordinator/node_modules", "/coordinator/.next"]
+
 # Test/dev tooling. The suite runs without an installed engine on purpose — it proves the
 # core stays engine-free while exercising the subprocess seams with test doubles.
 [dependency-groups]
