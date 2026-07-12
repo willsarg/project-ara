@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -179,10 +180,13 @@ def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> No
 
     if valid(backup_path):
         return
-    try:
-        backup_path.unlink()
-    except FileNotFoundError:
-        pass
+    now = time.time()
+    for orphan in backup_path.parent.glob(backup_path.name + ".*.tmp"):
+        try:
+            if now - orphan.stat().st_mtime > 86_400:
+                orphan.unlink()
+        except FileNotFoundError:
+            pass
     fd, temp_name = tempfile.mkstemp(
         prefix=backup_path.name + ".", suffix=".tmp", dir=backup_path.parent)
     os.close(fd)
@@ -196,11 +200,9 @@ def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> No
             backup.close()
         if not valid(temp_path):
             raise sqlite3.DatabaseError("pre-v3 backup validation failed")
-        try:
-            os.link(temp_path, backup_path)
-        except FileExistsError:
-            if not valid(backup_path):
-                raise sqlite3.DatabaseError("concurrent pre-v3 backup is invalid")
+        os.replace(temp_path, backup_path)
+        if not valid(backup_path):
+            raise sqlite3.DatabaseError("published pre-v3 backup validation failed")
     finally:
         try:
             temp_path.unlink()

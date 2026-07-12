@@ -641,12 +641,13 @@ def test_v3_backup_keeps_valid_concurrent_publisher(tmp_path, monkeypatch):
     con.commit()
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
 
+    real_replace = db.os.replace
+
     def concurrent_publish(source, destination):
         Path(destination).write_bytes(Path(source).read_bytes())
-        Path(source).unlink()
-        raise FileExistsError
+        real_replace(source, destination)
 
-    monkeypatch.setattr(db.os, "link", concurrent_publish)
+    monkeypatch.setattr(db.os, "replace", concurrent_publish)
     db._backup_before_engine_identity_v3(con, path)
     saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
     assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
@@ -673,17 +674,84 @@ def test_v3_backup_rejects_invalid_temporary_backup_and_cleans_it(tmp_path, monk
     con.close()
 
 
-def test_v3_backup_rejects_invalid_concurrent_publisher_and_cleans_temp(tmp_path, monkeypatch):
+def test_v3_backup_rejects_invalid_published_final_and_cleans_temp(tmp_path, monkeypatch):
     path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "bad-concurrent-backup.db")
     con.commit()
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
 
-    def concurrent_publish(source, destination):
+    def publish_invalid(source, destination):
         Path(destination).write_bytes(b"")
-        raise FileExistsError
+        Path(source).unlink()
 
-    monkeypatch.setattr(db.os, "link", concurrent_publish)
-    with pytest.raises(sqlite3.DatabaseError, match="concurrent pre-v3 backup is invalid"):
+    monkeypatch.setattr(db.os, "replace", publish_invalid)
+    with pytest.raises(sqlite3.DatabaseError, match="published pre-v3 backup validation failed"):
         db._backup_before_engine_identity_v3(con, path)
     assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_atomically_replaces_invalid_final_after_interleaving(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "interleaved-backup.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    final.write_bytes(b"")
+    real_replace = db.os.replace
+
+    def interleaved_replace(source, destination):
+        Path(destination).write_bytes(b"concurrent invalid file")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(db.os, "replace", interleaved_replace)
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{final}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_does_not_depend_on_hard_links(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "no-hardlink.db")
+    con.commit()
+    monkeypatch.setattr(db.os, "link", lambda *args: (_ for _ in ()).throw(OSError("unsupported")))
+    db._backup_before_engine_identity_v3(con, path)
+    assert path.with_name(path.name + ".pre-engine-identity-v3.bak").exists()
+    con.close()
+
+
+def test_v3_backup_removes_only_stale_orphan_temps(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "orphan-backup.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    stale = final.with_name(final.name + ".stale.tmp")
+    fresh = final.with_name(final.name + ".fresh.tmp")
+    stale.write_text("stale")
+    fresh.write_text("fresh")
+    old = 1_000_000_000
+    db.os.utime(stale, (old, old))
+    monkeypatch.setattr(db.time, "time", lambda: old + 172_800)
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    assert not stale.exists()
+    assert fresh.exists()
+    con.close()
+
+
+def test_v3_backup_tolerates_orphan_disappearing_during_cleanup(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "vanished-orphan.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    orphan = final.with_name(final.name + ".vanished.tmp")
+    orphan.write_text("orphan")
+    real_stat = Path.stat
+
+    def stat(candidate, *args, **kwargs):
+        if candidate == orphan:
+            candidate.unlink()
+            raise FileNotFoundError
+        return real_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    db._backup_before_engine_identity_v3(con, path)
+    assert final.exists()
     con.close()

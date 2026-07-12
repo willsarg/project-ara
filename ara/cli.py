@@ -1204,7 +1204,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     with db.connected() as cal_con:
         if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
-            c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+            if not as_json:
+                c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
             cal = bk.calibrate()
             overhead = (cal or {}).get("overhead_gb")
             wall = (cal or {}).get("wall_gb")
@@ -1212,7 +1213,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             # never let the conservative default masquerade as a measurement. The ramp still proceeds
             # safely on the default overhead; we just don't hide that it's a fallback.
             cal_err = (cal or {}).get("calibration_error")
-            if cal_err:
+            if cal_err and not as_json:
                 c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
                                        " — using conservative default overhead"))
             # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
@@ -1226,13 +1227,14 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             # Surface the measured wall right where it's measured — otherwise the user sees only the
             # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
             # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
-            if wall is not None:
+            if wall is not None and not as_json:
                 budget = (cal or {}).get("safe_budget_gb")
                 line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
                 if budget is not None:
                     line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
                 c.emit(line)
-    c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+    if not as_json:
+        c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)

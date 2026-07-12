@@ -3558,6 +3558,29 @@ def test_render_characterize_json(monkeypatch, capsys, store):
     assert "decode_context" in data
 
 
+def test_render_characterize_json_stdout_is_one_document_even_on_first_calibration(
+        monkeypatch, capsys, store):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=lambda m, *, progress=False, kv_quant="f16": {
+            "model": m, "safe_context": 2048, "decode_context": 2048, "points": []},
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m, *, progress=False: None,
+        calibrate=lambda: {"overhead_gb": 1.0, "wall_gb": 20.0, "safe_budget_gb": 18.0},
+    ))
+    c = cli.Console(color=False, stream=sys.stdout)
+
+    assert cli.render_characterize(c, "org/M", as_json=True) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "model": "org/M", "safe_context": 2048, "decode_context": 2048}
+
+
 def test_render_characterize_engine_flag_overrides_detected_backend(make_console, store, monkeypatch):
     # winbox's case: a GPU is detected (cuda), but `--engine cpu` must run on the CPU backend
     # and store under the cpu engine key — never silently fall through to the detected GPU.
