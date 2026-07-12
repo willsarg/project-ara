@@ -9,8 +9,8 @@ Response shapes (one JSON line):
   success:  ``{"context": <int>, "mem_gb": <number>}``
   refusal:  ``{"context": <int>, "refused": true, "reason": "<why>"}``   (RULE #1 pre-flight)
 
-Each backend's worker is engine-native (Apple reuses ``wmx_suite.probe_worker``; CPU will use
-a llama.cpp script); the adapter maps the engine's raw output into this canonical shape, and
+Each backend's worker is engine-native (Apple uses ``ara_engine_mlx.measure_one``; CPU will use a
+llama.cpp script); the adapter maps the engine's raw output into this canonical shape, and
 :func:`parse` guarantees ARA never feeds a malformed reading into the ramp fit.
 """
 from __future__ import annotations

@@ -11,10 +11,22 @@ from ara._engine_packages.mlx.ara_engine_mlx import config as mlx_config
 
 
 _ROOT = Path(__file__).resolve().parent.parent
+_ENGINE_PACKAGES = _ROOT / "ara" / "_engine_packages"
+
+
+def test_retired_revendor_script_is_absent():
+    assert not (_ROOT / "scripts" / "vendor_engine.py").exists()
+
+
+def test_native_engine_roots_retain_manifests_and_legal_sidecars():
+    for engine in ("mlx", "cuda"):
+        engine_root = _ENGINE_PACKAGES / engine
+        for sidecar in ("pyproject.toml", "LICENSE", "NOTICE"):
+            assert (engine_root / sidecar).is_file(), f"{engine}/{sidecar}"
 
 
 def test_mlx_engine_uses_native_distribution_and_package_identities():
-    engine_root = _ROOT / "ara" / "_engine_packages" / "mlx"
+    engine_root = _ENGINE_PACKAGES / "mlx"
     manifest = tomllib.loads((engine_root / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert manifest["project"]["name"] == "ara-engine-mlx"
@@ -52,7 +64,7 @@ def test_mlx_margin_accepts_the_legacy_environment_variable_for_one_release(monk
 
 
 def test_cuda_engine_uses_native_distribution_and_package_identities():
-    engine_root = _ROOT / "ara" / "_engine_packages" / "cuda"
+    engine_root = _ENGINE_PACKAGES / "cuda"
     manifest = tomllib.loads((engine_root / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert manifest["project"]["name"] == "ara-engine-cuda"

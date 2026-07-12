@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""NVIDIA / CUDA backend adapter — drives wcx-suite's VRAM measurement out-of-process.
+"""NVIDIA / CUDA backend adapter — drives ARA's native CUDA engine out-of-process.
 
-The CUDA twin of backends/apple.py: it reads the GPU's VRAM wall and runs wcx-suite's crash-safe
+The CUDA twin of backends/apple.py: it reads the GPU's VRAM wall and runs the native engine's crash-safe
 probe, but owns **no persistence** — ARA stores and reuses the calibration (see cli.render_profile).
-It never imports wcx in-process: every engine call goes through the isolated ``cuda`` env via
+It never imports the engine in-process: every call goes through the isolated ``cuda`` env via
 :mod:`ara.engine_env`, so nothing torch-shaped loads in ARA's interpreter and the core stays
 engine-free at runtime, not just at lock time.
 
@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import json
 
-# Core, engine-free helpers (no wcx) — safe to import at module load and patchable in tests.
+# Core, engine-free helpers — safe to import at module load and patchable in tests.
 from ara import calibration, db, engine_env
 from ara.contracts import driver
 
-# The wcx worker modules ARA drives in the isolated cuda env (never imported in-process).
+# Native CUDA worker modules ARA drives in the isolated cuda env (never imported in-process).
 DEVICE_MODULE = "ara_engine_cuda.device"
 WORKER_MODULE = "ara_engine_cuda.measure_one"
 
@@ -35,7 +35,7 @@ DEFAULT_OVERHEAD_GB = 0.6    # fallback CUDA-context overhead until calibrated
 
 
 def safe_limits() -> dict:
-    """Read this machine's safe VRAM limits via the wcx worker. Pure read — no model.
+    """Read this machine's safe VRAM limits via the native CUDA worker. Pure read — no model.
 
     Stateless: returns the budget with no stored overhead (``calibrated=False``). ARA overlays a
     previously-measured overhead from its own store — the engine no longer reads a database.
@@ -110,7 +110,7 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
 
 def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
-    calibration for the wcx engine, or a safe default if uncalibrated."""
+    calibration for the CUDA engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
     with db.connected() as con:
         stored = calibration.get_calibration(con, "wcx")
@@ -119,7 +119,7 @@ def _budget_params() -> tuple[float, float]:
     return DEFAULT_MARGIN_GB, overhead
 
 
-# Cross-engine --kv-quant → wcx --kv-bits. fp16 is the default; q8/q4 opt in. Effective bytes/elem
+# Cross-engine --kv-quant → CUDA worker --kv-bits. fp16 is the default; q8/q4 opt in. Effective bytes/elem
 # (group 64, fp16 scale+zero) drives the analytic decode-ceiling estimate — same scheme as MLX.
 _CUDA_KV_BITS = {"f16": None, "q8_0": 8, "q4_0": 4}
 _CUDA_KV_BYTES = {"f16": 2.0, "q8_0": 8 / 8 + 2 * 2 / 64, "q4_0": 4 / 8 + 2 * 2 / 64}
@@ -146,7 +146,7 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
 
 
 def flash_attn_capable() -> bool:
-    """Whether this GPU can run FlashAttention-2 (Ampere+ and the package present), per the wcx
+    """Whether this GPU can run FlashAttention-2 (Ampere+ and the package present), per the CUDA
     device worker. Lets the CLI tell the user upfront when a --flash-attn opt-in will use SDPA."""
     try:
         return bool(safe_limits().get("flash_attn_capable"))
@@ -155,7 +155,7 @@ def flash_attn_capable() -> bool:
 
 
 def fp8_capable() -> bool:
-    """Whether this GPU has hardware FP8 (Ada/Hopper, sm_89+), per the wcx device worker. Lets the
+    """Whether this GPU has hardware FP8 (Ada/Hopper, sm_89+), per the CUDA device worker. Lets the
     CLI reject --weight-quant fp8 on older GPUs instead of failing deep in a model load."""
     try:
         return bool(safe_limits().get("fp8_capable"))
@@ -169,8 +169,8 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
     """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
-    only supplies the CUDA specifics — the isolated ``cuda`` env, wcx's self-vetoing ``measure_one``
-    worker, the budget params, and the schedule. ARA never imports wcx in-process. Crash-safety is
+    only supplies the CUDA specifics — the isolated ``cuda`` env, the self-vetoing ``measure_one``
+    worker, the budget params, and the schedule. ARA never imports the engine in-process. Crash-safety is
     layered: the driver gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine
     refuses-before-load (L4) and a VRAM watchdog aborts mid-probe (L5). Returns
     ``{model, safe_context, points}``. ``kv_quant`` (default ``"f16"``) measures with that KV
@@ -200,7 +200,7 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
              kv_quant: str = "f16", flash_attn: bool = False, weight_quant: str = "none",
              prefill_chunk: int | None = None) -> dict:
     """One-shot CUDA completion, governed: max_context is the characterized safe ceiling, so the
-    worker generates under the wall. Out-of-process in the isolated `cuda` env via wcx-suite's
+    worker generates under the wall. Out-of-process in the isolated `cuda` env via the native
     generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``) and
     ``flash_attn`` (default off → SDPA) should match how *model* was characterized. Returns
     {context, completion} or a refusal {refused, reason}. ARA never imports torch in-process."""
@@ -225,7 +225,7 @@ def benchmark(model, prompts: list, *, max_context, max_tokens=DEFAULT_MAX_TOKEN
               prefill_chunk: int | None = None) -> dict:
     """Load-once multi-prompt CUDA benchmark, governed: ``max_context`` is the characterized safe
     ceiling, so the worker gates each prompt under the wall and loads weights only after a prompt's
-    gate passes. Out-of-process in the isolated ``cuda`` env via wcx-suite's ``benchmark`` worker;
+    gate passes. Out-of-process in the isolated ``cuda`` env via the native ``benchmark`` worker;
     the prompts go as a JSON array over stdin, never argv. ``kv_quant``/``flash_attn``/
     ``weight_quant``/``prefill_chunk`` should match how *model* was characterized. Returns the
     worker dict verbatim — ``{"context": N, "results": [...]}`` or a whole-run refusal

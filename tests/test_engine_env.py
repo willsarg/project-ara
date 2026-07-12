@@ -195,7 +195,7 @@ def test_create_honors_explicit_link_mode(engines_root, run_spy):
 
 
 def test_create_pins_python_when_requested(engines_root, run_spy):
-    engine_env.create("apple", ["wmx-suite"], python="3.12")
+    engine_env.create("apple", ["ara-engine-mlx"], python="3.12")
     venv = run_spy.calls[0]
     assert venv[venv.index("--python") + 1] == "3.12"
 
@@ -244,7 +244,7 @@ def test_create_raises_friendly_when_uv_missing(engines_root, run_spy, monkeypat
 
 
 # --------------------------------------------------------------------------- #
-# version stamp — tells a stale vendored engine from a current one
+# version stamp — tells a stale installed engine from the current native package
 # --------------------------------------------------------------------------- #
 def test_stamped_version_none_when_absent(engines_root):
     assert engine_env.stamped_version("ghost") is None
@@ -402,7 +402,7 @@ def test_run_worker_spawns_windows_interpreter(engines_root, run_spy, monkeypatc
     # Portability: the IPC seam must spawn Scripts\python.exe on Windows, not bin/python.
     monkeypatch.setattr(engine_env, "_is_windows", lambda: True)
     run_spy.add("python.exe", 0, out='{"ok": true}')
-    engine_env.run_worker("apple", ["-m", "wmx_suite.device", "limits"])
+    engine_env.run_worker("apple", ["-m", "ara_engine_mlx.device", "limits"])
     cmd = run_spy.calls[0]
     assert cmd[0] == str(engines_root / "apple" / "Scripts" / "python.exe")
 
@@ -531,7 +531,7 @@ def test_start_worker_server_returns_proc_and_dict_on_ready_json(engines_root, m
     ready = '{"ready": true, "url": "http://127.0.0.1:8080", "context": 4096}\n'
     proc, _ = _mock_server_popen(monkeypatch, ["log line\n", ready])
     result_proc, result_dict = engine_env.start_worker_server(
-        "apple", ["-m", "wmx_suite.serve"])
+        "apple", ["-m", "ara_engine_mlx.serve"])
     assert result_proc is proc
     assert result_dict == {"ready": True, "url": "http://127.0.0.1:8080", "context": 4096}
     # proc must NOT be waited on — the server keeps running
@@ -543,7 +543,7 @@ def test_start_worker_server_raises_on_refused(engines_root, monkeypatch):
     refused = '{"refused": true, "reason": "model exceeds safe budget"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [refused])
     with pytest.raises(engine_env.EngineEnvError, match="model exceeds safe budget"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
     assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
@@ -552,7 +552,7 @@ def test_start_worker_server_raises_on_error(engines_root, monkeypatch):
     error = '{"error": "load failed: model not found"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [error])
     with pytest.raises(engine_env.EngineEnvError, match="load failed"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
     assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
@@ -560,7 +560,7 @@ def test_start_worker_server_raises_when_no_json_before_exit(engines_root, monke
     """Stdout exhausted with no JSON line → EngineEnvError 'exited without a ready signal'."""
     proc, _ = _mock_server_popen(monkeypatch, ["log: starting\n", "log: crash\n"])
     with pytest.raises(engine_env.EngineEnvError, match="exited without a ready signal"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
 
 
 def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
@@ -568,9 +568,9 @@ def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
     monkeypatch.setattr(engine_env, "_is_windows", lambda: False)
     ready = '{"ready": true, "url": "http://127.0.0.1:9000", "context": 2048}\n'
     _proc, cmd = _mock_server_popen(monkeypatch, [ready])
-    engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve", "org/m"])
+    engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve", "org/m"])
     assert cmd[0] == str(engines_root / "apple" / "bin" / "python")
-    assert cmd[1:] == ["-m", "wmx_suite.serve", "org/m"]
+    assert cmd[1:] == ["-m", "ara_engine_mlx.serve", "org/m"]
 
 
 def test_start_worker_server_times_out_and_kills_child(engines_root, monkeypatch):

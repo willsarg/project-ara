@@ -33,7 +33,7 @@ from ara import engine_env, engine_identity
 def _ara_version() -> str:
     """The installed project-ara version (also behind ``ara --version``), or a sentinel when running
     from an un-installed source tree with no distribution metadata. Stamped into an engine env at
-    install and compared on the next ``ara install`` to detect a stale vendored engine — a newer ARA
+    install and compared on the next ``ara install`` to detect a stale engine package — a newer ARA
     wheel carries newer nested engine source that must reach a box that already has the env."""
     try:
         return metadata.version("project-ara")
@@ -55,11 +55,11 @@ ENGINES: dict[str, dict] = {
         # Nested: the native MLX engine source ships under ara/_engine_packages/mlx and installs into
         # the isolated `apple` env from there — no git fetch at install time, so a release is
         # reproducible from the wheel alone. Folded 2026-06-30 from wmx-suite@374c47d (the #107
-        # single-BOS + turn-end stop fixes). Re-vendor via scripts/vendor_engine.py to bump.
+        # single-BOS + turn-end stop fixes).
         # ARA_WMX_SOURCE still overrides to a local checkout (editable) for engine dev. MLX +
         # transformers stay engine-env-only — never ARA dependencies.
         "vendored": True,
-        "python": "3.12",          # wmx-suite requires >=3.12
+        "python": "3.12",          # ara-engine-mlx requires >=3.12
         "model_kinds": ("transformers",),
     },
     "cuda": {

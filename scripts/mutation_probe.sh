@@ -20,8 +20,8 @@
 #   scripts/mutation_probe.sh                          # scope = ara/*.py changed in the last 7 days
 #   scripts/mutation_probe.sh ara/estimate.py ara/foo.py  # explicit scope (e.g. for local bring-up)
 #
-# Vendored code (ara/_vendor/**) is never mutated regardless of scope — pyproject.toml's
-# [tool.mutmut] carries a permanent `do_not_mutate` filter for it.
+# Native engine package code (ara/_engine_packages/**) is never mutated regardless of scope —
+# pyproject.toml's [tool.mutmut] carries a permanent `do_not_mutate` filter for it.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -39,13 +39,14 @@ if [ "$#" -gt 0 ]; then
     FILES=("$@")
 else
     # Default scope: ara/*.py touched in the last 7 days (the weekly schedule window),
-    # excluding vendored code. `git log --name-only` over that window, deduped, filtered to
+    # excluding native engine package code. `git log --name-only` over that window, deduped,
+    # filtered to
     # files that still exist (a file renamed/deleted since shouldn't be probed).
     mapfile -t FILES < <(
         git log --since="7 days ago" --name-only --pretty=format: -- 'ara/*.py' \
             | sort -u \
             | grep -E '^ara/' \
-            | grep -v '^ara/_vendor/' \
+            | grep -v '^ara/_engine_packages/' \
             | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done
     )
 fi

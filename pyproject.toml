@@ -76,10 +76,10 @@ branch = true
 # not in ARA's test venv. Their pure logic still has unit tests (tests/test_workers_*),
 # but the subprocess-only worker modules are outside the 100% core gate.
 #
-# Nested engine source ships in the wheel under ``ara/_engine_packages`` or the remaining
-# ``ara/_vendor`` tree, but is never imported in ARA's process (it is pip-installed into an
-# isolated engine env and driven over a subprocess). It is therefore outside ARA's core gate.
-omit = ["ara/workers/*", "ara/_engine_packages/*", "ara/_vendor/*"]
+# Native engine source ships in the wheel under ``ara/_engine_packages``, but is never imported
+# in ARA's process (it is pip-installed into an isolated engine env and driven over a subprocess).
+# It is therefore outside ARA's core gate.
+omit = ["ara/workers/*", "ara/_engine_packages/*"]
 
 [tool.coverage.report]
 show_missing = true
@@ -92,7 +92,7 @@ exclude_also = ["if TYPE_CHECKING:"]
 source_paths = ["ara"]
 # Nested engine source is subprocess-only and outside ARA's own gate (see the coverage omit
 # above), so it is never mutated here either.
-do_not_mutate = ["ara/_engine_packages/*", "ara/_vendor/*"]
+do_not_mutate = ["ara/_engine_packages/*"]
 # Clear the project's addopts so --cov / fail_under=100 don't make every mutant
 # run exit non-zero (which would corrupt kill/survive detection). Fast, mocked, fail-fast: no
 # point paying for coverage instrumentation or a slow suite once per mutant. The marker filter

@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Boundary guard: ARA core reaches nested engines ONLY through their headless
+"""Boundary guard: ARA core reaches native engines ONLY through their headless
 measurement/governance subprocess entrypoints and never imports them in-process. Pins the surface trimmed by
-Spec 2026-07-05-refold-engines-to-adapter-surface so the suites can't silently re-bloat (a
-re-vendor that drags the standalone-app scaffolding back, or a reference to an unwired worker).
+Spec 2026-07-05-refold-engines-to-adapter-surface so the packages cannot silently re-bloat or
+expose an unwired worker.
 """
 from __future__ import annotations
 
 import ast
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
 
-_ARA = Path(__file__).resolve().parent.parent / "ara"
-_NESTED_ENGINE_DIRS = {"_vendor", "_engine_packages"}
-_ENGINE_PACKAGE_ROOTS = {"ara_engine_mlx", "ara_engine_cuda", "wmx_suite", "wcx_suite"}
+_ROOT = Path(__file__).resolve().parent.parent
+_ARA = _ROOT / "ara"
+_NESTED_ENGINE_DIRS = {"_engine_packages"}
+_ENGINE_PACKAGE_ROOTS = {"ara_engine_mlx", "ara_engine_cuda"}
 _CORE_PY = [p for p in _ARA.rglob("*.py") if not _NESTED_ENGINE_DIRS.intersection(p.parts)]
 
 # The legitimate headless-engine surface: the measurement/serve/govern `-m` entrypoints plus the
@@ -23,12 +25,27 @@ _CORE_PY = [p for p in _ARA.rglob("*.py") if not _NESTED_ENGINE_DIRS.intersectio
 # (cli/cli_benchmarks/db/ui/launcher/views), and NOT the unwired non-LLM workers
 # (kokoro*/embeddings*) — a core reference to any of those must fail here until a deliberate
 # follow-on (e.g. wiring non-LLM characterize) extends this list. That failure is the signal.
-_ALLOWED = {"device", "measure_one", "serve", "generate", "benchmark", "probe_worker"}
+_ALLOWED = {"device", "measure_one", "serve", "generate", "benchmark"}
+_APPROVED_BACKEND_SURFACES = {
+    "apple.py": {
+        "ara_engine_mlx.device",
+        "ara_engine_mlx.measure_one",
+        "ara_engine_mlx.serve",
+        "ara_engine_mlx.generate",
+        "ara_engine_mlx.benchmark",
+    },
+    "cuda.py": {
+        "ara_engine_cuda.device",
+        "ara_engine_cuda.measure_one",
+        "ara_engine_cuda.generate",
+        "ara_engine_cuda.benchmark",
+    },
+}
 
 
 def _suite_refs(text: str) -> set[str]:
     return set(re.findall(
-        r"(?:ara_engine_(?:mlx|cuda)|(?:wmx|wcx)_suite)\.([a-z_]+)",
+        r"ara_engine_(?:mlx|cuda)\.([a-z_]+)",
         text,
     ))
 
@@ -40,7 +57,7 @@ def test_core_only_references_the_headless_engine_surface():
         if extra:
             offenders[str(p.relative_to(_ARA.parent))] = sorted(extra)
     assert not offenders, (
-        f"ARA core references vendored engine modules outside the allowed headless surface "
+        f"ARA core references native engine modules outside the allowed headless surface "
         f"{sorted(_ALLOWED)}. Either standalone-app scaffolding / an unwired non-LLM worker crept "
         f"back, or a deliberate follow-on must extend the allow-list: {offenders}")
 
@@ -121,3 +138,33 @@ def test_native_engine_surface_references_are_matched():
         'argv = ["-m", "ara_engine_mlx.device"]\n'
         'other = "ara_engine_cuda.measure_one"\n'
     ) == {"device", "measure_one"}
+
+
+def _native_engine_module_literals(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.fullmatch(r"ara_engine_(?:mlx|cuda)\.[a-z_]+", node.value)
+    }
+
+
+@pytest.mark.parametrize(("backend", "approved"), _APPROVED_BACKEND_SURFACES.items())
+def test_backend_worker_module_literals_equal_approved_surface(backend, approved):
+    assert _native_engine_module_literals(_ARA / "backends" / backend) == approved
+
+
+def test_coverage_and_mutation_only_exclude_native_engine_packages():
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert project["tool"]["coverage"]["run"]["omit"] == [
+        "ara/workers/*",
+        "ara/_engine_packages/*",
+    ]
+    assert project["tool"]["mutmut"]["do_not_mutate"] == ["ara/_engine_packages/*"]
+
+    mutation_probe = (_ROOT / "scripts" / "mutation_probe.sh").read_text(encoding="utf-8")
+    assert "ara/_engine_packages/" in mutation_probe
+    assert "ara/_vendor/" not in mutation_probe
