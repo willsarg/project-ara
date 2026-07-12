@@ -5,6 +5,7 @@
 Spec 2026-06-23-capability-pipeline (Slice 1)."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import types
 
@@ -49,16 +50,18 @@ def test_rekey_legacy_key_transforms_and_guards():
 def test_capture_persists_machine_and_projection(store, monkeypatch):
     """capture() persists BOTH the lossless machine blob and the curated projection, and
     returns that record."""
-    m = detect.machine()
+    m = dataclasses.replace(detect.machine(), engine="wmx", backend="apple")
     monkeypatch.setattr(profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(profile.detect, "machine", lambda: m)   # fixed snapshot, no live churn
     d = profile.capture(store)
     # the curated projection: durable fields present, live ones absent
     proj = d["projection"]
     assert "chip" in proj and "backend" in proj and "ram_total_gb" in proj
+    assert proj["engine"] == "mlx" and proj["backend"] == "apple"
     assert "ram_available_gb" not in proj and "disk_free_gb" not in proj and "apps" not in proj
     # the lossless machine blob: full detect --json shape (live fields allowed)
     assert d["machine"] == serialize.machine(m)
+    assert d["machine"]["engine"] == "mlx" and d["machine"]["backend"] == "apple"
     saved = db.get_latest_profile(store, "mkey")          # persisted, keyed by machine_key
     # the stored JSON is the returned record (compare through one JSON round-trip: the store
     # normalises tuples→lists, so round-trip both sides to compare like-for-like)

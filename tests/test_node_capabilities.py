@@ -219,7 +219,7 @@ def test_advertised_capabilities_from_characterizations(monkeypatch):
     con.close()
     caps = capabilities.advertised_capabilities()
     assert caps == [
-        {"kind": "serve_model", "id": "org/model-a", "engine": "wcx", "evidence": "characterized"},
+        {"kind": "serve_model", "id": "org/model-a", "engine": "cuda", "evidence": "characterized"},
         {"kind": "serve_model", "id": "org/model-b", "engine": "cpu", "evidence": "characterized"},
     ]
     for cap in caps:
@@ -250,7 +250,7 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
     con.close()
     desc = capabilities.self_description()
     assert desc["capabilities"] == [
-        {"kind": "serve_model", "id": "org/m", "engine": "wcx", "evidence": "characterized"}]
+        {"kind": "serve_model", "id": "org/m", "engine": "cuda", "evidence": "characterized"}]
     _validate(desc, "https://ara.dev/wire/enroll.request.json")
 
 
