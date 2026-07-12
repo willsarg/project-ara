@@ -28,6 +28,10 @@ def test_catalog_has_only_canonical_public_engine_keys():
     assert "wmx" not in engines.ENGINES and "wcx" not in engines.ENGINES
 
 
+def test_mlx_catalog_declares_the_native_import_package():
+    assert engines.ENGINES["mlx"]["import_package"] == "ara_engine_mlx"
+
+
 def test_legacy_engine_aliases_resolve_to_canonical_keys():
     assert engines.resolve("wmx") == "mlx"
     assert engines.resolve("wcx") == "cuda"
@@ -153,6 +157,12 @@ def test_source_for_canonical_override_wins_over_legacy(monkeypatch):
     assert engines.source_for("mlx") == "../mlx-suite"
 
 
+def test_source_for_accepts_legacy_override_for_one_release(monkeypatch):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    assert engines.source_for("mlx") == "../legacy-wmx-suite"
+
+
 # --------------------------------------------------------------------------- #
 # _install_targets() — the uv-pip args per engine kind
 # --------------------------------------------------------------------------- #
@@ -219,6 +229,12 @@ def test_install_targets_vendored_is_plain_path(monkeypatch):
 def test_install_targets_external_local_is_editable(monkeypatch):
     monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
     assert engines._install_targets("mlx") == ["-e", "../mlx-suite"]
+
+
+def test_install_targets_legacy_local_source_remains_editable(monkeypatch):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    assert engines._install_targets("mlx") == ["-e", "../legacy-wmx-suite"]
 
 
 def test_install_targets_cuda_folds_extra_and_torch_backend(monkeypatch):
@@ -292,12 +308,17 @@ def test_install_stamps_env_with_current_version(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.setattr(engines, "_ara_version", lambda: "3.1.4")
     seen = {}
-    monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None, schema=None:
-                        seen.update(version=version, schema=schema))
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, *, python=None, version=None, schema=None,
+        expected_import=None: seen.update(
+            version=version, schema=schema, expected_import=expected_import),
+    )
     assert engines.install("mlx").status == "installed"
     assert seen["version"] == "3.1.4"
     assert seen["schema"] == "ara-engine-mlx:ara_engine_mlx:v1"
+    assert seen["expected_import"] == "ara_engine_mlx"
 
 
 def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
@@ -308,9 +329,17 @@ def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "1.0.0")
     removed, created = [], {}
     monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
-    monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None, schema=None:
-                        created.update(name=name, version=version, schema=schema))
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, *, python=None, version=None, schema=None,
+        expected_import=None: created.update(
+            name=name,
+            version=version,
+            schema=schema,
+            expected_import=expected_import,
+        ),
+    )
     r = engines.install("mlx")
     assert r.status == "refreshed"
     assert removed == ["apple"]                 # old env wiped first
@@ -318,6 +347,7 @@ def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
         "name": "apple",
         "version": "2.0.0",
         "schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "expected_import": "ara_engine_mlx",
     }
 
 

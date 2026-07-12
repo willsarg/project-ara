@@ -49,6 +49,7 @@ ENGINES: dict[str, dict] = {
         "available": True,
         "source_dir": "_engine_packages/mlx",
         "env_schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "import_package": "ara_engine_mlx",
         "source_env": "ARA_MLX_SOURCE",
         "legacy_source_env": "ARA_WMX_SOURCE",
         # Nested: the native MLX engine source ships under ara/_engine_packages/mlx and installs into
@@ -205,20 +206,23 @@ def is_installed(key: str) -> bool:
 
 
 def _vendored_source(key: str) -> Path:
-    """The directory of engine *key*'s vendored package source — ``ara/_vendor/<key>``, which holds
-    the engine's ``pyproject.toml``. This is the path handed to ``uv pip install``: uv builds the
-    engine package from it into the isolated env. Ships inside ARA's wheel (no network at install)."""
+    """The catalog-declared nested package source for engine *key*.
+
+    This directory holds the engine's ``pyproject.toml`` and is handed to ``uv pip install``.
+    It ships inside ARA's wheel, so the default install needs no engine-source network fetch.
+    """
     engine = ENGINES[key]
     return Path(__file__).resolve().parent / engine["source_dir"]
 
 
 def source_for(key: str) -> str:
-    """The install source for an external engine *key*: a dev override, else the vendored path.
+    """The install source for an external engine *key*: a dev override, else its nested source.
 
-      * ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) — a local checkout for engine
-        development; used verbatim (installed editable by :func:`_install_targets`).
-      * otherwise the package source ARA ships under ``ara/_vendor/<key>``, so a release installs the
-        exact engine code in the wheel — reproducibly and offline (no git fetch)."""
+      * The canonical source variable (for example ``ARA_MLX_SOURCE``) selects a local checkout for
+        engine development; a declared legacy variable remains a temporary compatibility fallback.
+      * Otherwise ARA installs the exact catalog source shipped in its wheel, reproducibly and
+        offline (no git fetch).
+    """
     engine = ENGINES[key]
     override = os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"])
     if override:
@@ -293,7 +297,7 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
     never creates an env for an unknown or not-yet-available engine.
 
     Version-aware: an installed env is *stale* when its stamped ARA version differs from the
-    current one (a newer ARA wheel ships newer ``ara/_vendor/*`` engine source) or when it carries
+    current one (a newer ARA wheel ships newer nested engine source) or when it carries
     no stamp at all (built by a pre-stamp ARA). A stale env is torn down and reinstalled so the
     shipped engine code actually reaches the box — reported as ``refreshed``. ``refresh=True`` forces
     that reinstall even when the stamp already matches. Every fresh/refresh install stamps the env
@@ -315,10 +319,15 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
         return InstallResult(key, "already")
     if stale:                       # wipe the old env so the reinstall isn't itself a noop
         engine_env.remove(engine["backend"])
+    create_kwargs = {
+        "python": engine.get("python"),
+        "version": current,
+        "schema": engine.get("env_schema"),
+    }
+    if engine.get("import_package") is not None:
+        create_kwargs["expected_import"] = engine["import_package"]
     try:
-        engine_env.create(engine["backend"], _install_targets(key),
-                          python=engine.get("python"), version=current,
-                          schema=engine.get("env_schema"))
+        engine_env.create(engine["backend"], _install_targets(key), **create_kwargs)
     except engine_env.EngineEnvError as e:
         return InstallResult(key, "failed", str(e))
     return InstallResult(key, "refreshed" if stale else "installed")

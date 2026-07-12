@@ -6,8 +6,7 @@ Each hardware engine lives in its own uv environment under the data dir
 (``engines/<name>/``), so incompatible toolchains (torch-CUDA vs torch-ROCm) and
 Python pins can never collide, and ARA's core stays engine-free. ARA never imports
 an engine; it drives one over a subprocess — spawning the env's own ``python`` and
-reading a single JSON line back (the same shape ``wmx_suite.probe_worker`` already
-emits).
+reading a single JSON line back from the engine's native worker package.
 
 Pure orchestration: no ML library is imported here. The one external boundary is
 :func:`_run` (uv / the engine's python), which tests stub.
@@ -72,7 +71,7 @@ def env_path(name: str) -> Path:
 def _stamp_path(name: str) -> Path:
     """The version-stamp file inside engine *name*'s env (``.ara-version``): the ARA release that
     installed it. Lets ``ara install`` tell a stale vendored engine (older ARA wheel) from a current
-    one, so a new wheel's ``ara/_vendor/*`` source actually reaches a box that already has the env."""
+    one, so a new wheel's nested engine source actually reaches a box that already has the env."""
     return env_path(name) / ".ara-version"
 
 
@@ -119,15 +118,16 @@ def exists(name: str) -> bool:
 
 def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE,
            python: str | None = None, version: str | None = None,
-           schema: str | None = None) -> Path:
+           schema: str | None = None, expected_import: str | None = None) -> Path:
     """Create engine *name*'s isolated uv env and install *packages* into it.
 
     *python* pins the interpreter version (e.g. ``"3.12"``) — some engines require a floor
-    (wmx-suite needs ``>=3.12``); omit to take uv's default. *version* and *schema*, when given, are
+    (the native MLX engine needs ``>=3.12``); omit to take uv's default. *version* and *schema* are
     stamped into the env (``.ara-version`` and ``.ara-schema``) after a successful install so a
-    later ``ara install`` can detect stale source or a stale package layout; omit either to write
-    no corresponding stamp. Raises
-    :class:`EngineEnvError` if ``uv`` is missing, or if the venv or the install fails.
+    later ``ara install`` can detect stale source or a stale package layout. *expected_import*,
+    when given, must be discoverable by the env's interpreter after installation and before either
+    stamp is written. Raises :class:`EngineEnvError` if ``uv`` is missing, the venv/install fails,
+    or the installed source does not provide the expected import package.
     """
     if shutil.which("uv") is None:
         raise EngineEnvError(
@@ -150,6 +150,19 @@ def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE
         # env down on install failure so `ara install` can be retried to actually repair it.
         shutil.rmtree(path, ignore_errors=True)
         raise EngineEnvError(f"installing into {name!r} failed: {err.strip()}")
+    if expected_import is not None:
+        rc, _out, _err = _run([
+            str(python_path(name)),
+            "-c",
+            "import importlib.util, sys; "
+            "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)",
+            expected_import,
+        ])
+        if rc != 0:
+            shutil.rmtree(path, ignore_errors=True)
+            raise EngineEnvError(
+                f"installed engine {name!r} does not provide expected import package "
+                f"{expected_import!r}")
     if version is not None:               # record the ARA release that built this env (staleness stamp)
         stamp = _stamp_path(name)
         stamp.parent.mkdir(parents=True, exist_ok=True)   # uv made this in prod; be robust regardless
@@ -234,8 +247,8 @@ def run_worker(name: str, args: list[str], *, input: str | None = None,
                stream: bool = False) -> dict:
     """Spawn engine *name*'s python with *args*, return the single JSON object it emits.
 
-    The worker prints one ``{...}`` line to stdout (other lines are ignored as logs),
-    mirroring ``wmx_suite.probe_worker``. Raises :class:`EngineEnvError` on a non-zero
+    The worker prints one ``{...}`` line to stdout (other lines are ignored as logs), matching
+    the native engine worker contract. Raises :class:`EngineEnvError` on a non-zero
     exit or if no JSON line is found.
 
     ``stream=False`` (default): stderr is captured and included in error messages.

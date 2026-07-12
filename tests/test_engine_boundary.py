@@ -15,6 +15,7 @@ import pytest
 
 _ARA = Path(__file__).resolve().parent.parent / "ara"
 _NESTED_ENGINE_DIRS = {"_vendor", "_engine_packages"}
+_ENGINE_PACKAGE_ROOTS = {"ara_engine_mlx", "ara_engine_cuda", "wmx_suite", "wcx_suite"}
 _CORE_PY = [p for p in _ARA.rglob("*.py") if not _NESTED_ENGINE_DIRS.intersection(p.parts)]
 
 # The legitimate headless-engine surface: the measurement/serve/govern `-m` entrypoints plus the
@@ -26,7 +27,10 @@ _ALLOWED = {"device", "measure_one", "serve", "generate", "benchmark", "probe_wo
 
 
 def _suite_refs(text: str) -> set[str]:
-    return set(re.findall(r"(?:wmx|wcx)_suite\.([a-z_]+)", text))
+    return set(re.findall(
+        r"(?:ara_engine_(?:mlx|cuda)|(?:wmx|wcx)_suite)\.([a-z_]+)",
+        text,
+    ))
 
 
 def test_core_only_references_the_headless_engine_surface():
@@ -65,7 +69,9 @@ def _nested_engine_imports(path: Path) -> list[str]:
                     and isinstance(node.args[0].value, str)):
                 names = [node.args[0].value]
         for name in names:
-            if _NESTED_ENGINE_DIRS.intersection(name.split(".")):
+            parts = name.split(".")
+            if (_NESTED_ENGINE_DIRS.intersection(parts)
+                    or (parts and parts[0] in _ENGINE_PACKAGE_ROOTS)):
                 display_path = path.relative_to(_ARA.parent) if path.is_relative_to(
                     _ARA.parent) else path
                 imports.append(f"{display_path}:{node.lineno}: {name}")
@@ -82,8 +88,12 @@ def test_core_never_imports_nested_engine_packages_in_process():
 
 
 @pytest.fixture(params=[
-    'import importlib\nimportlib.import_module("ara._vendor.wmx.wmx_suite.models")\n',
-    '__import__("ara._engine_packages.wcx.wcx_suite.models")\n',
+    "import ara_engine_mlx.models\n",
+    "from ara_engine_mlx import models\n",
+    'import importlib\nimportlib.import_module("ara_engine_mlx.models")\n',
+    '__import__("ara_engine_mlx.models")\n',
+    "import ara_engine_cuda.models\n",
+    'import importlib\nimportlib.import_module("ara_engine_cuda.models")\n',
 ])
 def dynamic_engine_import_source(request):
     return request.param
@@ -99,8 +109,15 @@ def test_nested_engine_guard_rejects_dynamic_imports(tmp_path, dynamic_engine_im
 def test_nested_engine_guard_allows_subprocess_module_strings(tmp_path):
     module = tmp_path / "subprocess_entrypoint.py"
     module.write_text(
-        'subprocess.run([python, "-m", "ara._engine_packages.wmx.wmx_suite.generate"])\n',
+        'subprocess.run([python, "-m", "ara_engine_mlx.generate"])\n',
         encoding="utf-8",
     )
 
     assert _nested_engine_imports(module) == []
+
+
+def test_native_engine_surface_references_are_matched():
+    assert _suite_refs(
+        'argv = ["-m", "ara_engine_mlx.device"]\n'
+        'other = "ara_engine_cuda.measure_one"\n'
+    ) == {"device", "measure_one"}

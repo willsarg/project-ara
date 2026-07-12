@@ -304,6 +304,46 @@ def test_create_does_not_leave_stamps_when_install_fails(engines_root, run_spy):
     assert not env.exists()
 
 
+def test_create_verifies_expected_import_package_before_stamping(engines_root, run_spy):
+    engine_env.create(
+        "apple",
+        ["/native/mlx"],
+        version="2.0.0",
+        schema="ara-engine-mlx:ara_engine_mlx:v1",
+        expected_import="ara_engine_mlx",
+    )
+
+    verify = run_spy.calls[2]
+    assert verify[0] == str(engine_env.python_path("apple"))
+    assert verify[1] == "-c"
+    assert "find_spec" in verify[2]
+    assert verify[3] == "ara_engine_mlx"
+    assert engine_env.stamped_version("apple") == "2.0.0"
+    assert engine_env.stamped_schema("apple") == "ara-engine-mlx:ara_engine_mlx:v1"
+
+
+def test_create_rejects_legacy_source_without_expected_import_and_removes_env(
+        engines_root, run_spy):
+    run_spy.add("ara_engine_mlx", 1)
+    env = engine_env.env_path("apple")
+    env.mkdir(parents=True)
+    (env / ".ara-version").write_text("old")
+    (env / ".ara-schema").write_text("old")
+
+    with pytest.raises(engine_env.EngineEnvError, match="ara_engine_mlx"):
+        engine_env.create(
+            "apple",
+            ["-e", "../legacy-wmx-suite"],
+            version="2.0.0",
+            schema="ara-engine-mlx:ara_engine_mlx:v1",
+            expected_import="ara_engine_mlx",
+        )
+
+    assert not env.exists()
+    assert engine_env.stamped_version("apple") is None
+    assert engine_env.stamped_schema("apple") is None
+
+
 # --------------------------------------------------------------------------- #
 # remove
 # --------------------------------------------------------------------------- #

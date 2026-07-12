@@ -16,8 +16,8 @@ dependencies = [
     "platformdirs>=4",
     "gguf>=0.19.0",
 ]
-# The hardware-specific engine (wmx-suite on Apple, wcx-suite on CUDA) is NOT a
-# dependency: ARA probes the machine and installs the matched suite on demand via
+# Hardware-specific engines (native MLX on Apple, CUDA on NVIDIA) are NOT dependencies:
+# ARA probes the machine and installs the matched nested package on demand via
 # `ara install` (see ara/engines.py). That keeps the core universal and the lock
 # engine-free, so clone-and-go `uv sync` works on every platform.
 
@@ -43,8 +43,8 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["ara"]
 
-# Test/dev tooling. The suite runs WITHOUT any engine on purpose — it proves the
-# core stays engine-free — so it never needs wmx-suite (the seam uses a fake).
+# Test/dev tooling. The suite runs without an installed engine on purpose — it proves the
+# core stays engine-free while exercising the subprocess seams with test doubles.
 [dependency-groups]
 # httpx is here (not just in the optional [node] extra) so the node's outbound client code is
 # exercised by the 100% coverage gate.
@@ -73,9 +73,8 @@ markers = [
 source = ["ara"]
 branch = true
 # Built-in engine workers run in their own isolated uv env (with llama-cpp-python etc.),
-# not in ARA's test venv — so they can't be exercised here, exactly like the external
-# wmx-suite. Their pure logic still has unit tests (tests/test_workers_*), they're just
-# out of the 100% core gate.
+# not in ARA's test venv. Their pure logic still has unit tests (tests/test_workers_*),
+# but the subprocess-only worker modules are outside the 100% core gate.
 #
 # Nested engine source ships in the wheel under ``ara/_engine_packages`` or the remaining
 # ``ara/_vendor`` tree, but is never imported in ARA's process (it is pip-installed into an
@@ -86,8 +85,7 @@ omit = ["ara/workers/*", "ara/_engine_packages/*", "ara/_vendor/*"]
 show_missing = true
 # Full statement + branch coverage is the standing bar — new code lands with tests.
 fail_under = 100
-# The lazy `from wmx_suite import ...` lines inside apple.py only execute when a real
-# engine is present; the seam's behavior is covered via a fake wmx_suite instead.
+# Type-only imports do not execute at runtime and are excluded from branch accounting.
 exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.mutmut]
