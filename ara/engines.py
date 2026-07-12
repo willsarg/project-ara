@@ -9,7 +9,7 @@ vs torch-ROCm, MLX vs llama.cpp) from ever colliding. ARA drives an engine over 
 worker in its env — it never imports one in-process.
 
 Two kinds of engine live here:
-  * **vendored suites** — the MLX and CUDA heavyweights ship under ``ara/_vendor`` and install
+  * **nested engines** — the MLX and CUDA heavyweights ship under ARA-owned source trees and install
     from that exact source into isolated environments.
   * **built-in engines** — everything else ships in the ARA repo (only the worker's heavy deps
     install into the env); described by a ``packages`` list and ``builtin: True``.
@@ -34,7 +34,7 @@ def _ara_version() -> str:
     """The installed project-ara version (also behind ``ara --version``), or a sentinel when running
     from an un-installed source tree with no distribution metadata. Stamped into an engine env at
     install and compared on the next ``ara install`` to detect a stale vendored engine — a newer ARA
-    wheel carries newer ``ara/_vendor/*`` source that must reach a box that already has the env."""
+    wheel carries newer nested engine source that must reach a box that already has the env."""
     try:
         return metadata.version("project-ara")
     except metadata.PackageNotFoundError:
@@ -47,10 +47,11 @@ ENGINES: dict[str, dict] = {
         "backend": "apple",
         "package": "ara-engine-mlx",
         "available": True,
-        "source_dir": "_vendor/wmx",
+        "source_dir": "_engine_packages/mlx",
+        "env_schema": "ara-engine-mlx:ara_engine_mlx:v1",
         "source_env": "ARA_MLX_SOURCE",
         "legacy_source_env": "ARA_WMX_SOURCE",
-        # Vendored: the wmx_suite source ships in ARA's wheel under ara/_vendor/wmx and installs into
+        # Nested: the native MLX engine source ships under ara/_engine_packages/mlx and installs into
         # the isolated `apple` env from there — no git fetch at install time, so a release is
         # reproducible from the wheel alone. Folded 2026-06-30 from wmx-suite@374c47d (the #107
         # single-BOS + turn-end stop fixes). Re-vendor via scripts/vendor_engine.py to bump.

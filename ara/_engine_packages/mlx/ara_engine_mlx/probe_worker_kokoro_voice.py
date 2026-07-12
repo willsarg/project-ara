@@ -28,7 +28,7 @@ def main() -> None:
     args = ap.parse_args()
 
     # Pre-flight BEFORE importing mlx/kokoro, so the Metal init can't cross the wall first.
-    from wmx_suite import kokoro_safety
+    from ara_engine_mlx import kokoro_safety
     threshold, _baseline, safe = kokoro_safety.preflight(args.margin)
     if not safe:
         print(json.dumps({

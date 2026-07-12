@@ -3,11 +3,11 @@
 """Device limits + calibration as JSON workers — for ARA's out-of-process engine driver.
 
 ARA owns no MLX knowledge: it drives these in wmx's isolated env and reads back a single JSON
-line (mirroring :mod:`wmx_suite.measure_one`). Progress/console output goes to **stderr** so
+line (mirroring :mod:`ara_engine_mlx.measure_one`). Progress/console output goes to **stderr** so
 stdout carries only the result object.
 
-    python -m wmx_suite.device limits [--margin G]
-    python -m wmx_suite.device calibrate [MODEL] [--margin G]
+    python -m ara_engine_mlx.device limits [--margin G]
+    python -m ara_engine_mlx.device calibrate [MODEL] [--margin G]
 """
 from __future__ import annotations
 

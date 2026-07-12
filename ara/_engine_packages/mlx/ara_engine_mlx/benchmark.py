@@ -20,7 +20,7 @@ Per-prompt items:
     per-item veto: {"prompt_index": <int>, "refused": true, "reason": "<why>"}
 
 Usage:
-    python -m wmx_suite.benchmark <hf_id> <ctx_ceiling> --margin G --overhead G
+    python -m ara_engine_mlx.benchmark <hf_id> <ctx_ceiling> --margin G --overhead G
         [--kv-bits N] [--max-tokens N]
     (JSON array of prompt strings on stdin)
 """

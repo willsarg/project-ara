@@ -18,7 +18,7 @@ from ara import calibration, db, engine_env
 from ara.contracts import driver
 
 # The wmx worker modules ARA drives in the isolated apple env (never imported in-process).
-DEVICE_MODULE = "wmx_suite.device"
+DEVICE_MODULE = "ara_engine_mlx.device"
 
 # Model ARA calibrates against — smallest SmolLM (MLX 4-bit). Calibration only measures
 # fixed memory overhead, so a tiny instruct model is plenty.
@@ -133,7 +133,7 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
 
 
 # ARA-owned ramp policy (the engine only measures; ARA decides the schedule + safety margin).
-WORKER_MODULE = "wmx_suite.measure_one"
+WORKER_MODULE = "ara_engine_mlx.measure_one"
 RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
 DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
 DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
@@ -197,10 +197,10 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
 
 def serve(model: str, *, port: int, max_context: int,
           kv_quant: str = "f16", measured_slope_gb_per_k: float | None = None) -> tuple:
-    """Start a governed MLX server for *model* via wmx_suite.serve, out-of-process.
+    """Start a governed MLX server for *model* via ara_engine_mlx.serve, out-of-process.
 
     Spawns the isolated ``apple`` env's python running
-    ``python -m wmx_suite.serve <model> <max_context> --margin G --overhead G --port N
+    ``python -m ara_engine_mlx.serve <model> <max_context> --margin G --overhead G --port N
     [--kv-bits N] [--measured-slope S]``. Reads stdout until the worker emits its ready JSON
     (``{"ready": true, "url": "...", "context": N}``), then returns
     ``(proc, url, context)`` without waiting — the server keeps running.
@@ -215,7 +215,7 @@ def serve(model: str, *, port: int, max_context: int,
     be the characterized safe ceiling for this machine (Rule #1).
     """
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.serve", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.serve", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--port", str(port)]
     bits = _MLX_KV_BITS[kv_quant]
@@ -238,7 +238,7 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
     should match how *model* was characterized. Returns {context, completion} or a refusal
     {refused, reason}. ARA never imports MLX in-process."""
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.generate", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.generate", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _MLX_KV_BITS[kv_quant]
@@ -252,7 +252,7 @@ def benchmark(model: str, prompts: list, *, max_context: int,
     """Multi-prompt MLX benchmark, governed: max_context is the characterized safe ceiling.
 
     Spawns the isolated ``apple`` env's python running
-    ``python -m wmx_suite.benchmark <model> <max_context> --margin G --overhead G
+    ``python -m ara_engine_mlx.benchmark <model> <max_context> --margin G --overhead G
     --max-tokens N [--kv-bits N]`` with the JSON prompt array on stdin. The worker loads
     the model once and iterates over all prompts; per-prompt governance enforces the ceiling
     for each item individually. Returns the worker dict verbatim:
@@ -261,7 +261,7 @@ def benchmark(model: str, prompts: list, *, max_context: int,
     safe ceiling.
     """
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.benchmark", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.benchmark", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _MLX_KV_BITS[kv_quant]

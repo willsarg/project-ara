@@ -77,10 +77,10 @@ branch = true
 # wmx-suite. Their pure logic still has unit tests (tests/test_workers_*), they're just
 # out of the 100% core gate.
 #
-# ara/_vendor/* is the vendored engine source (wmx_suite, wcx_suite) — it ships in the wheel
-# but is never imported in ARA's process (it's pip-installed into the isolated engine env and
-# driven over a subprocess). It has its own suites' test suites, so it's outside ARA's gate.
-omit = ["ara/workers/*", "ara/_vendor/*"]
+# Nested engine source ships in the wheel under ``ara/_engine_packages`` or the remaining
+# ``ara/_vendor`` tree, but is never imported in ARA's process (it is pip-installed into an
+# isolated engine env and driven over a subprocess). It is therefore outside ARA's core gate.
+omit = ["ara/workers/*", "ara/_engine_packages/*", "ara/_vendor/*"]
 
 [tool.coverage.report]
 show_missing = true
@@ -92,10 +92,9 @@ exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.mutmut]
 source_paths = ["ara"]
-# ara/_vendor/* is the vendored engine source (wmx_suite, wcx_suite) — shipped in the wheel but
-# never imported in ARA's process (see [tool.coverage.run] omit above) and outside ARA's own
-# gate; it has its own suites' tests, so it's never mutated here either.
-do_not_mutate = ["ara/_vendor/*"]
+# Nested engine source is subprocess-only and outside ARA's own gate (see the coverage omit
+# above), so it is never mutated here either.
+do_not_mutate = ["ara/_engine_packages/*", "ara/_vendor/*"]
 # Clear the project's addopts so --cov / fail_under=100 don't make every mutant
 # run exit non-zero (which would corrupt kill/survive detection). Fast, mocked, fail-fast: no
 # point paying for coverage instrumentation or a slow suite once per mutant. The marker filter

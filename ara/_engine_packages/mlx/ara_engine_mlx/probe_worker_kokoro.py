@@ -72,7 +72,7 @@ def main() -> None:
         sys.exit(1)
 
     # Pre-flight BEFORE importing mlx/kokoro, so the Metal init can't cross the wall first.
-    from wmx_suite import kokoro_safety
+    from ara_engine_mlx import kokoro_safety
     threshold, _baseline, safe = kokoro_safety.preflight(args.margin)
     if not safe:
         print(json.dumps({
@@ -86,7 +86,7 @@ def main() -> None:
     try:
         import mlx.core as mx
         from kokoro_mlx import KokoroTTS
-        from wmx_suite.system import wired_gb
+        from ara_engine_mlx.system import wired_gb
     except ImportError as e:
         print(json.dumps({"status": "error", "note": f"Import failed: {e}"}), flush=True)
         sys.exit(1)

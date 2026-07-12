@@ -12,7 +12,7 @@ reading). It emits a single canonical JSON object:
     safe:    {"context": <int>, "mem_gb": <os-wired high-water>}
     refused: {"context": <int>, "refused": true, "reason": "<why>"}
 
-Usage: ``python -m wmx_suite.measure_one <hf_id> <ctx> --margin G --overhead G``
+Usage: ``python -m ara_engine_mlx.measure_one <hf_id> <ctx> --margin G --overhead G``
 """
 from __future__ import annotations
 

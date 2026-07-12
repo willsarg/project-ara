@@ -86,6 +86,11 @@ def test_for_backend_cuda_still_returns_cuda_not_cuda_gguf():
 # --------------------------------------------------------------------------- #
 def test_is_installed_true_when_env_exists(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: name == "apple")
+    monkeypatch.setattr(
+        engines.engine_env,
+        "stamped_schema",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+    )
     assert engines.is_installed("mlx") is True
 
 
@@ -269,6 +274,11 @@ def test_install_already_present_is_noop(monkeypatch):
     # Present AND current (stamp matches) → noop: don't rebuild.
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: engines._ara_version())
+    monkeypatch.setattr(
+        engines.engine_env,
+        "stamped_schema",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+    )
     created = []
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
     r = engines.install("mlx")
@@ -287,7 +297,7 @@ def test_install_stamps_env_with_current_version(monkeypatch):
                         seen.update(version=version, schema=schema))
     assert engines.install("mlx").status == "installed"
     assert seen["version"] == "3.1.4"
-    assert seen["schema"] is None
+    assert seen["schema"] == "ara-engine-mlx:ara_engine_mlx:v1"
 
 
 def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
@@ -304,7 +314,11 @@ def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
     r = engines.install("mlx")
     assert r.status == "refreshed"
     assert removed == ["apple"]                 # old env wiped first
-    assert created == {"name": "apple", "version": "2.0.0", "schema": None}
+    assert created == {
+        "name": "apple",
+        "version": "2.0.0",
+        "schema": "ara-engine-mlx:ara_engine_mlx:v1",
+    }
 
 
 def test_install_reinstalls_on_missing_stamp(monkeypatch):

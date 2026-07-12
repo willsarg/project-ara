@@ -42,7 +42,7 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
 
     _fake_worker(monkeypatch, worker)
     m = apple.safe_limits()
-    assert calls == [("apple", ["-m", "wmx_suite.device", "limits"])]
+    assert calls == [("apple", ["-m", "ara_engine_mlx.device", "limits"])]
     assert m["device"] == "Apple M4 Pro"
     assert m["total_gb"] == pytest.approx(48.0 * _DEC)
     assert m["wall_gb"] == pytest.approx(40.0 * _DEC)
@@ -166,7 +166,7 @@ def test_calibrate_surfaces_effective_overhead(monkeypatch):
     assert m["overhead_gb"] == pytest.approx(6.0 * _DEC)
     assert m["calibrated"] is True
     assert m["calibration"]["n_points"] == 4           # … plus what it measured (engine-raw)
-    assert ["-m", "wmx_suite.device", "calibrate", "org/calib-model"] in calls
+    assert ["-m", "ara_engine_mlx.device", "calibrate", "org/calib-model"] in calls
 
 
 def test_calibrate_overhead_none_when_no_measurement(monkeypatch):
@@ -425,7 +425,7 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     out = apple.generate("org/m", "hi", max_context=8192, max_tokens=64)
     assert out == {"context": 8192, "completion": "hello there"}   # worker dict verbatim
     assert seen["name"] == "apple"
-    assert seen["argv"] == ["-m", "wmx_suite.generate", "org/m", "8192",
+    assert seen["argv"] == ["-m", "ara_engine_mlx.generate", "org/m", "8192",
                             "--margin", "2.0", "--overhead", "1.0", "--max-tokens", "64"]
     assert seen["input"] == "hi"               # prompt over stdin, not argv
 
@@ -451,13 +451,13 @@ def _fake_start_server(monkeypatch, url="http://127.0.0.1:8080", ctx=4096):
 
 
 def test_serve_builds_exact_argv(monkeypatch):
-    """serve() builds the exact wmx_suite.serve argv and passes it to start_worker_server."""
+    """serve() builds the exact ara_engine_mlx.serve argv and passes it to start_worker_server."""
     _patch_budget(monkeypatch)
     captured = _fake_start_server(monkeypatch)
     apple.serve("org/m", port=8080, max_context=4096)
     assert captured["name"] == "apple"
     assert captured["argv"] == [
-        "-m", "wmx_suite.serve", "org/m", "4096",
+        "-m", "ara_engine_mlx.serve", "org/m", "4096",
         "--margin", "2.0", "--overhead", "1.0",
         "--port", "8080",
     ]
@@ -514,7 +514,7 @@ def test_serve_returns_proc_url_context(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_benchmark_builds_exact_argv(monkeypatch):
-    """benchmark() builds the exact wmx_suite.benchmark argv and passes prompts as JSON stdin."""
+    """benchmark() builds the exact ara_engine_mlx.benchmark argv and passes prompts as JSON stdin."""
     import json
 
     _patch_budget(monkeypatch)
@@ -531,7 +531,7 @@ def test_benchmark_builds_exact_argv(monkeypatch):
     apple.benchmark("org/m", ["prompt1", "prompt2"], max_context=4096)
     assert seen["name"] == "apple"
     assert seen["argv"] == [
-        "-m", "wmx_suite.benchmark", "org/m", "4096",
+        "-m", "ara_engine_mlx.benchmark", "org/m", "4096",
         "--margin", "2.0", "--overhead", "1.0",
         "--max-tokens", "256",
     ]

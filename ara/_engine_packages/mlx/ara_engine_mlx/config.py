@@ -7,12 +7,16 @@ import math
 import os
 
 DEFAULT_MARGIN_GB = 2.0
-MARGIN_ENV = "WMX_SUITE_MARGIN_GB"
+MARGIN_ENV = "ARA_MLX_MARGIN_GB"
+LEGACY_MARGIN_ENV = "WMX_SUITE_MARGIN_GB"
 
 
 def margin_gb(value: float | str | None = None) -> float:
     """Return a validated safety margin; an explicit value overrides the environment."""
-    raw = os.environ.get(MARGIN_ENV, str(DEFAULT_MARGIN_GB)) if value is None else value
+    raw = (
+        os.environ.get(MARGIN_ENV, os.environ.get(LEGACY_MARGIN_ENV, str(DEFAULT_MARGIN_GB)))
+        if value is None else value
+    )
     try:
         margin = float(raw)
     except (TypeError, ValueError) as exc:

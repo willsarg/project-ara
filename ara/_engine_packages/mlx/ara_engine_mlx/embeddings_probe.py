@@ -123,7 +123,7 @@ def _coeffs(points: list[tuple[float, float, float]],
 
 
 def _run_cell(py: str, model: str, batch: int, seq: int, repeats: int, margin: float) -> dict:
-    cmd = [py, "-m", "wmx_suite.probe_worker_embeddings",
+    cmd = [py, "-m", "ara_engine_mlx.probe_worker_embeddings",
            "--model", model, "--batch", str(batch), "--seq", str(seq),
            "--repeats", str(repeats), "--margin", str(margin)]
     try:

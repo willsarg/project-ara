@@ -117,7 +117,7 @@ def estimate_base_gb(info: models.ModelInfo, limits: SystemLimits, overhead_gb: 
 
 def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None,
                 timeout: float = 600) -> dict:
-    cmd = [py, "-m", "wmx_suite.probe_worker", hf_id, str(ctx)]
+    cmd = [py, "-m", "ara_engine_mlx.probe_worker", hf_id, str(ctx)]
     if kv_bits is not None:
         cmd += ["--kv-bits", str(kv_bits)]
     if abort_wired_gb is not None:

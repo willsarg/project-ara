@@ -6,7 +6,7 @@ Run as a subprocess — one fresh process per cell — so wired-memory residue f
 cell never contaminates the high-water reading. Prints one JSON line.
 
 Usage:
-    python -m wmx_suite.probe_worker_embeddings --model <id> --batch B --seq S \
+    python -m ara_engine_mlx.probe_worker_embeddings --model <id> --batch B --seq S \
         [--repeats N] [--margin GB]
 
 Import convention: modules are imported (not their members) so tests can patch

@@ -14,7 +14,7 @@ Rule #1 logic. Slug: 2026-07-02-wmx-serve-measured-provenance-gate.
 """
 from __future__ import annotations
 
-from ara._vendor.wmx.wmx_suite import measure_one
+from ara._engine_packages.mlx.ara_engine_mlx import measure_one
 
 
 class _Info:

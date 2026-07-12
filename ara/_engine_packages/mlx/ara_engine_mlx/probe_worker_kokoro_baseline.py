@@ -25,7 +25,7 @@ def main() -> None:
 
     # Pre-flight BEFORE importing mlx/kokoro, so the Metal init can't cross the wall first.
     # Reserves model-load headroom on top of the settled baseline.
-    from wmx_suite import kokoro_safety
+    from ara_engine_mlx import kokoro_safety
     threshold, baseline_gb, safe = kokoro_safety.preflight(args.margin)
     if not safe:
         print(json.dumps({
@@ -40,7 +40,7 @@ def main() -> None:
         import mlx.core as mx
         from kokoro_mlx import KokoroTTS
         from kokoro_mlx.generate import generate
-        from wmx_suite.system import sample_settled_baseline
+        from ara_engine_mlx.system import sample_settled_baseline
     except ImportError as e:
         print(json.dumps({"status": "error", "note": f"Import failed: {e}"}), flush=True)
         sys.exit(1)

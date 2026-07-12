@@ -17,7 +17,7 @@ refused with HTTP 400 before generation starts.
     ready:   {"ready": true, "url": "http://127.0.0.1:<PORT>", "context": <ceiling>}
 
 Usage:
-    python -m wmx_suite.serve <hf_id> <ctx_ceiling> --margin G --overhead G --port N [--kv-bits N]
+    python -m ara_engine_mlx.serve <hf_id> <ctx_ceiling> --margin G --overhead G --port N [--kv-bits N]
 """
 from __future__ import annotations
 

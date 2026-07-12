@@ -14,7 +14,7 @@ prompt is read from **stdin**, never argv. Emits one JSON line:
     refused: {"context": <int>, "refused": true, "reason": "<why>"}
 
 Usage:
-    python -m wmx_suite.generate <hf_id> <ctx> --margin G --overhead G --max-tokens N
+    python -m ara_engine_mlx.generate <hf_id> <ctx> --margin G --overhead G --max-tokens N
     (prompt on stdin)
 """
 from __future__ import annotations
