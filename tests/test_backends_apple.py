@@ -53,7 +53,7 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
     assert m["calibrated_at"] is None
 
 
-def test_safe_limits_converts_wmx_decimal_to_gib_preserving_margin(monkeypatch):
+def test_safe_limits_converts_mlx_decimal_to_gib_preserving_margin(monkeypatch):
     """MLX wall/budget values are decimal GB (bytes/1e9); ARA's contract is binary GiB. The boundary
     conversion must NOT scale the absolute safety margin (a blind × factor would shrink it ~7%,
     an unsafe direction): safe_budget is re-derived as converted wall − margin, and headroom as
@@ -388,12 +388,14 @@ def test_generate_omits_kv_bits_for_fp16(monkeypatch):
 
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
+    engines = []
     monkeypatch.setattr(apple, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
-                            lambda con, eng: {"fixed_overhead_gb": 5.5})}), raising=False)
+                            lambda con, eng: engines.append(eng) or {"fixed_overhead_gb": 5.5})}), raising=False)
     margin, overhead = apple._budget_params()
     assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, 5.5)
+    assert engines == ["mlx"]
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):

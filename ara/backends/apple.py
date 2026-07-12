@@ -144,7 +144,7 @@ def _budget_params() -> tuple[float, float]:
     calibration for the MLX engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
     with db.connected() as con:
-        stored = calibration.get_calibration(con, "wmx")
+        stored = calibration.get_calibration(con, "mlx")
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
