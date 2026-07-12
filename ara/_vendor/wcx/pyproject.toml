@@ -1,8 +1,7 @@
 [project]
 name = "wcx-suite"
 version = "0.1.0"
-description = "Custom VRAM/stress bench for local CUDA inference on NVIDIA GPUs — finds safe context ceilings without exhausting the card."
-readme = "README.md"
+description = "Headless CUDA measurement/governance engine for ARA — finds safe context ceilings without exhausting the card."
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Will Sarg" }]
@@ -24,9 +23,6 @@ cuda = [
     "bitsandbytes>=0.43",  # weight quantization (int8 LLM.int8 / int4 NF4) — works on Turing sm_75+
     "accelerate>=0.30",    # device_map placement required by quantized (bnb/FP8/pre-quantized) loads
 ]
-
-[project.scripts]
-wcx-suite = "wcx_suite.cli:main"
 
 [build-system]
 requires = ["hatchling"]
