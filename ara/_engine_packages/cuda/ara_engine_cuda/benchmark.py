@@ -18,7 +18,7 @@ from a short prompt only reaches that much context. The gate uses the tokenizer 
 and the weights are loaded LAZILY on the first prompt whose gate passes — so a run that can't fit
 even its first prompt never loads a byte of weights (RULE #1: refuse before load).
 
-Usage: ``python -m wcx_suite.benchmark <hf_id> <ctx> --margin G --overhead G --max-tokens N``
+Usage: ``python -m ara_engine_cuda.benchmark <hf_id> <ctx> --margin G --overhead G --max-tokens N``
        (the PROMPTS are a JSON array read from stdin, never argv.)
 """
 from __future__ import annotations

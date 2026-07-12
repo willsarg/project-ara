@@ -3,13 +3,13 @@
 """Device limits + CUDA-overhead calibration as JSON workers — for ARA's out-of-process driver.
 
 ARA owns no CUDA knowledge: it drives these in wcx's isolated env and reads back a single JSON
-line (mirroring :mod:`wcx_suite.measure_one` and wmx's ``device``). The VRAM wall is read exactly
+line (mirroring :mod:`ara_engine_cuda.measure_one` and wmx's ``device``). The VRAM wall is read exactly
 from nvidia-smi, so — unlike Apple's hidden cold-start overhead — the *budget* needs no
 calibration. What calibration measures here is the fixed CUDA-context VRAM cost (cuBLAS/cuDNN),
 which the per-context safety gate adds on top of model weights.
 
-    python -m wcx_suite.device limits [--margin G]
-    python -m wcx_suite.device calibrate [MODEL] [--margin G]
+    python -m ara_engine_cuda.device limits [--margin G]
+    python -m ara_engine_cuda.device calibrate [MODEL] [--margin G]
 """
 from __future__ import annotations
 

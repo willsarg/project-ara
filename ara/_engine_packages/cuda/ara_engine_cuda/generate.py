@@ -16,7 +16,7 @@ dynamically during generation, so a one-shot from a short prompt only reaches
 memory and would refuse runs that ``characterize`` already certified. The token count uses the
 tokenizer ONLY (no model weights), so the gate runs before a single byte of weights loads (RULE #1).
 
-Usage: ``python -m wcx_suite.generate <hf_id> <ctx> --margin G --overhead G --max-tokens N``
+Usage: ``python -m ara_engine_cuda.generate <hf_id> <ctx> --margin G --overhead G --max-tokens N``
        (PROMPT is read from stdin, never argv.)
 """
 from __future__ import annotations

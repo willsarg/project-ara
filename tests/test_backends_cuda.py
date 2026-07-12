@@ -42,7 +42,7 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
 
     _fake_worker(monkeypatch, worker)
     m = cuda.safe_limits()
-    assert calls == [("cuda", ["-m", "wcx_suite.device", "limits"])]
+    assert calls == [("cuda", ["-m", "ara_engine_cuda.device", "limits"])]
     assert m["device"] == "NVIDIA GeForce RTX 2070"
     assert m["total_gb"] == 8.0 and m["wall_gb"] == 8.0
     assert m["safe_budget_gb"] == 7.0 and m["margin_gb"] == 1.0
@@ -154,7 +154,7 @@ def test_calibrate_surfaces_effective_overhead(monkeypatch):
     assert m["overhead_gb"] == 0.9                       # effective = max(default 0.6, measured 0.9)
     assert m["calibrated"] is True
     assert m["calibration"]["n_points"] == 1             # … plus what it measured
-    assert ["-m", "wcx_suite.device", "calibrate", "org/calib-model"] in calls
+    assert ["-m", "ara_engine_cuda.device", "calibrate", "org/calib-model"] in calls
 
 
 def test_calibrate_overhead_falls_back_to_default(monkeypatch):
@@ -330,7 +330,7 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
     out = cuda.generate("org/m", "hi", max_context=8192, max_tokens=64)
     assert out == {"context": 8192, "completion": "hello there"}   # worker dict verbatim
     assert seen["name"] == "cuda"
-    assert seen["argv"] == ["-m", "wcx_suite.generate", "org/m", "8192",
+    assert seen["argv"] == ["-m", "ara_engine_cuda.generate", "org/m", "8192",
                             "--margin", "1.0", "--overhead", "0.6", "--max-tokens", "64"]
     assert seen["input"] == "hi"               # prompt over stdin, not argv
 
@@ -446,7 +446,7 @@ def test_generate_appends_prefill_chunk(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# benchmark — load-once multi-prompt completion via wcx_suite.benchmark
+# benchmark — load-once multi-prompt completion via ara_engine_cuda.benchmark
 # --------------------------------------------------------------------------- #
 def test_benchmark_drives_worker_with_json_prompts(monkeypatch):
     import json
@@ -463,7 +463,7 @@ def test_benchmark_drives_worker_with_json_prompts(monkeypatch):
     out = cuda.benchmark("org/m", ["p0", "p1"], max_context=4096, max_tokens=128)
     assert out["results"][0]["completion"] == "x"          # worker dict verbatim
     assert seen["name"] == "cuda"
-    assert seen["argv"] == ["-m", "wcx_suite.benchmark", "org/m", "4096",
+    assert seen["argv"] == ["-m", "ara_engine_cuda.benchmark", "org/m", "4096",
                             "--margin", "1.0", "--overhead", "0.6", "--max-tokens", "128"]
     assert json.loads(seen["input"]) == ["p0", "p1"]       # prompts as JSON array over stdin
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from ara._engine_packages.cuda.ara_engine_cuda import config as cuda_config
 from ara._engine_packages.mlx.ara_engine_mlx import config as mlx_config
 
 
@@ -48,3 +49,49 @@ def test_mlx_margin_accepts_the_legacy_environment_variable_for_one_release(monk
     monkeypatch.setenv("WMX_SUITE_MARGIN_GB", "4.25")
 
     assert mlx_config.margin_gb() == 4.25
+
+
+def test_cuda_engine_uses_native_distribution_and_package_identities():
+    engine_root = _ROOT / "ara" / "_engine_packages" / "cuda"
+    manifest = tomllib.loads((engine_root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert manifest["project"]["name"] == "ara-engine-cuda"
+    assert manifest["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "ara_engine_cuda",
+    ]
+    assert manifest["project"]["dependencies"] == []
+    assert manifest["project"]["optional-dependencies"]["cuda"] == [
+        "torch>=2.4",
+        "transformers>=4.45",
+        "nvidia-ml-py>=12",
+        "hqq>=0.2",
+        "bitsandbytes>=0.43",
+        "accelerate>=0.30",
+    ]
+    assert "readme" not in manifest["project"]
+    assert "scripts" not in manifest["project"]
+
+    for relative_path in (
+        "LICENSE",
+        "NOTICE",
+        "ara_engine_cuda/__init__.py",
+        "ara_engine_cuda/device.py",
+        "ara_engine_cuda/measure_one.py",
+        "ara_engine_cuda/generate.py",
+        "ara_engine_cuda/benchmark.py",
+    ):
+        assert (engine_root / relative_path).is_file(), relative_path
+
+
+def test_cuda_margin_prefers_the_canonical_environment_variable(monkeypatch):
+    monkeypatch.setenv("ARA_CUDA_MARGIN_GB", "2.5")
+    monkeypatch.setenv("WCX_SUITE_MARGIN_GB", "8.0")
+
+    assert cuda_config.margin_gb() == 2.5
+
+
+def test_cuda_margin_accepts_the_legacy_environment_variable_for_one_release(monkeypatch):
+    monkeypatch.delenv("ARA_CUDA_MARGIN_GB", raising=False)
+    monkeypatch.setenv("WCX_SUITE_MARGIN_GB", "3.25")
+
+    assert cuda_config.margin_gb() == 3.25

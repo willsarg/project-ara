@@ -21,8 +21,8 @@ from ara import calibration, db, engine_env
 from ara.contracts import driver
 
 # The wcx worker modules ARA drives in the isolated cuda env (never imported in-process).
-DEVICE_MODULE = "wcx_suite.device"
-WORKER_MODULE = "wcx_suite.measure_one"
+DEVICE_MODULE = "ara_engine_cuda.device"
+WORKER_MODULE = "ara_engine_cuda.measure_one"
 
 # Tiny model ARA calibrates/characterizes against — transformers format (torch can't load the
 # mlx-community 4-bit build the Apple engine uses).
@@ -205,7 +205,7 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
     ``flash_attn`` (default off → SDPA) should match how *model* was characterized. Returns
     {context, completion} or a refusal {refused, reason}. ARA never imports torch in-process."""
     margin, overhead = _budget_params()
-    argv = ["-m", "wcx_suite.generate", model, str(max_context),
+    argv = ["-m", "ara_engine_cuda.generate", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _CUDA_KV_BITS[kv_quant]
@@ -231,7 +231,7 @@ def benchmark(model, prompts: list, *, max_context, max_tokens=DEFAULT_MAX_TOKEN
     worker dict verbatim — ``{"context": N, "results": [...]}`` or a whole-run refusal
     ``{"context": N, "refused": true, "reason": "..."}``. ARA never imports torch in-process."""
     margin, overhead = _budget_params()
-    argv = ["-m", "wcx_suite.benchmark", model, str(max_context),
+    argv = ["-m", "ara_engine_cuda.benchmark", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _CUDA_KV_BITS[kv_quant]

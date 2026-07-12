@@ -9,7 +9,8 @@ import os
 # VRAM cushion kept under the wall. Smaller than wmx's 2 GB because consumer NVIDIA
 # cards are smaller (an 8 GB card can't spare 2 GB) — refined during build-out.
 DEFAULT_MARGIN_GB = 1.0
-MARGIN_ENV = "WCX_SUITE_MARGIN_GB"
+MARGIN_ENV = "ARA_CUDA_MARGIN_GB"
+LEGACY_MARGIN_ENV = "WCX_SUITE_MARGIN_GB"
 
 # Conservative floor for the CUDA-context VRAM overhead (cuBLAS/cuDNN + context) used by the
 # safety gate when no live calibration is available. Real measurement (device.calibrate) almost
@@ -19,7 +20,10 @@ DEFAULT_OVERHEAD_GB = 0.6
 
 def margin_gb(value: float | str | None = None) -> float:
     """Return a validated safety margin; an explicit value overrides the environment."""
-    raw = os.environ.get(MARGIN_ENV, str(DEFAULT_MARGIN_GB)) if value is None else value
+    raw = (
+        os.environ.get(MARGIN_ENV, os.environ.get(LEGACY_MARGIN_ENV, str(DEFAULT_MARGIN_GB)))
+        if value is None else value
+    )
     try:
         margin = float(raw)
     except (TypeError, ValueError) as exc:

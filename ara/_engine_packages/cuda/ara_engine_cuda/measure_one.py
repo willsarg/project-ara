@@ -12,7 +12,7 @@ carries its own watchdog (L5). It emits one canonical JSON object:
     safe:    {"context": <int>, "mem_gb": <model VRAM delta over its launch baseline>}
     refused: {"context": <int>, "refused": true, "reason": "<why>"}
 
-Usage: ``python -m wcx_suite.measure_one <hf_id> <ctx> --margin G --overhead G [--preflight]``
+Usage: ``python -m ara_engine_cuda.measure_one <hf_id> <ctx> --margin G --overhead G [--preflight]``
 """
 from __future__ import annotations
 

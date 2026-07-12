@@ -65,14 +65,16 @@ ENGINES: dict[str, dict] = {
     "cuda": {
         "backend": "cuda",
         "package": "ara-engine-cuda",
-        # Converted to the isolated-env worker model (backends/cuda.py drives wcx-suite's
+        # Converted to the isolated-env worker model (backends/cuda.py drives the native CUDA
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
-        "source_dir": "_vendor/wcx",
+        "source_dir": "_engine_packages/cuda",
+        "env_schema": "ara-engine-cuda:ara_engine_cuda:v1",
+        "import_package": "ara_engine_cuda",
         "source_env": "ARA_CUDA_SOURCE",
         "legacy_source_env": "ARA_WCX_SOURCE",
-        # Vendored (see the wmx note): wcx_suite ships in ARA's wheel under ara/_vendor/wcx and
-        # installs into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
+        # Nested: the native CUDA engine source ships under ara/_engine_packages/cuda and installs
+        # into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
         "vendored": True,
         "extras": "cuda",                        # pulls torch + transformers (into the env, not ARA)
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default

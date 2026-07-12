@@ -32,6 +32,16 @@ def test_mlx_catalog_declares_the_native_import_package():
     assert engines.ENGINES["mlx"]["import_package"] == "ara_engine_mlx"
 
 
+def test_cuda_catalog_declares_the_native_package_contract():
+    cuda = engines.ENGINES["cuda"]
+
+    assert cuda["source_dir"] == "_engine_packages/cuda"
+    assert cuda["env_schema"] == "ara-engine-cuda:ara_engine_cuda:v1"
+    assert cuda["import_package"] == "ara_engine_cuda"
+    assert cuda["extras"] == "cuda"
+    assert cuda["pip_args"] == ["--torch-backend=auto"]
+
+
 def test_legacy_engine_aliases_resolve_to_canonical_keys():
     assert engines.resolve("wmx") == "mlx"
     assert engines.resolve("wcx") == "cuda"

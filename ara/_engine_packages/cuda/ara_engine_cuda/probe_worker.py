@@ -3,8 +3,8 @@
 """The process that actually touches the GPU — run in isolation so a crash/OOM kills it,
 not the suite. Emits exactly one JSON line on stdout.
 
-    python -m wcx_suite.probe_worker calibrate
-    python -m wcx_suite.probe_worker measure <hf_id> <ctx> <abort_gb>
+    python -m ara_engine_cuda.probe_worker calibrate
+    python -m ara_engine_cuda.probe_worker measure <hf_id> <ctx> <abort_gb>
 
 torch is imported lazily inside each mode, so the module loads without the (heavy,
 NVIDIA-only) ``[cuda]`` extras installed — only running a GPU mode needs them.

@@ -54,7 +54,7 @@ def _run_worker(args: list[str], timeout: float = 120) -> dict | None:
     """Run the probe worker in a subprocess; return its parsed JSON, or None on any failure."""
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "wcx_suite.probe_worker", *args],
+            [sys.executable, "-m", "ara_engine_cuda.probe_worker", *args],
             capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
@@ -72,7 +72,7 @@ def measure_once(hf_id: str, ctx: int, *, abort_gb: float, kv_bits: int | None =
                  chunk: int | None = None, timeout: float = 600) -> dict:
     """Probe *hf_id* at one context in the isolated GPU worker; normalise to the driver shape.
 
-    The worker speaks ``{ok, ...}``; ARA's :mod:`wcx_suite.measure_one` (and the wmx contract it
+    The worker speaks ``{ok, ...}``; ARA's :mod:`ara_engine_cuda.measure_one` (and the wmx contract it
     mirrors) speaks ``{status, ...}``. This is the one adapter between them, so the worker stays
     uniform. *abort_gb* is the absolute safe budget the worker's watchdog (L5) must not let live
     VRAM reach. *kv_bits* (when set) measures with a quantized KV cache. Returns
