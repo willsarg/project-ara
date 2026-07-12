@@ -8,14 +8,53 @@ ceiling was measured against a *different* model — governance should say so ra
 trust it (Rule #3).
 
 The staleness test itself (cache mtime vs the stored timestamp) is engine-agnostic and depends
-only on the standard HF cache layout, so ARA reuses the vendored pure helper — wmx/wcx are part of
-ARA, and ``wmx_suite.models`` is stdlib-only (no mlx/torch), safe to import in ARA's interpreter.
-This module is the single, mockable seam ARA's core uses, instead of reaching into ``_vendor`` from
-every call site.
+only on the standard HF cache layout. ARA owns that pure, standard-library-only logic here so core
+code never imports a nested engine package in-process.
 """
 from __future__ import annotations
 
-from ara._vendor.wmx.wmx_suite.models import fit_is_stale
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _cache_dir(model_id: str) -> Path:
+    return Path.home() / ".cache" / "huggingface" / "hub" / (
+        "models--" + model_id.replace("/", "--"))
+
+
+def _cache_updated_at(model_id: str) -> float | None:
+    """Newest artifact mtime in any locally cached model snapshot."""
+    root = _cache_dir(model_id)
+    if not root.is_dir():
+        return None
+    latest: float | None = None
+    for dirpath, _, filenames in os.walk(root / "snapshots"):
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            try:
+                mtime = max(path.lstat().st_mtime, path.stat().st_mtime)
+            except OSError:
+                continue
+            latest = mtime if latest is None else max(latest, mtime)
+    return latest
+
+
+def fit_is_stale(model_id: str, measured_at: str | None) -> bool:
+    """Whether cache artifacts are newer than a characterization run."""
+    if not measured_at:
+        return False
+    try:
+        measured = datetime.fromisoformat(measured_at)
+    except ValueError:
+        return False
+    if measured.tzinfo is None:
+        measured = measured.replace(tzinfo=timezone.utc)
+    cache_mtime = _cache_updated_at(model_id)
+    if cache_mtime is None:
+        return False
+    # DB timestamps use second precision; avoid false positives within that second.
+    return cache_mtime > measured.timestamp() + 1.0
 
 
 def ceiling_is_stale(model_id: str, measured_at: str | None) -> bool:
