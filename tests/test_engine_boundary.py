@@ -11,6 +11,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 _ARA = Path(__file__).resolve().parent.parent / "ara"
 _NESTED_ENGINE_DIRS = {"_vendor", "_engine_packages"}
 _CORE_PY = [p for p in _ARA.rglob("*.py") if not _NESTED_ENGINE_DIRS.intersection(p.parts)]
@@ -50,9 +52,23 @@ def _nested_engine_imports(path: Path) -> list[str]:
             names = [node.module or ""]
             if node.module in {None, "ara"}:
                 names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call) and node.args:
+            is_import_module = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr == "import_module"
+            )
+            is_dunder_import = isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            if ((is_import_module or is_dunder_import)
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                names = [node.args[0].value]
         for name in names:
             if _NESTED_ENGINE_DIRS.intersection(name.split(".")):
-                imports.append(f"{path.relative_to(_ARA.parent)}:{node.lineno}: {name}")
+                display_path = path.relative_to(_ARA.parent) if path.is_relative_to(
+                    _ARA.parent) else path
+                imports.append(f"{display_path}:{node.lineno}: {name}")
     return imports
 
 
@@ -63,3 +79,28 @@ def test_core_never_imports_nested_engine_packages_in_process():
     assert not offenders, (
         f"ara/ imports nested engine code in-process — this breaks the isolation contract "
         f"(ARA's process must never import an engine package): {offenders}")
+
+
+@pytest.fixture(params=[
+    'import importlib\nimportlib.import_module("ara._vendor.wmx.wmx_suite.models")\n',
+    '__import__("ara._engine_packages.wcx.wcx_suite.models")\n',
+])
+def dynamic_engine_import_source(request):
+    return request.param
+
+
+def test_nested_engine_guard_rejects_dynamic_imports(tmp_path, dynamic_engine_import_source):
+    module = tmp_path / "dynamic_import.py"
+    module.write_text(dynamic_engine_import_source, encoding="utf-8")
+
+    assert _nested_engine_imports(module)
+
+
+def test_nested_engine_guard_allows_subprocess_module_strings(tmp_path):
+    module = tmp_path / "subprocess_entrypoint.py"
+    module.write_text(
+        'subprocess.run([python, "-m", "ara._engine_packages.wmx.wmx_suite.generate"])\n',
+        encoding="utf-8",
+    )
+
+    assert _nested_engine_imports(module) == []

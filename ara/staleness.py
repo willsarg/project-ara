@@ -17,10 +17,11 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+_HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
+
 
 def _cache_dir(model_id: str) -> Path:
-    return Path.home() / ".cache" / "huggingface" / "hub" / (
-        "models--" + model_id.replace("/", "--"))
+    return _HUB / ("models--" + model_id.replace("/", "--"))
 
 
 def _cache_updated_at(model_id: str) -> float | None:
