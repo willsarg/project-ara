@@ -161,16 +161,34 @@ def test_source_for_uses_env_override(monkeypatch):
     assert engines.source_for("mlx") == "../mlx-suite"
 
 
-def test_source_for_canonical_override_wins_over_legacy(monkeypatch):
+def test_source_for_canonical_override_wins_over_legacy(monkeypatch, capsys):
     monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
     monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
     assert engines.source_for("mlx") == "../mlx-suite"
+    assert capsys.readouterr().err == ""
 
 
-def test_source_for_accepts_legacy_override_for_one_release(monkeypatch):
+def test_source_for_accepts_legacy_override_for_one_release(monkeypatch, capsys):
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
     assert engines.source_for("mlx") == "../legacy-wmx-suite"
+    assert capsys.readouterr().err == (
+        "ara: ARA_WMX_SOURCE is deprecated; use ARA_MLX_SOURCE\n")
+
+
+def test_cuda_source_for_accepts_legacy_override_with_warning(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../legacy-wcx-suite")
+    assert engines.source_for("cuda") == "../legacy-wcx-suite"
+    assert capsys.readouterr().err == (
+        "ara: ARA_WCX_SOURCE is deprecated; use ARA_CUDA_SOURCE\n")
+
+
+def test_cuda_source_for_canonical_override_wins_without_warning(monkeypatch, capsys):
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../legacy-wcx-suite")
+    monkeypatch.setenv("ARA_CUDA_SOURCE", "../cuda-suite")
+    assert engines.source_for("cuda") == "../cuda-suite"
+    assert capsys.readouterr().err == ""
 
 
 # --------------------------------------------------------------------------- #

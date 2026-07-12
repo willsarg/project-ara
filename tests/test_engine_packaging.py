@@ -49,18 +49,27 @@ def test_mlx_engine_uses_native_distribution_and_package_identities():
         assert (engine_root / relative_path).is_file(), relative_path
 
 
-def test_mlx_margin_prefers_the_canonical_environment_variable(monkeypatch):
+def test_mlx_margin_prefers_the_canonical_environment_variable(monkeypatch, capsys):
     monkeypatch.setenv("ARA_MLX_MARGIN_GB", "3.5")
     monkeypatch.setenv("WMX_SUITE_MARGIN_GB", "9.0")
 
     assert mlx_config.margin_gb() == 3.5
+    assert capsys.readouterr().err == ""
 
 
-def test_mlx_margin_accepts_the_legacy_environment_variable_for_one_release(monkeypatch):
+def test_mlx_margin_accepts_the_legacy_environment_variable_for_one_release(monkeypatch, capsys):
     monkeypatch.delenv("ARA_MLX_MARGIN_GB", raising=False)
     monkeypatch.setenv("WMX_SUITE_MARGIN_GB", "4.25")
 
     assert mlx_config.margin_gb() == 4.25
+    assert capsys.readouterr().err == (
+        "ara-engine-mlx: WMX_SUITE_MARGIN_GB is deprecated; use ARA_MLX_MARGIN_GB\n")
+
+
+def test_mlx_explicit_margin_suppresses_legacy_warning(monkeypatch, capsys):
+    monkeypatch.setenv("WMX_SUITE_MARGIN_GB", "9.0")
+    assert mlx_config.margin_gb(2.25) == 2.25
+    assert capsys.readouterr().err == ""
 
 
 def test_cuda_engine_uses_native_distribution_and_package_identities():
@@ -95,15 +104,24 @@ def test_cuda_engine_uses_native_distribution_and_package_identities():
         assert (engine_root / relative_path).is_file(), relative_path
 
 
-def test_cuda_margin_prefers_the_canonical_environment_variable(monkeypatch):
+def test_cuda_margin_prefers_the_canonical_environment_variable(monkeypatch, capsys):
     monkeypatch.setenv("ARA_CUDA_MARGIN_GB", "2.5")
     monkeypatch.setenv("WCX_SUITE_MARGIN_GB", "8.0")
 
     assert cuda_config.margin_gb() == 2.5
+    assert capsys.readouterr().err == ""
 
 
-def test_cuda_margin_accepts_the_legacy_environment_variable_for_one_release(monkeypatch):
+def test_cuda_margin_accepts_the_legacy_environment_variable_for_one_release(monkeypatch, capsys):
     monkeypatch.delenv("ARA_CUDA_MARGIN_GB", raising=False)
     monkeypatch.setenv("WCX_SUITE_MARGIN_GB", "3.25")
 
     assert cuda_config.margin_gb() == 3.25
+    assert capsys.readouterr().err == (
+        "ara-engine-cuda: WCX_SUITE_MARGIN_GB is deprecated; use ARA_CUDA_MARGIN_GB\n")
+
+
+def test_cuda_explicit_margin_suppresses_legacy_warning(monkeypatch, capsys):
+    monkeypatch.setenv("WCX_SUITE_MARGIN_GB", "9.0")
+    assert cuda_config.margin_gb(1.25) == 1.25
+    assert capsys.readouterr().err == ""

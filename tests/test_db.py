@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -591,3 +592,98 @@ def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monke
     assert second.execute("SELECT engine FROM calibrations").fetchone()[0] == "mlx"
     second.close()
     assert backup.read_bytes() == before
+
+
+def test_v3_backup_failure_leaves_no_final_then_retry_creates_valid_pre_v3_backup(
+        tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "backup-retry.db")
+    con.execute("INSERT INTO calibrations VALUES ('m','wmx',1.0,'t',2.0,1.0)")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    class FailingBackup:
+        def execute(self, sql):
+            return con.execute(sql)
+
+        def backup(self, target):
+            raise RuntimeError("forced backup failure")
+
+    with pytest.raises(RuntimeError, match="forced backup failure"):
+        db._backup_before_engine_identity_v3(FailingBackup(), path)
+    assert not backup.exists()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert saved.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_replaces_invalid_existing_file(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "invalid-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    backup.write_bytes(b"")
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_keeps_valid_concurrent_publisher(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "concurrent-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    def concurrent_publish(source, destination):
+        Path(destination).write_bytes(Path(source).read_bytes())
+        Path(source).unlink()
+        raise FileExistsError
+
+    monkeypatch.setattr(db.os, "link", concurrent_publish)
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_rejects_invalid_temporary_backup_and_cleans_it(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "invalid-temp-backup.db")
+    con.commit()
+    real_connect = db.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if isinstance(database, str) and ".tmp?mode=ro" in database:
+            return real_connect(":memory:")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", connect)
+    with pytest.raises(sqlite3.DatabaseError, match="pre-v3 backup validation failed"):
+        db._backup_before_engine_identity_v3(con, path)
+    assert not path.with_name(path.name + ".pre-engine-identity-v3.bak").exists()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_rejects_invalid_concurrent_publisher_and_cleans_temp(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "bad-concurrent-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    def concurrent_publish(source, destination):
+        Path(destination).write_bytes(b"")
+        raise FileExistsError
+
+    monkeypatch.setattr(db.os, "link", concurrent_publish)
+    with pytest.raises(sqlite3.DatabaseError, match="concurrent pre-v3 backup is invalid"):
+        db._backup_before_engine_identity_v3(con, path)
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()

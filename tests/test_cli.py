@@ -1747,6 +1747,24 @@ def test_render_install_json(monkeypatch, capsys):
     assert out["status"] == "installed" and out["key"] == "mlx" and rc == 0
 
 
+def test_render_install_json_legacy_source_warning_keeps_stdout_clean(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    monkeypatch.setattr(cli.engines, "resolve", lambda value: "mlx")
+
+    def fake_install(key, *, refresh=False):
+        assert cli.engines._install_targets(key) == ["-e", "../legacy-wmx-suite"]
+        return cli.engines.InstallResult(key, "installed")
+
+    monkeypatch.setattr(cli.engines, "install", fake_install)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_install(c, engine="mlx", as_json=True) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"key": "mlx", "status": "installed", "detail": ""}
+    assert captured.err == "ara: ARA_WMX_SOURCE is deprecated; use ARA_MLX_SOURCE\n"
+
+
 def _stub_uninstall(monkeypatch, key, status, detail=""):
     monkeypatch.setattr(cli.engines, "resolve", lambda v: key)
     monkeypatch.setattr(cli.engines, "uninstall",

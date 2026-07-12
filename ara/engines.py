@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -226,9 +227,16 @@ def source_for(key: str) -> str:
         offline (no git fetch).
     """
     engine = ENGINES[key]
-    override = os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"])
+    override = os.environ.get(engine["source_env"])
     if override:
         return override
+    legacy_override = os.environ.get(engine["legacy_source_env"])
+    if legacy_override:
+        print(
+            f"ara: {engine['legacy_source_env']} is deprecated; use {engine['source_env']}",
+            file=sys.stderr,
+        )
+        return legacy_override
     return str(_vendored_source(key))
 
 

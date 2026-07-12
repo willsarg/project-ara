@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,13 +163,49 @@ _ENGINE_REKEY_TABLES = (
 def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> None:
     """Keep one byte-independent SQLite backup of the pre-v3 evidence store."""
     backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
-    if backup_path.exists():
+    expected_version = con.execute("PRAGMA user_version").fetchone()[0]
+
+    def valid(candidate: Path) -> bool:
+        try:
+            check = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+            try:
+                return (check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                        and check.execute("PRAGMA user_version").fetchone()[0]
+                        == expected_version)
+            finally:
+                check.close()
+        except sqlite3.Error:
+            return False
+
+    if valid(backup_path):
         return
-    backup = sqlite3.connect(backup_path)
     try:
-        con.backup(backup)
+        backup_path.unlink()
+    except FileNotFoundError:
+        pass
+    fd, temp_name = tempfile.mkstemp(
+        prefix=backup_path.name + ".", suffix=".tmp", dir=backup_path.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.unlink()
+    try:
+        backup = sqlite3.connect(temp_path)
+        try:
+            con.backup(backup)
+        finally:
+            backup.close()
+        if not valid(temp_path):
+            raise sqlite3.DatabaseError("pre-v3 backup validation failed")
+        try:
+            os.link(temp_path, backup_path)
+        except FileExistsError:
+            if not valid(backup_path):
+                raise sqlite3.DatabaseError("concurrent pre-v3 backup is invalid")
     finally:
-        backup.close()
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _canonicalize_engine_pk_table(con: sqlite3.Connection, table: str,
