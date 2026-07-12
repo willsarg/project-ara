@@ -98,6 +98,30 @@ def test_is_installed_false_for_unknown_engine():
     assert engines.is_installed("nonsense") is False
 
 
+def test_is_installed_false_when_declared_schema_stamp_is_missing(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    assert engines.is_installed("mlx") is False
+
+
+def test_is_installed_false_when_declared_schema_stamp_is_wrong(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v1")
+    assert engines.is_installed("mlx") is False
+
+
+def test_is_installed_true_when_declared_schema_stamp_matches(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v2")
+    assert engines.is_installed("mlx") is True
+
+
 # --------------------------------------------------------------------------- #
 # source_for() — the install source, with a dev env-var override (external suites)
 # --------------------------------------------------------------------------- #
@@ -212,7 +236,7 @@ def test_install_targets_cuda_local_is_editable_with_extra(monkeypatch):
 def test_cuda_is_available_and_installs_into_its_cuda_env(monkeypatch):
     # cuda is converted to the isolated-env worker model, so it installs like any other engine —
     # into the `cuda` env, folding the [cuda] extra + the auto torch-backend selector.
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
     seen = {}
 
@@ -243,7 +267,7 @@ def test_install_unavailable_engine_is_coming_soon(monkeypatch):
 
 def test_install_already_present_is_noop(monkeypatch):
     # Present AND current (stamp matches) → noop: don't rebuild.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: engines._ara_version())
     created = []
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
@@ -255,36 +279,37 @@ def test_install_already_present_is_noop(monkeypatch):
 def test_install_stamps_env_with_current_version(monkeypatch):
     # A fresh install stamps the env with the current ARA version (so the next install can tell
     # whether it's stale). version= is threaded into engine_env.create.
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.setattr(engines, "_ara_version", lambda: "3.1.4")
     seen = {}
     monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None:
-                        seen.update(version=version))
+                        lambda name, packages, *, python=None, version=None, schema=None:
+                        seen.update(version=version, schema=schema))
     assert engines.install("mlx").status == "installed"
     assert seen["version"] == "3.1.4"
+    assert seen["schema"] is None
 
 
 def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
     # Present but a DIFFERENT stamp (an older ARA wheel built this env) → tear down + reinstall,
     # reported as "refreshed", stamped with the current version.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "1.0.0")
     removed, created = [], {}
     monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
     monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None:
-                        created.update(name=name, version=version))
+                        lambda name, packages, *, python=None, version=None, schema=None:
+                        created.update(name=name, version=version, schema=schema))
     r = engines.install("mlx")
     assert r.status == "refreshed"
     assert removed == ["apple"]                 # old env wiped first
-    assert created == {"name": "apple", "version": "2.0.0"}
+    assert created == {"name": "apple", "version": "2.0.0", "schema": None}
 
 
 def test_install_reinstalls_on_missing_stamp(monkeypatch):
     # Present but UNSTAMPED (a pre-stamp ARA built this env) → treated as stale → refreshed.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: None)
     removed = []
@@ -296,7 +321,7 @@ def test_install_reinstalls_on_missing_stamp(monkeypatch):
 
 def test_install_refresh_forces_reinstall_even_when_current(monkeypatch):
     # refresh=True: reinstall even though the stamp already matches the current version.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "2.0.0")
     removed = []
@@ -307,7 +332,7 @@ def test_install_refresh_forces_reinstall_even_when_current(monkeypatch):
 
 
 def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     seen = {}
 
@@ -327,7 +352,7 @@ def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
     # takes the prebuilt-wheel path (already covered by test_install_targets_cpu_forces_prebuilt_wheel_on_windows),
     # and this test exercises the plain source-build path.
     monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     seen = {}
     monkeypatch.setattr(engines.engine_env, "create",
                         lambda name, packages, **kw: seen.update(name=name, packages=packages))
@@ -337,7 +362,7 @@ def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
 
 
 def test_install_reports_failed_on_engine_env_error(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
 
     def boom(*a, **k):
@@ -347,6 +372,57 @@ def test_install_reports_failed_on_engine_env_error(monkeypatch):
     r = engines.install("mlx")
     assert r.status == "failed"
     assert "resolution impossible" in r.detail
+
+
+def test_install_refreshes_present_env_when_declared_schema_is_missing(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    removed, created = [], {}
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, **kwargs: created.update(name=name, **kwargs),
+    )
+
+    result = engines.install("mlx")
+
+    assert result.status == "refreshed"
+    assert removed == ["apple"]
+    assert created["schema"] == "mlx-worker-v2"
+
+
+def test_install_refreshes_wrong_schema_at_unknown_source_version(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v1")
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(engines.engine_env, "create", lambda *args, **kwargs: None)
+
+    assert engines.install("mlx").status == "refreshed"
+    assert removed == ["apple"]
+
+
+def test_install_keeps_matching_schema_at_unknown_source_version(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v2")
+    created = []
+    monkeypatch.setattr(engines.engine_env, "create", lambda *args, **kwargs: created.append(args))
+
+    assert engines.install("mlx").status == "already"
+    assert created == []
 
 
 # --------------------------------------------------------------------------- #

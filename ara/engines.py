@@ -191,10 +191,16 @@ def resolve(value: str) -> str | None:
 
 
 def is_installed(key: str) -> bool:
-    """Is engine *key*'s isolated env present? Cheap — just checks the env's python exists,
-    never imports the engine. Unknown keys are simply 'not installed'."""
+    """Is engine *key*'s isolated env ready? Cheap and engine-free.
+
+    An env is ready when its Python exists and, if the catalog declares an engine-package schema,
+    its schema stamp matches. Unknown keys and stale package layouts are not installed-ready.
+    """
     engine = ENGINES.get(engine_identity.canonical_engine(key))
-    return engine is not None and engine_env.exists(engine["backend"])
+    if engine is None or not engine_env.exists(engine["backend"]):
+        return False
+    schema = engine.get("env_schema")
+    return schema is None or engine_env.stamped_schema(engine["backend"]) == schema
 
 
 def _vendored_source(key: str) -> Path:
@@ -297,15 +303,21 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
     if not engine["available"]:
         return InstallResult(key, "coming_soon", f"{engine['package']} isn't available yet")
     current = _ara_version()
-    installed = is_installed(key)
-    stale = installed and (refresh or engine_env.stamped_version(engine["backend"]) != current)
-    if installed and not stale:
+    present = engine_env.exists(engine["backend"])
+    stale = present and (
+        refresh
+        or engine_env.stamped_version(engine["backend"]) != current
+        or (engine.get("env_schema") is not None
+            and engine_env.stamped_schema(engine["backend"]) != engine["env_schema"])
+    )
+    if present and not stale:
         return InstallResult(key, "already")
     if stale:                       # wipe the old env so the reinstall isn't itself a noop
         engine_env.remove(engine["backend"])
     try:
         engine_env.create(engine["backend"], _install_targets(key),
-                          python=engine.get("python"), version=current)
+                          python=engine.get("python"), version=current,
+                          schema=engine.get("env_schema"))
     except engine_env.EngineEnvError as e:
         return InstallResult(key, "failed", str(e))
     return InstallResult(key, "refreshed" if stale else "installed")

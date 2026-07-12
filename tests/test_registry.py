@@ -61,6 +61,22 @@ def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):
     assert "wmx_suite" not in sys.modules
 
 
+def test_engine_status_reports_present_env_unready_when_schema_is_missing(
+        set_platform, monkeypatch):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setitem(
+        registry.engines.ENGINES,
+        "mlx",
+        {**registry.engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"},
+    )
+    monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(registry.engines.engine_env, "stamped_schema", lambda name: None)
+
+    installed, name = registry.engine_status()
+
+    assert installed is False and name == "MLX engine"
+
+
 # ---------------------------------------------------------------------------
 # resolve_engine
 # ---------------------------------------------------------------------------

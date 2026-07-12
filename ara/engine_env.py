@@ -85,6 +85,19 @@ def stamped_version(name: str) -> str | None:
         return None
 
 
+def _schema_stamp_path(name: str) -> Path:
+    """The engine-package schema stamp inside engine *name*'s env."""
+    return env_path(name) / ".ara-schema"
+
+
+def stamped_schema(name: str) -> str | None:
+    """The package schema stamped into engine *name*'s env, or None when absent."""
+    try:
+        return _schema_stamp_path(name).read_text().strip()
+    except OSError:
+        return None
+
+
 def _is_windows() -> bool:
     """Indirection so tests can flip the OS without monkeypatching ``os.name``
     globally (which would make pathlib try to build a WindowsPath on posix)."""
@@ -105,13 +118,15 @@ def exists(name: str) -> bool:
 
 
 def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE,
-           python: str | None = None, version: str | None = None) -> Path:
+           python: str | None = None, version: str | None = None,
+           schema: str | None = None) -> Path:
     """Create engine *name*'s isolated uv env and install *packages* into it.
 
     *python* pins the interpreter version (e.g. ``"3.12"``) — some engines require a floor
-    (wmx-suite needs ``>=3.12``); omit to take uv's default. *version*, when given, is stamped into
-    the env (``.ara-version``) after a successful install so a later ``ara install`` can detect a
-    stale vendored engine; omit it (existing callers) to write no stamp. Raises
+    (wmx-suite needs ``>=3.12``); omit to take uv's default. *version* and *schema*, when given, are
+    stamped into the env (``.ara-version`` and ``.ara-schema``) after a successful install so a
+    later ``ara install`` can detect stale source or a stale package layout; omit either to write
+    no corresponding stamp. Raises
     :class:`EngineEnvError` if ``uv`` is missing, or if the venv or the install fails.
     """
     if shutil.which("uv") is None:
@@ -139,6 +154,10 @@ def create(name: str, packages: list[str], *, link_mode: str = DEFAULT_LINK_MODE
         stamp = _stamp_path(name)
         stamp.parent.mkdir(parents=True, exist_ok=True)   # uv made this in prod; be robust regardless
         stamp.write_text(version)
+    if schema is not None:
+        stamp = _schema_stamp_path(name)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(schema)
     return path
 
 

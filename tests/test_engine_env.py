@@ -268,6 +268,43 @@ def test_create_omits_stamp_when_version_none(engines_root, run_spy):
 
 
 # --------------------------------------------------------------------------- #
+# package schema stamp — tells an old module layout from the engine's current one
+# --------------------------------------------------------------------------- #
+def test_stamped_schema_none_when_absent(engines_root):
+    assert engine_env.stamped_schema("ghost") is None
+
+
+def test_stamped_schema_reads_written_stamp(engines_root):
+    env = engine_env.env_path("apple")
+    env.mkdir(parents=True)
+    (env / ".ara-schema").write_text("mlx-worker-v2\n")
+    assert engine_env.stamped_schema("apple") == "mlx-worker-v2"
+
+
+def test_create_writes_schema_stamp_when_schema_given(engines_root, run_spy):
+    engine_env.create("cpu", ["x"], schema="cpu-worker-v1")
+    assert engine_env.stamped_schema("cpu") == "cpu-worker-v1"
+
+
+def test_create_omits_schema_stamp_when_schema_none(engines_root, run_spy):
+    engine_env.create("cpu", ["x"])
+    assert engine_env.stamped_schema("cpu") is None
+
+
+def test_create_does_not_leave_stamps_when_install_fails(engines_root, run_spy):
+    run_spy.add("pip install", 1, err="boom")
+    env = engine_env.env_path("cpu")
+    env.mkdir(parents=True)
+    (env / ".ara-version").write_text("old")
+    (env / ".ara-schema").write_text("old")
+
+    with pytest.raises(engine_env.EngineEnvError):
+        engine_env.create("cpu", ["x"], version="2.0.0", schema="cpu-worker-v2")
+
+    assert not env.exists()
+
+
+# --------------------------------------------------------------------------- #
 # remove
 # --------------------------------------------------------------------------- #
 def test_remove_deletes_existing_env(engines_root):
