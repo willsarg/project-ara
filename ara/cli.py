@@ -1182,12 +1182,12 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if lever_err is not None:
         print(json.dumps({"error": lever_err})) if as_json else c.emit(c.style("bad", f"  {lever_err}"))
         return 1
-    engine_ok, engine_pkg = engine_status(sel.backend)
+    engine_ok, engine_label = engine_status(sel.backend)
     if not engine_ok:
         if as_json:
-            print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
+            print(json.dumps({"error": f"{engine_label} not installed"}))
         else:
-            c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
+            c.emit(c.style("warn", f"  the {engine_label} isn't installed — run: ")
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     bk = get_backend(sel.backend)
@@ -1255,7 +1255,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         if as_json:
             print(json.dumps({"error": result["error"]}))
         else:
-            c.emit(c.style("warn", f"  {engine_pkg} couldn't load {model}: {result['error']}") + hint)
+            c.emit(c.style("warn", f"  {engine_label} couldn't load {model}: {result['error']}") + hint)
         return 1
 
     ceiling = result["safe_context"]
@@ -1778,12 +1778,12 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if lever_err is not None:
         return err(lever_err)
 
-    engine_ok, engine_pkg = engine_status(backend)
+    engine_ok, engine_label = engine_status(backend)
     if not engine_ok:
-        return err(f"the {engine_pkg} engine isn't installed — run: ara install{suffix}")
+        return err(f"the {engine_label} isn't installed — run: ara install{suffix}")
     bk = get_backend(backend)
     if not hasattr(bk, "generate"):
-        return err(f"run isn't supported on the {engine_pkg} engine yet")
+        return err(f"run isn't supported on the {engine_label} yet")
     hw_err = _weight_quant_hw_error(bk, backend, weight_quant)
     if hw_err is not None:
         return err(hw_err)
@@ -1791,12 +1791,12 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
     # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
     if not as_json and not assume_yes and sys.stdin.isatty():
-        if not _confirm(f"Load {model} on {engine_pkg} and generate (≤ ~{safe} tokens)?"):
+        if not _confirm(f"Load {model} on {engine_label} and generate (≤ ~{safe} tokens)?"):
             c.emit(c.style("dim", "  skipped."))
             return 0
 
     if not as_json:
-        c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
+        c.emit(c.style("dim", f"  running {model} on {engine_label} … (≤ ~{safe} tokens)"))
     fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
@@ -1805,7 +1805,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if result.get("refused"):
-        return err(f"the {engine_pkg} engine refused: {result.get('reason', 'no reason given')}")
+        return err(f"the {engine_label} refused: {result.get('reason', 'no reason given')}")
 
     completion = result.get("completion", "")
     if as_json:

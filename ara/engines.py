@@ -9,8 +9,8 @@ vs torch-ROCm, MLX vs llama.cpp) from ever colliding. ARA drives an engine over 
 worker in its env — it never imports one in-process.
 
 Two kinds of engine live here:
-  * **external suites** — the two heavyweights that get their own repos (``wmx`` = MLX/Apple,
-    ``wcx`` = CUDA); installed from a git ``spec``.
+  * **vendored suites** — the MLX and CUDA heavyweights ship under ``ara/_vendor`` and install
+    from that exact source into isolated environments.
   * **built-in engines** — everything else ships in the ARA repo (only the worker's heavy deps
     install into the env); described by a ``packages`` list and ``builtin: True``.
 
@@ -145,7 +145,7 @@ ENGINES: dict[str, dict] = {
         "model_kinds": ("gguf",),
         # CUDA-offload GGUF via llama.cpp's CUDA build (opt-in, --engine cuda-gguf). Enables the
         # two-wall hybrid path: K layers on NVIDIA VRAM, N-K on CPU RAM, auto-fitted each run.
-        # NOT a hardware auto-pick — NVIDIA still auto-picks ``wcx`` (the full-GPU transformers
+        # NOT a hardware auto-pick — NVIDIA still auto-picks ``cuda`` (the full-GPU transformers
         # engine). Prebuilt CUDA-124 wheels on the project's own index; we MUST force the prebuilt
         # wheel (same reason as vulkan: a plain install gets the CPU wheel from cache). `--only-binary`
         # (added in _builtin_targets) makes that deterministic. Kept AFTER `vulkan` so the GGUF
@@ -176,7 +176,7 @@ def for_hardware() -> str | None:
 
 
 def for_backend(backend: str) -> str | None:
-    """The engine key whose backend matches *backend* (e.g. 'cuda' → 'wcx'), or None.
+    """The engine key whose backend matches *backend* (e.g. 'cuda' → 'cuda'), or None.
     One place maps hardware backends to engines, shared by detect and the registry."""
     return next((k for k, e in ENGINES.items() if e["backend"] == backend), None)
 

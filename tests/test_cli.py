@@ -2422,9 +2422,19 @@ def test_run_refuses_when_no_safe_ceiling(make_console, monkeypatch):
 
 def test_run_engine_not_installed(make_console, monkeypatch):
     _wire_run(monkeypatch, engine_ok=False, characterization=_CHAR)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "CUDA engine"))
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi") == 1
-    assert "isn't installed" in buf.getvalue()
+    assert buf.getvalue() == "  the CUDA engine isn't installed — run: ara install\n"
+
+
+def test_run_engine_not_installed_json_uses_complete_label(monkeypatch, capsys):
+    _wire_run(monkeypatch, engine_ok=False, characterization=_CHAR)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "CUDA engine"))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "the CUDA engine isn't installed — run: ara install"}
 
 
 def test_run_unsupported_engine(make_console, monkeypatch):
@@ -3481,9 +3491,18 @@ def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, 
 
 def test_render_characterize_engine_not_installed(make_console, monkeypatch):
     _wire_characterize(monkeypatch, engine_ok=False)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "MLX engine"))
     c, buf = make_console()
     assert cli.render_characterize(c, "x") == 1
-    assert "ara install" in buf.getvalue()
+    assert buf.getvalue() == "  the MLX engine isn't installed — run: ara install --engine mlx\n"
+
+
+def test_render_characterize_engine_not_installed_json_uses_complete_label(monkeypatch, capsys):
+    _wire_characterize(monkeypatch, engine_ok=False)
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "MLX engine"))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(c, "x", as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "MLX engine not installed"}
 
 
 def test_render_characterize_engine_error(make_console, monkeypatch):
