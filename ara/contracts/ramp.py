@@ -5,7 +5,7 @@
 For hardware with a hard memory wall (Apple, CUDA, ROCm, …), a model's footprint grows
 ~linearly with context as the KV cache fills. ARA owns this methodology so the number means
 the same thing on every ramp-class backend; engines only supply safe ``(context, memory)``
-measurements. Mirrors wmx-suite's proven fit (least-squares ``y = a + b·x``, x in thousands
+measurements. Preserves the predecessor MLX engine's proven fit (least-squares ``y = a + b·x``, x in thousands
 of tokens) and ceiling solve.
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ def would_breach(base_gb: float, slope_gb_per_k: float, ctx_tokens: int,
                  budget_gb: float) -> bool:
     """Would probing at *ctx_tokens* reach/exceed the safe budget? (RULE #1 gate.)
 
-    Mirrors wmx-suite's predict-before-probe abort: ``>=`` is unsafe — rounding *toward*
+    Preserves the MLX engine's predict-before-probe abort: ``>=`` is unsafe — rounding *toward*
     the wall is how you crash, so the budget is a hard ceiling, never a target.
     """
     return predict_gb(base_gb, slope_gb_per_k, ctx_tokens) >= budget_gb
@@ -220,7 +220,7 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
     trace confirmed binary GiB is correct here. At the sole ``decode_ceiling`` call site
     (estimate.model_fit), the budget is binary GiB on every backend — RAM is ``vm.total/1024³``
     and CUDA VRAM is nvidia-smi MiB ``/1024`` — and the two decimal leaks feeding it (the
-    weights intercept, on-disk bytes/1e9; wmx's measured wall) are now converted at their
+    weights intercept, on-disk bytes/1e9; the MLX engine's measured wall) are now converted at their
     boundaries (estimate.model_fit; backends/apple). test_analytic_kv_slope_uses_binary_gib_
     not_decimal_gb pins this. Slug 2026-07-02-analytic-units-gib.
     """
@@ -249,7 +249,7 @@ def safe_ceiling(f: Fit, budget_gb: float, ref_baseline_gb: float = 0.0) -> int 
 
     The fit is on the model's DELTA over its own launch baseline (so ``intercept_gb`` is the
     model's footprint at context→0, free of ambient noise); *ref_baseline_gb* is the live OS
-    baseline added back at solve time — mirroring wmx's ``ref_baseline + model_base + slope·c``.
+    baseline added back at solve time — mirroring MLX's ``ref_baseline + model_base + slope·c``.
     Returns ``None`` when there's no measurable growth (slope ≤ 0), ``0`` when the base already
     exceeds budget, else the floored token count.
     """

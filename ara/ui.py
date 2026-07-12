@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """Minimal CLI rendering for ARA — semantic roles over raw ANSI. Stdlib only.
 
-Mirrors the wmx-suite Console feel (accent/dim/gloss/section) but trimmed to
+Uses the established engine-console feel (accent/dim/gloss/section) but trimmed to
 exactly what ARA's front door needs. Color only on a TTY without NO_COLOR;
 otherwise plain text so piping stays clean.
 """

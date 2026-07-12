@@ -4,7 +4,7 @@
 
 ``download(repo_id)`` fetches a model; ``repo_size_gb`` / ``free_disk_gb`` back the
 pre-download disk check. Uses ``huggingface_hub`` directly, which produces the exact
-cache layout that mlx_lm / wmx-suite reads.
+cache layout that the native MLX engine reads.
 
 No token required for ungated models (e.g. mlx-community/*). Set HF_TOKEN or
 HUGGING_FACE_HUB_TOKEN for gated ones, or HF_ENDPOINT for a mirror.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Render functions for ``wmx-suite characterize`` progress + outcome.
+"""Render functions for native MLX characterization progress + outcome.
 
 ``characterize`` is a streaming command (it probes context rungs one at a time),
 so it has several small renderers instead of one. Each is PURE: ``(console,
@@ -83,14 +83,14 @@ def render_refusal(console, data: dict) -> None:
                f"without risking a hard lock, so we never probe it."]
         tries = [
             ("huggingface.co/mlx-community", "browse for a smaller / more-quantized build"),
-            ("wmx-suite health", "see what does fit right now"),
+            ("ara recommend", "see what does fit right now"),
         ]
     else:  # borderline
         why = [f"Its estimated load footprint ({data['est_gb']:.2f} GB) is above the "
                f"safe budget ({data['threshold_gb']:.2f} GB) but below the wall — the "
                f"estimate may just be pessimistic."]
         tries = [
-            (f"wmx-suite characterize {model} --min-probe",
+            (f"ara characterize {model} --engine mlx --min-probe",
              "measure the true base with one supervised safe probe"),
             ("huggingface.co/mlx-community", "or pick a smaller build"),
         ]
@@ -108,7 +108,7 @@ def render_failure(console, data: dict) -> None:
         f"Couldn't measure {model}.",
         [data.get("note") or "The model failed to load during probing."],
         [("huggingface.co/mlx-community", "find a different build that loads"),
-         ("wmx-suite list", "see what already fits this Mac")],
+         ("ara models", "see what already fits this Mac")],
     ))
 
 
@@ -129,6 +129,6 @@ def render_summary(console, data: dict) -> None:
     c.emit(c.field("fit quality", f"R²={data['r2']}",
                    f"from {data['n_points']} measured points"))
     c.emit(c.next_block([
-        (f"wmx-suite run --model {model}", "launch it safely now"),
-        ("wmx-suite health", "see it alongside your other models"),
+        (f"ara run {model} '<prompt>' --engine mlx", "launch it safely now"),
+        ("ara models", "see it alongside your other models"),
     ]))

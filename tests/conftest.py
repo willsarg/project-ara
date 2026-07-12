@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """Shared fixtures for the ARA test suite.
 
-The suite runs with NO real ``wmx_suite`` and NO real host probing: the
+The suite runs with NO real MLX/CUDA engine dependency and NO real host probing: the
 system-call boundary (``detect._run``, ``platform``, ``psutil``, the filesystem)
 is mocked so both the Apple and non-Apple code paths run on any host.
 """
@@ -125,4 +125,3 @@ def fake_home(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
     return tmp_path
-

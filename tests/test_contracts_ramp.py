@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """The ramp contract — linear fit of memory vs context + safe-ceiling solve.
 
-Pure math, no engine. Mirrors wmx-suite's proven methodology (least-squares
+Pure math, no engine. Preserves the predecessor MLX engine's proven methodology (least-squares
 y = a + b·x with x in thousands of tokens, then solve for the context where
 memory meets the safe budget), moved up into ARA so every ramp-class backend
 shares one comparable methodology.
@@ -87,7 +87,7 @@ def test_safe_ceiling_none_when_no_measurable_growth():
 
 
 # --------------------------------------------------------------------------- #
-# predict-before-probe — the crash-prevention gate (mirrors wmx probe.py)
+# predict-before-probe — the crash-prevention gate (mirrors the MLX probe)
 # --------------------------------------------------------------------------- #
 def test_predict_gb_is_base_plus_slope_times_kilotokens():
     # base 6 GB + 0.5 GB/1k * 8k tokens = 10 GB
@@ -232,7 +232,7 @@ def test_run_bisection_is_bounded():
 def test_run_refines_gate_from_measurements_to_escalate_safely():
     # a-priori slope is STEEP (2.0) → a static gate would stop escalating after ~8000.
     # The real measured slope is shallow, so once ≥2 points exist the gate uses the refined
-    # fit and safely climbs higher — mirroring wmx (more data → more accurate gate).
+    # fit and safely climbs higher — mirroring MLX (more data → more accurate gate).
     seen = []
 
     def measure(ctx):

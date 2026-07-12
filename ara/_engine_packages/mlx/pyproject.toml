@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 # The non-LLM (Kokoro TTS + embeddings) characterization workers install on demand — same pattern
-# as wcx's `[cuda]` extra. ARA requests this only when it drives a non-LLM probe (follow-on wiring);
+# as the CUDA engine's `[cuda]` extra. ARA requests this only when it drives a non-LLM probe (follow-on wiring);
 # until then the workers ship inert (lazy heavy imports) and the default install pulls only mlx-lm.
 [project.optional-dependencies]
 nonllm = [

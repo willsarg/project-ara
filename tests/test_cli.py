@@ -1719,7 +1719,7 @@ def test_render_install_refreshed_json_is_success(monkeypatch, capsys):
 
 
 def test_render_install_coming_soon_exits_nonzero(make_console, monkeypatch):
-    _stub_install(monkeypatch, "cuda", "coming_soon", "wcx_suite isn't available yet")
+    _stub_install(monkeypatch, "cuda", "coming_soon", "CUDA engine isn't available yet")
     c, buf = make_console()
     assert cli.render_install(c, engine="cuda") == 1
     assert "coming soon" in buf.getvalue().lower()

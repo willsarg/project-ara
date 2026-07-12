@@ -58,7 +58,7 @@ def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):
     # presence is an env-existence check (no find_spec, no import of the engine)
     monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: True)
     registry.engine_status()
-    assert "wmx_suite" not in sys.modules
+    assert "ara_engine_mlx" not in sys.modules
 
 
 def test_engine_status_reports_present_env_unready_when_schema_is_missing(

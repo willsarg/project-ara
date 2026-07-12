@@ -25,7 +25,7 @@ DEVICE_MODULE = "ara_engine_mlx.device"
 CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
 # The MLX engine denominates memory in DECIMAL GB (bytes / 1e9) — except swap, reported in binary
-# GiB already. ARA's contract is binary GiB throughout (matching detect, the workers, and wcx),
+# GiB already. ARA's contract is binary GiB throughout (matching detect and the workers),
 # so engine facts are converted at this boundary. Slug 2026-07-02-analytic-units-gib.
 _GIB = 1024 ** 3
 _DEC_TO_GIB = 1e9 / _GIB

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Will's MLX Suite (wmx-suite) — a custom memory/stress bench for local MLX inference on Apple Silicon.
+"""ARA's native MLX engine — safe local MLX inference on Apple Silicon.
 
 First rule: never crash the laptop. The suite finds each model's safe context ceiling
 by extrapolating from measurements taken well below the hardware wall — it never probes

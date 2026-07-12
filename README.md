@@ -69,13 +69,13 @@ stays lean and works the same on every platform.
 | `ara python` | Every Python interpreter on the system (macOS / Homebrew / python.org / pyenv / conda / uv / asdf), which has which AI libraries, and which you shouldn't `pip install` into. |
 | `ara apps` | Full inventory of installed AI/ML apps with versions and install source (App / Homebrew cask / formula), flagging real duplicates and self-update-vs-Homebrew drift. |
 | `ara mlx` | The MLX ecosystem (Apple Silicon): libraries by modality + readiness (Metal GPU, cached `mlx-community` models, LM Studio's MLX runtime). |
-| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {wmx\|wcx\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `wmx` on Apple Silicon, `wcx` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `wmx` ([`wmx-suite`](https://github.com/willsarg/wmx-suite), Apple Silicon/MLX), `wcx` ([`wcx-suite`](https://github.com/willsarg/wcx-suite), NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on an AMD iGPU's shared memory), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
+| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on an AMD iGPU's shared memory), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
 | `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under the engine that refuses before it risks the memory wall, then stores the ceiling for `recommend` / `run`. The command that crosses into the engine. |
 | `ara recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
 | `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on every engine (CPU, MLX, CUDA, Vulkan, cuda-gguf). |
 | `ara benchmark <model> --use-case <coding\|reasoning\|agentic\|extraction\|rag>` | **Governed capability benchmark**: run a probe set for that use-case under the engine (capped at the safe ceiling, like `run`) and store the measured score. The model's own chat template is applied, so template-strict instruct models score honestly. |
-| `ara serve <model>` | Stand the model up as a **governed OpenAI-compatible endpoint** — on Ollama, or the MLX server with `--engine wmx` — capped at the model's safe context ceiling, and return the endpoint. |
+| `ara serve <model>` | Stand the model up as a **governed OpenAI-compatible endpoint** — on Ollama, or the MLX server with `--engine mlx` — capped at the model's safe context ceiling, and return the endpoint. |
 | `ara models [<model>]` | Catalog the models in your HF cache with each one's best measured safe-context ceiling; pass a model id for its architecture + per-engine ceiling detail. |
 | `ara search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 | `ara hf login` / `logout` / `status` | Manage your Hugging Face token (needed for gated models). `login` reads it from a hidden prompt, piped stdin, or `--token`, verifies it against the Hub, and stores it in the **standard HF token file** — so every fetch and engine worker picks it up. `status` shows who you're logged in as (never the token); `logout` removes it. |
@@ -90,9 +90,9 @@ or hide specific sections, e.g. `ara detect --exclude models`).
 ARA is a **pure-Python core** with **swappable backend adapters**. The core never imports a
 hardware-specific engine; it picks a backend for the machine and loads only that one.
 
-- **Apple Silicon** → the [`wmx-suite`](https://github.com/willsarg/wmx-suite) engine (MLX),
+- **Apple Silicon** → ARA's native **MLX engine**,
   which finds each model's safe context ceiling *without crashing the machine*.
-- **NVIDIA / CUDA** → the [`wcx-suite`](https://github.com/willsarg/wcx-suite) engine (torch).
+- **NVIDIA / CUDA** → ARA's native **CUDA engine** (torch).
 - **Everything else** → the built-in **CPU engine** (llama.cpp on system RAM) — the universal
   fallback, so any machine with enough RAM can run models, just not GPU-accelerated.
 - **AMD iGPU** → the built-in **Vulkan engine** (llama.cpp GGUF on the integrated GPU's shared
@@ -101,8 +101,9 @@ hardware-specific engine; it picks a backend for the machine and loads only that
   offload `n_gpu_layers=K`) — ARA's first **two-wall** engine, governing discrete VRAM *and*
   system RAM at once so a model too big for VRAM runs K layers on the GPU and the rest on CPU.
 
-The engine is **not a dependency**. ARA probes the machine and installs the matched suite into
-its **own isolated environment** on demand (`ara install`) — so the core stays universal,
+The engine is **not a core dependency**. ARA ships the native MLX and CUDA package sources under
+`ara/_engine_packages/{mlx,cuda}` and installs only the matched package and its heavy dependencies
+into its **own isolated environment** on demand (`ara install`) — so the core stays universal,
 `uv sync` is identical on every OS, and you never download MLX onto an NVIDIA box or vice-versa.
 The catalog of engines and the install logic live in [`ara/engines.py`](./ara/engines.py). See
 [AGENTS.md](./AGENTS.md) for the design boundary and conventions.
@@ -112,12 +113,11 @@ The catalog of engines and the install logic live in [`ara/engines.py`](./ara/en
 | OS | Engines verified |
 |---|---|
 | **macOS (Apple Silicon)** | CPU + MLX — the primary development machine |
-| **Windows** | CPU + CUDA (full-GPU `wcx` **and** the `cuda-gguf` partial-offload hybrid) — full test suite green, inference verified on an RTX 2070 |
+| **Windows** | CPU + CUDA (full-GPU `cuda` **and** the `cuda-gguf` partial-offload hybrid) — full test suite green, inference verified on an RTX 2070 |
 | **Linux** | CPU + Vulkan — full suite + integration tests green; Vulkan (AMD iGPU) inference verified on a Ryzen Z1 Extreme |
 
-CUDA on Linux shares the same [`wcx-suite`](https://github.com/willsarg/wcx-suite) engine path as
-Windows, but hasn't yet been exercised on an NVIDIA-on-Linux box, so it isn't claimed here until it
-has been.
+CUDA on Linux shares the same native CUDA engine path as Windows, but isn't claimed here until the
+full suite is green on an NVIDIA-on-Linux box.
 
 ---
 

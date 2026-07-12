@@ -144,7 +144,7 @@ def test_safety_gate_passes_when_safe():
     assert w.safety_gate(base_gb=2.0, slope_gb_per_k=0.5, ctx=2000, budget_gb=9.9) is None
 
 
-# ── per-prompt governance (parity with the MLX wmx-suite serve.governed_max_tokens) ──
+# ── per-prompt governance (parity with the native MLX engine governor) ──
 def test_governed_max_tokens_allows_when_fits():
     # prompt 100 + request 256 = 356 <= 2048 → allow the full request.
     assert w.governed_max_tokens(100, 256, 2048) == 256

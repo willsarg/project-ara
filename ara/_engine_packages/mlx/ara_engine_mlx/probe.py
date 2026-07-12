@@ -122,7 +122,7 @@ def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None,
         cmd += ["--kv-bits", str(kv_bits)]
     if abort_wired_gb is not None:
         cmd += ["--abort-wired-gb", str(abort_wired_gb)]
-    # Bound the subprocess (parity with wcx probe.py) so a wedged worker — a stalled HF load or a
+    # Bound the subprocess (parity with the CUDA probe) so a wedged worker — a stalled HF load or a
     # GPU/driver hang before the L5 wired-mem watchdog can trip — can't block the ramp forever. A
     # timeout is reported as a dead worker (no JSON line), the caller's existing load_error path.
     try:
@@ -493,7 +493,7 @@ def _calibrate_one(hf_id: str, *, margin_gb: float, repeats: int, prior_overhead
     measured_overhead = round(intercept - profiles.DEFAULT_RESIDENT_FACTOR * info.weights_gb, 3)
     fixed_overhead = max(profiles.DEFAULT_FIXED_OVERHEAD_GB, measured_overhead)
 
-    # Pure measurement — return the result; the CALLER persists (wmx cmd_calibrate to its
+    # Pure measurement — return the result; the CALLER persists (the calibration command to its
     # db, ARA to its own store). probe no longer writes the profile.
     return {
         "hf_id": hf_id, "machine_key": profiles.machine_key(), "intercept_gb": round(intercept, 3),
@@ -514,7 +514,7 @@ def calibrate(model: str | None = None, *, margin_gb: float | None = None,
     With an explicit ``model`` we calibrate that one (and surface a clean error if
     it won't load). With no model we auto-pick the smallest cached causal model
     and, if it fails to LOAD, fall back to the next-smallest — so a single broken
-    checkpoint in the cache doesn't sink ``wmx-suite calibrate``.
+    checkpoint in the cache doesn't sink MLX calibration.
     """
     margin_gb = config.margin_gb(margin_gb)
     if prior_overhead_gb is None:

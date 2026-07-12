@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""wmx benchmark pre-load gate — gate the EFFECTIVE context, not the raw ceiling.
+"""MLX benchmark pre-load gate — gate the EFFECTIVE context, not the raw ceiling.
 
 MLX grows its KV cache dynamically, so a benchmark batch of short prompts only ever reaches
 ``longest_prompt + max_tokens`` of context — not the measured ceiling it is governed under.
-``generate.run`` and wcx's benchmark already gate this way (their docstrings: gating the raw
+``generate.run`` and CUDA's benchmark already gate this way (their docstrings: gating the raw
 ceiling "would over-predict memory and refuse runs that characterize already certified safe");
 ``ara_engine_mlx.benchmark`` was the one verb still gating the raw ceiling, which refused e.g.
 Qwen3-0.6B at its measured window-bound 40960 ("predicted 28.05GB ... >= safe budget 15.18GB")
 for a run whose prompts would never exceed ~1k tokens. (The llama.cpp-family workers correctly
 gate the raw ceiling — llama.cpp allocates the full KV at n_ctx up front; MLX does not.)
 
-Vendored wmx code is outside the coverage gate (omit list) but tested here directly — the gate
+The separately packaged MLX code is outside the coverage gate (omit list) but tested here directly — the gate
 is Rule #1 logic.
 
 Slug: 2026-07-02-wmx-benchmark-effective-ctx-gate

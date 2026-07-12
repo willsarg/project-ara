@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""wmx safety gate — measured-provenance slope (Rule #1).
+"""MLX safety gate — measured-provenance slope (Rule #1).
 
 When ARA serves a model it has CHARACTERIZED, the measured ramp already fit the real (smaller)
 growth slope and certified the ceiling safe on this machine. Re-predicting that ceiling with the
@@ -9,7 +9,7 @@ safe (Qwen3-0.6B at its measured 40960). ``safety_gate`` gains ``measured_slope_
 present it predicts with the MEASURED slope instead of the a-priori one — still adding the current
 live baseline, still running the base-load check. Absent → behaviour is unchanged (a-priori).
 
-Vendored wmx code is outside the coverage gate (omit list) but tested here directly — this is
+The separately packaged MLX code is outside the coverage gate (omit list) but tested here directly — this is
 Rule #1 logic. Slug: 2026-07-02-wmx-serve-measured-provenance-gate.
 """
 from __future__ import annotations

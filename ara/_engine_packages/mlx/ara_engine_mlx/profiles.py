@@ -5,7 +5,7 @@
 The crash wall, the ambient baseline, and per-model fits already adapt to the host
 at runtime. The only part still tied to the testbed is the cold-start base estimate for
 models that haven't been characterized yet: until a machine is calibrated it falls back to
-priors measured on the M4 Pro testbed. `wmx-suite calibrate` measures this machine's real
+priors measured on the M4 Pro testbed. The native MLX calibration worker measures this machine's real
 FIXED_OVERHEAD_GB once and stores it (keyed by chip + RAM + macOS major) so the estimate
 is trustworthy on any Apple Silicon SKU. `characterize` remains the per-model mechanism.
 """

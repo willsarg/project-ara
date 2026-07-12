@@ -2,13 +2,13 @@
 # Copyright 2026 Will Sarg
 """Model registry — read the HF-cache config.json and classify each model's VRAM behaviour.
 
-The CUDA sibling of ``wmx_suite.models``: same job (estimate weights + KV-cache growth from a
+The CUDA counterpart to the MLX engine's model inspector: same job (estimate weights + KV-cache growth from a
 model's config, with no torch import and no GPU), against transformers-format checkpoints rather
 than the mlx-community 4-bit builds. ARA owns the ramp methodology; this only supplies the facts
 ARA's driver fits and solves on top — the context→0 base, the a-priori slope, the window.
 
 Only layers with unbounded (``full_attention``) KV grow with context. ``sliding_attention`` /
-``linear_attention`` layers are window-capped or recurrent, so they don't scale, mirroring wmx.
+``linear_attention`` layers are window-capped or recurrent, so they don't scale, mirroring MLX.
 """
 from __future__ import annotations
 

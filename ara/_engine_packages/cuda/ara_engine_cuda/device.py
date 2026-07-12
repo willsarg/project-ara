@@ -2,8 +2,8 @@
 # Copyright 2026 Will Sarg
 """Device limits + CUDA-overhead calibration as JSON workers — for ARA's out-of-process driver.
 
-ARA owns no CUDA knowledge: it drives these in wcx's isolated env and reads back a single JSON
-line (mirroring :mod:`ara_engine_cuda.measure_one` and wmx's ``device``). The VRAM wall is read exactly
+ARA owns no CUDA runtime dependency: it drives these in the CUDA engine's isolated env and reads back a single JSON
+line (mirroring :mod:`ara_engine_cuda.measure_one` and the MLX engine's ``device``). The VRAM wall is read exactly
 from nvidia-smi, so — unlike Apple's hidden cold-start overhead — the *budget* needs no
 calibration. What calibration measures here is the fixed CUDA-context VRAM cost (cuBLAS/cuDNN),
 which the per-context safety gate adds on top of model weights.
@@ -71,7 +71,7 @@ def calibrate(model: str | None = None, margin_gb: float | None = None) -> dict:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Device VRAM limits / CUDA-overhead calibration as JSON.")
     ap.add_argument("mode", choices=["limits", "calibrate"])
-    ap.add_argument("model", nargs="?", default=None, help="ignored (argv symmetry with wmx)")
+    ap.add_argument("model", nargs="?", default=None, help="ignored (worker argv symmetry)")
     ap.add_argument("--margin", type=float, default=None)
     args = ap.parse_args(argv)
     if args.mode == "calibrate":

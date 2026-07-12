@@ -47,7 +47,7 @@ def _model_base_gb(info, overhead_gb: float, weight_quant: str = "none") -> floa
 
 def _effective_kv_bits(info, kv_bits: int | None) -> int | None:
     """The KV precision we'll actually use: the request, forced to fp16 (None) when the model's
-    cache can't be quantized (sliding-window). Mirrors the apple/wmx rule — never crash a model
+    cache can't be quantized (sliding-window). Mirrors the Apple/MLX rule — never crash a model
     that can't quantize; silently fall back to the safe fp16 path."""
     return kv_bits if info.can_quantize_kv else None
 

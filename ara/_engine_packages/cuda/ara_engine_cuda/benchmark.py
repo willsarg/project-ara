@@ -72,7 +72,7 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
     index and continues (it does NOT abort the run). The model is loaded LAZILY on the first prompt
     whose gate passes (its gate already proved the weights-base fits), then reused for every later
     prompt — so the load happens at most once, and never before a gate has cleared it. Reports the
-    ceiling *ctx* (consistent with the wmx/cpu/vulkan verbs), not the smaller effective context."""
+    ceiling *ctx* (consistent with the mlx/cpu/vulkan verbs), not the smaller effective context."""
     info = models.describe(hf_id)
     if info is None:
         return _refused(ctx, f"model not found in HF cache: {hf_id}")
@@ -102,7 +102,7 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
             model = probe_worker._load_model(hf_id, torch, prefer_flash=prefer_flash,
                                              weight_quant=weight_quant)
         # A per-prompt exception (decode failure, OOM) must NOT crash the whole run and lose the
-        # completed work — capture it as an error result and press on (Rule #3, mirrors wmx).
+        # completed work — capture it as an error result and press on (Rule #3, mirrors MLX).
         try:
             completion = _generate_one(model, tokenizer, prompt, max_tokens, eff_kv_bits, chunk)
             results.append({"prompt_index": i, "completion": completion})

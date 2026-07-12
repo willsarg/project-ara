@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Render functions for ``wmx-suite calibrate`` — progress + outcome.
+"""Render functions for native MLX calibration — progress + outcome.
 
 PURE: ``(console, data)`` in, styled output via console primitives. Data schemas
 documented per function.
@@ -42,18 +42,18 @@ def render_abort(console, data: dict) -> None:
         # The chosen model failed to load (e.g. an incompatible checkpoint) —
         # the fix is a different model, not more memory.
         tries = [
-            ("wmx-suite calibrate --model <other>", "calibrate with a model that loads"),
+            ("ara characterize <other> --engine mlx", "try a model that loads"),
             ("huggingface.co/mlx-community", "find a working build to download"),
         ]
     elif kind == "memory":
         tries = [
             ("free up memory", "close other apps, then retry"),
-            ("wmx-suite calibrate --model <smaller>", "or calibrate with a smaller model"),
+            ("ara characterize <smaller> --engine mlx", "or try a smaller model"),
         ]
     else:  # fit / unknown
         tries = [
-            ("wmx-suite calibrate", "run it again (transient measurement noise)"),
-            ("wmx-suite calibrate --model <other>", "or try a different model"),
+            ("ara characterize <model> --engine mlx", "run it again (transient measurement noise)"),
+            ("ara characterize <other> --engine mlx", "or try a different model"),
         ]
     console.emit(console.guidance(
         "Couldn't calibrate this machine.", [data["reason"]], tries))
@@ -76,6 +76,6 @@ def render_summary(console, data: dict) -> None:
         note = "kept the safe default (measurement didn't beat the floor)"
     c.emit(c.field("stored", f"{data['fixed_overhead_gb']:.2f} GB", note))
     c.emit(c.next_block([
-        ("wmx-suite system", "confirm the updated calibration"),
-        ("wmx-suite health", "re-check per-model go/no-go with the tighter estimate"),
+        ("ara profile", "confirm the updated machine estimate"),
+        ("ara models", "re-check per-model ceilings"),
     ]))

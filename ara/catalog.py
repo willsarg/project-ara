@@ -3,7 +3,7 @@
 """The model catalog — metadata ARA knows about each model, and where it's remembered.
 
 ``describe`` reads a model's architecture from its Hugging Face ``config.json`` (the
-transformers analog of wmx-suite's ``models.describe``); the rest stores/reads that metadata
+transformers analog of the native MLX engine's model description); the rest stores/reads that metadata
 in ARA's db. Discovery seeds this (a model ARA finds or characterizes gets remembered); a
 curated by-modality list is a later concern (recommend's input).
 """

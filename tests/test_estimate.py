@@ -20,7 +20,7 @@ def _machine(**over) -> Machine:
         cpu_physical=12, cpu_logical=12, cpu_features=[], python_version="3.12.8",
         ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0, backend="apple", engine="wmx-suite",
+        disk_free_gb=500.0, backend="apple", engine="mlx",
     )
     base.update(over)
     return Machine(**base)
@@ -69,7 +69,7 @@ def test_limits_cuda_falsy_count_defaults_to_one_device():
 
 
 # --- CUDA multi-GPU: the analytic wall must match what the engine actually governs --------- #
-# The shipped wcx engine measures ONE device (nvml index 0) and does NOT shard a model across
+# The shipped CUDA engine measures ONE device (NVML index 0) and does NOT shard a model across
 # GPUs. So on a multi-GPU box the analytic wall must be a *single* card's VRAM — otherwise
 # `profile` (basis="estimated") promises a budget `characterize` (basis="measured") will refuse,
 # violating Rule #3. `total_gb` still reports the true physical total across all cards; a future
@@ -79,7 +79,7 @@ def test_limits_cuda_multi_gpu_wall_is_single_device_by_default():
                  accel=Accelerator("nvidia", "RTX 4090", 24.0, "CUDA", count=2))
     lim = estimate.limits(m)
     assert lim["total_gb"] == 48.0           # physical truth: 24 GB × 2 cards
-    assert lim["wall_gb"] == 24.0            # governable: one device (wcx measures index 0)
+    assert lim["wall_gb"] == 24.0            # governable: one device (CUDA measures index 0)
     assert lim["safe_budget_gb"] == 24.0 - estimate.MARGIN_GB
 
 

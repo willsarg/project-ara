@@ -20,9 +20,10 @@ uv run ara                    # landing screen
 uv run pytest                 # tests (100% statement + branch coverage is the bar)
 ```
 
-ARA needs **Python 3.12+** and [`uv`](https://github.com/astral-sh/uv). On Apple Silicon the
-[`wmx-suite`](https://github.com/willsarg/wmx-suite) engine is pulled in automatically; on
-other platforms recon works without it.
+ARA needs **Python 3.12+** and [`uv`](https://github.com/astral-sh/uv). The core stays lean on every
+platform. `ara install --engine mlx` or `ara install --engine cuda` installs the selected native
+engine package and its heavy dependencies into an isolated environment on demand; recon needs
+neither engine.
 
 ## The rules that override everything
 
@@ -30,19 +31,20 @@ From [AGENTS.md](./AGENTS.md) — a change must not violate these:
 
 - **Recon is read-only.** `detect` / `status` / `python` / `apps` / `mlx` observe; they never
   stress the machine, load a model, or mutate state.
-- **`profile` is consent-gated.** It measures (and downloads a calibration model) only with
-  explicit opt-in.
+- **`characterize` is consent-gated.** It measures (and may download model weights) only with
+  explicit opt-in; `profile` remains engine-free and read-only.
 - **Advisory, never destructive.** ARA surfaces facts; it never runs or prescribes
   state-mutating commands for the user.
-- **The core stays engine-free.** No hardware-specific import outside a lazily-loaded
-  backend adapter. The test suite runs *without* `wmx-suite` to enforce this.
+- **The core stays engine-free.** No hardware-specific import outside an isolated engine
+  subprocess. Native engine sources live under `ara/_engine_packages/{mlx,cuda}` but are never
+  imported by the core process.
 
 ## Conventions
 
 - **`uv` only** — no `pip install --break-system-packages`. The HF CLI is `hf`.
 - **Report the user's environment, not ARA's** — strip ARA's venv when probing tools.
-- **Tests land with code** — `fail_under = 100` (statement + branch). Cover the seam with the
-  fake `wmx_suite`, not the real engine.
+- **Tests land with code** — `fail_under = 100` (statement + branch). Cover engine seams with
+  subprocess fakes; the normal suite does not install or import MLX, torch, or CUDA.
 - **Match the surrounding style** — semantic console roles (`accent`/`dim`/`good`/`warn`),
   honest copy, and the `--json` / `--include` / `--exclude` flags where a recon command adds
   output.

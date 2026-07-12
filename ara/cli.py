@@ -969,7 +969,7 @@ def _stale_ceiling_note(c: Console, model: str, measured_at: str | None, *,
 def _measured_ramp_slope(row: dict | None) -> float | None:
     """Fit the measured growth slope (GB per 1k tok) from a characterization row's stored ramp
     points, or None when it can't (missing/too-few points, degenerate fit). The points are in the
-    engine's native units (wmx: decimal GB) — the SAME units the wmx serve gate predicts in — so
+    engine's native units (MLX: decimal GB) — the SAME units the MLX serve gate predicts in — so
     the slope passes straight through with no conversion. Lets ``serve`` gate a measured ceiling
     with the real slope instead of the conservative a-priori one; None falls back to a-priori.
     Slug 2026-07-02-wmx-serve-measured-provenance-gate."""
@@ -1075,7 +1075,7 @@ def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
                  kv_quant: str, weight_quant: str = "none",
                  prefill_chunk: int | None = None) -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
-    on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes. Flash-attention has
+    on the AMD iGPU (`vulkan`), Apple (`mlx`), and NVIDIA (`cuda`) lanes. Flash-attention has
     OPPOSITE defaults per engine: vulkan's llama.cpp FA is on-by-default (``flash_attn``, the
     ``--no-flash-attn`` opt-out), while CUDA defaults to SDPA with FA2 an availability-gated opt-in
     (``flash_attn_optin``, the ``--flash-attn`` flag). MLX's SDPA is always fused (no knob). Runtime
@@ -1113,7 +1113,7 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
                       *, as_json: bool, progress: bool) -> int | None:
     """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
 
-    So wcx/wmx fetch on demand like the GGUF engines (which download in-worker), instead of the
+    So the CUDA/MLX engines fetch on demand like the GGUF engines (which download in-worker), instead of the
     worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
     ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
     No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
@@ -1247,7 +1247,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
     # persist a misleading null row. Suggest a compatible engine when we can tell cheaply (e.g. a
-    # GGUF handed to the torch-based wcx → suggest the CPU/llama.cpp engine).
+    # GGUF handed to the torch-based CUDA engine → suggest the CPU/llama.cpp engine).
     if result.get("error"):
         suggest = engines.engine_for_model(model)
         hint = ("  — try " + c.style("accent", f"ara characterize {model} --engine {suggest}")
@@ -1583,7 +1583,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
     # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
-    # Pre-fetch weights so wcx/wmx benchmark uncached models on demand (like the GGUF engines),
+    # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
     if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
@@ -1824,7 +1824,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # (Decision 2026-06-26; spec 2026-06-26-ara-serve-governed-endpoint)
 # --------------------------------------------------------------------------- #
 # Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
-# engines transfers; the MLX (wmx) ceiling does NOT (different allocation model — the seam mismatch).
+# engines transfers; the MLX ceiling does NOT (different allocation model — the seam mismatch).
 _OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "vulkan", "cuda-gguf")
 
 
@@ -2002,9 +2002,9 @@ def _free_port() -> int:
 def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | None = None,
                       assume_yes: bool = False, as_json: bool = False,
                       kv_quant: str = "f16") -> int:
-    """Stand *model* up on the governed MLX server (wmx-suite), capped at the MEASURED apple
+    """Stand *model* up on the governed MLX server, capped at the MEASURED apple
     ceiling (or explicit ``--ctx``), and hand back an OpenAI-compatible endpoint. ARA owns the
-    server subprocess, so it stays foreground until Ctrl-C. The wmx ceiling is valid here because
+    server subprocess, so it stays foreground until Ctrl-C. The MLX ceiling is valid here because
     serve and characterize share the mlx_lm allocation path (seam-mismatch rule, the other way).
     Spec 2026-06-28-recommend-use-case-and-serve-selection."""
     def err(msg: str) -> int:
@@ -2092,7 +2092,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     true source and never a silent guess (Rule #1/#3). A missing model is pulled rather than refused,
     so a fresh model serves in one command. After load it verifies the ceiling actually took before
     returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
-    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine wmx`` routes to the governed MLX
+    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine mlx`` routes to the governed MLX
     server instead (spec 2026-06-28); the Ollama path below is unchanged."""
     auto_selected = model is None    # bare `ara serve` → pick the best-fitting model in the store
     if engine is not None and model is not None:
@@ -2876,7 +2876,7 @@ def _main_impl() -> int:
                                     exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
-        # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
+        # engine from a positional (`ara install mlx`), else --engine, else the auto-matched one.
         return render_install(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
                               refresh=refresh, as_json=as_json)
 

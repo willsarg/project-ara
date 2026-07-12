@@ -5,7 +5,7 @@
 ARA's first **two-wall** engine: offloads K of N layers to discrete VRAM, runs the remaining
 N−K on the CPU — so it must stay under both the discrete VRAM wall AND the system-RAM wall at
 once. Every other engine governs a single wall. **Opt-in** via ``--engine cuda-gguf`` — NVIDIA
-auto-picks ``wcx`` (the full-GPU transformers engine); cuda-gguf is the hybrid fallback when the
+auto-picks ``cuda`` (the full-GPU transformers engine); cuda-gguf is the hybrid fallback when the
 model is too large for VRAM alone.
 
 Contract class: **ramp** (safe context ceiling). Two wall sources: **discrete VRAM**
@@ -13,7 +13,7 @@ Contract class: **ramp** (safe context ceiling). Two wall sources: **discrete VR
 overhead: both walls are read at the time of the run and the per-layer split is auto-fitted.
 Nothing to calibrate for the budget itself (``calibrated`` True, ``overhead_gb`` None).
 
-Built into ARA (only the huge CUDA/MLX suites get their own repos). The worker is a self-contained
+Built into ARA (the heavy CUDA/MLX stacks stay in separately installed native packages). The worker is a self-contained
 script — ``ara/workers/cuda_gguf_llama.py``, which never imports ``ara`` — run by the isolated
 ``cuda_gguf`` env's own python over ``engine_env``, so llama-cpp-python never enters ARA core's
 lock. ``characterize`` is pure wiring into the engine-agnostic

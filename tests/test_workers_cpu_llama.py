@@ -262,7 +262,7 @@ def test_benchmark_refuses_individual_prompt_that_fills_ceiling(monkeypatch):
 
 def test_benchmark_captures_per_prompt_error_and_continues(monkeypatch):
     """A mid-generation exception on one prompt is captured as {'error': ...} for that prompt and
-    the run continues — completed work is never lost, mirroring the wmx contract (Rule #3).
+    the run continues — completed work is never lost, mirroring the MLX contract (Rule #3).
     Spec 2026-07-02-benchmark-honesty-persistence."""
     import sys as _sys
     import types as _t

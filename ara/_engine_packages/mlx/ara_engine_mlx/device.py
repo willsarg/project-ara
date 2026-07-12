@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """Device limits + calibration as JSON workers — for ARA's out-of-process engine driver.
 
-ARA owns no MLX knowledge: it drives these in wmx's isolated env and reads back a single JSON
+ARA owns no MLX runtime dependency: it drives these in the MLX engine's isolated env and reads back a single JSON
 line (mirroring :mod:`ara_engine_mlx.measure_one`). Progress/console output goes to **stderr** so
 stdout carries only the result object.
 
@@ -37,7 +37,7 @@ def limits(margin_gb: float | None = None) -> dict:
 
 
 def calibrate(model: str | None, margin_gb: float | None = None) -> dict:
-    """Run wmx's crash-safe cold-start calibration; return what it measured (ARA persists it).
+    """Run the MLX engine's crash-safe cold-start calibration; return what it measured (ARA persists it).
     The interactive console is routed to stderr so stdout stays JSON-only."""
     return probe.calibrate(model, margin_gb=margin_gb,
                            console=Console.from_args(stream=sys.stderr))
@@ -47,7 +47,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Device limits / calibration as JSON.")
     ap.add_argument("mode", choices=["limits", "calibrate"])
     ap.add_argument("model", nargs="?", default=None,
-                    help="explicit model for calibrate (else wmx auto-picks)")
+                    help="explicit model for calibrate (else the MLX engine auto-picks)")
     ap.add_argument("--margin", type=float, default=None)
     args = ap.parse_args(argv)
     if args.mode == "calibrate":

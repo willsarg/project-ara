@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""backends/cuda.py — a lean wcx-suite seam (stateless; ARA owns persistence).
+"""backends/cuda.py — the native CUDA engine seam (stateless; ARA owns persistence).
 
-The CUDA twin of test_backends_apple.py: cuda drives wcx-suite's device + measure_one workers
-out-of-process through engine_env, never importing wcx in ARA's interpreter.
+The CUDA twin of test_backends_apple.py: cuda drives device + measure_one workers
+out-of-process through engine_env, never importing the engine in ARA's interpreter.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _fake_worker(monkeypatch, fn):
                         type("E", (), {"run_worker": staticmethod(fn)}))
 
 
-# Engine facts the wcx `device limits` worker returns (ARA overlays its own calibration fields).
+# Engine facts the CUDA `device limits` worker returns (ARA overlays its own calibration fields).
 _LIMITS_FACTS = {
     "device": "NVIDIA GeForce RTX 2070", "total_gb": 8.0, "wall_gb": 8.0,
     "safe_budget_gb": 7.0, "margin_gb": 1.0, "headroom_gb": 5.0, "swap_free_gb": None,
@@ -186,7 +186,7 @@ def test_calibrate_returns_uncalibrated_on_worker_exception(monkeypatch):
     """Worker raises → calibrate() must NOT crash; must return uncalibrated + error (Rule #3)."""
     def worker(name, argv):
         if argv[2] == "calibrate":
-            raise RuntimeError("wcx engine env not installed")
+            raise RuntimeError("CUDA engine env not installed")
         return dict(_LIMITS_FACTS)
     _fake_worker(monkeypatch, worker)
     m = cuda.calibrate("org/calib-model")
@@ -194,7 +194,7 @@ def test_calibrate_returns_uncalibrated_on_worker_exception(monkeypatch):
     assert m["overhead_gb"] is None
     assert "calibration_error" in m
     assert "org/calib-model" in m["calibration_error"]
-    assert "wcx engine env not installed" in m["calibration_error"]
+    assert "CUDA engine env not installed" in m["calibration_error"]
 
 
 class _FakeEngine:
@@ -336,7 +336,7 @@ def test_generate_drives_worker_capped_at_context(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# KV-quant lever: --kv-quant {f16,q8_0,q4_0} → wcx --kv-bits {None,8,4}
+# KV-quant lever: --kv-quant {f16,q8_0,q4_0} → CUDA --kv-bits {None,8,4}
 # --------------------------------------------------------------------------- #
 def test_worker_argv_appends_kv_bits_for_quant():
     q4 = cuda._worker_argv("org/m", 2000, 1.0, 0.6, kv_quant="q4_0")
@@ -415,7 +415,7 @@ def test_generate_appends_weight_quant(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Chunked prefill lever (--prefill-chunk N) → wcx --prefill-chunk N
+# Chunked prefill lever (--prefill-chunk N) → CUDA --prefill-chunk N
 # --------------------------------------------------------------------------- #
 def test_worker_argv_appends_prefill_chunk():
     argv = cuda._worker_argv("org/m", 2000, 1.0, 0.6, prefill_chunk=256)

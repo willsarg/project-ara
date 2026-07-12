@@ -4,7 +4,7 @@
 
 ARA drives this out-of-process for a single completion: given a model, a context ceiling, and a
 prompt on stdin, refuse-before-loading if the run wouldn't be safe, else load on CUDA, generate,
-and emit one JSON line. The CUDA sibling of ``wmx_suite.generate`` — identical contract and safety
+and emit one JSON line. It shares the MLX engine's contract and safety
 discipline, but torch + transformers (imported LAZILY) instead of mlx_lm.
 
     success:  {"context": <int>, "completion": "<text>"}
@@ -121,7 +121,7 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
         weight_quant: str = "none", chunk: int | None = None) -> dict:
     """Gate on the effective context, then (if safe) load + generate. Returns the result dict.
 
-    The refusal/success both report the ceiling *ctx* (consistent with the wmx verb and the cpu
+    The refusal/success both report the ceiling *ctx* (consistent with the MLX verb and the cpu
     worker), even though the gate is evaluated against the smaller effective context. *kv_bits* is
     resolved to the effective precision (fp16 unless quant was requested and the cache supports it)
     and used for BOTH the gate's a-priori slope and the actual generation, so they never disagree.

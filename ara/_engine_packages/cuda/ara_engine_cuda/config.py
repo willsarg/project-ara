@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import os
 
-# VRAM cushion kept under the wall. Smaller than wmx's 2 GB because consumer NVIDIA
+# VRAM cushion kept under the wall. Smaller than MLX's 2 GB because consumer NVIDIA
 # cards are smaller (an 8 GB card can't spare 2 GB) — refined during build-out.
 DEFAULT_MARGIN_GB = 1.0
 MARGIN_ENV = "ARA_CUDA_MARGIN_GB"

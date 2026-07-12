@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """Hugging Face Hub search via the ``hf`` CLI — no Python hub dependency for the query.
 
-Engine-agnostic: unlike wmx-suite's MLX-defaulted search, this searches the whole Hub
+Engine-agnostic: unlike the MLX engine's format-specific discovery, this searches the whole Hub
 (filter by author/library at the call site if a backend wants to).
 """
 from __future__ import annotations
