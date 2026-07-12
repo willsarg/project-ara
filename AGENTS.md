@@ -18,7 +18,7 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
 
 1. **Safety** — *don't crash the system.* Never exceed the memory wall; run right up to the safe
    edge and no further. In ARA's core this means **recon is read-only** and **`characterize` is
-   consent-gated** (see Hard rules); the engines (wmx/wcx) enforce the wall when they measure and
+   consent-gated** (see Hard rules); the engines (`mlx`/`cuda` and the GGUF lanes) enforce the wall when they measure and
    launch.
 2. **Reliability** — *every component is properly tested.* `fail_under = 100` (statement + branch);
    new code lands with tests (see Conventions). A component you can't trust isn't shipped.
@@ -63,30 +63,36 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
 - **Pure-Python core, swappable backend adapters.** The core (`ara/detect.py`, `cli.py`,
   recon modules) must **never import a hardware-specific engine**. Backends live behind a
   registry and are loaded lazily — only the one chosen for the machine.
-- **Apple backend wraps `wmx-suite`; CUDA backend wraps `wcx-suite`.** Both are now **vendored**
-  into ARA (`ara/_vendor/wmx`, `ara/_vendor/wcx`) — pure-Python source shipped in ARA's wheel, never
-  imported in-process. The engine import happens *inside* the adapter's functions, not at module
-  load — so nothing MLX/torch-shaped loads until ARA actually runs the engine (always over a
-  subprocess in the isolated env).
-  - **The `wmx-suite` / `wcx-suite` git repos are NO LONGER part of ARA (folded 2026-06-30).** ARA's
-    copy of record is the vendored tree under `ara/_vendor/<key>`. **Leave the upstream repos alone**
-    — do not clone, edit, commit to, or release them as part of ARA work *unless explicitly asked*.
-    To change a folded engine, edit/re-vendor through ARA (`scripts/vendor_engine.py`), never the
-    standalone repo.
+- **Apple and CUDA use native ARA engine packages.** Their pure-Python sources ship under
+  `ara/_engine_packages/mlx` and `ara/_engine_packages/cuda`. They are independently installable,
+  but never imported by ARA core: adapters invoke `ara_engine_mlx.*` / `ara_engine_cuda.*` modules
+  only as subprocesses inside isolated engine environments.
+  - **The predecessor Apple/MLX and CUDA repositories are retired.** ARA is the sole source of
+    truth; do not clone, edit, sync, commit to, or release the retired repositories as part of ARA
+    work unless explicitly asked. There is no re-vendoring workflow: change the native package in
+    `_engine_packages` directly.
 - **Engines install on demand, not as dependencies.** The hardware engine's heavy deps (MLX, torch)
   are **not** in ARA's `pyproject.toml`. ARA probes the machine and installs the matched suite at
-  runtime via `ara install` (`ara/engines.py` is the catalog). The folded suites install from their
-  **vendored source** (`uv pip install ara/_vendor/<key>`) — no git fetch, so a release installs the
-  exact engine code in its wheel, reproducibly and offline. (`ARA_<KEY>_SOURCE=../<repo>` overrides
-  to a local checkout, installed editable, for engine dev; re-vendor a bump with
-  `scripts/vendor_engine.py`.) This keeps the core universal, the lock engine-free, and `uv sync`
-  identical on every OS — and never ships MLX/torch to a machine that can't use it. `--engine {wmx|wcx|cpu|vulkan|cuda-gguf|auto}` is the
+  runtime via `ara install` (`ara/engines.py` is the catalog). The native packages install from
+  **bundled source** (`uv pip install ara/_engine_packages/<key>`) — no git fetch, so a release
+  installs the exact engine code in its wheel, reproducibly and offline. `ARA_MLX_SOURCE` and
+  `ARA_CUDA_SOURCE` can override those roots with a local checkout installed editable for engine
+  development. The predecessor source-variable names remain one-release compatibility aliases and
+  must not appear in new instructions. This keeps the core universal, the lock engine-free, and
+  `uv sync` identical on every OS — and never installs MLX/torch on a machine that does not select
+  it. `--engine {mlx|cuda|cpu|vulkan|cuda-gguf|auto}` is the
   consent surface (the flag itself authorizes the install, so it stays scriptable). `vulkan`
   (GGUF on an AMD APU's iGPU) and `cuda-gguf` (GGUF on NVIDIA via **partial** offload —
   `n_gpu_layers=K`) are opt-in GPU-offload lanes; `cuda-gguf` is ARA's first **two-wall** engine,
   governing discrete VRAM *and* system RAM at once (a model too big for VRAM runs K layers on the
   GPU, the rest on CPU). The full engine matrix is runtime × backend: mlx/torch/llamacpp/ollama ×
   apple/cuda/cpu/vulkan.
+- **Compatibility aliases last one release.** New commands and configuration must use the canonical
+  names. During the compatibility release only, `wmx` → `mlx` and `wcx` → `cuda` CLI inputs,
+  `ARA_WMX_SOURCE` → `ARA_MLX_SOURCE` and `ARA_WCX_SOURCE` → `ARA_CUDA_SOURCE` package-source
+  overrides, and `WMX_SUITE_MARGIN_GB` → `ARA_MLX_MARGIN_GB` and `WCX_SUITE_MARGIN_GB` →
+  `ARA_CUDA_MARGIN_GB` direct-engine margin overrides remain accepted with lower precedence and
+  deprecation warnings. They are scheduled for deletion in the following release.
 
 ## Hard rules
 
@@ -108,8 +114,8 @@ These are how **Rule #1 (Safety)** and **Rule #3 (Accuracy)** are enforced in th
 - **`uv` only.** No `pip install --break-system-packages`. The HF CLI is `hf`, not the
   deprecated `huggingface-cli`.
 - **Tests are the bar.** `fail_under = 100` (statement + branch). New code lands with tests.
-  The suite runs **without** `wmx-suite` on purpose — it proves the core stays engine-free;
-  the seam is covered via a fake `wmx_suite`.
+  The suite runs **without** MLX, torch, or CUDA engine dependencies on purpose — it proves the
+  core stays engine-free; subprocess seams are covered with fakes.
 - **Planning/design docs live in the private vault, not the repo.** This repo is code +
   standard community files. Don't add design specs or logs here.
 - **Write portable; claim only what's tested.** Shared layers (the engine env, worker IPC,

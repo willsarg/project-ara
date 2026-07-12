@@ -10,6 +10,7 @@ env is created here; a separate smoke test exercises the real thing.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -194,7 +195,7 @@ def test_create_honors_explicit_link_mode(engines_root, run_spy):
 
 
 def test_create_pins_python_when_requested(engines_root, run_spy):
-    engine_env.create("apple", ["wmx-suite"], python="3.12")
+    engine_env.create("apple", ["ara-engine-mlx"], python="3.12")
     venv = run_spy.calls[0]
     assert venv[venv.index("--python") + 1] == "3.12"
 
@@ -243,7 +244,7 @@ def test_create_raises_friendly_when_uv_missing(engines_root, run_spy, monkeypat
 
 
 # --------------------------------------------------------------------------- #
-# version stamp — tells a stale vendored engine from a current one
+# version stamp — tells a stale installed engine from the current native package
 # --------------------------------------------------------------------------- #
 def test_stamped_version_none_when_absent(engines_root):
     assert engine_env.stamped_version("ghost") is None
@@ -265,6 +266,103 @@ def test_create_omits_stamp_when_version_none(engines_root, run_spy):
     # Existing callers pass no version → no stamp written (stamped_version stays None).
     engine_env.create("cpu", ["x"])
     assert engine_env.stamped_version("cpu") is None
+
+
+# --------------------------------------------------------------------------- #
+# package schema stamp — tells an old module layout from the engine's current one
+# --------------------------------------------------------------------------- #
+def test_stamped_schema_none_when_absent(engines_root):
+    assert engine_env.stamped_schema("ghost") is None
+
+
+def test_stamped_schema_reads_written_stamp(engines_root):
+    env = engine_env.env_path("apple")
+    env.mkdir(parents=True)
+    (env / ".ara-schema").write_text("mlx-worker-v2\n")
+    assert engine_env.stamped_schema("apple") == "mlx-worker-v2"
+
+
+def test_create_writes_schema_stamp_when_schema_given(engines_root, run_spy):
+    engine_env.create("cpu", ["x"], schema="cpu-worker-v1")
+    assert engine_env.stamped_schema("cpu") == "cpu-worker-v1"
+
+
+def test_create_omits_schema_stamp_when_schema_none(engines_root, run_spy):
+    engine_env.create("cpu", ["x"])
+    assert engine_env.stamped_schema("cpu") is None
+
+
+def test_create_does_not_leave_stamps_when_install_fails(engines_root, run_spy):
+    run_spy.add("pip install", 1, err="boom")
+    env = engine_env.env_path("cpu")
+    env.mkdir(parents=True)
+    (env / ".ara-version").write_text("old")
+    (env / ".ara-schema").write_text("old")
+
+    with pytest.raises(engine_env.EngineEnvError):
+        engine_env.create("cpu", ["x"], version="2.0.0", schema="cpu-worker-v2")
+
+    assert not env.exists()
+
+
+def test_create_verifies_expected_import_package_before_stamping(engines_root, run_spy):
+    engine_env.create(
+        "apple",
+        ["/native/mlx"],
+        version="2.0.0",
+        schema="ara-engine-mlx:ara_engine_mlx:v1",
+        expected_import="ara_engine_mlx",
+    )
+
+    verify = run_spy.calls[2]
+    assert verify[0] == str(engine_env.python_path("apple"))
+    assert verify[1:3] == ["-I", "-c"]
+    assert "find_spec" in verify[3]
+    assert verify[4] == "ara_engine_mlx"
+    assert engine_env.stamped_version("apple") == "2.0.0"
+    assert engine_env.stamped_schema("apple") == "ara-engine-mlx:ara_engine_mlx:v1"
+
+
+def test_python_isolated_mode_ignores_hostile_cwd_and_pythonpath(tmp_path, monkeypatch):
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / "hostile_engine.py").write_text("SPOOFED = True\n")
+    monkeypatch.chdir(hostile)
+    monkeypatch.setenv("PYTHONPATH", str(hostile))
+    script = (
+        "import importlib.util, sys; "
+        "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)"
+    )
+
+    normal, _out, _err = engine_env._run(
+        [sys.executable, "-c", script, "hostile_engine"])
+    isolated, _out, _err = engine_env._run(
+        [sys.executable, "-I", "-c", script, "hostile_engine"])
+
+    assert normal == 0
+    assert isolated == 1
+
+
+def test_create_rejects_legacy_source_without_expected_import_and_removes_env(
+        engines_root, run_spy):
+    run_spy.add("ara_engine_mlx", 1)
+    env = engine_env.env_path("apple")
+    env.mkdir(parents=True)
+    (env / ".ara-version").write_text("old")
+    (env / ".ara-schema").write_text("old")
+
+    with pytest.raises(engine_env.EngineEnvError, match="ara_engine_mlx"):
+        engine_env.create(
+            "apple",
+            ["-e", "../legacy-wmx-suite"],
+            version="2.0.0",
+            schema="ara-engine-mlx:ara_engine_mlx:v1",
+            expected_import="ara_engine_mlx",
+        )
+
+    assert not env.exists()
+    assert engine_env.stamped_version("apple") is None
+    assert engine_env.stamped_schema("apple") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -304,7 +402,7 @@ def test_run_worker_spawns_windows_interpreter(engines_root, run_spy, monkeypatc
     # Portability: the IPC seam must spawn Scripts\python.exe on Windows, not bin/python.
     monkeypatch.setattr(engine_env, "_is_windows", lambda: True)
     run_spy.add("python.exe", 0, out='{"ok": true}')
-    engine_env.run_worker("apple", ["-m", "wmx_suite.device", "limits"])
+    engine_env.run_worker("apple", ["-m", "ara_engine_mlx.device", "limits"])
     cmd = run_spy.calls[0]
     assert cmd[0] == str(engines_root / "apple" / "Scripts" / "python.exe")
 
@@ -433,7 +531,7 @@ def test_start_worker_server_returns_proc_and_dict_on_ready_json(engines_root, m
     ready = '{"ready": true, "url": "http://127.0.0.1:8080", "context": 4096}\n'
     proc, _ = _mock_server_popen(monkeypatch, ["log line\n", ready])
     result_proc, result_dict = engine_env.start_worker_server(
-        "apple", ["-m", "wmx_suite.serve"])
+        "apple", ["-m", "ara_engine_mlx.serve"])
     assert result_proc is proc
     assert result_dict == {"ready": True, "url": "http://127.0.0.1:8080", "context": 4096}
     # proc must NOT be waited on — the server keeps running
@@ -445,7 +543,7 @@ def test_start_worker_server_raises_on_refused(engines_root, monkeypatch):
     refused = '{"refused": true, "reason": "model exceeds safe budget"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [refused])
     with pytest.raises(engine_env.EngineEnvError, match="model exceeds safe budget"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
     assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
@@ -454,7 +552,7 @@ def test_start_worker_server_raises_on_error(engines_root, monkeypatch):
     error = '{"error": "load failed: model not found"}\n'
     proc, _ = _mock_server_popen(monkeypatch, [error])
     with pytest.raises(engine_env.EngineEnvError, match="load failed"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
     assert proc.killed and proc.waited   # reap signal — the happy path asserts `not proc.waited`
 
 
@@ -462,7 +560,7 @@ def test_start_worker_server_raises_when_no_json_before_exit(engines_root, monke
     """Stdout exhausted with no JSON line → EngineEnvError 'exited without a ready signal'."""
     proc, _ = _mock_server_popen(monkeypatch, ["log: starting\n", "log: crash\n"])
     with pytest.raises(engine_env.EngineEnvError, match="exited without a ready signal"):
-        engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve"])
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
 
 
 def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
@@ -470,9 +568,9 @@ def test_start_worker_server_spawns_envs_own_python(engines_root, monkeypatch):
     monkeypatch.setattr(engine_env, "_is_windows", lambda: False)
     ready = '{"ready": true, "url": "http://127.0.0.1:9000", "context": 2048}\n'
     _proc, cmd = _mock_server_popen(monkeypatch, [ready])
-    engine_env.start_worker_server("apple", ["-m", "wmx_suite.serve", "org/m"])
+    engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve", "org/m"])
     assert cmd[0] == str(engines_root / "apple" / "bin" / "python")
-    assert cmd[1:] == ["-m", "wmx_suite.serve", "org/m"]
+    assert cmd[1:] == ["-m", "ara_engine_mlx.serve", "org/m"]
 
 
 def test_start_worker_server_times_out_and_kills_child(engines_root, monkeypatch):

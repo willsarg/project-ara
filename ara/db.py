@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,6 +133,17 @@ def connect() -> sqlite3.Connection:
         _rekey_legacy(con)
         con.execute("PRAGMA user_version = 2")
         con.commit()
+    if con.execute("PRAGMA user_version").fetchone()[0] < 3:
+        _backup_before_engine_identity_v3(con, path)
+        try:
+            con.execute("BEGIN")
+            _migrate_engine_identity_v3(con)
+            con.execute("PRAGMA user_version = 3")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.close()
+            raise
     return con
 
 
@@ -141,6 +154,110 @@ _REKEY_PK_TABLES = (
     ("characterizations", ("engine", "model_id"), "measured_at"),
     ("benchmark_results", ("model_id", "use_case"), "measured_at"),
 )
+
+_ENGINE_REKEY_TABLES = (
+    ("calibrations", ("machine_key", "engine"), "calibrated_at"),
+    ("characterizations", ("machine_key", "engine", "model_id"), "measured_at"),
+)
+
+
+def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> None:
+    """Keep one byte-independent SQLite backup of the pre-v3 evidence store."""
+    backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    expected_version = con.execute("PRAGMA user_version").fetchone()[0]
+
+    def valid(candidate: Path) -> bool:
+        try:
+            check = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+            try:
+                return (check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                        and check.execute("PRAGMA user_version").fetchone()[0]
+                        == expected_version)
+            finally:
+                check.close()
+        except sqlite3.Error:
+            return False
+
+    now = time.time()
+    for orphan in backup_path.parent.glob(backup_path.name + ".*.tmp"):
+        try:
+            if now - orphan.stat().st_mtime > 86_400:
+                orphan.unlink()
+        except FileNotFoundError:
+            pass
+    if valid(backup_path):
+        return
+    fd, temp_name = tempfile.mkstemp(
+        prefix=backup_path.name + ".", suffix=".tmp", dir=backup_path.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.unlink()
+    try:
+        backup = sqlite3.connect(temp_path)
+        try:
+            con.backup(backup)
+        finally:
+            backup.close()
+        if not valid(temp_path):
+            raise sqlite3.DatabaseError("pre-v3 backup validation failed")
+        os.replace(temp_path, backup_path)
+        if not valid(backup_path):
+            raise sqlite3.DatabaseError("published pre-v3 backup validation failed")
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _canonicalize_engine_pk_table(con: sqlite3.Connection, table: str,
+                                  key_cols: tuple[str, ...], timestamp: str) -> None:
+    """Canonicalize an engine-bearing PK while retaining one complete newest row per key."""
+    from ara.engine_identity import canonical_engine
+
+    rows = [dict(r) for r in con.execute(f"SELECT rowid, * FROM {table}")]  # noqa: S608
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = tuple(canonical_engine(row[col]) if col == "engine" else row[col]
+                    for col in key_cols)
+        groups.setdefault(key, []).append(row)
+    for key, group in groups.items():
+        if len(group) == 1 and group[0]["engine"] == key[key_cols.index("engine")]:
+            continue
+        winner = max(group, key=lambda row: ((row[timestamp] or ""), row["rowid"]))
+        cols = [col for col in winner if col != "rowid"]
+        for row in group:
+            con.execute(f"DELETE FROM {table} WHERE rowid=?", (row["rowid"],))  # noqa: S608
+        values = [key[key_cols.index(col)] if col in key_cols else winner[col] for col in cols]
+        con.execute(
+            f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            values,
+        )  # noqa: S608
+
+
+def _migrate_engine_identity_v3(con: sqlite3.Connection) -> None:
+    """Rewrite legacy engine identities in persisted and serialized evidence."""
+    from ara.engine_identity import canonical_engine
+
+    for table, key_cols, timestamp in _ENGINE_REKEY_TABLES:
+        _canonicalize_engine_pk_table(con, table, key_cols, timestamp)
+    benchmark_cols = {row["name"] for row in con.execute("PRAGMA table_info(benchmark_results)")}
+    if "engine_key" in benchmark_cols:
+        con.execute("UPDATE benchmark_results SET engine_key='mlx' WHERE engine_key IN ('wmx','wmx-suite')")
+        con.execute("UPDATE benchmark_results SET engine_key='cuda' WHERE engine_key IN ('wcx','wcx-suite')")
+    for row in con.execute("SELECT rowid, profile_json FROM profiles").fetchall():
+        profile_json = json.loads(row["profile_json"])
+        changed = False
+        for section in ("machine", "projection"):
+            record = profile_json.get(section)
+            if isinstance(record, dict) and "engine" in record:
+                canonical = canonical_engine(record["engine"])
+                if canonical != record["engine"]:
+                    record["engine"] = canonical
+                    changed = True
+        if changed:
+            con.execute("UPDATE profiles SET profile_json=? WHERE rowid=?",
+                        (json.dumps(profile_json, separators=(",", ":")), row["rowid"]))
 
 
 def _rekey_pk_table(con: sqlite3.Connection, table: str, pk_rest: tuple[str, ...],
@@ -214,19 +331,22 @@ def _now() -> str:
 def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *,
                    fixed_overhead_gb: float, calibrated_at: str,
                    wall_gb: float | None = None, safe_budget_gb: float | None = None) -> None:
+    from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO calibrations "
         "(machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb) "
         "VALUES (?,?,?,?,?,?) ON CONFLICT(machine_key, engine) DO UPDATE SET "
         "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at, "
         "wall_gb=excluded.wall_gb, safe_budget_gb=excluded.safe_budget_gb",
-        (machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb))
+        (machine_key, canonical_engine(engine), fixed_overhead_gb, calibrated_at,
+         wall_gb, safe_budget_gb))
     con.commit()
 
 
 def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str) -> dict | None:
+    from ara.engine_identity import canonical_engine
     row = con.execute("SELECT * FROM calibrations WHERE machine_key=? AND engine=?",
-                      (machine_key, engine)).fetchone()
+                      (machine_key, canonical_engine(engine))).fetchone()
     return dict(row) if row else None
 
 
@@ -259,22 +379,24 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
                           model_id: str, *, safe_context: int | None,
                           points: list, measured_at: str | None = None,
                           decode_context: int | None = None) -> None:
+    from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO characterizations "
         "(machine_key, engine, model_id, safe_context, decode_context, points_json, measured_at) "
         "VALUES (?,?,?,?,?,?,?) ON CONFLICT(machine_key, engine, model_id) DO UPDATE SET "
         "safe_context=excluded.safe_context, decode_context=excluded.decode_context, "
         "points_json=excluded.points_json, measured_at=excluded.measured_at",
-        (machine_key, engine, model_id, safe_context, decode_context,
+        (machine_key, canonical_engine(engine), model_id, safe_context, decode_context,
          json.dumps(points), measured_at or _now()))
     con.commit()
 
 
 def get_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
                          model_id: str) -> dict | None:
+    from ara.engine_identity import canonical_engine
     row = con.execute(
         "SELECT * FROM characterizations WHERE machine_key=? AND engine=? AND model_id=?",
-        (machine_key, engine, model_id)).fetchone()
+        (machine_key, canonical_engine(engine), model_id)).fetchone()
     if not row:
         return None
     d = dict(row)
@@ -291,9 +413,10 @@ def list_characterizations(con: sqlite3.Connection, machine_key: str,
             "SELECT * FROM characterizations WHERE machine_key=? ORDER BY model_id, engine",
             (machine_key,)).fetchall()
     else:
+        from ara.engine_identity import canonical_engine
         rows = con.execute(
             "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
-            (machine_key, engine)).fetchall()
+            (machine_key, canonical_engine(engine))).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -336,6 +459,7 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
                           benchmark_id: str | None = None, max_score: float | None = None,
                           sample_size: int | None = None, tier: str = "measured",
                           refused_n: int | None = None, errored_n: int | None = None) -> None:
+    from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO benchmark_results "
         "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
@@ -349,7 +473,7 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
         "max_score=excluded.max_score, sample_size=excluded.sample_size, "
         "refused_n=excluded.refused_n, errored_n=excluded.errored_n, "
         "source=excluded.source, measured_at=excluded.measured_at",
-        (machine_key, model_id, use_case, engine_key, backend, base_model, quant,
+        (machine_key, model_id, use_case, canonical_engine(engine_key), backend, base_model, quant,
          benchmark_id, tier, score, max_score, sample_size, refused_n, errored_n,
          source, _now()))
     con.commit()

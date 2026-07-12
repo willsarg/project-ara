@@ -5,6 +5,12 @@
 Profiles persistence: Spec 2026-06-23-capability-pipeline (Slice 1)."""
 from __future__ import annotations
 
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
 from ara import db
 
 
@@ -65,7 +71,7 @@ def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
     assert db.get_calibration(con, _NEW, "cpu") is not None
     assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
     assert db.get_latest_profile(con, _NEW) is not None
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 3
     assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
 
 
@@ -147,9 +153,8 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     con = db.connect()
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
-    # the migration chain now ends at 2 (wmx purge = v1, then the machine_key rekey = v2); the
-    # single-field key 'm' isn't a legacy 4-field key, so the rekey leaves these rows in place.
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
+    # The migration chain now ends at v3; the single-field key 'm' is not a legacy machine key.
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 3
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
@@ -271,7 +276,7 @@ def test_list_characterizations_across_all_engines_when_engine_omitted(store):
     db.save_characterization(store, "m", "wmx", "c", safe_context=3000, points=[])
     db.save_characterization(store, "other", "wcx", "z", safe_context=1, points=[])  # other machine
     rows = db.list_characterizations(store, "m")           # engine omitted → every engine
-    assert [(r["model_id"], r["engine"]) for r in rows] == [("a", "wcx"), ("c", "wmx")]
+    assert [(r["model_id"], r["engine"]) for r in rows] == [("a", "cuda"), ("c", "mlx")]
 
 
 # --- decode_context persistence ---
@@ -377,7 +382,7 @@ def test_benchmark_result_save_and_get_round_trips_all_fields(store):
     assert row["use_case"] == "coding"
     assert row["score"] == 0.72
     assert row["source"] == "mmlu-v1"
-    assert row["engine_key"] == "wcx"
+    assert row["engine_key"] == "cuda"
     assert row["backend"] == "cuda"
     assert row["base_model"] == "llama3"
     assert row["quant"] == "q4_0"
@@ -490,3 +495,311 @@ def test_migration_adds_refused_errored_columns_to_old_schema(tmp_path, monkeypa
     row = db.get_benchmark_result(con, "m", "org/model", "coding")
     assert row is not None and row["score"] == 0.5
     assert row["refused_n"] is None and row["errored_n"] is None
+
+
+# --- canonical engine identity migration (user_version 2 -> 3) ---
+def _v2_engine_identity_db(tmp_path, monkeypatch, name="identity.db"):
+    path = tmp_path / name
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript(db.SCHEMA)
+    con.execute("PRAGMA user_version = 2")
+    return path, con
+
+
+def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monkeypatch):
+    _, con = _v2_engine_identity_db(tmp_path, monkeypatch, "canonical-only.db")
+    calibrations = [
+        ("mlx-machine", "mlx", 1.25, "2026-03-01", 24.0, None),
+        ("cuda-machine", "cuda", None, None, 8.0, 7.0),
+    ]
+    con.executemany("INSERT INTO calibrations VALUES (?,?,?,?,?,?)", calibrations)
+    characterizations = [
+        ("mlx-machine", "mlx", "org/mlx-model", 4096, None,
+         '[[512, 3.25], [4096, 7.5]]', "2026-03-02"),
+        ("cuda-machine", "cuda", "org/cuda-model", None, 8192, None, None),
+    ]
+    con.executemany("INSERT INTO characterizations VALUES (?,?,?,?,?,?,?)", characterizations)
+    con.commit()
+    con.close()
+
+    migrated = db.connect()
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert [tuple(row) for row in migrated.execute(
+        "SELECT machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, "
+        "safe_budget_gb FROM calibrations ORDER BY machine_key"
+    )] == sorted(calibrations)
+    assert [tuple(row) for row in migrated.execute(
+        "SELECT machine_key, engine, model_id, safe_context, decode_context, points_json, "
+        "measured_at FROM characterizations ORDER BY machine_key"
+    )] == sorted(characterizations)
+
+
+def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch)
+    calibrations = [
+        ("old", "wmx", 1.0, "2026-01-01", 10.0, 9.0),
+        ("tie", "wmx", 1.0, "2026-02-01", 11.0, 10.0),
+        ("tie", "mlx", 2.0, "2026-02-01", 22.0, 20.0),
+        ("null-ts", "wcx", 1.0, None, 7.0, 6.0),
+        ("null-ts", "cuda", 2.0, "2026-01-01", 8.0, 7.0),
+    ]
+    con.executemany("INSERT INTO calibrations VALUES (?,?,?,?,?,?)", calibrations)
+    characterizations = [
+        ("old", "wcx", "a", 100, 101, '["old"]', "2026-01-01"),
+        ("collision", "wcx", "b", 100, 101, '["legacy"]', "2026-01-01"),
+        ("collision", "cuda", "b", 200, 202, '["complete-winner"]', "2026-02-01"),
+    ]
+    con.executemany("INSERT INTO characterizations VALUES (?,?,?,?,?,?,?)", characterizations)
+    con.execute(
+        "INSERT INTO benchmark_results (machine_key, model_id, use_case, engine_key, score, source, measured_at) "
+        "VALUES ('m','model','coding','wcx',1.0,'wcx probe','2026-01-01')")
+    profile = {
+        "machine": {"engine": "wmx", "description": "wmx remains prose"},
+        "projection": {"engine": "wcx", "nested": {"engine": "wmx"}},
+        "engine": "wmx",
+    }
+    con.execute("INSERT INTO profiles VALUES ('m','2026-01-01',?)", (json.dumps(profile),))
+    con.execute("INSERT INTO profiles VALUES ('m','2026-01-02',?)", (
+        json.dumps({"machine": {"engine": "cpu"}, "projection": {"engine": "wcx"}}),))
+    con.commit()
+    con.close()
+
+    migrated = db.connect()
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated.execute("SELECT engine FROM calibrations WHERE machine_key='old'").fetchone()[0] == "mlx"
+    tie = dict(migrated.execute("SELECT * FROM calibrations WHERE machine_key='tie'").fetchone())
+    assert tie["engine"] == "mlx" and tie["fixed_overhead_gb"] == 2.0 and tie["wall_gb"] == 22.0
+    null_ts = dict(migrated.execute("SELECT * FROM calibrations WHERE machine_key='null-ts'").fetchone())
+    assert null_ts["engine"] == "cuda" and null_ts["fixed_overhead_gb"] == 2.0
+    char = dict(migrated.execute("SELECT * FROM characterizations WHERE machine_key='collision'").fetchone())
+    assert char["engine"] == "cuda" and char["safe_context"] == 200
+    assert char["decode_context"] == 202 and char["points_json"] == '["complete-winner"]'
+    old_char = migrated.execute("SELECT engine FROM characterizations WHERE machine_key='old'").fetchone()
+    assert old_char[0] == "cuda"
+    bench = dict(migrated.execute("SELECT engine_key, source FROM benchmark_results").fetchone())
+    assert bench == {"engine_key": "cuda", "source": "wcx probe"}
+    migrated_profile = json.loads(migrated.execute("SELECT profile_json FROM profiles").fetchone()[0])
+    assert migrated_profile["machine"]["engine"] == "mlx"
+    assert migrated_profile["projection"]["engine"] == "cuda"
+    assert migrated_profile["machine"]["description"] == "wmx remains prose"
+    assert migrated_profile["projection"]["nested"]["engine"] == "wmx"
+    assert migrated_profile["engine"] == "wmx"
+    assert path.with_name(path.name + ".pre-engine-identity-v3.bak").exists()
+
+
+def test_v3_malformed_profile_rolls_back_every_write(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "malformed.db")
+    con.execute("INSERT INTO calibrations VALUES ('m','wmx',1.0,'t',2.0,1.0)")
+    con.execute("INSERT INTO benchmark_results (machine_key,model_id,use_case,engine_key,score,source,measured_at) "
+                "VALUES ('m','model','coding','wcx',1.0,'wcx probe','t')")
+    con.execute("INSERT INTO profiles VALUES ('m','t','{not json')")
+    con.commit()
+    con.close()
+
+    with pytest.raises(json.JSONDecodeError):
+        db.connect()
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert raw.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
+    assert raw.execute("SELECT engine_key FROM benchmark_results").fetchone()[0] == "wcx"
+    assert raw.execute("SELECT profile_json FROM profiles").fetchone()[0] == "{not json"
+
+
+def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "noop.db")
+    con.execute("INSERT INTO calibrations VALUES ('m','wmx',1.0,'t',2.0,1.0)")
+    con.commit()
+    con.close()
+    first = db.connect()
+    first.close()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    before = backup.read_bytes()
+    second = db.connect()
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert second.execute("SELECT engine FROM calibrations").fetchone()[0] == "mlx"
+    second.close()
+    assert backup.read_bytes() == before
+
+
+def test_v3_backup_failure_leaves_no_final_then_retry_creates_valid_pre_v3_backup(
+        tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "backup-retry.db")
+    con.execute("INSERT INTO calibrations VALUES ('m','wmx',1.0,'t',2.0,1.0)")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    class FailingBackup:
+        def execute(self, sql):
+            return con.execute(sql)
+
+        def backup(self, target):
+            raise RuntimeError("forced backup failure")
+
+    with pytest.raises(RuntimeError, match="forced backup failure"):
+        db._backup_before_engine_identity_v3(FailingBackup(), path)
+    assert not backup.exists()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert saved.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_replaces_invalid_existing_file(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "invalid-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    backup.write_bytes(b"")
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_keeps_valid_concurrent_publisher(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "concurrent-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    real_replace = db.os.replace
+
+    def concurrent_publish(source, destination):
+        Path(destination).write_bytes(Path(source).read_bytes())
+        real_replace(source, destination)
+
+    monkeypatch.setattr(db.os, "replace", concurrent_publish)
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_rejects_invalid_temporary_backup_and_cleans_it(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "invalid-temp-backup.db")
+    con.commit()
+    real_connect = db.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if isinstance(database, str) and ".tmp?mode=ro" in database:
+            return real_connect(":memory:")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", connect)
+    with pytest.raises(sqlite3.DatabaseError, match="pre-v3 backup validation failed"):
+        db._backup_before_engine_identity_v3(con, path)
+    assert not path.with_name(path.name + ".pre-engine-identity-v3.bak").exists()
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_rejects_invalid_published_final_and_cleans_temp(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "bad-concurrent-backup.db")
+    con.commit()
+    backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+
+    def publish_invalid(source, destination):
+        Path(destination).write_bytes(b"")
+        Path(source).unlink()
+
+    monkeypatch.setattr(db.os, "replace", publish_invalid)
+    with pytest.raises(sqlite3.DatabaseError, match="published pre-v3 backup validation failed"):
+        db._backup_before_engine_identity_v3(con, path)
+    assert list(tmp_path.glob("*.pre-engine-identity-v3.bak.*.tmp")) == []
+    con.close()
+
+
+def test_v3_backup_atomically_replaces_invalid_final_after_interleaving(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "interleaved-backup.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    final.write_bytes(b"")
+    real_replace = db.os.replace
+
+    def interleaved_replace(source, destination):
+        Path(destination).write_bytes(b"concurrent invalid file")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(db.os, "replace", interleaved_replace)
+    db._backup_before_engine_identity_v3(con, path)
+    saved = sqlite3.connect(f"file:{final}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 2
+    saved.close()
+    con.close()
+
+
+def test_v3_backup_does_not_depend_on_hard_links(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "no-hardlink.db")
+    con.commit()
+    monkeypatch.setattr(db.os, "link", lambda *args: (_ for _ in ()).throw(OSError("unsupported")))
+    db._backup_before_engine_identity_v3(con, path)
+    assert path.with_name(path.name + ".pre-engine-identity-v3.bak").exists()
+    con.close()
+
+
+def test_v3_backup_removes_only_stale_orphan_temps(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "orphan-backup.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    stale = final.with_name(final.name + ".stale.tmp")
+    fresh = final.with_name(final.name + ".fresh.tmp")
+    stale.write_text("stale")
+    fresh.write_text("fresh")
+    old = 1_000_000_000
+    db.os.utime(stale, (old, old))
+    monkeypatch.setattr(db.time, "time", lambda: old + 172_800)
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    assert not stale.exists()
+    assert fresh.exists()
+    con.close()
+
+
+def test_v3_backup_tolerates_orphan_disappearing_during_cleanup(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "vanished-orphan.db")
+    con.commit()
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    orphan = final.with_name(final.name + ".vanished.tmp")
+    orphan.write_text("orphan")
+    real_stat = Path.stat
+
+    def stat(candidate, *args, **kwargs):
+        if candidate == orphan:
+            candidate.unlink()
+            raise FileNotFoundError
+        return real_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    db._backup_before_engine_identity_v3(con, path)
+    assert final.exists()
+    con.close()
+
+
+def test_v3_valid_backup_still_cleans_only_stale_orphan_temps(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "valid-with-orphans.db")
+    con.commit()
+    db._backup_before_engine_identity_v3(con, path)
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    stale = final.with_name(final.name + ".stale.tmp")
+    fresh = final.with_name(final.name + ".fresh.tmp")
+    stale.write_text("stale")
+    fresh.write_text("fresh")
+    old = 1_000_000_000
+    db.os.utime(stale, (old, old))
+    monkeypatch.setattr(db.time, "time", lambda: old + 172_800)
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    assert not stale.exists()
+    assert fresh.exists()
+    con.close()

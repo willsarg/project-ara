@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Apple-Silicon backend adapter — drives wmx-suite's MLX measurement out-of-process.
+"""Apple-Silicon backend adapter — drives ARA's native MLX engine out-of-process.
 
 
 A lean device oracle, symmetric with backends/cuda.py: it reads the machine's memory wall and
-runs wmx-suite's crash-safe calibration, but it owns **no persistence** — ARA stores and reuses
-the calibration (see cli.render_profile). It never imports wmx in-process: every engine call
+runs the engine's crash-safe calibration, but it owns **no persistence** — ARA stores and reuses
+the calibration (see cli.render_profile). It never imports the engine in-process: every call
 goes through the isolated ``apple`` env via :mod:`ara.engine_env`, so nothing MLX-shaped loads
 in ARA's interpreter and the core stays engine-free at runtime, not just at lock time.
 """
@@ -13,26 +13,26 @@ from __future__ import annotations
 
 import json
 
-# Core, engine-free helpers (no wmx) — safe to import at module load and patchable in tests.
+# Core, engine-free helpers — safe to import at module load and patchable in tests.
 from ara import calibration, db, engine_env
 from ara.contracts import driver
 
-# The wmx worker modules ARA drives in the isolated apple env (never imported in-process).
-DEVICE_MODULE = "wmx_suite.device"
+# Native MLX worker modules ARA drives in the isolated apple env (never imported in-process).
+DEVICE_MODULE = "ara_engine_mlx.device"
 
 # Model ARA calibrates against — smallest SmolLM (MLX 4-bit). Calibration only measures
 # fixed memory overhead, so a tiny instruct model is plenty.
 CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
-# wmx denominates memory in DECIMAL GB (bytes / 1e9) — except swap, which it reports in binary
-# GiB already. ARA's contract is binary GiB throughout (matching detect, the workers, and wcx),
-# so wmx facts are converted at this boundary. Slug 2026-07-02-analytic-units-gib.
+# The MLX engine denominates memory in DECIMAL GB (bytes / 1e9) — except swap, reported in binary
+# GiB already. ARA's contract is binary GiB throughout (matching detect and the workers),
+# so engine facts are converted at this boundary. Slug 2026-07-02-analytic-units-gib.
 _GIB = 1024 ** 3
 _DEC_TO_GIB = 1e9 / _GIB
 
 
 def _facts_to_gib(facts: dict) -> dict:
-    """Convert wmx's decimal-GB limit facts to ARA's binary-GiB contract.
+    """Convert the MLX engine's decimal-GB limit facts to ARA's binary-GiB contract.
 
     The margin-bearing fields are RE-DERIVED rather than scaled: ``margin_gb`` is an absolute
     policy cushion, and multiplying it by the ≈0.93 conversion factor would silently shrink it
@@ -43,7 +43,7 @@ def _facts_to_gib(facts: dict) -> dict:
     wall = facts["wall_gb"] * _DEC_TO_GIB
     margin = facts["margin_gb"]
     safe = wall - margin
-    # wmx's headroom = its (decimal) safe budget − wired-now; recover wired, convert, re-derive.
+    # Engine headroom = decimal safe budget − wired-now; recover wired, convert, re-derive.
     wired = (facts["safe_budget_gb"] - facts["headroom_gb"]) * _DEC_TO_GIB
     return {
         **facts,
@@ -55,11 +55,11 @@ def _facts_to_gib(facts: dict) -> dict:
 
 
 def safe_limits() -> dict:
-    """Read this machine's safe memory limits via the wmx worker. Pure read — no model.
+    """Read this machine's safe memory limits via the native MLX worker. Pure read — no model.
 
     Stateless: returns the budget with no stored overhead (``calibrated=False``). ARA overlays
     a previously-measured overhead from its own store — the engine no longer reads a database.
-    Facts arrive in wmx's decimal GB and leave here in ARA's binary GiB (see ``_facts_to_gib``).
+    Facts arrive in engine decimal GB and leave here in ARA's binary GiB (see ``_facts_to_gib``).
     """
     facts = _facts_to_gib(engine_env.run_worker("apple", ["-m", DEVICE_MODULE, "limits"]))
     return {
@@ -89,10 +89,10 @@ def download_calibration_model(model: str = CALIBRATION_MODEL, *,
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
-    """Run wmx-suite's crash-safe calibration via the worker; return fresh limits + what it
+    """Run the native MLX engine's crash-safe calibration; return fresh limits + what it
     measured.
 
-    The worker loads the model and watches memory under wmx-suite's predictive safety ramp,
+    The worker loads the model and watches memory under the engine's predictive safety ramp,
     which aborts before approaching the safe budget. ARA only invokes it (out-of-process in the
     apple env). Surfaces the **effective** cold-start overhead (clamped to the engine's floor:
     ``max(default, measured)``) as ``overhead_gb`` so ARA can persist it; the raw measurement is
@@ -121,7 +121,7 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
         )
         limits["calibration"] = result
         return limits
-    # Overheads are wmx-measured (decimal GB) and get subtracted from the GiB wall later —
+    # Overheads are engine-measured (decimal GB) and get subtracted from the GiB wall later —
     # convert them to the wall's units here (Slug 2026-07-02-analytic-units-gib). The raw
     # engine numbers stay visible unconverted in the "calibration" sub-dict.
     overheads = [v * _DEC_TO_GIB for v in (result.get("measured_overhead_gb"),
@@ -133,7 +133,7 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
 
 
 # ARA-owned ramp policy (the engine only measures; ARA decides the schedule + safety margin).
-WORKER_MODULE = "wmx_suite.measure_one"
+WORKER_MODULE = "ara_engine_mlx.measure_one"
 RAMP_SCHEDULE = [2000, 4000, 8000, 16000, 32000, 65536, 131072]
 DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
 DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
@@ -141,10 +141,10 @@ DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
 
 def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
-    calibration for the wmx engine, or a safe default if uncalibrated."""
+    calibration for the MLX engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
     with db.connected() as con:
-        stored = calibration.get_calibration(con, "wmx")
+        stored = calibration.get_calibration(con, "mlx")
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -175,8 +175,8 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver`` (the
     antidote to an Apple-shaped abstraction); this adapter only supplies the Apple specifics —
-    the isolated ``apple`` env, wmx's self-vetoing ``measure_one`` worker, the budget params,
-    and the schedule. ARA never imports wmx in-process. Crash-safety is layered: the driver
+    the isolated ``apple`` env, the engine's self-vetoing ``measure_one`` worker, the budget
+    params, and the schedule. ARA never imports the engine in-process. Crash-safety is layered:
     gates each rung (L1 ``plan_next`` + L2 actual-footprint check), the engine refuses-before-
     load (L4) and a watchdog aborts mid-probe (L5). Returns ``{model, safe_context, points}``.
 
@@ -197,10 +197,10 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
 
 def serve(model: str, *, port: int, max_context: int,
           kv_quant: str = "f16", measured_slope_gb_per_k: float | None = None) -> tuple:
-    """Start a governed MLX server for *model* via wmx_suite.serve, out-of-process.
+    """Start a governed MLX server for *model* via ara_engine_mlx.serve, out-of-process.
 
     Spawns the isolated ``apple`` env's python running
-    ``python -m wmx_suite.serve <model> <max_context> --margin G --overhead G --port N
+    ``python -m ara_engine_mlx.serve <model> <max_context> --margin G --overhead G --port N
     [--kv-bits N] [--measured-slope S]``. Reads stdout until the worker emits its ready JSON
     (``{"ready": true, "url": "...", "context": N}``), then returns
     ``(proc, url, context)`` without waiting — the server keeps running.
@@ -215,7 +215,7 @@ def serve(model: str, *, port: int, max_context: int,
     be the characterized safe ceiling for this machine (Rule #1).
     """
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.serve", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.serve", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--port", str(port)]
     bits = _MLX_KV_BITS[kv_quant]
@@ -233,12 +233,12 @@ DEFAULT_MAX_TOKENS = 256
 def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
              kv_quant: str = "f16") -> dict:
     """One-shot MLX completion, governed: max_context is the characterized safe ceiling, so the
-    worker generates under the wall. Out-of-process in the isolated `apple` env via wmx-suite's
+    worker generates under the wall. Out-of-process in the isolated `apple` env via the engine's
     generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``)
     should match how *model* was characterized. Returns {context, completion} or a refusal
     {refused, reason}. ARA never imports MLX in-process."""
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.generate", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.generate", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _MLX_KV_BITS[kv_quant]
@@ -252,7 +252,7 @@ def benchmark(model: str, prompts: list, *, max_context: int,
     """Multi-prompt MLX benchmark, governed: max_context is the characterized safe ceiling.
 
     Spawns the isolated ``apple`` env's python running
-    ``python -m wmx_suite.benchmark <model> <max_context> --margin G --overhead G
+    ``python -m ara_engine_mlx.benchmark <model> <max_context> --margin G --overhead G
     --max-tokens N [--kv-bits N]`` with the JSON prompt array on stdin. The worker loads
     the model once and iterates over all prompts; per-prompt governance enforces the ceiling
     for each item individually. Returns the worker dict verbatim:
@@ -261,7 +261,7 @@ def benchmark(model: str, prompts: list, *, max_context: int,
     safe ceiling.
     """
     margin, overhead = _budget_params()
-    argv = ["-m", "wmx_suite.benchmark", model, str(max_context),
+    argv = ["-m", "ara_engine_mlx.benchmark", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
     bits = _MLX_KV_BITS[kv_quant]

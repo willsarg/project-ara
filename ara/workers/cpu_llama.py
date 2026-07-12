@@ -121,7 +121,7 @@ def governed_max_tokens(prompt_tokens: int, requested_max_tokens: int,
                         ceiling: int) -> int | None:
     """Allowed max_tokens for one prompt under *ceiling*, or None to refuse the prompt.
 
-    Identical contract to the Vulkan worker and wmx-suite ``serve.governed_max_tokens``, so every
+    Identical contract to the Vulkan worker and native MLX engine's per-prompt governor, so every
     engine governs per-prompt the same way (Rule #1): refuse if the prompt alone fills the ceiling,
     or if ``prompt_tokens + requested_max_tokens`` would exceed it; otherwise allow the request (the
     ``min`` is a conservative clamp belt — it equals the request in the acceptance branch)."""
@@ -380,7 +380,7 @@ def benchmark(model: str, ctx: int, prompts: list, *, margin_gb: float, overhead
                             "reason": f"prompt fills context ceiling {ctx}"})
             continue
         # A per-prompt exception (decode failure, OOM) must NOT crash the whole run and lose the
-        # completed work — capture it as an error result and press on (Rule #3, mirrors wmx).
+        # completed work — capture it as an error result and press on (Rule #3, mirrors MLX).
         try:
             out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
                                              max_tokens=allowed)

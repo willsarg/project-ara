@@ -25,7 +25,7 @@ function selfDesc(machineKey: string) {
   return {
     machine_key: machineKey,
     identity: { hostname: machineKey, os: "linux", arch: "x86_64" },
-    capabilities: [{ kind: "serve_model", id: "qwen", engine: "vulkan", evidence: "characterized" }],
+    capabilities: [{ kind: "serve_model", id: "qwen", engine: "mlx", evidence: "characterized" }],
     environment: VALID_ENV,
   };
 }
@@ -303,13 +303,33 @@ describe("dashboard agent-listing helper", () => {
   it("summarizeAgent extracts serve_model entries into serve_models: {id, engine}", () => {
     const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
     const caps = JSON.stringify([
-      { kind: "serve_model", id: "qwen3:0.6b", engine: "ollama", evidence: "characterized" },
-      { kind: "serve_model", id: "llama3:8b", engine: "wcx", evidence: "characterized" },
+      { kind: "serve_model", id: "qwen3:0.6b", engine: "mlx", evidence: "characterized" },
+      { kind: "serve_model", id: "llama3:8b", engine: "cuda", evidence: "characterized" },
     ]);
     expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
-      { id: "qwen3:0.6b", engine: "ollama" },
-      { id: "llama3:8b", engine: "wcx" },
+      { id: "qwen3:0.6b", engine: "mlx" },
+      { id: "llama3:8b", engine: "cuda" },
     ]);
+  });
+
+  it("renders historical wmx/wcx caps canonically without rewriting stored caps_json", () => {
+    const historical = selfDesc("box-historical");
+    historical.capabilities = [
+      { kind: "serve_model", id: "apple-model", engine: "wmx", evidence: "characterized" },
+      { kind: "serve_model", id: "nvidia-model", engine: "wcx", evidence: "characterized" },
+    ];
+    const { token } = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(token, historical)!;
+    const stored = db.getAgentByEnrollmentId(enrollment_id)!;
+    const originalCapsJson = stored.caps_json;
+
+    expect(enroll.summarizeAgent(stored).serve_models).toEqual([
+      { id: "apple-model", engine: "mlx" },
+      { id: "nvidia-model", engine: "cuda" },
+    ]);
+    expect(db.getAgentByEnrollmentId(enrollment_id)!.caps_json).toBe(originalCapsJson);
+    expect(originalCapsJson).toContain('"engine":"wmx"');
+    expect(originalCapsJson).toContain('"engine":"wcx"');
   });
 
   it("summarizeAgent keeps only serve_model entries out of a mixed capabilities list", () => {

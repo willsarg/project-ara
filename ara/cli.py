@@ -15,7 +15,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
+from ara import (acquire, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  staleness, status, versions)
 from ara.contracts import ramp
@@ -969,7 +969,7 @@ def _stale_ceiling_note(c: Console, model: str, measured_at: str | None, *,
 def _measured_ramp_slope(row: dict | None) -> float | None:
     """Fit the measured growth slope (GB per 1k tok) from a characterization row's stored ramp
     points, or None when it can't (missing/too-few points, degenerate fit). The points are in the
-    engine's native units (wmx: decimal GB) — the SAME units the wmx serve gate predicts in — so
+    engine's native units (MLX: decimal GB) — the SAME units the MLX serve gate predicts in — so
     the slope passes straight through with no conversion. Lets ``serve`` gate a measured ceiling
     with the real slope instead of the conservative a-priori one; None falls back to a-priori.
     Slug 2026-07-02-wmx-serve-measured-provenance-gate."""
@@ -1075,7 +1075,7 @@ def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
                  kv_quant: str, weight_quant: str = "none",
                  prefill_chunk: int | None = None) -> dict:
     """The context-lever kwargs each backend's characterize/generate accepts. KV-quant is a lever
-    on the AMD iGPU (vulkan), Apple (wmx), and NVIDIA (wcx/cuda) lanes. Flash-attention has
+    on the AMD iGPU (`vulkan`), Apple (`mlx`), and NVIDIA (`cuda`) lanes. Flash-attention has
     OPPOSITE defaults per engine: vulkan's llama.cpp FA is on-by-default (``flash_attn``, the
     ``--no-flash-attn`` opt-out), while CUDA defaults to SDPA with FA2 an availability-gated opt-in
     (``flash_attn_optin``, the ``--flash-attn`` flag). MLX's SDPA is always fused (no knob). Runtime
@@ -1113,7 +1113,7 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
                       *, as_json: bool, progress: bool) -> int | None:
     """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
 
-    So wcx/wmx fetch on demand like the GGUF engines (which download in-worker), instead of the
+    So the CUDA/MLX engines fetch on demand like the GGUF engines (which download in-worker), instead of the
     worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
     ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
     No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
@@ -1182,12 +1182,12 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if lever_err is not None:
         print(json.dumps({"error": lever_err})) if as_json else c.emit(c.style("bad", f"  {lever_err}"))
         return 1
-    engine_ok, engine_pkg = engine_status(sel.backend)
+    engine_ok, engine_label = engine_status(sel.backend)
     if not engine_ok:
         if as_json:
-            print(json.dumps({"error": f"{engine_pkg} engine not installed"}))
+            print(json.dumps({"error": f"{engine_label} not installed"}))
         else:
-            c.emit(c.style("warn", f"  the {engine_pkg} engine isn't installed — run: ")
+            c.emit(c.style("warn", f"  the {engine_label} isn't installed — run: ")
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     bk = get_backend(sel.backend)
@@ -1202,9 +1202,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
+    calibration_error = None
     with db.connected() as cal_con:
         if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
-            c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+            if not as_json:
+                c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
             cal = bk.calibrate()
             overhead = (cal or {}).get("overhead_gb")
             wall = (cal or {}).get("wall_gb")
@@ -1212,7 +1214,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             # never let the conservative default masquerade as a measurement. The ramp still proceeds
             # safely on the default overhead; we just don't hide that it's a fallback.
             cal_err = (cal or {}).get("calibration_error")
-            if cal_err:
+            calibration_error = cal_err
+            if cal_err and not as_json:
                 c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
                                        " — using conservative default overhead"))
             # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
@@ -1226,13 +1229,14 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             # Surface the measured wall right where it's measured — otherwise the user sees only the
             # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
             # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
-            if wall is not None:
+            if wall is not None and not as_json:
                 budget = (cal or {}).get("safe_budget_gb")
                 line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
                 if budget is not None:
                     line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
                 c.emit(line)
-    c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+    if not as_json:
+        c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
     fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
@@ -1242,20 +1246,29 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"characterization failed: {exc}"
         # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
         # styled text or a traceback that would break the parse.
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        if as_json:
+            payload = {"error": msg}
+            if calibration_error:
+                payload.update(calibration_error=calibration_error, calibration_fallback=True)
+            print(json.dumps(payload))
+        else:
+            c.emit(c.style("bad", f"  {msg}"))
         return 1
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
     # persist a misleading null row. Suggest a compatible engine when we can tell cheaply (e.g. a
-    # GGUF handed to the torch-based wcx → suggest the CPU/llama.cpp engine).
+    # GGUF handed to the torch-based CUDA engine → suggest the CPU/llama.cpp engine).
     if result.get("error"):
         suggest = engines.engine_for_model(model)
         hint = ("  — try " + c.style("accent", f"ara characterize {model} --engine {suggest}")
                 if suggest and suggest != sel.engine_key else "")
         if as_json:
-            print(json.dumps({"error": result["error"]}))
+            payload = {"error": result["error"]}
+            if calibration_error:
+                payload.update(calibration_error=calibration_error, calibration_fallback=True)
+            print(json.dumps(payload))
         else:
-            c.emit(c.style("warn", f"  {engine_pkg} couldn't load {model}: {result['error']}") + hint)
+            c.emit(c.style("warn", f"  {engine_label} couldn't load {model}: {result['error']}") + hint)
         return 1
 
     ceiling = result["safe_context"]
@@ -1268,6 +1281,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if as_json:
         out: dict = {"model": model, "safe_context": ceiling,
                      "decode_context": result.get("decode_context")}
+        if calibration_error:
+            out.update(calibration_error=calibration_error, calibration_fallback=True)
         if ceiling is None:
             # Carry through the diagnostic fields the driver surfaced so automated callers
             # can explain why — not just a bare null.
@@ -1583,7 +1598,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
     # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
-    # Pre-fetch weights so wcx/wmx benchmark uncached models on demand (like the GGUF engines),
+    # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
     if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
@@ -1778,12 +1793,12 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if lever_err is not None:
         return err(lever_err)
 
-    engine_ok, engine_pkg = engine_status(backend)
+    engine_ok, engine_label = engine_status(backend)
     if not engine_ok:
-        return err(f"the {engine_pkg} engine isn't installed — run: ara install{suffix}")
+        return err(f"the {engine_label} isn't installed — run: ara install{suffix}")
     bk = get_backend(backend)
     if not hasattr(bk, "generate"):
-        return err(f"run isn't supported on the {engine_pkg} engine yet")
+        return err(f"run isn't supported on the {engine_label} yet")
     hw_err = _weight_quant_hw_error(bk, backend, weight_quant)
     if hw_err is not None:
         return err(hw_err)
@@ -1791,12 +1806,12 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
     # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
     if not as_json and not assume_yes and sys.stdin.isatty():
-        if not _confirm(f"Load {model} on {engine_pkg} and generate (≤ ~{safe} tokens)?"):
+        if not _confirm(f"Load {model} on {engine_label} and generate (≤ ~{safe} tokens)?"):
             c.emit(c.style("dim", "  skipped."))
             return 0
 
     if not as_json:
-        c.emit(c.style("dim", f"  running {model} on {engine_pkg} … (≤ ~{safe} tokens)"))
+        c.emit(c.style("dim", f"  running {model} on {engine_label} … (≤ ~{safe} tokens)"))
     fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
@@ -1805,7 +1820,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if result.get("refused"):
-        return err(f"the {engine_pkg} engine refused: {result.get('reason', 'no reason given')}")
+        return err(f"the {engine_label} refused: {result.get('reason', 'no reason given')}")
 
     completion = result.get("completion", "")
     if as_json:
@@ -1824,7 +1839,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # (Decision 2026-06-26; spec 2026-06-26-ara-serve-governed-endpoint)
 # --------------------------------------------------------------------------- #
 # Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
-# engines transfers; the MLX (wmx) ceiling does NOT (different allocation model — the seam mismatch).
+# engines transfers; the MLX ceiling does NOT (different allocation model — the seam mismatch).
 _OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "vulkan", "cuda-gguf")
 
 
@@ -2002,9 +2017,9 @@ def _free_port() -> int:
 def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | None = None,
                       assume_yes: bool = False, as_json: bool = False,
                       kv_quant: str = "f16") -> int:
-    """Stand *model* up on the governed MLX server (wmx-suite), capped at the MEASURED apple
+    """Stand *model* up on the governed MLX server, capped at the MEASURED apple
     ceiling (or explicit ``--ctx``), and hand back an OpenAI-compatible endpoint. ARA owns the
-    server subprocess, so it stays foreground until Ctrl-C. The wmx ceiling is valid here because
+    server subprocess, so it stays foreground until Ctrl-C. The MLX ceiling is valid here because
     serve and characterize share the mlx_lm allocation path (seam-mismatch rule, the other way).
     Spec 2026-06-28-recommend-use-case-and-serve-selection."""
     def err(msg: str) -> int:
@@ -2092,7 +2107,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     true source and never a silent guess (Rule #1/#3). A missing model is pulled rather than refused,
     so a fresh model serves in one command. After load it verifies the ceiling actually took before
     returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
-    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine wmx`` routes to the governed MLX
+    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine mlx`` routes to the governed MLX
     server instead (spec 2026-06-28); the Ollama path below is unchanged."""
     auto_selected = model is None    # bare `ara serve` → pick the best-fitting model in the store
     if engine is not None and model is not None:
@@ -2644,6 +2659,13 @@ def _main_impl() -> int:
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
     chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
 
+    def _canonical_engine_arg(value: str | None) -> str | None:
+        if value in engine_identity.LEGACY_ENGINE_ALIASES:
+            canonical = engine_identity.LEGACY_ENGINE_ALIASES[value]
+            print(f"ara: --engine {value} is deprecated; use --engine {canonical}", file=sys.stderr)
+            return canonical
+        return value
+
     # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
     model: str | None = None
     engine: str | None = None
@@ -2672,11 +2694,11 @@ def _main_impl() -> int:
             model = a.split("=", 1)[1] or None
             continue
         if a == "--engine":
-            engine = argv[i + 1] if i + 1 < len(argv) else None
+            engine = _canonical_engine_arg(argv[i + 1] if i + 1 < len(argv) else None)
             skip = True
             continue
         if a.startswith("--engine="):
-            engine = a.split("=", 1)[1] or None
+            engine = _canonical_engine_arg(a.split("=", 1)[1] or None)
             continue
         if a == "--token":
             token = argv[i + 1] if i + 1 < len(argv) else None
@@ -2869,12 +2891,12 @@ def _main_impl() -> int:
                                     exec_consent=exec_consent, as_json=as_json)
 
     if cmd == "install":
-        # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
-        return render_install(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+        # engine from a positional (`ara install mlx`), else --engine, else the auto-matched one.
+        return render_install(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
                               refresh=refresh, as_json=as_json)
 
     if cmd == "uninstall":
-        return render_uninstall(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+        return render_uninstall(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
                                 as_json=as_json)
 
     if cmd == "hf":

@@ -9,9 +9,8 @@ slow, so it's not usable headroom). One adapter for *all* CPU-only inference reg
 ``detect``, not a separate backend, because it doesn't change the wall. This is the universal
 fallback: nearly every machine matches it.
 
-It exists to keep the abstraction honest. Unlike Apple (whose engine is the external
-``wmx-suite``), llama.cpp is **built into ARA** (see the engine repo-split rule: only the huge
-CUDA/MLX suites get their own repos). The worker is a self-contained script —
+It exists to keep the abstraction honest. Unlike Apple (whose native engine is a separately
+installed package), llama.cpp is **built into ARA**. The worker is a self-contained script —
 ``ara/workers/cpu_llama.py``, which never imports ``ara`` — run by the isolated ``cpu`` env's
 own python over ``engine_env``, so llama-cpp-python never enters ARA core's lock. ``characterize``
 is pure wiring into the engine-agnostic :func:`ara.contracts.driver.characterize`; the only

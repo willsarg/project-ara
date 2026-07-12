@@ -9,8 +9,8 @@ vs torch-ROCm, MLX vs llama.cpp) from ever colliding. ARA drives an engine over 
 worker in its env — it never imports one in-process.
 
 Two kinds of engine live here:
-  * **external suites** — the two heavyweights that get their own repos (``wmx`` = MLX/Apple,
-    ``wcx`` = CUDA); installed from a git ``spec``.
+  * **nested engines** — the MLX and CUDA heavyweights ship under ARA-owned source trees and install
+    from that exact source into isolated environments.
   * **built-in engines** — everything else ships in the ARA repo (only the worker's heavy deps
     install into the env); described by a ``packages`` list and ``builtin: True``.
 
@@ -23,18 +23,19 @@ import os
 import platform
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
-from ara import engine_env
+from ara import engine_env, engine_identity
 
 
 def _ara_version() -> str:
     """The installed project-ara version (also behind ``ara --version``), or a sentinel when running
     from an un-installed source tree with no distribution metadata. Stamped into an engine env at
-    install and compared on the next ``ara install`` to detect a stale vendored engine — a newer ARA
-    wheel carries newer ``ara/_vendor/*`` source that must reach a box that already has the env."""
+    install and compared on the next ``ara install`` to detect a stale engine package — a newer ARA
+    wheel carries newer nested engine source that must reach a box that already has the env."""
     try:
         return metadata.version("project-ara")
     except metadata.PackageNotFoundError:
@@ -43,28 +44,38 @@ def _ara_version() -> str:
 # Short, stable handles → how to install each. ``backend`` is both the adapter module name and
 # the isolated env name. ``available`` is False for engines whose suite isn't shippable yet.
 ENGINES: dict[str, dict] = {
-    "wmx": {
+    "mlx": {
         "backend": "apple",
-        "package": "wmx-suite",
+        "package": "ara-engine-mlx",
         "available": True,
-        # Vendored: the wmx_suite source ships in ARA's wheel under ara/_vendor/wmx and installs into
+        "source_dir": "_engine_packages/mlx",
+        "env_schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "import_package": "ara_engine_mlx",
+        "source_env": "ARA_MLX_SOURCE",
+        "legacy_source_env": "ARA_WMX_SOURCE",
+        # Nested: the native MLX engine source ships under ara/_engine_packages/mlx and installs into
         # the isolated `apple` env from there — no git fetch at install time, so a release is
         # reproducible from the wheel alone. Folded 2026-06-30 from wmx-suite@374c47d (the #107
-        # single-BOS + turn-end stop fixes). Re-vendor via scripts/vendor_engine.py to bump.
+        # single-BOS + turn-end stop fixes).
         # ARA_WMX_SOURCE still overrides to a local checkout (editable) for engine dev. MLX +
         # transformers stay engine-env-only — never ARA dependencies.
         "vendored": True,
-        "python": "3.12",          # wmx-suite requires >=3.12
+        "python": "3.12",          # ara-engine-mlx requires >=3.12
         "model_kinds": ("transformers",),
     },
-    "wcx": {
+    "cuda": {
         "backend": "cuda",
-        "package": "wcx-suite",
-        # Converted to the isolated-env worker model (backends/cuda.py drives wcx-suite's
+        "package": "ara-engine-cuda",
+        # Converted to the isolated-env worker model (backends/cuda.py drives the native CUDA
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
-        # Vendored (see the wmx note): wcx_suite ships in ARA's wheel under ara/_vendor/wcx and
-        # installs into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
+        "source_dir": "_engine_packages/cuda",
+        "env_schema": "ara-engine-cuda:ara_engine_cuda:v1",
+        "import_package": "ara_engine_cuda",
+        "source_env": "ARA_CUDA_SOURCE",
+        "legacy_source_env": "ARA_WCX_SOURCE",
+        # Nested: the native CUDA engine source ships under ara/_engine_packages/cuda and installs
+        # into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
         "vendored": True,
         "extras": "cuda",                        # pulls torch + transformers (into the env, not ARA)
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default
@@ -139,7 +150,7 @@ ENGINES: dict[str, dict] = {
         "model_kinds": ("gguf",),
         # CUDA-offload GGUF via llama.cpp's CUDA build (opt-in, --engine cuda-gguf). Enables the
         # two-wall hybrid path: K layers on NVIDIA VRAM, N-K on CPU RAM, auto-fitted each run.
-        # NOT a hardware auto-pick — NVIDIA still auto-picks ``wcx`` (the full-GPU transformers
+        # NOT a hardware auto-pick — NVIDIA still auto-picks ``cuda`` (the full-GPU transformers
         # engine). Prebuilt CUDA-124 wheels on the project's own index; we MUST force the prebuilt
         # wheel (same reason as vulkan: a plain install gets the CPU wheel from cache). `--only-binary`
         # (added in _builtin_targets) makes that deterministic. Kept AFTER `vulkan` so the GGUF
@@ -163,14 +174,14 @@ def for_hardware() -> str | None:
     bare ``nvidia-smi`` on PATH. This is the resolution behind ``--engine auto``.
     """
     if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "wmx"
+        return "mlx"
     if shutil.which("nvidia-smi"):
-        return "wcx"
+        return "cuda"
     return None
 
 
 def for_backend(backend: str) -> str | None:
-    """The engine key whose backend matches *backend* (e.g. 'cuda' → 'wcx'), or None.
+    """The engine key whose backend matches *backend* (e.g. 'cuda' → 'cuda'), or None.
     One place maps hardware backends to engines, shared by detect and the registry."""
     return next((k for k, e in ENGINES.items() if e["backend"] == backend), None)
 
@@ -180,33 +191,52 @@ def resolve(value: str) -> str | None:
     name one. ``auto`` defers to :func:`for_hardware`; explicit keys pass through."""
     if value == "auto":
         return for_hardware()
-    return value if value in ENGINES else None
+    canonical = engine_identity.canonical_engine(value)
+    return canonical if canonical in ENGINES else None
 
 
 def is_installed(key: str) -> bool:
-    """Is engine *key*'s isolated env present? Cheap — just checks the env's python exists,
-    never imports the engine. Unknown keys are simply 'not installed'."""
-    engine = ENGINES.get(key)
-    return engine is not None and engine_env.exists(engine["backend"])
+    """Is engine *key*'s isolated env ready? Cheap and engine-free.
+
+    An env is ready when its Python exists and, if the catalog declares an engine-package schema,
+    its schema stamp matches. Unknown keys and stale package layouts are not installed-ready.
+    """
+    engine = ENGINES.get(engine_identity.canonical_engine(key))
+    if engine is None or not engine_env.exists(engine["backend"]):
+        return False
+    schema = engine.get("env_schema")
+    return schema is None or engine_env.stamped_schema(engine["backend"]) == schema
 
 
 def _vendored_source(key: str) -> Path:
-    """The directory of engine *key*'s vendored package source — ``ara/_vendor/<key>``, which holds
-    the engine's ``pyproject.toml``. This is the path handed to ``uv pip install``: uv builds the
-    engine package from it into the isolated env. Ships inside ARA's wheel (no network at install)."""
-    return Path(__file__).resolve().parent / "_vendor" / key
+    """The catalog-declared nested package source for engine *key*.
+
+    This directory holds the engine's ``pyproject.toml`` and is handed to ``uv pip install``.
+    It ships inside ARA's wheel, so the default install needs no engine-source network fetch.
+    """
+    engine = ENGINES[key]
+    return Path(__file__).resolve().parent / engine["source_dir"]
 
 
 def source_for(key: str) -> str:
-    """The install source for an external engine *key*: a dev override, else the vendored path.
+    """The install source for an external engine *key*: a dev override, else its nested source.
 
-      * ``ARA_<KEY>_SOURCE`` (e.g. ``ARA_WMX_SOURCE=../wmx-suite``) — a local checkout for engine
-        development; used verbatim (installed editable by :func:`_install_targets`).
-      * otherwise the package source ARA ships under ``ara/_vendor/<key>``, so a release installs the
-        exact engine code in the wheel — reproducibly and offline (no git fetch)."""
-    override = os.environ.get(f"ARA_{key.upper()}_SOURCE")
+      * The canonical source variable (for example ``ARA_MLX_SOURCE``) selects a local checkout for
+        engine development; a declared legacy variable remains a temporary compatibility fallback.
+      * Otherwise ARA installs the exact catalog source shipped in its wheel, reproducibly and
+        offline (no git fetch).
+    """
+    engine = ENGINES[key]
+    override = os.environ.get(engine["source_env"])
     if override:
         return override
+    legacy_override = os.environ.get(engine["legacy_source_env"])
+    if legacy_override:
+        print(
+            f"ara: {engine['legacy_source_env']} is deprecated; use {engine['source_env']}",
+            file=sys.stderr,
+        )
+        return legacy_override
     return str(_vendored_source(key))
 
 
@@ -267,7 +297,7 @@ def _install_targets(key: str) -> list[str]:
     # A dev override (ARA_<KEY>_SOURCE) installs editable so engine edits are live; the vendored
     # default installs plain — its source is read-only inside ARA's wheel.
     target = f"{source_for(key)}{suffix}"
-    if os.environ.get(f"ARA_{key.upper()}_SOURCE"):
+    if os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"]):
         return [*pip_args, "-e", target]
     return [*pip_args, target]
 
@@ -277,7 +307,7 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
     never creates an env for an unknown or not-yet-available engine.
 
     Version-aware: an installed env is *stale* when its stamped ARA version differs from the
-    current one (a newer ARA wheel ships newer ``ara/_vendor/*`` engine source) or when it carries
+    current one (a newer ARA wheel ships newer nested engine source) or when it carries
     no stamp at all (built by a pre-stamp ARA). A stale env is torn down and reinstalled so the
     shipped engine code actually reaches the box — reported as ``refreshed``. ``refresh=True`` forces
     that reinstall even when the stamp already matches. Every fresh/refresh install stamps the env
@@ -288,26 +318,37 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
     if not engine["available"]:
         return InstallResult(key, "coming_soon", f"{engine['package']} isn't available yet")
     current = _ara_version()
-    installed = is_installed(key)
-    stale = installed and (refresh or engine_env.stamped_version(engine["backend"]) != current)
-    if installed and not stale:
+    present = engine_env.exists(engine["backend"])
+    stale = present and (
+        refresh
+        or engine_env.stamped_version(engine["backend"]) != current
+        or (engine.get("env_schema") is not None
+            and engine_env.stamped_schema(engine["backend"]) != engine["env_schema"])
+    )
+    if present and not stale:
         return InstallResult(key, "already")
     if stale:                       # wipe the old env so the reinstall isn't itself a noop
         engine_env.remove(engine["backend"])
+    create_kwargs = {
+        "python": engine.get("python"),
+        "version": current,
+        "schema": engine.get("env_schema"),
+    }
+    if engine.get("import_package") is not None:
+        create_kwargs["expected_import"] = engine["import_package"]
     try:
-        engine_env.create(engine["backend"], _install_targets(key),
-                          python=engine.get("python"), version=current)
+        engine_env.create(engine["backend"], _install_targets(key), **create_kwargs)
     except engine_env.EngineEnvError as e:
         return InstallResult(key, "failed", str(e))
     return InstallResult(key, "refreshed" if stale else "installed")
 
 
 def uninstall(key: str) -> InstallResult:
-    """Remove engine *key*'s isolated env. No-op when it isn't an engine or isn't installed.
+    """Remove engine *key*'s isolated env. No-op when it isn't an engine or isn't present.
     The shared uv cache and other engines' envs are untouched."""
     if key not in ENGINES:
         return InstallResult(key, "unknown")
-    if not is_installed(key):
+    if not engine_env.exists(ENGINES[key]["backend"]):
         return InstallResult(key, "absent")
     engine_env.remove(ENGINES[key]["backend"])
     return InstallResult(key, "removed")

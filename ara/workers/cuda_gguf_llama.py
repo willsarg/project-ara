@@ -444,7 +444,7 @@ def benchmark(model: str, ctx: int, prompts: list, *, vram_margin_gb: float, ram
                             "reason": f"prompt fills context ceiling {ctx}"})
             continue
         # A per-prompt exception (decode failure, OOM) must NOT crash the whole run and lose the
-        # completed work — capture it as an error result and press on (Rule #3, mirrors wmx).
+        # completed work — capture it as an error result and press on (Rule #3, mirrors MLX).
         try:
             out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
                                              max_tokens=allowed)

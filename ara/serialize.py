@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from ara import detect
+from ara import detect, engine_identity
 
 
 def machine(m: detect.Machine) -> dict:
@@ -22,7 +22,9 @@ def machine(m: detect.Machine) -> dict:
     ``dataclasses.asdict`` expands the nested hardware/runtime structures but drops the
     ``accelerated`` @property, so add it back explicitly. This is the single source of truth
     for ``detect --json``."""
-    return {**dataclasses.asdict(m), "accelerated": m.accelerated}
+    rec = {**dataclasses.asdict(m), "accelerated": m.accelerated}
+    rec["engine"] = engine_identity.canonical_engine(rec["engine"])
+    return rec
 
 
 # The durable capability fields the profile projection keeps. EXCLUDED (live/transient, would
@@ -47,6 +49,7 @@ def profile_record(m: detect.Machine) -> dict:
     Nested domain objects (accel, gpus, board, runtimes) come through asdict-expanded as
     JSON-ready dicts/lists."""
     rec = {name: getattr(m, name) for name in _PROFILE_SCALARS}
+    rec["engine"] = engine_identity.canonical_engine(rec["engine"])
     rec["accel"] = dataclasses.asdict(m.accel)
     rec["gpus"] = [dataclasses.asdict(g) for g in m.gpus]
     rec["board"] = dataclasses.asdict(m.board)

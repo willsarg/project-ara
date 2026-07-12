@@ -9,18 +9,42 @@ import ara.engines as engines
 # --------------------------------------------------------------------------- #
 # for_hardware() — the light "what would ARA pick here?" probe behind `auto`
 # --------------------------------------------------------------------------- #
-def test_for_hardware_picks_wmx_on_apple_silicon(monkeypatch):
+def test_for_hardware_picks_mlx_on_apple_silicon(monkeypatch):
     monkeypatch.setattr(engines.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(engines.platform, "machine", lambda: "arm64")
-    assert engines.for_hardware() == "wmx"
+    assert engines.for_hardware() == "mlx"
 
 
-def test_for_hardware_picks_wcx_when_nvidia_smi_present(monkeypatch):
+def test_for_hardware_picks_cuda_when_nvidia_smi_present(monkeypatch):
     monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
     monkeypatch.setattr(engines.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(engines.shutil, "which",
                         lambda n: "C:/Windows/System32/nvidia-smi.exe" if n == "nvidia-smi" else None)
-    assert engines.for_hardware() == "wcx"
+    assert engines.for_hardware() == "cuda"
+
+
+def test_catalog_has_only_canonical_public_engine_keys():
+    assert "mlx" in engines.ENGINES and "cuda" in engines.ENGINES
+    assert "wmx" not in engines.ENGINES and "wcx" not in engines.ENGINES
+
+
+def test_mlx_catalog_declares_the_native_import_package():
+    assert engines.ENGINES["mlx"]["import_package"] == "ara_engine_mlx"
+
+
+def test_cuda_catalog_declares_the_native_package_contract():
+    cuda = engines.ENGINES["cuda"]
+
+    assert cuda["source_dir"] == "_engine_packages/cuda"
+    assert cuda["env_schema"] == "ara-engine-cuda:ara_engine_cuda:v1"
+    assert cuda["import_package"] == "ara_engine_cuda"
+    assert cuda["extras"] == "cuda"
+    assert cuda["pip_args"] == ["--torch-backend=auto"]
+
+
+def test_legacy_engine_aliases_resolve_to_canonical_keys():
+    assert engines.resolve("wmx") == "mlx"
+    assert engines.resolve("wcx") == "cuda"
 
 
 def test_for_hardware_none_when_no_known_accelerator(monkeypatch):
@@ -31,19 +55,19 @@ def test_for_hardware_none_when_no_known_accelerator(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# resolve() — map an --engine value (wmx | wcx | cpu | auto) to a concrete key
+# resolve() — map an --engine value (mlx | cuda | cpu | auto) to a concrete key
 # --------------------------------------------------------------------------- #
 def test_resolve_passes_through_explicit_engine():
-    assert engines.resolve("wmx") == "wmx"
-    assert engines.resolve("wcx") == "wcx"
+    assert engines.resolve("mlx") == "mlx"
+    assert engines.resolve("cuda") == "cuda"
     assert engines.resolve("cpu") == "cpu"
     assert engines.resolve("vulkan") == "vulkan"
     assert engines.resolve("cuda-gguf") == "cuda-gguf"
 
 
 def test_resolve_auto_uses_hardware_pick(monkeypatch):
-    monkeypatch.setattr(engines, "for_hardware", lambda: "wcx")
-    assert engines.resolve("auto") == "wcx"
+    monkeypatch.setattr(engines, "for_hardware", lambda: "cuda")
+    assert engines.resolve("auto") == "cuda"
 
 
 def test_resolve_auto_none_when_no_match(monkeypatch):
@@ -56,18 +80,18 @@ def test_resolve_unknown_is_none():
 
 
 def test_for_backend_maps_backend_to_engine():
-    assert engines.for_backend("apple") == "wmx"
-    assert engines.for_backend("cuda") == "wcx"          # NVIDIA still auto-picks wcx
+    assert engines.for_backend("apple") == "mlx"
+    assert engines.for_backend("cuda") == "cuda"          # NVIDIA still auto-picks cuda
     assert engines.for_backend("cpu") == "cpu"
     assert engines.for_backend("vulkan") == "vulkan"
     assert engines.for_backend("cuda_gguf") == "cuda-gguf"
     assert engines.for_backend("unsupported") is None
 
 
-def test_for_backend_cuda_still_returns_wcx_not_cuda_gguf():
-    # cuda-gguf is opt-in only; hardware auto-pick for NVIDIA is wcx (backend="cuda").
+def test_for_backend_cuda_still_returns_cuda_not_cuda_gguf():
+    # cuda-gguf is opt-in only; hardware auto-pick for NVIDIA is cuda (backend="cuda").
     # for_backend("cuda") must NOT return "cuda-gguf" (its backend is "cuda_gguf", distinct).
-    assert engines.for_backend("cuda") == "wcx"
+    assert engines.for_backend("cuda") == "cuda"
     assert engines.for_backend("cuda") != "cuda-gguf"
 
 
@@ -76,16 +100,45 @@ def test_for_backend_cuda_still_returns_wcx_not_cuda_gguf():
 # --------------------------------------------------------------------------- #
 def test_is_installed_true_when_env_exists(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: name == "apple")
-    assert engines.is_installed("wmx") is True
+    monkeypatch.setattr(
+        engines.engine_env,
+        "stamped_schema",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+    )
+    assert engines.is_installed("mlx") is True
 
 
 def test_is_installed_false_when_env_absent(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
-    assert engines.is_installed("wmx") is False
+    assert engines.is_installed("mlx") is False
 
 
 def test_is_installed_false_for_unknown_engine():
     assert engines.is_installed("nonsense") is False
+
+
+def test_is_installed_false_when_declared_schema_stamp_is_missing(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    assert engines.is_installed("mlx") is False
+
+
+def test_is_installed_false_when_declared_schema_stamp_is_wrong(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v1")
+    assert engines.is_installed("mlx") is False
+
+
+def test_is_installed_true_when_declared_schema_stamp_matches(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v2")
+    assert engines.is_installed("mlx") is True
 
 
 # --------------------------------------------------------------------------- #
@@ -94,17 +147,48 @@ def test_is_installed_false_for_unknown_engine():
 def test_source_for_defaults_to_vendored_path(monkeypatch):
     # A folded engine (no git spec) installs from the package source ARA ships in its wheel,
     # under ara/_vendor/<key> — reproducible and offline. The dir (with its pyproject) must exist.
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    assert "spec" not in engines.ENGINES["wmx"]            # folded in — no git source
-    src = engines.source_for("wmx")
-    assert src == str(engines._vendored_source("wmx"))
-    assert (engines._vendored_source("wmx") / "pyproject.toml").is_file()
+    assert "spec" not in engines.ENGINES["mlx"]            # folded in — no git source
+    src = engines.source_for("mlx")
+    assert src == str(engines._vendored_source("mlx"))
+    assert (engines._vendored_source("mlx") / "pyproject.toml").is_file()
 
 
 def test_source_for_uses_env_override(monkeypatch):
     # The dev override is a local checkout — used verbatim, with no SHA pin appended.
-    monkeypatch.setenv("ARA_WMX_SOURCE", "../wmx-suite")
-    assert engines.source_for("wmx") == "../wmx-suite"
+    monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
+    assert engines.source_for("mlx") == "../mlx-suite"
+
+
+def test_source_for_canonical_override_wins_over_legacy(monkeypatch, capsys):
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
+    assert engines.source_for("mlx") == "../mlx-suite"
+    assert capsys.readouterr().err == ""
+
+
+def test_source_for_accepts_legacy_override_for_one_release(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    assert engines.source_for("mlx") == "../legacy-wmx-suite"
+    assert capsys.readouterr().err == (
+        "ara: ARA_WMX_SOURCE is deprecated; use ARA_MLX_SOURCE\n")
+
+
+def test_cuda_source_for_accepts_legacy_override_with_warning(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../legacy-wcx-suite")
+    assert engines.source_for("cuda") == "../legacy-wcx-suite"
+    assert capsys.readouterr().err == (
+        "ara: ARA_WCX_SOURCE is deprecated; use ARA_CUDA_SOURCE\n")
+
+
+def test_cuda_source_for_canonical_override_wins_without_warning(monkeypatch, capsys):
+    monkeypatch.setenv("ARA_WCX_SOURCE", "../legacy-wcx-suite")
+    monkeypatch.setenv("ARA_CUDA_SOURCE", "../cuda-suite")
+    assert engines.source_for("cuda") == "../cuda-suite"
+    assert capsys.readouterr().err == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -165,49 +249,55 @@ def test_install_targets_vulkan_plain_on_macos(monkeypatch):
 
 def test_install_targets_vendored_is_plain_path(monkeypatch):
     # A folded engine installs from its vendored dir — a plain (non-editable) path, since the source
-    # is read-only inside ARA's wheel. No extras for wmx.
-    monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    assert engines._install_targets("wmx") == [str(engines._vendored_source("wmx"))]
+    # is read-only inside ARA's wheel. No extras for mlx.
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    assert engines._install_targets("mlx") == [str(engines._vendored_source("mlx"))]
 
 
 def test_install_targets_external_local_is_editable(monkeypatch):
-    monkeypatch.setenv("ARA_WMX_SOURCE", "../wmx-suite")
-    assert engines._install_targets("wmx") == ["-e", "../wmx-suite"]
+    monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
+    assert engines._install_targets("mlx") == ["-e", "../mlx-suite"]
 
 
-def test_install_targets_wcx_folds_extra_and_torch_backend(monkeypatch):
-    # Vendored wcx installs from its path with the [cuda] extra appended and the torch-backend
+def test_install_targets_legacy_local_source_remains_editable(monkeypatch):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
+    assert engines._install_targets("mlx") == ["-e", "../legacy-wmx-suite"]
+
+
+def test_install_targets_cuda_folds_extra_and_torch_backend(monkeypatch):
+    # Vendored cuda installs from its path with the [cuda] extra appended and the torch-backend
     # selector leading — plain (non-editable), since it's read-only inside ARA's wheel.
-    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
-    assert engines._install_targets("wcx") == [
-        "--torch-backend=auto", f"{engines._vendored_source('wcx')}[cuda]"]
+    monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
+    assert engines._install_targets("cuda") == [
+        "--torch-backend=auto", f"{engines._vendored_source('cuda')}[cuda]"]
 
 
-def test_install_targets_wcx_local_is_editable_with_extra(monkeypatch):
-    monkeypatch.setenv("ARA_WCX_SOURCE", "../wcx-suite")
-    assert engines._install_targets("wcx") == [
-        "--torch-backend=auto", "-e", "../wcx-suite[cuda]"]
+def test_install_targets_cuda_local_is_editable_with_extra(monkeypatch):
+    monkeypatch.setenv("ARA_CUDA_SOURCE", "../cuda-suite")
+    assert engines._install_targets("cuda") == [
+        "--torch-backend=auto", "-e", "../cuda-suite[cuda]"]
 
 
 # --------------------------------------------------------------------------- #
 # install() — create the isolated env (engine_env injected)
 # --------------------------------------------------------------------------- #
-def test_wcx_is_available_and_installs_into_its_cuda_env(monkeypatch):
-    # wcx is converted to the isolated-env worker model, so it installs like any other engine —
+def test_cuda_is_available_and_installs_into_its_cuda_env(monkeypatch):
+    # cuda is converted to the isolated-env worker model, so it installs like any other engine —
     # into the `cuda` env, folding the [cuda] extra + the auto torch-backend selector.
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
+    monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
     seen = {}
 
     def fake_create(name, packages, *, python=None, **kw):
         seen.update(name=name, packages=packages, python=python)
 
     monkeypatch.setattr(engines.engine_env, "create", fake_create)
-    assert engines.ENGINES["wcx"]["available"] is True
-    assert engines.install("wcx").status == "installed"
+    assert engines.ENGINES["cuda"]["available"] is True
+    assert engines.install("cuda").status == "installed"
     assert seen["name"] == "cuda" and seen["python"] == "3.12"
     assert seen["packages"] == [
-        "--torch-backend=auto", f"{engines._vendored_source('wcx')}[cuda]"]
+        "--torch-backend=auto", f"{engines._vendored_source('cuda')}[cuda]"]
 
 
 def test_install_unknown_engine_reports_unknown():
@@ -215,22 +305,27 @@ def test_install_unknown_engine_reports_unknown():
 
 
 def test_install_unavailable_engine_is_coming_soon(monkeypatch):
-    monkeypatch.setitem(engines.ENGINES["wcx"], "available", False)   # force coming-soon
+    monkeypatch.setitem(engines.ENGINES["cuda"], "available", False)   # force coming-soon
     created = []
     monkeypatch.setattr(engines.engine_env, "create",
                         lambda *a, **k: created.append(a))
-    r = engines.install("wcx")
+    r = engines.install("cuda")
     assert r.status == "coming_soon"
     assert created == []   # never built an env for a not-yet-available engine
 
 
 def test_install_already_present_is_noop(monkeypatch):
     # Present AND current (stamp matches) → noop: don't rebuild.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: engines._ara_version())
+    monkeypatch.setattr(
+        engines.engine_env,
+        "stamped_schema",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+    )
     created = []
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
-    r = engines.install("wmx")
+    r = engines.install("mlx")
     assert r.status == "already"
     assert created == []   # already there + current → don't rebuild
 
@@ -238,70 +333,89 @@ def test_install_already_present_is_noop(monkeypatch):
 def test_install_stamps_env_with_current_version(monkeypatch):
     # A fresh install stamps the env with the current ARA version (so the next install can tell
     # whether it's stale). version= is threaded into engine_env.create.
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     monkeypatch.setattr(engines, "_ara_version", lambda: "3.1.4")
     seen = {}
-    monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None:
-                        seen.update(version=version))
-    assert engines.install("wmx").status == "installed"
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, *, python=None, version=None, schema=None,
+        expected_import=None: seen.update(
+            version=version, schema=schema, expected_import=expected_import),
+    )
+    assert engines.install("mlx").status == "installed"
     assert seen["version"] == "3.1.4"
+    assert seen["schema"] == "ara-engine-mlx:ara_engine_mlx:v1"
+    assert seen["expected_import"] == "ara_engine_mlx"
 
 
 def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
     # Present but a DIFFERENT stamp (an older ARA wheel built this env) → tear down + reinstall,
     # reported as "refreshed", stamped with the current version.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "1.0.0")
     removed, created = [], {}
     monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
-    monkeypatch.setattr(engines.engine_env, "create",
-                        lambda name, packages, *, python=None, version=None:
-                        created.update(name=name, version=version))
-    r = engines.install("wmx")
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, *, python=None, version=None, schema=None,
+        expected_import=None: created.update(
+            name=name,
+            version=version,
+            schema=schema,
+            expected_import=expected_import,
+        ),
+    )
+    r = engines.install("mlx")
     assert r.status == "refreshed"
     assert removed == ["apple"]                 # old env wiped first
-    assert created == {"name": "apple", "version": "2.0.0"}
+    assert created == {
+        "name": "apple",
+        "version": "2.0.0",
+        "schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "expected_import": "ara_engine_mlx",
+    }
 
 
 def test_install_reinstalls_on_missing_stamp(monkeypatch):
     # Present but UNSTAMPED (a pre-stamp ARA built this env) → treated as stale → refreshed.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: None)
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: None)
-    assert engines.install("wmx").status == "refreshed"
+    assert engines.install("mlx").status == "refreshed"
     assert removed == ["apple"]
 
 
 def test_install_refresh_forces_reinstall_even_when_current(monkeypatch):
     # refresh=True: reinstall even though the stamp already matches the current version.
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda n: "2.0.0")
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda n: removed.append(n))
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: None)
-    assert engines.install("wmx", refresh=True).status == "refreshed"
+    assert engines.install("mlx", refresh=True).status == "refreshed"
     assert removed == ["apple"]
 
 
 def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     seen = {}
 
     def fake_create(name, packages, *, python=None, **kw):
         seen.update(name=name, packages=packages, python=python)
 
     monkeypatch.setattr(engines.engine_env, "create", fake_create)
-    r = engines.install("wmx")
+    r = engines.install("mlx")
     assert r.status == "installed"
     assert seen == {"name": "apple",
-                    "packages": [str(engines._vendored_source("wmx"))],
+                    "packages": [str(engines._vendored_source("mlx"))],
                     "python": "3.12"}
 
 
@@ -310,7 +424,7 @@ def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
     # takes the prebuilt-wheel path (already covered by test_install_targets_cpu_forces_prebuilt_wheel_on_windows),
     # and this test exercises the plain source-build path.
     monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     seen = {}
     monkeypatch.setattr(engines.engine_env, "create",
                         lambda name, packages, **kw: seen.update(name=name, packages=packages))
@@ -320,16 +434,67 @@ def test_install_builtin_cpu_creates_env_with_packages(monkeypatch):
 
 
 def test_install_reports_failed_on_engine_env_error(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
-    monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
 
     def boom(*a, **k):
         raise engines.engine_env.EngineEnvError("resolution impossible")
 
     monkeypatch.setattr(engines.engine_env, "create", boom)
-    r = engines.install("wmx")
+    r = engines.install("mlx")
     assert r.status == "failed"
     assert "resolution impossible" in r.detail
+
+
+def test_install_refreshes_present_env_when_declared_schema_is_missing(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "2.0.0")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    removed, created = [], {}
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(
+        engines.engine_env,
+        "create",
+        lambda name, packages, **kwargs: created.update(name=name, **kwargs),
+    )
+
+    result = engines.install("mlx")
+
+    assert result.status == "refreshed"
+    assert removed == ["apple"]
+    assert created["schema"] == "mlx-worker-v2"
+
+
+def test_install_refreshes_wrong_schema_at_unknown_source_version(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v1")
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(engines.engine_env, "create", lambda *args, **kwargs: None)
+
+    assert engines.install("mlx").status == "refreshed"
+    assert removed == ["apple"]
+
+
+def test_install_keeps_matching_schema_at_unknown_source_version(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines, "_ara_version", lambda: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0+unknown")
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v2")
+    created = []
+    monkeypatch.setattr(engines.engine_env, "create", lambda *args, **kwargs: created.append(args))
+
+    assert engines.install("mlx").status == "already"
+    assert created == []
 
 
 # --------------------------------------------------------------------------- #
@@ -340,27 +505,42 @@ def test_uninstall_unknown_engine_reports_unknown():
 
 
 def test_uninstall_absent_engine_is_noop(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
-    assert engines.uninstall("wmx").status == "absent"
+    assert engines.uninstall("mlx").status == "absent"
     assert removed == []   # nothing installed → nothing to remove
 
 
 def test_uninstall_removes_the_env(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
-    r = engines.uninstall("wmx")
+    r = engines.uninstall("mlx")
     assert r.status == "removed"
     assert removed == ["apple"]   # the backend/env name, not the dist
+
+
+def test_uninstall_removes_present_env_with_missing_schema_stamp(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    assert engines.is_installed("mlx") is False
+
+    result = engines.uninstall("mlx")
+
+    assert result.status == "removed"
+    assert removed == ["apple"]
 
 
 # --------------------------------------------------------------------------- #
 # model_kinds — every shipping engine declares which model formats it accepts
 # --------------------------------------------------------------------------- #
 def test_every_shipping_engine_has_model_kinds():
-    for key in ("wmx", "wcx", "cpu", "vulkan", "cuda-gguf"):
+    for key in ("mlx", "cuda", "cpu", "vulkan", "cuda-gguf"):
         assert "model_kinds" in engines.ENGINES[key], f"{key!r} missing model_kinds"
 
 

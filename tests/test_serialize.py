@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from ara import detect, serialize
 
 
@@ -14,8 +16,17 @@ def test_machine_matches_detect_json_shape():
     """serialize.machine(m) == asdict(m) + the `accelerated` @property — the detect --json shape."""
     m = detect.machine()
     d = serialize.machine(m)
-    assert d == {**dataclasses.asdict(m), "accelerated": m.accelerated}
+    expected = {**dataclasses.asdict(m), "accelerated": m.accelerated}
+    expected["engine"] = {"wmx": "mlx", "wmx-suite": "mlx", "wcx": "cuda",
+                          "wcx-suite": "cuda"}.get(expected["engine"], expected["engine"])
+    assert d == expected
     assert isinstance(d["accelerated"], bool)
+
+
+@pytest.mark.parametrize(("legacy", "canonical"), [("wmx", "mlx"), ("wcx", "cuda")])
+def test_machine_canonicalizes_legacy_engine_identity(legacy, canonical):
+    m = dataclasses.replace(detect.machine(), engine=legacy)
+    assert serialize.machine(m)["engine"] == canonical
 
 
 def test_profile_record_includes_durable_capability():
@@ -31,6 +42,14 @@ def test_profile_record_includes_durable_capability():
     assert isinstance(rec["gpus"], list)
     assert isinstance(rec["board"], dict)
     assert isinstance(rec["runtimes"], list)
+
+
+@pytest.mark.parametrize(("legacy", "canonical"), [("wmx", "mlx"), ("wcx", "cuda")])
+def test_profile_record_canonicalizes_engine_without_changing_backend(legacy, canonical):
+    m = dataclasses.replace(detect.machine(), engine=legacy, backend="apple" if legacy == "wmx" else "cuda")
+    rec = serialize.profile_record(m)
+    assert rec["engine"] == canonical
+    assert rec["backend"] == ("apple" if legacy == "wmx" else "cuda")
 
 
 def test_profile_record_excludes_live_transient_fields():

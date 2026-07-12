@@ -1,31 +1,103 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""staleness.py — is a stored characterization ceiling stale for the current model revision?
-
-ARA's one seam over the (engine-agnostic, stdlib-only) vendored ``fit_is_stale`` — governance
-consumers of a stored ``safe_context`` warn, never block, when the model's cache artifacts have
-changed since it was measured (Rule #3: honest about a possibly-outdated measurement).
-
-Slug: 2026-07-02-ara-ceiling-staleness
-"""
+"""Behavior of ARA's engine-independent characterization-staleness check."""
 from __future__ import annotations
+
+import importlib
+import os
+from pathlib import Path
 
 from ara import staleness
 
 
-def test_ceiling_is_stale_delegates_and_passes_args(monkeypatch):
-    seen = {}
-
-    def fake(model_id, measured_at):
-        seen["args"] = (model_id, measured_at)
-        return True
-
-    monkeypatch.setattr(staleness, "fit_is_stale", fake)
-    assert staleness.ceiling_is_stale("org/m", "2020-01-01T00:00:00+00:00") is True
-    assert seen["args"] == ("org/m", "2020-01-01T00:00:00+00:00")
+def _point_hub_at(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        staleness, "_HUB", home / ".cache" / "huggingface" / "hub", raising=False)
 
 
-def test_ceiling_is_stale_passes_through_false(monkeypatch):
-    # Conservative default from the vendored helper (no timestamp / uncached) → not stale.
-    monkeypatch.setattr(staleness, "fit_is_stale", lambda model_id, measured_at: False)
-    assert staleness.ceiling_is_stale("org/m", None) is False
+def _cached_artifact(home: Path, model_id: str = "org/model") -> Path:
+    artifact = (home / ".cache" / "huggingface" / "hub"
+                / f"models--{model_id.replace('/', '--')}" / "snapshots" / "revision" / "weights")
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    return artifact
+
+
+def test_ceiling_is_not_stale_without_measurement_timestamp(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    artifact = _cached_artifact(tmp_path)
+    os.utime(artifact, (2_000_000_000, 2_000_000_000))
+
+    assert staleness.ceiling_is_stale("org/model", None) is False
+
+
+def test_ceiling_is_not_stale_when_model_is_not_cached(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+
+    assert staleness.ceiling_is_stale("org/model", "2026-01-01T00:00:00+00:00") is False
+
+
+def test_ceiling_is_not_stale_when_cache_is_within_timestamp_tolerance(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    artifact = _cached_artifact(tmp_path)
+    os.utime(artifact, (1_700_000_001, 1_700_000_001))
+
+    assert staleness.ceiling_is_stale("org/model", "2023-11-14T22:13:20+00:00") is False
+
+
+def test_ceiling_is_not_stale_when_cache_is_older(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    artifact = _cached_artifact(tmp_path)
+    os.utime(artifact, (1_699_999_999, 1_699_999_999))
+
+    assert staleness.ceiling_is_stale("org/model", "2023-11-14T22:13:20+00:00") is False
+
+
+def test_ceiling_is_stale_when_cache_is_more_than_one_second_newer(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    artifact = _cached_artifact(tmp_path)
+    os.utime(artifact, (1_700_000_002, 1_700_000_002))
+
+    assert staleness.ceiling_is_stale("org/model", "2023-11-14T22:13:20") is True
+
+
+def test_ceiling_is_not_stale_for_malformed_timestamp(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    _cached_artifact(tmp_path)
+
+    assert staleness.ceiling_is_stale("org/model", "not-a-timestamp") is False
+
+
+def test_ceiling_ignores_artifact_filesystem_errors(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    artifact = _cached_artifact(tmp_path)
+    original_lstat = Path.lstat
+
+    def failing_lstat(path):
+        if path == artifact:
+            raise OSError("artifact disappeared")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", failing_lstat)
+
+    assert staleness.ceiling_is_stale("org/model", "2020-01-01T00:00:00+00:00") is False
+
+
+def test_hub_root_is_captured_when_module_is_imported(tmp_path, monkeypatch):
+    imported_home = tmp_path / "imported-home"
+    changed_home = tmp_path / "changed-home"
+    home_var = "USERPROFILE" if os.name == "nt" else "HOME"
+    artifact = _cached_artifact(imported_home)
+    os.utime(artifact, (1_700_000_002, 1_700_000_002))
+
+    try:
+        with monkeypatch.context() as context:
+            context.setenv(home_var, str(imported_home))
+            importlib.reload(staleness)
+            context.setenv(home_var, str(changed_home))
+
+            assert staleness.ceiling_is_stale(
+                "org/model", "2023-11-14T22:13:20+00:00") is True
+    finally:
+        importlib.reload(staleness)
