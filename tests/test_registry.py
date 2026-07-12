@@ -33,14 +33,14 @@ def test_engine_status_apple_reports_wmx(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(registry.engines, "is_installed", lambda k: True)
     installed, name = registry.engine_status()
-    assert installed is True and name == "wmx-suite"
+    assert installed is True and name == "MLX engine"
 
 
 def test_engine_status_apple_missing_engine(set_platform, monkeypatch):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(registry.engines, "is_installed", lambda k: False)
     installed, name = registry.engine_status()
-    assert installed is False and name == "wmx-suite"
+    assert installed is False and name == "MLX engine"
 
 
 def test_engine_status_cpu_fallback(set_platform, monkeypatch):
@@ -66,17 +66,17 @@ def test_engine_status_does_not_import_wmx(set_platform, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_resolve_engine_none_on_cuda(monkeypatch):
-    """resolve_engine(None) on a cuda machine returns the wcx selection."""
+    """resolve_engine(None) on a cuda machine returns the cuda selection."""
     monkeypatch.setattr(registry.detect, "backend_name", lambda: "cuda")
     sel = registry.resolve_engine(None)
-    assert sel == registry.EngineSelection("cuda", "wcx", "wcx-suite")
+    assert sel == registry.EngineSelection("cuda", "cuda", "ara-engine-cuda")
 
 
 def test_resolve_engine_auto_identical_to_none(monkeypatch):
     """resolve_engine('auto') is identical to resolve_engine(None)."""
     monkeypatch.setattr(registry.detect, "backend_name", lambda: "cuda")
     sel = registry.resolve_engine("auto")
-    assert sel == registry.EngineSelection("cuda", "wcx", "wcx-suite")
+    assert sel == registry.EngineSelection("cuda", "cuda", "ara-engine-cuda")
 
 
 def test_resolve_engine_cpu_explicit(monkeypatch):
@@ -87,17 +87,17 @@ def test_resolve_engine_cpu_explicit(monkeypatch):
 
 
 def test_resolve_engine_wcx_explicit(monkeypatch):
-    """resolve_engine('wcx') returns the wcx/cuda selection."""
+    """resolve_engine('cuda') returns the cuda/cuda selection."""
     monkeypatch.setattr(registry.detect, "backend_name", lambda: "cpu")
-    sel = registry.resolve_engine("wcx")
-    assert sel == registry.EngineSelection("cuda", "wcx", "wcx-suite")
+    sel = registry.resolve_engine("cuda")
+    assert sel == registry.EngineSelection("cuda", "cuda", "ara-engine-cuda")
 
 
 def test_resolve_engine_wmx_explicit(monkeypatch):
-    """resolve_engine('wmx') returns the wmx/apple selection."""
+    """resolve_engine('mlx') returns the mlx/apple selection."""
     monkeypatch.setattr(registry.detect, "backend_name", lambda: "cpu")
-    sel = registry.resolve_engine("wmx")
-    assert sel == registry.EngineSelection("apple", "wmx", "wmx-suite")
+    sel = registry.resolve_engine("mlx")
+    assert sel == registry.EngineSelection("apple", "mlx", "ara-engine-mlx")
 
 
 def test_resolve_engine_bogus_raises(monkeypatch):

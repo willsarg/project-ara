@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
-from ara import engine_env
+from ara import engine_env, engine_identity
 
 
 def _ara_version() -> str:
@@ -43,10 +43,13 @@ def _ara_version() -> str:
 # Short, stable handles → how to install each. ``backend`` is both the adapter module name and
 # the isolated env name. ``available`` is False for engines whose suite isn't shippable yet.
 ENGINES: dict[str, dict] = {
-    "wmx": {
+    "mlx": {
         "backend": "apple",
-        "package": "wmx-suite",
+        "package": "ara-engine-mlx",
         "available": True,
+        "source_dir": "_vendor/wmx",
+        "source_env": "ARA_MLX_SOURCE",
+        "legacy_source_env": "ARA_WMX_SOURCE",
         # Vendored: the wmx_suite source ships in ARA's wheel under ara/_vendor/wmx and installs into
         # the isolated `apple` env from there — no git fetch at install time, so a release is
         # reproducible from the wheel alone. Folded 2026-06-30 from wmx-suite@374c47d (the #107
@@ -57,12 +60,15 @@ ENGINES: dict[str, dict] = {
         "python": "3.12",          # wmx-suite requires >=3.12
         "model_kinds": ("transformers",),
     },
-    "wcx": {
+    "cuda": {
         "backend": "cuda",
-        "package": "wcx-suite",
+        "package": "ara-engine-cuda",
         # Converted to the isolated-env worker model (backends/cuda.py drives wcx-suite's
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
+        "source_dir": "_vendor/wcx",
+        "source_env": "ARA_CUDA_SOURCE",
+        "legacy_source_env": "ARA_WCX_SOURCE",
         # Vendored (see the wmx note): wcx_suite ships in ARA's wheel under ara/_vendor/wcx and
         # installs into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
         "vendored": True,
@@ -163,9 +169,9 @@ def for_hardware() -> str | None:
     bare ``nvidia-smi`` on PATH. This is the resolution behind ``--engine auto``.
     """
     if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "wmx"
+        return "mlx"
     if shutil.which("nvidia-smi"):
-        return "wcx"
+        return "cuda"
     return None
 
 
@@ -180,13 +186,14 @@ def resolve(value: str) -> str | None:
     name one. ``auto`` defers to :func:`for_hardware`; explicit keys pass through."""
     if value == "auto":
         return for_hardware()
-    return value if value in ENGINES else None
+    canonical = engine_identity.canonical_engine(value)
+    return canonical if canonical in ENGINES else None
 
 
 def is_installed(key: str) -> bool:
     """Is engine *key*'s isolated env present? Cheap — just checks the env's python exists,
     never imports the engine. Unknown keys are simply 'not installed'."""
-    engine = ENGINES.get(key)
+    engine = ENGINES.get(engine_identity.canonical_engine(key))
     return engine is not None and engine_env.exists(engine["backend"])
 
 
@@ -194,7 +201,8 @@ def _vendored_source(key: str) -> Path:
     """The directory of engine *key*'s vendored package source — ``ara/_vendor/<key>``, which holds
     the engine's ``pyproject.toml``. This is the path handed to ``uv pip install``: uv builds the
     engine package from it into the isolated env. Ships inside ARA's wheel (no network at install)."""
-    return Path(__file__).resolve().parent / "_vendor" / key
+    engine = ENGINES[key]
+    return Path(__file__).resolve().parent / engine["source_dir"]
 
 
 def source_for(key: str) -> str:
@@ -204,7 +212,8 @@ def source_for(key: str) -> str:
         development; used verbatim (installed editable by :func:`_install_targets`).
       * otherwise the package source ARA ships under ``ara/_vendor/<key>``, so a release installs the
         exact engine code in the wheel — reproducibly and offline (no git fetch)."""
-    override = os.environ.get(f"ARA_{key.upper()}_SOURCE")
+    engine = ENGINES[key]
+    override = os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"])
     if override:
         return override
     return str(_vendored_source(key))
@@ -267,7 +276,7 @@ def _install_targets(key: str) -> list[str]:
     # A dev override (ARA_<KEY>_SOURCE) installs editable so engine edits are live; the vendored
     # default installs plain — its source is read-only inside ARA's wheel.
     target = f"{source_for(key)}{suffix}"
-    if os.environ.get(f"ARA_{key.upper()}_SOURCE"):
+    if os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"]):
         return [*pip_args, "-e", target]
     return [*pip_args, target]
 

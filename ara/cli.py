@@ -15,7 +15,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, benchmark, catalog, db, detect, engines, estimate, hub,
+from ara import (acquire, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  staleness, status, versions)
 from ara.contracts import ramp
@@ -2644,6 +2644,13 @@ def _main_impl() -> int:
     flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
     chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
 
+    def _canonical_engine_arg(value: str | None) -> str | None:
+        if value in engine_identity.LEGACY_ENGINE_ALIASES:
+            canonical = engine_identity.LEGACY_ENGINE_ALIASES[value]
+            print(f"ara: --engine {value} is deprecated; use --engine {canonical}", file=sys.stderr)
+            return canonical
+        return value
+
     # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
     model: str | None = None
     engine: str | None = None
@@ -2672,11 +2679,11 @@ def _main_impl() -> int:
             model = a.split("=", 1)[1] or None
             continue
         if a == "--engine":
-            engine = argv[i + 1] if i + 1 < len(argv) else None
+            engine = _canonical_engine_arg(argv[i + 1] if i + 1 < len(argv) else None)
             skip = True
             continue
         if a.startswith("--engine="):
-            engine = a.split("=", 1)[1] or None
+            engine = _canonical_engine_arg(a.split("=", 1)[1] or None)
             continue
         if a == "--token":
             token = argv[i + 1] if i + 1 < len(argv) else None
@@ -2870,11 +2877,11 @@ def _main_impl() -> int:
 
     if cmd == "install":
         # engine from a positional (`ara install wmx`), else --engine, else the auto-matched one.
-        return render_install(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+        return render_install(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
                               refresh=refresh, as_json=as_json)
 
     if cmd == "uninstall":
-        return render_uninstall(c, engine=rest[1] if len(rest) > 1 else (engine or "auto"),
+        return render_uninstall(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
                                 as_json=as_json)
 
     if cmd == "hf":

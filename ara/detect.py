@@ -570,7 +570,7 @@ def machine() -> Machine:
 
     backend = backend_name()
     key = _engines.for_backend(backend)
-    engine = _engines.ENGINES[key]["package"] if key else backend
+    engine = key or backend
     engine_ready = key is not None and _engines.is_installed(key)
     accel = accelerator(chip)
     user_py = _user_python()

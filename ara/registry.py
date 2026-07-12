@@ -65,4 +65,5 @@ def engine_status(backend: str | None = None) -> tuple[bool, str]:
     resolves.
     """
     key = engines.for_backend(backend or detect.backend_name())
-    return engines.is_installed(key), engines.ENGINES[key]["package"]
+    labels = {"mlx": "MLX engine", "cuda": "CUDA engine"}
+    return engines.is_installed(key), labels.get(key, engines.ENGINES[key]["package"])

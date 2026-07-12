@@ -521,7 +521,7 @@ def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     m = detect.machine()
     assert isinstance(m, Machine)
     assert m.backend == "apple"
-    assert m.engine == "wmx-suite"
+    assert m.engine == "mlx"
     assert m.engine_ready is False
     assert m.accelerated is True
     assert m.arch == "arm64"
@@ -637,7 +637,7 @@ def test_profile_cpu_fallback(set_platform, run_stub, fake_home, monkeypatch):
     m = detect.machine()
     assert m.backend == "cpu"             # universal fallback — every machine has a backend
     assert m.accelerated is False         # but no GPU-class acceleration
-    assert m.engine == "llama.cpp"
+    assert m.engine == "cpu"
     assert m.engine_ready is False        # cpu env not installed here
 
 

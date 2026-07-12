@@ -104,6 +104,10 @@ def _capture_dispatch(monkeypatch):
                         (rec.update(recommend=as_json, recommend_uc=use_case) or 0))
     monkeypatch.setattr(cli, "render_run",
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
+    monkeypatch.setattr(cli, "render_serve",
+                        lambda c, model, **kw: (rec.update(serve={"model": model, **kw}) or 0))
+    monkeypatch.setattr(cli, "render_benchmark",
+                        lambda c, model, **kw: (rec.update(benchmark={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
     monkeypatch.setattr(cli, "render_uninstall", lambda c, **kw: (rec.update(uninstall=kw) or 0))
     monkeypatch.setattr(cli, "render_hf",
@@ -440,10 +444,45 @@ def test_render_help_json(capsys):
 
 
 # ---- install / uninstall take a positional engine (not just --engine) ---------------------
-def test_main_install_honors_positional_engine(monkeypatch):
+def test_main_install_honors_legacy_positional_engine(monkeypatch, capsys):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["install", "wmx"])
-    assert rec["install"]["engine"] == "wmx"
+    assert rec["install"]["engine"] == "mlx"
+    assert "--engine wmx is deprecated; use --engine mlx" in capsys.readouterr().err
+
+
+def test_main_legacy_alias_with_json_keeps_stdout_parseable(monkeypatch, capsys):
+    monkeypatch.setattr(cli.engines, "install",
+                        lambda key, **kw: cli.engines.InstallResult(key, "installed"))
+    assert _run_main(monkeypatch, ["install", "wcx", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["key"] == "cuda"
+    assert captured.err == "ara: --engine wcx is deprecated; use --engine cuda\n"
+
+
+def test_main_uninstall_legacy_positional_with_json_keeps_stdout_parseable(monkeypatch, capsys):
+    monkeypatch.setattr(cli.engines, "uninstall",
+                        lambda key: cli.engines.InstallResult(key, "removed"))
+    assert _run_main(monkeypatch, ["uninstall", "wcx", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["key"] == "cuda"
+    assert captured.err == "ara: --engine wcx is deprecated; use --engine cuda\n"
+
+
+@pytest.mark.parametrize("command,args,field", [
+    ("characterize", ["model", "--engine", "wmx"], "characterize_engine"),
+    ("profile", ["--engine=wcx"], "profile"),
+    ("run", ["model", "prompt", "--engine", "wmx"], "run"),
+    ("serve", ["model", "--engine=wcx"], "serve"),
+    ("benchmark", ["model", "--use-case", "rag", "--engine", "wmx"], "benchmark"),
+])
+def test_main_canonicalizes_legacy_engine_flags(monkeypatch, capsys, command, args, field):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, [command, *args])
+    value = rec[field]
+    engine = value["engine"] if isinstance(value, dict) else value
+    assert engine in ("mlx", "cuda")
+    assert "is deprecated; use --engine" in capsys.readouterr().err
 
 
 def test_main_install_engine_flag_still_works(monkeypatch):
@@ -532,7 +571,7 @@ def test_render_landing_supported(make_console, monkeypatch):
     out = buf.getvalue()
     assert "ara" in out and "Apple M4 Pro" in out
     assert "24 GB unified memory" in out and "16-core GPU" in out   # hardware, in plain terms
-    assert "wmx-suite" not in out and "backend apple" not in out    # no internal jargon on the line
+    assert "ara-engine-mlx" not in out and "backend apple" not in out    # no internal jargon on the line
     assert "GETTING STARTED" in out
     assert "detect" in out and "status" in out and "profile" in out
     assert "--python" in out and "--runtime" in out   # detect facet hint (python/apps/mlx collapsed in)
@@ -584,7 +623,7 @@ def _machine(**over) -> Machine:
         framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0),
                       ModelStore("Ollama", True, 0, 0.0)],
-        hf_token=True, power="AC power", backend="apple", engine="wmx-suite",
+        hf_token=True, power="AC power", backend="apple", engine="mlx",
         engine_ready=False,
     )
     base.update(over)
@@ -800,7 +839,7 @@ def _wire_profile(monkeypatch, set_platform, machine=None):
     """Wire render_profile engine-free (Spec 2026-06-23-capability-pipeline, Slice 2 Task 2):
     a stubbed Machine + machine_key on Apple. profile makes NO engine call — there is
     deliberately no backend wired here."""
-    set_platform("Darwin", "arm64")  # resolve_engine(None) -> apple/wmx
+    set_platform("Darwin", "arm64")  # resolve_engine(None) -> apple/mlx
     monkeypatch.setattr(cli.detect, "machine", lambda: machine if machine is not None else _machine())
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
 
@@ -842,7 +881,7 @@ def test_profile_reports_measured_wall_after_calibration(make_console, monkeypat
     # profile reports the MEASURED numbers (labelled), not the heuristic.
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c, buf = make_console()
     assert cli.render_profile(c) == 0
@@ -854,7 +893,7 @@ def test_profile_reports_measured_wall_after_calibration(make_console, monkeypat
 def test_profile_json_reports_measured_basis(monkeypatch, set_platform, capsys, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
@@ -879,7 +918,7 @@ def test_profile_footer_drops_estimated_when_measured(make_console, monkeypatch,
     # so the footer must NOT contradict it with the "estimated —" framing.
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c, buf = make_console()
     assert cli.render_profile(c) == 0
@@ -997,8 +1036,8 @@ def test_profile_model_json_includes_fit(monkeypatch, set_platform, capsys):
 
 def test_main_profile_passes_engine(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["profile", "--engine", "wmx"])
-    assert rec["profile"]["engine"] == "wmx"
+    _run_main(monkeypatch, ["profile", "--engine", "mlx"])
+    assert rec["profile"]["engine"] == "mlx"
 
 
 def test_profile_unknown_engine_errors(make_console, monkeypatch):
@@ -1009,12 +1048,12 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
 
 def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli.db.save_characterization(store, "mkey", "wcx", "org/SmolLM", safe_context=16000, points=[],
+    cli.db.save_characterization(store, "mkey", "cuda", "org/SmolLM", safe_context=16000, points=[],
                                  decode_context=None)
-    cli.db.save_characterization(store, "mkey", "wcx", "org/Unbound", safe_context=None, points=[],
+    cli.db.save_characterization(store, "mkey", "cuda", "org/Unbound", safe_context=None, points=[],
                                  decode_context=None)
     c, buf = make_console()
-    cli._emit_characterized(c, "wcx")
+    cli._emit_characterized(c, "cuda")
     out = buf.getvalue()
     assert "CHARACTERIZED" in out and "SmolLM" in out and "16000" in out
     assert "—" in out               # the None-ceiling model
@@ -1023,7 +1062,7 @@ def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch
 def test_emit_characterized_empty_shows_nothing(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     c, buf = make_console()
-    cli._emit_characterized(c, "wcx")
+    cli._emit_characterized(c, "cuda")
     assert buf.getvalue() == ""
 
 
@@ -1630,13 +1669,13 @@ def test_render_mlx_unmanaged_interp_with_all_packages(make_console, monkeypatch
 # ara install / ara uninstall — engine bootstrap commands
 # --------------------------------------------------------------------------- #
 def test_render_install_installs_resolved_engine(make_console, monkeypatch):
-    monkeypatch.setattr(cli.engines, "resolve", lambda v: "wmx")
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: "mlx")
     monkeypatch.setattr(cli.engines, "install",
-                        lambda k, **kw: cli.engines.InstallResult("wmx", "installed", "ok"))
+                        lambda k, **kw: cli.engines.InstallResult("mlx", "installed", "ok"))
     c, buf = make_console()
     rc = cli.render_install(c, engine="auto")
     assert rc == 0
-    assert "wmx-suite" in buf.getvalue()
+    assert "ara-engine-mlx" in buf.getvalue()
     assert "installed" in buf.getvalue().lower()
 
 
@@ -1647,49 +1686,49 @@ def _stub_install(monkeypatch, key, status, detail=""):
 
 
 def test_render_install_already_present_is_success(make_console, monkeypatch):
-    _stub_install(monkeypatch, "wmx", "already")
+    _stub_install(monkeypatch, "mlx", "already")
     c, buf = make_console()
-    assert cli.render_install(c, engine="wmx") == 0
+    assert cli.render_install(c, engine="mlx") == 0
     assert "already" in buf.getvalue().lower()
 
 
 def test_render_install_refreshed_is_success(make_console, monkeypatch):
-    _stub_install(monkeypatch, "wmx", "refreshed")
+    _stub_install(monkeypatch, "mlx", "refreshed")
     c, buf = make_console()
-    assert cli.render_install(c, engine="wmx") == 0
+    assert cli.render_install(c, engine="mlx") == 0
     assert "refreshed" in buf.getvalue().lower()
 
 
 def test_render_install_threads_refresh_to_engines(make_console, monkeypatch):
     seen = {}
-    monkeypatch.setattr(cli.engines, "resolve", lambda v: "wmx")
+    monkeypatch.setattr(cli.engines, "resolve", lambda v: "mlx")
     monkeypatch.setattr(cli.engines, "install",
                         lambda k, *, refresh=False:
                         seen.update(refresh=refresh) or cli.engines.InstallResult(k, "refreshed"))
     c, _ = make_console()
-    assert cli.render_install(c, engine="wmx", refresh=True) == 0
+    assert cli.render_install(c, engine="mlx", refresh=True) == 0
     assert seen == {"refresh": True}
 
 
 def test_render_install_refreshed_json_is_success(monkeypatch, capsys):
-    _stub_install(monkeypatch, "wmx", "refreshed")
+    _stub_install(monkeypatch, "mlx", "refreshed")
     c = cli.Console(color=False, stream=sys.stderr)
-    rc = cli.render_install(c, engine="wmx", as_json=True)
+    rc = cli.render_install(c, engine="mlx", as_json=True)
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "refreshed" and rc == 0
 
 
 def test_render_install_coming_soon_exits_nonzero(make_console, monkeypatch):
-    _stub_install(monkeypatch, "wcx", "coming_soon", "wcx_suite isn't available yet")
+    _stub_install(monkeypatch, "cuda", "coming_soon", "wcx_suite isn't available yet")
     c, buf = make_console()
-    assert cli.render_install(c, engine="wcx") == 1
+    assert cli.render_install(c, engine="cuda") == 1
     assert "coming soon" in buf.getvalue().lower()
 
 
 def test_render_install_failed_shows_detail_and_exits_nonzero(make_console, monkeypatch):
-    _stub_install(monkeypatch, "wmx", "failed", "git clone exploded")
+    _stub_install(monkeypatch, "mlx", "failed", "git clone exploded")
     c, buf = make_console()
-    assert cli.render_install(c, engine="wmx") == 1
+    assert cli.render_install(c, engine="mlx") == 1
     assert "git clone exploded" in buf.getvalue()
 
 
@@ -1701,11 +1740,11 @@ def test_render_install_no_hardware_match_exits_nonzero(make_console, monkeypatc
 
 
 def test_render_install_json(monkeypatch, capsys):
-    _stub_install(monkeypatch, "wmx", "installed", "ok")
+    _stub_install(monkeypatch, "mlx", "installed", "ok")
     c = cli.Console(color=False, stream=sys.stderr)
-    rc = cli.render_install(c, engine="wmx", as_json=True)
+    rc = cli.render_install(c, engine="mlx", as_json=True)
     out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "installed" and out["key"] == "wmx" and rc == 0
+    assert out["status"] == "installed" and out["key"] == "mlx" and rc == 0
 
 
 def _stub_uninstall(monkeypatch, key, status, detail=""):
@@ -1715,23 +1754,23 @@ def _stub_uninstall(monkeypatch, key, status, detail=""):
 
 
 def test_render_uninstall_removes_engine(make_console, monkeypatch):
-    _stub_uninstall(monkeypatch, "wmx", "removed")
+    _stub_uninstall(monkeypatch, "mlx", "removed")
     c, buf = make_console()
-    assert cli.render_uninstall(c, engine="wmx") == 0
-    assert "removed" in buf.getvalue().lower() and "wmx-suite" in buf.getvalue()
+    assert cli.render_uninstall(c, engine="mlx") == 0
+    assert "removed" in buf.getvalue().lower() and "ara-engine-mlx" in buf.getvalue()
 
 
 def test_render_uninstall_absent_is_success(make_console, monkeypatch):
-    _stub_uninstall(monkeypatch, "wmx", "absent")
+    _stub_uninstall(monkeypatch, "mlx", "absent")
     c, buf = make_console()
-    assert cli.render_uninstall(c, engine="wmx") == 0
+    assert cli.render_uninstall(c, engine="mlx") == 0
     assert "not installed" in buf.getvalue().lower()
 
 
 def test_render_uninstall_failed_exits_nonzero(make_console, monkeypatch):
-    _stub_uninstall(monkeypatch, "wmx", "failed", "permission denied")
+    _stub_uninstall(monkeypatch, "mlx", "failed", "permission denied")
     c, buf = make_console()
-    assert cli.render_uninstall(c, engine="wmx") == 1
+    assert cli.render_uninstall(c, engine="mlx") == 1
     assert "permission denied" in buf.getvalue()
 
 
@@ -1743,9 +1782,9 @@ def test_render_uninstall_no_match_exits_nonzero(make_console, monkeypatch):
 
 
 def test_render_uninstall_json(monkeypatch, capsys):
-    _stub_uninstall(monkeypatch, "wmx", "removed")
+    _stub_uninstall(monkeypatch, "mlx", "removed")
     c = cli.Console(color=False, stream=sys.stderr)
-    rc = cli.render_uninstall(c, engine="wmx", as_json=True)
+    rc = cli.render_uninstall(c, engine="mlx", as_json=True)
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "removed" and rc == 0
 
@@ -1758,26 +1797,26 @@ def test_main_install_defaults_to_auto(monkeypatch):
 
 def test_main_install_with_engine_flag(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["install", "--engine", "wmx"])
-    assert rec["install"]["engine"] == "wmx"
+    _run_main(monkeypatch, ["install", "--engine", "mlx"])
+    assert rec["install"]["engine"] == "mlx"
 
 
 def test_main_install_engine_equals_form(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["install", "--engine=wcx", "--json"])
-    assert rec["install"] == {"engine": "wcx", "refresh": False, "as_json": True}
+    _run_main(monkeypatch, ["install", "--engine=cuda", "--json"])
+    assert rec["install"] == {"engine": "cuda", "refresh": False, "as_json": True}
 
 
 def test_main_install_refresh_flag_forwarded(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["install", "wmx", "--refresh"])
-    assert rec["install"]["engine"] == "wmx" and rec["install"]["refresh"] is True
+    _run_main(monkeypatch, ["install", "mlx", "--refresh"])
+    assert rec["install"]["engine"] == "mlx" and rec["install"]["refresh"] is True
 
 
 def test_main_uninstall_with_engine_flag(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["uninstall", "--engine", "wmx"])
-    assert rec["uninstall"]["engine"] == "wmx"
+    _run_main(monkeypatch, ["uninstall", "--engine", "mlx"])
+    assert rec["uninstall"]["engine"] == "mlx"
 
 
 def test_render_install_no_match_json(monkeypatch, capsys):
@@ -1799,7 +1838,7 @@ def test_render_uninstall_no_match_json(monkeypatch, capsys):
 def test_render_landing_lists_install_command(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "chip_name", lambda: "Apple M4 Pro")
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "MLX engine"))
     c, buf = make_console()
     cli.render_landing(c)
     assert "install the engine" in buf.getvalue()
@@ -1907,9 +1946,9 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models",
                         lambda con: [{"model_id": "org/L", "modality": "text"}])
-    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = wcx
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = cuda
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    per_engine = {"wcx": [{"model_id": "org/L", "safe_context": 3500, "decode_context": None}],
+    per_engine = {"cuda": [{"model_id": "org/L", "safe_context": 3500, "decode_context": None}],
                   "cpu": [{"model_id": "org/L", "safe_context": 8192, "decode_context": None}]}
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: per_engine.get(e, []))
@@ -1987,7 +2026,7 @@ def test_recommend_marks_characterized(make_console, monkeypatch, set_platform):
     _wire_recommend(monkeypatch, set_platform, [_model_row("org/Known")])
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/Known", "safe_context": 12000,
-                                             "decode_context": None}] if e == "wmx" else [])
+                                             "decode_context": None}] if e == "mlx" else [])
     c, buf = make_console()
     assert cli.render_recommend(c) == 0
     assert "characterized" in buf.getvalue()
@@ -2048,7 +2087,7 @@ def test_recommend_uses_measured_wall(make_console, monkeypatch, set_platform, s
     _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small", max_context=8192)])
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.estimate, "limits", spy_limits)
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=1.7,
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c, buf = make_console()
     assert cli.render_recommend(c) == 0
@@ -2102,9 +2141,9 @@ def _wire_inversion_bench(monkeypatch, four_bit=0.098, eight_bit=0.061, n=50):
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda con, mk: [
         {"model_id": "org/Model-4bit", "use_case": "coding", "score": four_bit,
-         "source": "wmx probe", "sample_size": n, "refused_n": 0, "errored_n": 0},
+         "source": "mlx probe", "sample_size": n, "refused_n": 0, "errored_n": 0},
         {"model_id": "org/Model-8bit", "use_case": "coding", "score": eight_bit,
-         "source": "wmx probe", "sample_size": n, "refused_n": 0, "errored_n": 0}])
+         "source": "mlx probe", "sample_size": n, "refused_n": 0, "errored_n": 0}])
 
 
 def test_recommend_text_discloses_quant_inversion(make_console, monkeypatch, set_platform):
@@ -2233,17 +2272,17 @@ def test_main_recommend_use_case_dispatch(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# ara serve --engine wmx — governed MLX endpoint (this Mac)
+# ara serve --engine mlx — governed MLX endpoint (this Mac)
 # Spec 2026-06-28-recommend-use-case-and-serve-selection
 # --------------------------------------------------------------------------- #
 def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_platform):
-    # `serve --engine wmx` stands the model up on the governed MLX server at the MEASURED apple
+    # `serve --engine mlx` stands the model up on the governed MLX server at the MEASURED apple
     # ceiling, hands back an OpenAI-compatible /v1 endpoint, and stays foreground (proc.wait).
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    # Characterizations are keyed by ENGINE KEY ("wmx"), not backend name ("apple").
+    # Characterizations are keyed by ENGINE KEY ("mlx"), not backend name ("apple").
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     captured = {}
 
@@ -2258,7 +2297,7 @@ def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_p
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
     c, buf = make_console()
     rc = cli.render_serve(c, "mlx-community/Llama-3.2-3B-Instruct-4bit",
-                          engine="wmx", assume_yes=True)
+                          engine="mlx", assume_yes=True)
     assert rc == 0
     assert captured["max_context"] == 8000 and captured["port"] == 12399
     assert captured["waited"] is True                      # foreground: our child IS the server
@@ -2272,7 +2311,7 @@ def test_serve_mlx_json_carries_stale_ceiling_flag(make_console, monkeypatch, se
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: ({"safe_context": 8000,
                                                 "measured_at": "2026-01-01T00:00:00+00:00"}
-                                               if e == "wmx" else None))
+                                               if e == "mlx" else None))
     monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
 
@@ -2281,7 +2320,7 @@ def test_serve_mlx_json_carries_stale_ceiling_flag(make_console, monkeypatch, se
 
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
     c, _ = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True, as_json=True) == 0
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True, as_json=True) == 0
     assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
 
 
@@ -2291,11 +2330,11 @@ def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, s
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: None)
     c, buf = make_console()
-    assert cli.render_serve(c, "org/Uncharacterized", engine="wmx", assume_yes=True) == 1
+    assert cli.render_serve(c, "org/Uncharacterized", engine="mlx", assume_yes=True) == 1
     assert "characterize" in buf.getvalue()
 
 
-# --- measured-provenance slope (2026-07-02-wmx-serve-measured-provenance-gate) -- #
+# --- measured-provenance slope (2026-07-02-mlx-serve-measured-provenance-gate) -- #
 def test_measured_ramp_slope_fits_and_skips_incomplete_points():
     row = {"points": [{"context": 2000, "mem_gb": 1.5},
                       {"context": None, "mem_gb": 9.9},      # incomplete → skipped
@@ -2324,7 +2363,7 @@ def test_serve_mlx_passes_measured_slope_from_points(make_console, monkeypatch, 
     row = {"safe_context": 40960,
            "points": [{"context": 2000, "mem_gb": 1.535}, {"context": 16000, "mem_gb": 4.48}]}
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: row if e == "wmx" else None)
+                        lambda con, mk, e, m: row if e == "mlx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     captured = {}
 
@@ -2338,7 +2377,7 @@ def test_serve_mlx_passes_measured_slope_from_points(make_console, monkeypatch, 
 
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
     c, _ = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 0
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 0
     assert captured["slope"] is not None and abs(captured["slope"] - (4.48 - 1.535) / 14) < 1e-6
 
 
@@ -2516,12 +2555,12 @@ def test_run_picks_largest_safe_context_engine(monkeypatch, capsys):
     _wire_run_cross(
         monkeypatch, detected="cpu",
         chars={"cpu": {"model_id": "org/m", "safe_context": 4096},
-               "wcx": {"model_id": "org/m", "safe_context": 16000}},
+               "cuda": {"model_id": "org/m", "safe_context": 16000}},
         supports={"cpu": True, "cuda": True})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["engine"] == "wcx" and payload["safe_context"] == 16000
+    assert payload["engine"] == "cuda" and payload["safe_context"] == 16000
 
 
 def test_run_engine_override_pins_named_engine(make_console, monkeypatch):
@@ -2529,11 +2568,11 @@ def test_run_engine_override_pins_named_engine(make_console, monkeypatch):
     _wire_run_cross(
         monkeypatch, detected="cpu",
         chars={"cpu": {"model_id": "org/m", "safe_context": 4096},
-               "wcx": {"model_id": "org/m", "safe_context": 16000}},
+               "cuda": {"model_id": "org/m", "safe_context": 16000}},
         supports={"cpu": True, "cuda": True})
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", engine="cpu", assume_yes=True) == 0
-    assert "ran on cpu" in buf.getvalue()        # pinned to cpu (4096), not the bigger wcx
+    assert "ran on cpu" in buf.getvalue()        # pinned to cpu (4096), not the bigger cuda
 
 
 def test_run_characterized_only_on_unsupported_engine(make_console, monkeypatch):
@@ -2541,12 +2580,12 @@ def test_run_characterized_only_on_unsupported_engine(make_console, monkeypatch)
     # NOT a silent "uncharacterized" refusal.
     _wire_run_cross(
         monkeypatch, detected="apple",
-        chars={"wmx": {"model_id": "org/m", "safe_context": 8192}},
+        chars={"mlx": {"model_id": "org/m", "safe_context": 8192}},
         supports={"apple": False, "cpu": True})
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
     out = buf.getvalue()
-    assert "wmx" in out and "isn't supported" in out
+    assert "mlx" in out and "isn't supported" in out
     assert "ara characterize" not in out         # it IS characterized — don't point at characterize
 
 
@@ -2864,7 +2903,7 @@ def test_render_characterize_rejects_fp8_on_incapable_gpu(make_console, monkeypa
 
 def test_render_run_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
     _wire_run_cross(monkeypatch, detected="cuda",
-                    chars={"wcx": {"model_id": "org/m", "safe_context": 4096}},
+                    chars={"cuda": {"model_id": "org/m", "safe_context": 4096}},
                     supports={"cuda": True})
     # the fake backend must expose generate (run-selectable) + fp8_capable (False → reject fp8)
     bk = types.SimpleNamespace(generate=lambda *a, **k: {"completion": "x"},
@@ -2878,7 +2917,7 @@ def test_render_run_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
 
 def test_render_run_rejects_invalid_weight_quant(monkeypatch, capsys):
     _wire_run_cross(monkeypatch, detected="cuda",
-                    chars={"wcx": {"model_id": "org/m", "safe_context": 4096}},
+                    chars={"cuda": {"model_id": "org/m", "safe_context": 4096}},
                     supports={"cuda": True})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True,
@@ -3081,7 +3120,7 @@ def test_main_engine_env_error_with_json_is_structured(monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# ara models <id> — single-model detail (wmx's `show`)
+# ara models <id> — single-model detail (mlx's `show`)
 # --------------------------------------------------------------------------- #
 def _meta(**over):
     base = dict(modality="text", n_layers=30, hidden_size=576, kv_heads=3,
@@ -3219,7 +3258,7 @@ def test_main_models_id_dispatch(monkeypatch):
 # --------------------------------------------------------------------------- #
 def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     if characterize is not None:
@@ -3242,7 +3281,7 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Model") == 0
     assert "20000" in buf.getvalue()
-    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
 
 
@@ -3251,7 +3290,7 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     # persists the engine baseline once when none is stored, before the ramp.
     calls = []
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
@@ -3265,7 +3304,7 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     c, _ = make_console()
     assert cli.render_characterize(c, "org/M") == 0
     assert calls == ["cal"]                                            # calibrated once, before ramp
-    row = cli.db.get_calibration(store, "mkey", "wmx")
+    row = cli.db.get_calibration(store, "mkey", "mlx")
     assert row["fixed_overhead_gb"] == 1.7                             # persisted
     # The measured wall + budget ride alongside so profile/recommend can report reality.
     assert row["wall_gb"] == 41.3 and row["safe_budget_gb"] == 39.3
@@ -3275,7 +3314,7 @@ def test_characterize_warns_when_calibration_unavailable(make_console, store, mo
     # Honesty (Rule #3): a failed calibration must be surfaced, not silently replaced by the
     # conservative default. The ramp still proceeds; the user is just told it's a fallback.
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
@@ -3292,14 +3331,14 @@ def test_characterize_warns_when_calibration_unavailable(make_console, store, mo
     assert "calibration skipped" in out and "boom" in out    # the failure is surfaced, with reason
     assert "conservative default" in out
     # nothing measured (overhead and wall both None) → no calibration row persisted
-    assert cli.db.get_calibration(store, "mkey", "wmx") is None
+    assert cli.db.get_calibration(store, "mkey", "mlx") is None
 
 
 def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     # Spec 2026-06-23-capability-pipeline: on first run characterize must SHOW the measured wall
     # (and safe budget) at the moment it's measured, not just persist it silently.
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
@@ -3320,7 +3359,7 @@ def test_characterize_wall_line_without_budget(make_console, store, monkeypatch)
     # A wall with no safe budget: show the wall, but don't append a budget clause.
     # Spec 2026-06-23-capability-pipeline.
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
@@ -3341,7 +3380,7 @@ def test_characterize_omits_wall_line_when_wall_none(make_console, store, monkey
     # An engine that only measures cold-start overhead (wall_gb=None) must NOT print an empty/
     # misleading wall line. Spec 2026-06-23-capability-pipeline.
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
@@ -3382,11 +3421,11 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
     # Already calibrated → characterize does NOT recalibrate (idempotent).
     calls = []
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
-    cli.calibration.save_calibration(store, "wmx", fixed_overhead_gb=2.0)   # already calibrated
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=2.0)   # already calibrated
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
@@ -3396,7 +3435,7 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
     c, _ = make_console()
     assert cli.render_characterize(c, "org/M") == 0
     assert calls == []                                                 # not recalibrated
-    assert cli.db.get_calibration(store, "mkey", "wmx")["fixed_overhead_gb"] == 2.0   # unchanged
+    assert cli.db.get_calibration(store, "mkey", "mlx")["fixed_overhead_gb"] == 2.0   # unchanged
 
 
 def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
@@ -3406,7 +3445,7 @@ def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Big") == 0
     assert "couldn't fit" in buf.getvalue()
-    assert cli.db.get_characterization(store, "mkey", "wmx", "org/Big")["safe_context"] is None
+    assert cli.db.get_characterization(store, "mkey", "mlx", "org/Big")["safe_context"] is None
 
 
 def test_render_characterize_no_ceiling_explains_with_budget(make_console, store, monkeypatch):
@@ -3521,13 +3560,13 @@ def _error_characterize(model, *, progress=False):
 def test_render_characterize_skips_persist_on_engine_error(make_console, store, monkeypatch):
     # An engine that can't load the model returns `error` (not a measurement): don't persist a
     # misleading null row, and suggest a compatible engine when we can tell (a .gguf → cpu).
-    _wire_characterize(monkeypatch, characterize=_error_characterize)   # default backend apple→wmx
+    _wire_characterize(monkeypatch, characterize=_error_characterize)   # default backend apple→mlx
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Model.gguf") == 1
     out = buf.getvalue()
     assert "couldn't load" in out
     assert "--engine cpu" in out                       # suggested the GGUF-capable engine
-    assert cli.db.get_characterization(store, "mkey", "wmx", "org/Model.gguf") is None   # not stored
+    assert cli.db.get_characterization(store, "mkey", "mlx", "org/Model.gguf") is None   # not stored
 
 
 def test_render_characterize_engine_error_json(monkeypatch, capsys, store):
@@ -3572,7 +3611,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
                           size_gb=4.0, free_gb=50.0):
     """Wire render_characterize with a FakeBackend and stubbed acquire functions."""
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
@@ -3596,7 +3635,7 @@ def test_render_characterize_prefetch_uncached_transformers(make_console, store,
     assert bk.downloaded == ["org/Model"]            # download was called
     assert "downloading" in buf.getvalue()            # status line emitted
     assert "16000" in buf.getvalue()                  # characterize result shown
-    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 16000               # result persisted
 
 
@@ -3612,13 +3651,13 @@ def test_render_characterize_prefetch_already_cached(make_console, store, monkey
 
 
 def test_render_characterize_prefetch_incompatible_engine(make_console, store, monkeypatch):
-    # A .gguf model on the wmx (apple) engine: engine_for_model returns "cpu" != "wmx"
+    # A .gguf model on the mlx (apple) engine: engine_for_model returns "cpu" != "mlx"
     # → incompatible=True → download NOT called; existing flow proceeds (engine error path).
     bk = FakeBackend(_limits(), cached=False)
     bk.characterize = _fake_bk_characterize
     _wire_characterize_bk(monkeypatch, bk)
     c, buf = make_console()
-    # "org/model.gguf" → engine_for_model returns "cpu"; sel.engine_key is "wmx" → incompatible
+    # "org/model.gguf" → engine_for_model returns "cpu"; sel.engine_key is "mlx" → incompatible
     assert cli.render_characterize(c, "org/model.gguf") == 0
     assert bk.downloaded == []                        # download skipped (incompatible)
 
@@ -3764,7 +3803,7 @@ def _wire_characterize_progress(monkeypatch, *, backend="apple", cached=True):
         return {"model": model, "safe_context": 8000, "decode_context": None, "points": []}
 
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
@@ -3870,7 +3909,7 @@ def test_render_characterize_decode_persisted(store, monkeypatch):
                                                "decode_context": 25000, "points": []})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_characterize(c, "org/Model") == 0
-    row = cli.db.get_characterization(store, "mkey", "wmx", "org/Model")
+    row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["decode_context"] == 25000
 
 
@@ -3976,12 +4015,12 @@ def test_model_detail_json_has_decode_context(monkeypatch, capsys):
 
 def test_model_detail_json_decode_context_paired_with_best_safe_engine(monkeypatch, capsys):
     # M1: top-level decode_context must come from the same engine that has the highest
-    # safe_context — NOT a global max across engines. Here wcx has safe_context=16000/decode=18000
+    # safe_context — NOT a global max across engines. Here cuda has safe_context=16000/decode=18000
     # and cpu has safe_context=8000/decode=25000. Top-level decode_context must be 18000, not 25000.
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    _per_engine = {"wcx": {"safe_context": 16000, "decode_context": 18000},
+    _per_engine = {"cuda": {"safe_context": 16000, "decode_context": 18000},
                    "cpu": {"safe_context": 8000, "decode_context": 25000}}
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, mid: _per_engine.get(e))
@@ -3989,25 +4028,25 @@ def test_model_detail_json_decode_context_paired_with_best_safe_engine(monkeypat
     assert cli.render_model_detail(c, "org/A", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["safe_context"] == 16000
-    assert data["decode_context"] == 18000   # paired with wcx (best safe), not cpu's 25000
+    assert data["decode_context"] == 18000   # paired with cuda (best safe), not cpu's 25000
 
 
 def test_emit_characterized_decode_gloss_when_greater(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
+    cli.db.save_characterization(store, "mkey", "cuda", "org/Model",
                                  safe_context=16000, points=[], decode_context=20000)
     c, buf = make_console()
-    cli._emit_characterized(c, "wcx")
+    cli._emit_characterized(c, "cuda")
     out = buf.getvalue()
     assert "20000" in out and "stream-only" in out
 
 
 def test_emit_characterized_decode_hidden_when_not_greater(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli.db.save_characterization(store, "mkey", "wcx", "org/Model",
+    cli.db.save_characterization(store, "mkey", "cuda", "org/Model",
                                  safe_context=16000, points=[], decode_context=8000)
     c, buf = make_console()
-    cli._emit_characterized(c, "wcx")
+    cli._emit_characterized(c, "cuda")
     assert "decode" not in buf.getvalue()
 
 
@@ -4848,11 +4887,11 @@ def test_run_rejects_invalid_kv_quant(make_console, monkeypatch):
 
 
 def test_characterize_threads_kv_quant_to_apple_backend(make_console, store, monkeypatch):
-    # KV-quant is also a wmx(apple) lever; render_characterize passes kv_quant (NOT flash_attn,
+    # KV-quant is also a mlx(apple) lever; render_characterize passes kv_quant (NOT flash_attn,
     # which MLX has no knob for). Slug: 2026-06-25-mlx-kv-quant-lever
     seen = {}
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
 
@@ -4864,7 +4903,7 @@ def test_characterize_threads_kv_quant_to_apple_backend(make_console, store, mon
         characterize=char, calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None))
     c, _ = make_console()
-    assert cli.render_characterize(c, "org/m", engine="wmx", kv_quant="q8_0") == 0
+    assert cli.render_characterize(c, "org/m", engine="mlx", kv_quant="q8_0") == 0
     assert seen["kv_quant"] == "q8_0"
 
 
@@ -4872,7 +4911,7 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
     # Slug: 2026-06-25-mlx-kv-quant-lever
     seen = {}
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: {"safe_context": 8000})
@@ -4884,7 +4923,7 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(generate=gen))
     c, _ = make_console()
-    assert cli.render_run(c, "org/m", prompt="hi", engine="wmx", kv_quant="q4_0") == 0
+    assert cli.render_run(c, "org/m", prompt="hi", engine="mlx", kv_quant="q4_0") == 0
     assert seen["kv_quant"] == "q4_0"
 
 
@@ -5588,7 +5627,7 @@ def test_serve_zero_arg_refuses_when_store_empty(make_console, monkeypatch):
 def test_serve_zero_arg_with_engine_refuses(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     c, buf = make_console()
-    assert cli.render_serve(c, None, engine="wmx") == 1   # can't pick + honor --engine at once
+    assert cli.render_serve(c, None, engine="mlx") == 1   # can't pick + honor --engine at once
     assert "pass a model to use --engine" in buf.getvalue()
 
 
@@ -5728,7 +5767,7 @@ def test_main_serve_name_flag_at_end_is_none(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ara benchmark — capability probe + measured tier (Spec 2026-06-28)
 # --------------------------------------------------------------------------- #
-def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine_key="wmx"):
+def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine_key="mlx"):
     """Wire up all dependencies for render_benchmark; returns the captured-save dict."""
     if items is None:
         items = [{"id": 0}, {"id": 1}]
@@ -5778,14 +5817,14 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["model"] == "org/m"
     assert saved["use_case"] == "coding"
     assert saved["score"] == 0.75
-    assert saved["engine_key"] == "wmx"
+    assert saved["engine_key"] == "mlx"
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
 
 
 def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, monkeypatch):
-    """render_benchmark pre-fetches uncached weights for wcx/wmx (like the GGUF engines, #109);
+    """render_benchmark pre-fetches uncached weights for cuda/mlx (like the GGUF engines, #109);
     a disk shortfall during that fetch is a clean error, not a crash."""
     _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
     bk = cli.get_backend("apple")
@@ -6115,15 +6154,15 @@ def test_render_benchmark_no_advisory_on_mid_score(make_console, monkeypatch):
 
 
 def test_serve_mlx_refuses_ctx_above_measured_ceiling(make_console, monkeypatch, set_platform):
-    """serve --engine wmx --ctx above the stored ceiling is a hard refusal (rc=1) — Rule #1.
+    """serve --engine mlx --ctx above the stored ceiling is a hard refusal (rc=1) — Rule #1.
     Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     c, buf = make_console()
-    rc = cli.render_serve(c, "org/m", engine="wmx", ctx=16000, assume_yes=True)
+    rc = cli.render_serve(c, "org/m", engine="mlx", ctx=16000, assume_yes=True)
     assert rc == 1
     out = buf.getvalue()
     assert "--ctx 16000 exceeds the measured safe ceiling 8000" in out
@@ -6131,12 +6170,12 @@ def test_serve_mlx_refuses_ctx_above_measured_ceiling(make_console, monkeypatch,
 
 
 def test_serve_mlx_allows_ctx_under_measured_ceiling(make_console, monkeypatch, set_platform):
-    """serve --engine wmx --ctx at/below the stored ceiling proceeds with no gate noise.
+    """serve --engine mlx --ctx at/below the stored ceiling proceeds with no gate noise.
     Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "wmx" else None)
+                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
 
     class _Proc:
@@ -6147,7 +6186,7 @@ def test_serve_mlx_allows_ctx_under_measured_ceiling(make_console, monkeypatch, 
 
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
     c, buf = make_console()
-    rc = cli.render_serve(c, "org/m", engine="wmx", ctx=4000, assume_yes=True)
+    rc = cli.render_serve(c, "org/m", engine="mlx", ctx=4000, assume_yes=True)
     assert rc == 0
     assert "exceeds the measured safe ceiling" not in buf.getvalue()
 
@@ -6187,7 +6226,7 @@ def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_
                      _model_row("org/Weak", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
                         lambda con, mk: [{"model_id": "org/Strong", "use_case": "coding",
-                                          "score": 0.9, "source": "wmx probe=5 (org/Strong)"}])
+                                          "score": 0.9, "source": "mlx probe=5 (org/Strong)"}])
     monkeypatch.setattr(cli.scoring, "load_imported",
                         lambda: {"org/Strong": {"coding": {"score": 0.5, "source": "HumanEval"}},
                                  "org/Weak": {"coding": {"score": 0.7, "source": "HumanEval"}}})
@@ -6229,7 +6268,7 @@ def test_recommend_measured_partial_refusal_and_low_confidence_annotated(make_co
                     [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
                         lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
-                                          "score": 0.4, "source": "wmx probe",
+                                          "score": 0.4, "source": "mlx probe",
                                           "sample_size": 30, "refused_n": 2, "errored_n": 0}])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c, buf = make_console()
@@ -6245,7 +6284,7 @@ def test_recommend_measured_errored_partial_no_low_confidence_at_threshold(make_
                     [_model_row("org/Err", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
                         lambda con, mk: [{"model_id": "org/Err", "use_case": "coding",
-                                          "score": 0.6, "source": "wcx probe",
+                                          "score": 0.6, "source": "cuda probe",
                                           "sample_size": 100, "refused_n": 0, "errored_n": 3}])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c, buf = make_console()
@@ -6261,7 +6300,7 @@ def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platfor
                     [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
                         lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
-                                          "score": 0.4, "source": "wmx probe",
+                                          "score": 0.4, "source": "mlx probe",
                                           "sample_size": 30, "refused_n": 2, "errored_n": 1}])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c = cli.Console(color=False, stream=sys.stderr)
@@ -6659,13 +6698,13 @@ def test_main_benchmark_noninteger_repeat_folds_to_invalid(monkeypatch):
     assert rec["benchmark"]["repeat"] == 0
 
 
-# --- serve: MLX (wmx) governed-server path ---
+# --- serve: MLX (mlx) governed-server path ---
 def _wire_serve_mlx(monkeypatch, set_platform, *, ceiling=8000, serve=None):
-    """Route `serve --engine wmx` to the MLX path with the db + port + apple.serve seams stubbed."""
+    """Route `serve --engine mlx` to the MLX path with the db + port + apple.serve seams stubbed."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": ceiling} if e == "wmx" else None)
+                        lambda con, mk, e, m: {"safe_context": ceiling} if e == "mlx" else None)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     if serve is not None:
         monkeypatch.setattr("ara.backends.apple.serve", serve)
@@ -6674,7 +6713,7 @@ def _wire_serve_mlx(monkeypatch, set_platform, *, ceiling=8000, serve=None):
 def test_serve_mlx_rejects_nonpositive_ctx(make_console, monkeypatch, set_platform):
     _wire_serve_mlx(monkeypatch, set_platform)
     c, buf = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", ctx=0, assume_yes=True) == 1
+    assert cli.render_serve(c, "org/m", engine="mlx", ctx=0, assume_yes=True) == 1
     assert "positive" in buf.getvalue()
 
 
@@ -6683,7 +6722,7 @@ def test_serve_mlx_confirm_declined_skips(make_console, monkeypatch, set_platfor
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr(cli, "_confirm", lambda q: False)
     c, buf = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx") == 0     # not --yes → prompts → declined
+    assert cli.render_serve(c, "org/m", engine="mlx") == 0     # not --yes → prompts → declined
     assert "skipped" in buf.getvalue()
 
 
@@ -6692,7 +6731,7 @@ def test_serve_mlx_handles_serve_failure(make_console, monkeypatch, set_platform
         raise RuntimeError("gate refused")
     _wire_serve_mlx(monkeypatch, set_platform, serve=boom)
     c, buf = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 1
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
     out = buf.getvalue()
     assert "couldn't start the MLX server" in out and "gate refused" in out
 
@@ -6705,7 +6744,7 @@ def test_serve_mlx_json_output(make_console, monkeypatch, set_platform, capsys):
                     serve=lambda model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None:
                     (_Proc(), f"http://127.0.0.1:{port}", max_context))
     c, _ = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True, as_json=True) == 0
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["runtime"] == "mlx" and payload["served_context"] == 8000
     assert payload["endpoint"].endswith("/v1") and payload["ceiling_source"] == "measured"
@@ -6733,7 +6772,7 @@ def test_serve_mlx_sigterm_handler_terminates_child(make_console, monkeypatch, s
         return _signal.SIG_DFL
     monkeypatch.setattr(_signal, "signal", fake_signal)
     c, _ = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx", assume_yes=True) == 0
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 0
     # the installed SIGTERM handler must terminate the child, then exit (no orphaned server)
     with pytest.raises(SystemExit):
         captured["handler"](_signal.SIGTERM, None)
@@ -6779,7 +6818,7 @@ def test_serve_mlx_confirm_accepted_proceeds(make_console, monkeypatch, set_plat
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr(cli, "_confirm", lambda q: True)
     c, buf = make_console()
-    assert cli.render_serve(c, "org/m", engine="wmx") == 0      # tty + accepted → serves
+    assert cli.render_serve(c, "org/m", engine="mlx") == 0      # tty + accepted → serves
     assert "serving" in buf.getvalue()
 
 

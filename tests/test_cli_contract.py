@@ -27,7 +27,7 @@ def _machine() -> Machine:
         runtimes=[Runtime("MLX", True, "0.18", kind="engine", accels=("apple",), usable=True)],
         framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0)],
-        hf_token=True, power="AC power", backend="apple", engine="wmx-suite",
+        hf_token=True, power="AC power", backend="apple", engine="mlx",
         engine_ready=True,
     )
 
@@ -81,7 +81,7 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key: None)
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])
-    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "wmx-suite"))
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
     monkeypatch.setattr(cli.engines, "install",
                         lambda key, **kw: cli.engines.InstallResult(key, "installed"))
@@ -101,8 +101,8 @@ CONTRACT = [
     (["search", "smol", "--json"], list, None),
     (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
-    (["install", "--engine", "wmx", "--json"], dict, "status"),
-    (["uninstall", "--engine", "wmx", "--json"], dict, "status"),
+    (["install", "--engine", "mlx", "--json"], dict, "status"),
+    (["uninstall", "--engine", "mlx", "--json"], dict, "status"),
 ]
 
 
@@ -149,7 +149,7 @@ def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):
 ])
 def test_json_error_paths_emit_json(mocked_world, monkeypatch, capsys, argv, setup):
     if setup == "engine_off":
-        monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "wmx-suite"))
+        monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "MLX engine"))
     elif setup == "undescribable":
         monkeypatch.setattr(cli.catalog, "describe", lambda model_id: None)
     # bad_engine needs no stub: resolve_engine raises UnknownEngine for 'bogus'
