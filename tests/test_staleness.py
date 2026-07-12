@@ -87,14 +87,15 @@ def test_ceiling_ignores_artifact_filesystem_errors(tmp_path, monkeypatch):
 def test_hub_root_is_captured_when_module_is_imported(tmp_path, monkeypatch):
     imported_home = tmp_path / "imported-home"
     changed_home = tmp_path / "changed-home"
+    home_var = "USERPROFILE" if os.name == "nt" else "HOME"
     artifact = _cached_artifact(imported_home)
     os.utime(artifact, (1_700_000_002, 1_700_000_002))
 
     try:
         with monkeypatch.context() as context:
-            context.setenv("HOME", str(imported_home))
+            context.setenv(home_var, str(imported_home))
             importlib.reload(staleness)
-            context.setenv("HOME", str(changed_home))
+            context.setenv(home_var, str(changed_home))
 
             assert staleness.ceiling_is_stale(
                 "org/model", "2023-11-14T22:13:20+00:00") is True
