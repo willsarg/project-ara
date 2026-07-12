@@ -507,6 +507,34 @@ def _v2_engine_identity_db(tmp_path, monkeypatch, name="identity.db"):
     return path, con
 
 
+def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monkeypatch):
+    _, con = _v2_engine_identity_db(tmp_path, monkeypatch, "canonical-only.db")
+    calibrations = [
+        ("mlx-machine", "mlx", 1.25, "2026-03-01", 24.0, None),
+        ("cuda-machine", "cuda", None, None, 8.0, 7.0),
+    ]
+    con.executemany("INSERT INTO calibrations VALUES (?,?,?,?,?,?)", calibrations)
+    characterizations = [
+        ("mlx-machine", "mlx", "org/mlx-model", 4096, None,
+         '[[512, 3.25], [4096, 7.5]]', "2026-03-02"),
+        ("cuda-machine", "cuda", "org/cuda-model", None, 8192, None, None),
+    ]
+    con.executemany("INSERT INTO characterizations VALUES (?,?,?,?,?,?,?)", characterizations)
+    con.commit()
+    con.close()
+
+    migrated = db.connect()
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert [tuple(row) for row in migrated.execute(
+        "SELECT machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, "
+        "safe_budget_gb FROM calibrations ORDER BY machine_key"
+    )] == sorted(calibrations)
+    assert [tuple(row) for row in migrated.execute(
+        "SELECT machine_key, engine, model_id, safe_context, decode_context, points_json, "
+        "measured_at FROM characterizations ORDER BY machine_key"
+    )] == sorted(characterizations)
+
+
 def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_path, monkeypatch):
     path, con = _v2_engine_identity_db(tmp_path, monkeypatch)
     calibrations = [
