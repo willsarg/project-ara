@@ -178,8 +178,6 @@ def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> No
         except sqlite3.Error:
             return False
 
-    if valid(backup_path):
-        return
     now = time.time()
     for orphan in backup_path.parent.glob(backup_path.name + ".*.tmp"):
         try:
@@ -187,6 +185,8 @@ def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> No
                 orphan.unlink()
         except FileNotFoundError:
             pass
+    if valid(backup_path):
+        return
     fd, temp_name = tempfile.mkstemp(
         prefix=backup_path.name + ".", suffix=".tmp", dir=backup_path.parent)
     os.close(fd)

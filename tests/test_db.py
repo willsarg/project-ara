@@ -755,3 +755,23 @@ def test_v3_backup_tolerates_orphan_disappearing_during_cleanup(tmp_path, monkey
     db._backup_before_engine_identity_v3(con, path)
     assert final.exists()
     con.close()
+
+
+def test_v3_valid_backup_still_cleans_only_stale_orphan_temps(tmp_path, monkeypatch):
+    path, con = _v2_engine_identity_db(tmp_path, monkeypatch, "valid-with-orphans.db")
+    con.commit()
+    db._backup_before_engine_identity_v3(con, path)
+    final = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    stale = final.with_name(final.name + ".stale.tmp")
+    fresh = final.with_name(final.name + ".fresh.tmp")
+    stale.write_text("stale")
+    fresh.write_text("fresh")
+    old = 1_000_000_000
+    db.os.utime(stale, (old, old))
+    monkeypatch.setattr(db.time, "time", lambda: old + 172_800)
+
+    db._backup_before_engine_identity_v3(con, path)
+
+    assert not stale.exists()
+    assert fresh.exists()
+    con.close()

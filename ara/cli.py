@@ -1202,6 +1202,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
+    calibration_error = None
     with db.connected() as cal_con:
         if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
             if not as_json:
@@ -1213,6 +1214,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             # never let the conservative default masquerade as a measurement. The ramp still proceeds
             # safely on the default overhead; we just don't hide that it's a fallback.
             cal_err = (cal or {}).get("calibration_error")
+            calibration_error = cal_err
             if cal_err and not as_json:
                 c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
                                        " — using conservative default overhead"))
@@ -1244,7 +1246,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"characterization failed: {exc}"
         # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
         # styled text or a traceback that would break the parse.
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        if as_json:
+            payload = {"error": msg}
+            if calibration_error:
+                payload.update(calibration_error=calibration_error, calibration_fallback=True)
+            print(json.dumps(payload))
+        else:
+            c.emit(c.style("bad", f"  {msg}"))
         return 1
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
@@ -1255,7 +1263,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         hint = ("  — try " + c.style("accent", f"ara characterize {model} --engine {suggest}")
                 if suggest and suggest != sel.engine_key else "")
         if as_json:
-            print(json.dumps({"error": result["error"]}))
+            payload = {"error": result["error"]}
+            if calibration_error:
+                payload.update(calibration_error=calibration_error, calibration_fallback=True)
+            print(json.dumps(payload))
         else:
             c.emit(c.style("warn", f"  {engine_label} couldn't load {model}: {result['error']}") + hint)
         return 1
@@ -1270,6 +1281,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if as_json:
         out: dict = {"model": model, "safe_context": ceiling,
                      "decode_context": result.get("decode_context")}
+        if calibration_error:
+            out.update(calibration_error=calibration_error, calibration_fallback=True)
         if ceiling is None:
             # Carry through the diagnostic fields the driver surfaced so automated callers
             # can explain why — not just a bare null.

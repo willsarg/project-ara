@@ -3570,7 +3570,7 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
             "model": m, "safe_context": 2048, "decode_context": 2048, "points": []},
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
-        calibrate=lambda: {"overhead_gb": 1.0, "wall_gb": 20.0, "safe_budget_gb": 18.0},
+        calibrate=lambda: {"calibration_error": "calibration unavailable: boom"},
     ))
     c = cli.Console(color=False, stream=sys.stdout)
 
@@ -3578,7 +3578,40 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
 
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
-        "model": "org/M", "safe_context": 2048, "decode_context": 2048}
+        "model": "org/M", "safe_context": 2048, "decode_context": 2048,
+        "calibration_error": "calibration unavailable: boom",
+        "calibration_fallback": True,
+    }
+
+
+@pytest.mark.parametrize(("characterize", "expected_error"), [
+    (lambda m, **kw: (_ for _ in ()).throw(RuntimeError("ramp boom")),
+     "characterization failed: ramp boom"),
+    (lambda m, **kw: {"error": "load boom"}, "load boom"),
+])
+def test_render_characterize_json_error_carries_calibration_fallback(
+        monkeypatch, capsys, store, characterize, expected_error):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=characterize,
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m, *, progress=False: None,
+        calibrate=lambda: {"calibration_error": "calibration unavailable: boom"},
+    ))
+    c = cli.Console(color=False, stream=sys.stdout)
+
+    assert cli.render_characterize(c, "org/M", as_json=True) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "error": expected_error,
+        "calibration_error": "calibration unavailable: boom",
+        "calibration_fallback": True,
+    }
 
 
 def test_render_characterize_engine_flag_overrides_detected_backend(make_console, store, monkeypatch):
