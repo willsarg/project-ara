@@ -324,11 +324,11 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
 
 
 def uninstall(key: str) -> InstallResult:
-    """Remove engine *key*'s isolated env. No-op when it isn't an engine or isn't installed.
+    """Remove engine *key*'s isolated env. No-op when it isn't an engine or isn't present.
     The shared uv cache and other engines' envs are untouched."""
     if key not in ENGINES:
         return InstallResult(key, "unknown")
-    if not is_installed(key):
+    if not engine_env.exists(ENGINES[key]["backend"]):
         return InstallResult(key, "absent")
     engine_env.remove(ENGINES[key]["backend"])
     return InstallResult(key, "removed")

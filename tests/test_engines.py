@@ -433,7 +433,7 @@ def test_uninstall_unknown_engine_reports_unknown():
 
 
 def test_uninstall_absent_engine_is_noop(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: False)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
     assert engines.uninstall("mlx").status == "absent"
@@ -441,12 +441,27 @@ def test_uninstall_absent_engine_is_noop(monkeypatch):
 
 
 def test_uninstall_removes_the_env(monkeypatch):
-    monkeypatch.setattr(engines, "is_installed", lambda k: True)
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     removed = []
     monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
     r = engines.uninstall("mlx")
     assert r.status == "removed"
     assert removed == ["apple"]   # the backend/env name, not the dist
+
+
+def test_uninstall_removes_present_env_with_missing_schema_stamp(monkeypatch):
+    monkeypatch.setitem(
+        engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
+    removed = []
+    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    assert engines.is_installed("mlx") is False
+
+    result = engines.uninstall("mlx")
+
+    assert result.status == "removed"
+    assert removed == ["apple"]
 
 
 # --------------------------------------------------------------------------- #
