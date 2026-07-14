@@ -18,6 +18,7 @@ import platform
 import subprocess
 import sys
 import unicodedata
+from enum import Enum
 from pathlib import Path
 
 UNIT_NAME = "ara-node.service"
@@ -30,10 +31,29 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _checked(cmd: list[str], *, allowed: tuple[int, ...] = (0,)) -> tuple[str, str]:
+class _SystemctlResult(Enum):
+    SUCCESS = "success"
+    ABSENT = "absent"
+    FAILURE = "failure"
+
+
+def _classify_systemctl(rc: int, out: str, err: str) -> _SystemctlResult:
+    """Classify only explicit systemd absence as idempotent; everything else is a failure."""
+    if rc == 0:
+        return _SystemctlResult.SUCCESS
+    message = f"{out}\n{err}".casefold()
+    absent = ("unit" in message and any(marker in message for marker in (
+        "does not exist", "not loaded", "not found",
+    )))
+    return _SystemctlResult.ABSENT if absent else _SystemctlResult.FAILURE
+
+
+def _checked(cmd: list[str], *, allowed: tuple[int, ...] = (0,),
+             allow_absent: bool = False) -> tuple[str, str]:
     """Run one systemctl command, raising with all daemon diagnostics on failure."""
     rc, out, err = _run(cmd)
-    if rc not in allowed:
+    outcome = _classify_systemctl(rc, out, err)
+    if rc not in allowed and not (allow_absent and outcome is _SystemctlResult.ABSENT):
         details = "; ".join(part.strip() for part in (out, err) if part.strip())
         suffix = details or "no diagnostic output"
         raise RuntimeError(f"`{' '.join(cmd)}` exited {rc}: {suffix}")
@@ -46,7 +66,7 @@ def _require_linux() -> None:
     if platform.system() != "Linux":
         raise RuntimeError(
             f"`ara node install` uses systemd --user and is Linux-only (this is "
-            f"{platform.system()}); run `ara node start` to launch it in the foreground instead")
+            f"{platform.system()}); run `ara node run` to launch it in the foreground instead")
 
 
 def _unit_dir() -> Path:
@@ -133,8 +153,6 @@ def uninstall() -> None:
     """Disable+stop the unit, remove its file, and reload so systemd forgets it."""
     _require_linux()
     path = _unit_path()
-    if not path.exists():
-        return
-    _checked(["systemctl", "--user", "disable", "--now", UNIT_NAME])
-    path.unlink()
+    _checked(["systemctl", "--user", "disable", "--now", UNIT_NAME], allow_absent=True)
+    path.unlink(missing_ok=True)
     _checked(["systemctl", "--user", "daemon-reload"])

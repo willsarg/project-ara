@@ -346,30 +346,3 @@ def test_concurrent_same_identity_manifest_writers_both_complete_atomically(
     files = list((registry / "serving").glob("*.json"))
     assert len(files) == 1
     assert json.loads(files[0].read_text())["context"] in {4096, 8192}
-
-
-def test_fallback_manifest_write_and_snapshot(registry, monkeypatch):
-    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
-    path = _record()
-    assert path.exists()
-    _wire_live(monkeypatch)
-    assert [item.model for item in activity.snapshot()] == ["org/model"]
-
-
-def test_fallback_serving_symlink_is_rejected(registry, monkeypatch, tmp_path):
-    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
-    registry.mkdir()
-    outside = tmp_path / "fallback-serving-outside"
-    outside.mkdir()
-    (registry / "serving").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(OSError, match="serving activity directory"):
-        _record()
-    assert activity.snapshot() == []
-    assert list(outside.iterdir()) == []
-
-
-def test_fallback_snapshot_without_serving_child_skips_it(registry, monkeypatch):
-    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
-    registry.mkdir()
-    monkeypatch.setattr("ara.ollama.ps", lambda: pytest.fail("queried Ollama"))
-    assert activity.snapshot() == []

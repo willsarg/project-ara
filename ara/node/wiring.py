@@ -43,7 +43,11 @@ def _run_cli_payload(args: list[str], expected_type: type[dict] | type[list],
         return {"error": f"`ara {args[0]}` produced unparseable output",
                 "stderr": (proc.stderr or "").strip()}
     if proc.returncode != 0:
-        if isinstance(payload, dict):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, str) and error.strip():
+            stderr = (proc.stderr or "").strip()
+            if stderr and "stderr" not in payload:
+                payload["stderr"] = stderr
             return payload
         return {"error": f"`ara {args[0]}` exited {proc.returncode}",
                 "stderr": (proc.stderr or "").strip()}

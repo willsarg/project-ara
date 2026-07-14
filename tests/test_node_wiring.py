@@ -45,7 +45,42 @@ def test_run_cli_nonzero_exit_preserves_valid_operational_json(monkeypatch):
         wiring.subprocess, "run",
         lambda *a, **k: _FakeProc(1, stdout=json.dumps(payload), stderr="internal detail\n"),
     )
-    assert wiring._run_cli(["run", "--", "org/m"]) == payload
+    assert wiring._run_cli(["run", "--", "org/m"]) == {
+        **payload, "stderr": "internal detail",
+    }
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"warning": "partial"}, {"error": ""}, {"error": 7}, {"error": None},
+])
+def test_run_cli_nonzero_rejects_objects_without_real_error(monkeypatch, payload):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(6, stdout=json.dumps(payload), stderr="daemon detail\n"),
+    )
+    assert wiring._run_cli(["status"]) == {
+        "error": "`ara status` exited 6", "stderr": "daemon detail",
+    }
+
+
+def test_run_cli_nonzero_operational_error_retains_stderr(monkeypatch):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(
+            2, stdout=json.dumps({"error": "operation failed"}), stderr="actionable detail\n"),
+    )
+    assert wiring._run_cli(["run"]) == {
+        "error": "operation failed", "stderr": "actionable detail",
+    }
+
+
+def test_run_cli_nonzero_operational_error_does_not_overwrite_stderr(monkeypatch):
+    payload = {"error": "operation failed", "stderr": "public detail"}
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(2, stdout=json.dumps(payload), stderr="internal detail\n"),
+    )
+    assert wiring._run_cli(["run"]) == payload
 
 
 def test_run_models_inventory_wraps_successful_array(monkeypatch):
@@ -63,7 +98,7 @@ def test_run_models_inventory_preserves_nonzero_error_object(monkeypatch):
         wiring.subprocess, "run",
         lambda *a, **k: _FakeProc(1, stdout=json.dumps(payload), stderr="detail\n"),
     )
-    assert wiring._run_models_inventory() == payload
+    assert wiring._run_models_inventory() == {**payload, "stderr": "detail"}
 
 
 @pytest.mark.parametrize("payload", [{"unexpected": []}, None, "text", 7, True])

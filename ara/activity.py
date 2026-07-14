@@ -19,7 +19,6 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import psutil
 from platformdirs import user_data_path
@@ -74,49 +73,192 @@ def _note_cleanup_failure(original: BaseException, action: str, cleanup: OSError
     original.add_note(f"ARA could not {action}: {cleanup}")
 
 
-_USE_DIR_FD = (os.name != "nt" and hasattr(os, "O_DIRECTORY")
-               and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd)
+_POSIX_DIR_FD = (os.name == "posix" and hasattr(os, "O_DIRECTORY")
+                 and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd)
+
+_WIN_GENERIC_READ = 0x80000000
+_WIN_FILE_SHARE_READ = 0x00000001
+_WIN_FILE_SHARE_WRITE = 0x00000002
+_WIN_FILE_SHARE_DELETE = 0x00000004
+_WIN_OPEN_EXISTING = 3
+_WIN_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WIN_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 
-def _fallback_identity(path: Path) -> tuple[int, int]:
-    """Verify a fallback directory is real and return its stable filesystem identity."""
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise OSError(f"ARA activity directory is not a real directory: {path}")
-    return info.st_dev, info.st_ino
+def _platform_mode() -> str | None:
+    if os.name == "nt":
+        return "windows"
+    if _POSIX_DIR_FD:
+        return "posix"
+    return None
 
 
-def _open_root(*, create: bool) -> tuple[int | None, tuple[int, int] | None]:
-    """Open the configured root without following it; create only for writer calls."""
-    path = activity_dir()
+def _win_create_file(path: Path, access: int, share: int, creation: int, flags: int) -> int:
+    """Create one Windows handle. Imported lazily so non-Windows never loads Win32 APIs."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(path), access, share, None, creation, flags, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle)
+
+
+def _win_file_info(handle: int) -> tuple[int, int]:
+    """Return ``(attributes, reparse_tag)`` for an already-open Windows handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    info = _FileAttributeTagInfo()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    get_info.restype = wintypes.BOOL
+    if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(info.FileAttributes), int(info.ReparseTag)
+
+
+def _win_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close = kernel32.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    if not close(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _win_handle_to_fd(handle: int) -> int:
+    import msvcrt
+    return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+
+
+def _win_open_checked(path: Path, *, directory: bool) -> int:
+    flags = _WIN_FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= _WIN_FILE_FLAG_BACKUP_SEMANTICS
+    handle = _win_create_file(
+        path, _WIN_GENERIC_READ, _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE,
+        _WIN_OPEN_EXISTING, flags)
+    try:
+        attributes, tag = _win_file_info(handle)
+        is_directory = bool(attributes & _WIN_FILE_ATTRIBUTE_DIRECTORY)
+        is_reparse = bool(attributes & _WIN_FILE_ATTRIBUTE_REPARSE_POINT) or tag != 0
+        if is_reparse or is_directory != directory:
+            raise OSError(f"unsafe Windows activity path: {path}")
+    except BaseException as original:
+        try:
+            _win_close_handle(handle)
+        except OSError as cleanup:
+            _note_cleanup_failure(original, "close the Windows activity handle", cleanup)
+        raise
+    return handle
+
+
+def _win_open_directory(path: Path) -> int:
+    return _win_open_checked(path, directory=True)
+
+
+def _win_open_record(path: Path) -> int:
+    return _win_open_checked(path, directory=False)
+
+
+@dataclass
+class _DirectoryGuard:
+    path: Path
+    mode: str
+    value: int
+
+    @property
+    def dir_fd(self) -> int | None:
+        return self.value if self.mode == "posix" else None
+
+    def close(self) -> None:
+        if self.mode == "posix":
+            os.close(self.value)
+        else:
+            _win_close_handle(self.value)
+
+
+def _close_guards(guards, *, original: BaseException | None = None) -> None:
+    """Close every held directory, preserving the first failure or annotating *original*."""
+    first = original
+    for guard in guards:
+        if guard is None:
+            continue
+        try:
+            guard.close()
+        except OSError as cleanup:
+            if first is None:
+                first = cleanup
+            else:
+                _note_cleanup_failure(first, "close an activity directory", cleanup)
+    if original is None and first is not None:
+        raise first
+
+
+def _open_directory(path: Path, *, create: bool) -> _DirectoryGuard:
+    mode = _platform_mode()
+    if mode is None:
+        raise OSError("no safe activity registry primitive is available on this platform")
     if create:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
             pass
-    if _USE_DIR_FD:
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        return os.open(path, flags), None
-    return None, _fallback_identity(path)
+    if mode == "posix":
+        value = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    else:
+        value = _win_open_directory(path)
+    return _DirectoryGuard(path, mode, value)
 
 
-def _same_fallback_directory(path: Path, identity: tuple[int, int]) -> None:
-    if _fallback_identity(path) != identity:
-        raise OSError(f"ARA activity directory changed during operation: {path}")
+def _open_root(*, create: bool) -> _DirectoryGuard:
+    return _open_directory(activity_dir(), create=create)
 
 
-def _atomic_write(path: Path, record: dict, *, directory_fd: int | None = None,
-                  fallback_identity: tuple[int, int] | None = None) -> None:
-    """Write one record atomically, relative to a held directory when available."""
-    if directory_fd is None:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        identity = cast(tuple[int, int], fallback_identity)
-        _same_fallback_directory(path.parent, identity)
+def _open_serving(root: _DirectoryGuard, *, create: bool) -> _DirectoryGuard:
+    path = root.path / "serving"
+    if root.mode == "posix":
+        if create:
+            try:
+                os.mkdir("serving", mode=0o700, dir_fd=root.value)
+            except FileExistsError:
+                pass
+        value = os.open(
+            "serving", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root.value)
+        return _DirectoryGuard(path, "posix", value)
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    return _DirectoryGuard(path, "windows", _win_open_directory(path))
+
+
+def _atomic_write(path: Path, record: dict, *, guard: _DirectoryGuard) -> None:
+    """Write atomically while a no-follow/no-reparse directory guard is held."""
     temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
-    temporary_arg = temporary.name if directory_fd is not None else temporary
-    target_arg = path.name if directory_fd is not None else path
-    open_kwargs = {"dir_fd": directory_fd} if directory_fd is not None else {}
+    relative = guard.mode == "posix"
+    temporary_arg = temporary.name if relative else temporary
+    target_arg = path.name if relative else path
+    open_kwargs = {"dir_fd": guard.value} if relative else {}
     descriptor = os.open(temporary_arg, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                          0o600, **open_kwargs)
     try:
@@ -132,21 +274,20 @@ def _atomic_write(path: Path, record: dict, *, directory_fd: int | None = None,
             json.dump(record, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        if directory_fd is None:
-            os.replace(temporary_arg, target_arg)
-            _same_fallback_directory(path.parent, identity)
-        else:
+        if relative:
             os.replace(temporary_arg, target_arg,
-                       src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                       src_dir_fd=guard.value, dst_dir_fd=guard.value)
+        else:
+            os.replace(temporary_arg, target_arg)
     except BaseException as original:
         try:
-            if directory_fd is None:
-                temporary.unlink(missing_ok=True)
-            else:
+            if relative:
                 try:
-                    os.unlink(temporary_arg, dir_fd=directory_fd)
+                    os.unlink(temporary_arg, dir_fd=guard.value)
                 except FileNotFoundError:
                     pass
+            else:
+                temporary.unlink(missing_ok=True)
         except OSError as cleanup:
             _note_cleanup_failure(original, "remove the partial activity record", cleanup)
         raise
@@ -157,8 +298,7 @@ class _Tracker:
         self._kind = kind
         self._model = model
         self._path = activity_dir() / f"{uuid.uuid4().hex}.json"
-        self._directory_fd: int | None = None
-        self._fallback_identity: tuple[int, int] | None = None
+        self._guard: _DirectoryGuard | None = None
 
     def __enter__(self) -> None:
         pid = os.getpid()
@@ -170,30 +310,22 @@ class _Tracker:
         }
         if self._model is not None:
             record["model"] = self._model
-        self._directory_fd, self._fallback_identity = _open_root(create=True)
+        self._guard = _open_root(create=True)
         try:
-            _atomic_write(self._path, record, directory_fd=self._directory_fd,
-                          fallback_identity=self._fallback_identity)
+            _atomic_write(self._path, record, guard=self._guard)
         except BaseException as original:
-            if self._directory_fd is not None:
-                try:
-                    os.close(self._directory_fd)
-                except OSError as cleanup:
-                    _note_cleanup_failure(original, "close the activity directory", cleanup)
-                self._directory_fd = None
+            _close_guards([self._guard], original=original)
+            self._guard = None
             raise
 
     def __exit__(self, _exc_type, exc, _traceback) -> bool:
         cleanup_error: OSError | None = None
         try:
-            if self._directory_fd is None:
-                identity = cast(tuple[int, int], self._fallback_identity)
-                _same_fallback_directory(self._path.parent, identity)
+            if self._guard.mode == "windows":
                 self._path.unlink(missing_ok=True)
-                _same_fallback_directory(self._path.parent, identity)
             else:
                 try:
-                    os.unlink(self._path.name, dir_fd=self._directory_fd)
+                    os.unlink(self._path.name, dir_fd=self._guard.value)
                 except FileNotFoundError:
                     pass
         except OSError as cleanup:
@@ -202,16 +334,9 @@ class _Tracker:
             else:
                 _note_cleanup_failure(exc, "remove the finished activity record", cleanup)
         finally:
-            if self._directory_fd is not None:
-                try:
-                    os.close(self._directory_fd)
-                except OSError as close_error:
-                    original = exc or cleanup_error
-                    if original is None:
-                        raise
-                    _note_cleanup_failure(
-                        original, "close the activity directory", close_error)
-                self._directory_fd = None
+            original = exc or cleanup_error
+            _close_guards([self._guard], original=original)
+            self._guard = None
         if cleanup_error is not None:
             raise cleanup_error
         return False
@@ -269,33 +394,17 @@ def record_ollama_serving(*, served_name: str, model: str, context: int,
         raise ValueError("invalid Ollama serving activity")
     identity = hashlib.sha256(
         f"{endpoint}\0{served_name}".encode("utf-8")).hexdigest()
-    root_fd, root_identity = _open_root(create=True)
-    serving = activity_dir() / "serving"
-    serving_fd: int | None = None
-    serving_identity: tuple[int, int] | None = None
+    root = _open_root(create=True)
+    serving: _DirectoryGuard | None = None
     try:
-        if root_fd is None:
-            if serving.is_symlink():
-                raise OSError("ARA serving activity directory must not be a symlink")
-            serving.mkdir(mode=0o700, exist_ok=True)
-            _same_fallback_directory(activity_dir(), root_identity)
-            serving_identity = _fallback_identity(serving)
-        else:
-            try:
-                os.mkdir("serving", mode=0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
-            serving_fd = os.open(
-                "serving", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-        path = serving / f"{identity}.json"
-        _atomic_write(path, record, directory_fd=serving_fd,
-                      fallback_identity=serving_identity)
-        return path
-    finally:
-        if serving_fd is not None:
-            os.close(serving_fd)
-        if root_fd is not None:
-            os.close(root_fd)
+        serving = _open_serving(root, create=True)
+        path = serving.path / f"{identity}.json"
+        _atomic_write(path, record, guard=serving)
+    except BaseException as original:
+        _close_guards([serving, root], original=original)
+        raise
+    _close_guards([serving, root])
+    return path
 
 
 def _number(value) -> bool:
@@ -303,24 +412,63 @@ def _number(value) -> bool:
             and math.isfinite(value))
 
 
-def _json_record(path: Path, *, directory_fd: int | None = None):
-    """Load one no-follow JSON file relative to a held directory when available."""
+def _open_record_fd(path: Path, guard: _DirectoryGuard) -> int | None:
+    """Open and validate one regular record without following a link or blocking on a FIFO."""
+    windows_handle: int | None = None
     try:
-        if directory_fd is None:
-            if path.is_symlink() or not path.is_file():
+        if guard.mode == "posix":
+            descriptor = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=guard.value)
+        else:
+            windows_handle = _win_open_record(path)
+            try:
+                descriptor = _win_handle_to_fd(windows_handle)
+            except BaseException as original:
+                try:
+                    _win_close_handle(windows_handle)
+                except OSError as cleanup:
+                    _note_cleanup_failure(original, "close the activity record", cleanup)
+                raise
+        try:
+            info = os.fstat(descriptor)
+        except BaseException as original:
+            try:
+                os.close(descriptor)
+            except OSError as cleanup:
+                _note_cleanup_failure(original, "close the activity record", cleanup)
+            if isinstance(original, OSError):
                 return None
-            with path.open("r", encoding="utf-8") as stream:
-                return json.load(stream)
-        descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except OSError:
+        return None
+
+
+def _json_record(path: Path, *, guard: _DirectoryGuard):
+    descriptor = _open_record_fd(path, guard)
+    if descriptor is None:
+        return None
+    try:
+        stream = os.fdopen(descriptor, "r", encoding="utf-8")
+    except BaseException as original:
+        try:
+            os.close(descriptor)
+        except OSError as cleanup:
+            _note_cleanup_failure(original, "close the activity record", cleanup)
+        raise
+    try:
+        with stream:
             return json.load(stream)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
 
 
-def _read_record(path: Path, *, directory_fd: int | None = None) -> Activity | None:
-    record = _json_record(path, directory_fd=directory_fd)
+def _read_record(path: Path, *, guard: _DirectoryGuard) -> Activity | None:
+    record = _json_record(path, guard=guard)
     if not isinstance(record, dict) or set(record) - _ALLOWED_FIELDS \
             or not _REQUIRED_FIELDS.issubset(record):
         return None
@@ -345,14 +493,13 @@ def _read_record(path: Path, *, directory_fd: int | None = None) -> Activity | N
     return Activity(kind=kind, model=model, pid=pid, started_at=float(started))
 
 
-def _record_names(directory: Path, *, directory_fd: int | None = None) -> list[str]:
+def _record_names(directory: Path, *, guard: _DirectoryGuard) -> list[str]:
     """List regular JSON record names without following directory entries."""
     try:
-        if directory_fd is None:
+        if guard.mode == "windows":
             return sorted(path.name for path in directory.iterdir()
-                          if path.suffix == ".json" and not path.is_symlink()
-                          and path.is_file())
-        with os.scandir(directory_fd) as entries:
+                          if path.suffix == ".json")
+        with os.scandir(guard.value) as entries:
             return sorted(entry.name for entry in entries
                           if entry.name.endswith(".json")
                           and entry.is_file(follow_symlinks=False))
@@ -360,44 +507,26 @@ def _record_names(directory: Path, *, directory_fd: int | None = None) -> list[s
         return []
 
 
-def _read_serving_records(directory: Path, *, root_fd: int | None = None,
-                          root_identity: tuple[int, int] | None = None) -> list[tuple[dict, str]]:
-    serving_fd: int | None = None
-    if root_fd is None:
-        _same_fallback_directory(
-            directory.parent, cast(tuple[int, int], root_identity))
-        if directory.is_symlink():
-            return []
-        try:
-            serving_identity = _fallback_identity(directory)
-        except OSError:
-            return []
-    else:
-        try:
-            serving_fd = os.open(
-                "serving", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-        except OSError:
-            return []
-        serving_identity = None
+def _read_serving_records(root: _DirectoryGuard) -> list[tuple[dict, str]]:
+    try:
+        serving = _open_serving(root, create=False)
+    except OSError:
+        return []
     found = []
     try:
-        for name in _record_names(directory, directory_fd=serving_fd):
-            record = _json_record(directory / name, directory_fd=serving_fd)
+        for name in _record_names(serving.path, guard=serving):
+            record = _json_record(serving.path / name, guard=serving)
             if _valid_serving_record(record):
                 found.append((record, name))
-        if serving_identity is not None:
-            _same_fallback_directory(directory, serving_identity)
-    finally:
-        if serving_fd is not None:
-            os.close(serving_fd)
+    except BaseException as original:
+        _close_guards([serving], original=original)
+        raise
+    _close_guards([serving])
     return found
 
 
-def _live_ollama_serving(directory: Path, *, root_fd: int | None = None,
-                         root_identity: tuple[int, int] | None = None
-                         ) -> list[tuple[Activity, str]]:
-    records = _read_serving_records(
-        directory / "serving", root_fd=root_fd, root_identity=root_identity)
+def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
+    records = _read_serving_records(root)
     if not records:
         return []
     # Import lazily: status remains core/engine-free and contacts Ollama only when ARA has a
@@ -436,24 +565,26 @@ def snapshot() -> list[Activity]:
     """Read live records without creating, repairing, or deleting anything."""
     directory = activity_dir()
     try:
-        root_fd, root_identity = _open_root(create=False)
+        root = _open_root(create=False)
     except OSError:
         return []
     found: list[tuple[Activity, str]] = []
     try:
-        for name in _record_names(directory, directory_fd=root_fd):
-            parsed = _read_record(directory / name, directory_fd=root_fd)
+        for name in _record_names(directory, guard=root):
+            parsed = _read_record(directory / name, guard=root)
             if parsed is not None:
                 found.append((parsed, name))
-        found.extend(_live_ollama_serving(
-            directory, root_fd=root_fd, root_identity=root_identity))
-        if root_identity is not None:
-            _same_fallback_directory(directory, root_identity)
+        found.extend(_live_ollama_serving(root))
+    except OSError as original:
+        _close_guards([root], original=original)
+        return []
+    except BaseException as original:
+        _close_guards([root], original=original)
+        raise
+    try:
+        _close_guards([root])
     except OSError:
         return []
-    finally:
-        if root_fd is not None:
-            os.close(root_fd)
     found.sort(key=lambda pair: (
         pair[0].started_at, pair[0].pid or 0, pair[0].kind,
         pair[0].model or "", pair[1],

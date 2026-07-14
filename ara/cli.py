@@ -2645,7 +2645,7 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
                 return 0
             getattr(service, sub)()            # start | stop | uninstall
             return _node_say(c, as_json, f"{sub} ok")
-        except RuntimeError as exc:             # the systemd path is Linux-only
+        except (RuntimeError, OSError, ValueError) as exc:
             return _node_err(c, as_json, str(exc))
 
     return _node_err(c, as_json,

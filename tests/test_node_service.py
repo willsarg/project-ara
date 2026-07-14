@@ -34,8 +34,10 @@ def test_run_is_the_subprocess_boundary(monkeypatch):
 
 def test_require_linux_raises_off_linux(monkeypatch):
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
-    with pytest.raises(RuntimeError, match="Linux-only"):
+    with pytest.raises(RuntimeError, match="Linux-only") as caught:
         service._require_linux()
+    assert "ara node run" in str(caught.value)
+    assert "ara node start" not in str(caught.value)
 
 
 def test_require_linux_passes_on_linux(linux):
@@ -146,7 +148,57 @@ def test_uninstall_disables_removes_and_reloads(tmp_path, monkeypatch, linux, ca
 def test_uninstall_is_idempotent_when_absent(tmp_path, monkeypatch, linux, calls):
     monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))   # no unit file present
     service.uninstall()                                          # must not raise
-    assert calls == []
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", service.UNIT_NAME],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_uninstall_missing_file_converges_loaded_systemd_unit(tmp_path, monkeypatch, linux):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(service, "_run", lambda cmd: calls.append(cmd) or (0, "disabled", ""))
+    service.uninstall()
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", service.UNIT_NAME],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+@pytest.mark.parametrize("message", [
+    "Unit ara-node.service does not exist.",
+    "Failed to disable unit: Unit file ara-node.service does not exist.",
+    "Unit ara-node.service not loaded.",
+])
+def test_uninstall_missing_file_accepts_explicit_absent_systemd_state(
+        tmp_path, monkeypatch, linux, message):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    results = iter(((1, "", message), (0, "", "")))
+    monkeypatch.setattr(service, "_run", lambda _cmd: next(results))
+    service.uninstall()
+
+
+def test_uninstall_missing_file_rejects_unclassified_disable_failure(
+        tmp_path, monkeypatch, linux):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    monkeypatch.setattr(service, "_run", lambda _cmd: (1, "", "permission denied"))
+    with pytest.raises(RuntimeError, match="permission denied"):
+        service.uninstall()
+
+
+def test_uninstall_retry_after_reload_failure_converges(tmp_path, monkeypatch, linux):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    unit = tmp_path / service.UNIT_NAME
+    unit.write_text("stub")
+    first = iter(((0, "", ""), (1, "", "reload failed")))
+    monkeypatch.setattr(service, "_run", lambda _cmd: next(first))
+    with pytest.raises(RuntimeError, match="reload failed"):
+        service.uninstall()
+    assert not unit.exists()
+
+    second = iter(((1, "", "Unit ara-node.service not loaded."), (0, "", "")))
+    monkeypatch.setattr(service, "_run", lambda _cmd: next(second))
+    service.uninstall()
 
 
 def test_uninstall_disable_failure_keeps_unit_and_skips_reload(tmp_path, monkeypatch, linux):
