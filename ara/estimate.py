@@ -22,7 +22,8 @@ APPLE_WORKING_SET = 0.75
 GIB = 1024 ** 3
 
 
-def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> dict:
+def limits(machine, measured: dict | None = None, *, sharded: bool = False,
+           backend: str | None = None) -> dict:
     """Analytic memory limits from detect facts — no engine, no model load.
 
     Mirrors the wall each backend would read: CUDA → a single device's VRAM by default (the
@@ -32,7 +33,9 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> d
     true physical total across all cards; ``wall_gb`` is the governable budget. The safe budget
     is the wall minus ARA's margin. Shape is compatible with the limits dict the engines return.
 
-    Pure: the heuristic never touches a database. The CALLER may pass *measured* — a stored
+    *backend* overrides the machine's detected backend for an explicit analytic engine choice
+    (for example, the CPU fallback on a CUDA host). Pure: the heuristic never touches a database.
+    The CALLER may pass *measured* — a stored
     calibration dict carrying ``wall_gb``/``safe_budget_gb`` from the engine's own ``safe_limits``.
     When it holds a usable wall, those measured numbers replace the heuristic and the result is
     labelled ``basis="measured"`` / ``calibrated=True`` (the heuristic value is kept alongside as
@@ -40,7 +43,8 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> d
     result is the honest heuristic: ``basis="estimated"`` / ``calibrated=False``. The label always
     matches the data source — a heuristic is never reported as measured.
     """
-    if machine.backend == "cuda":
+    selected_backend = backend or machine.backend
+    if selected_backend == "cuda":
         per_device = machine.accel.vram_gb
         count = machine.accel.count or 1
         total = per_device * count if per_device is not None else None
@@ -49,7 +53,7 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False) -> d
     else:
         total = machine.ram_total_gb
         device = machine.chip
-        wall = total * APPLE_WORKING_SET if (machine.backend == "apple" and total is not None) \
+        wall = total * APPLE_WORKING_SET if (selected_backend == "apple" and total is not None) \
             else total
     safe_budget = wall - MARGIN_GB if wall is not None else None
     out = {

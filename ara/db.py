@@ -357,9 +357,18 @@ def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *
 
 
 def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str) -> dict | None:
-    from ara.engine_identity import canonical_engine
+    from ara.engine_identity import LEGACY_ENGINE_ALIASES, canonical_engine
+    canonical = canonical_engine(engine)
     row = con.execute("SELECT * FROM calibrations WHERE machine_key=? AND engine=?",
-                      (machine_key, canonical_engine(engine))).fetchone()
+                      (machine_key, canonical)).fetchone()
+    if row is None:
+        for legacy, replacement in LEGACY_ENGINE_ALIASES.items():
+            if replacement == canonical:
+                row = con.execute(
+                    "SELECT * FROM calibrations WHERE machine_key=? AND engine=?",
+                    (machine_key, legacy)).fetchone()
+                if row is not None:
+                    break
     return dict(row) if row else None
 
 

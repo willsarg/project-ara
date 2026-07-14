@@ -910,16 +910,31 @@ def _emit_limits(c: Console, m: dict) -> None:
     tag = "  (measured)" if measured else "  (estimated — not calibrated)"
     c.emit()
     c.emit(c.section("  SAFE LIMITS") + c.style("dim", tag))
-    c.emit(c.field("device", f"{m['device']} · {m['total_gb']:.0f} GB"))
+    if m.get("engine"):
+        c.emit(c.field("engine", m["engine"]))
+    c.emit(c.field("device", f"{m['device']} · {_fmt_gb(m['total_gb'], 0)}"))
     c.emit(c.field("crash wall", _fmt_gb(m["wall_gb"], 1),
                    "the hard ceiling — never cross", value_role="bad"))
     c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
                    f"wall − {m['margin_gb']:.0f} GB margin", value_role="good"))
+    if c.verbose:
+        if measured:
+            calibrated_at = m.get("calibrated_at") or "unknown"
+            c.emit(c.field("provenance", "stored measurement",
+                           f"calibrated {calibrated_at}"))
+            if m.get("estimated_wall_gb") is not None:
+                c.emit(c.field("analytic wall", _fmt_gb(m["estimated_wall_gb"], 1),
+                               "before measured correction", label_width=16))
+            if m.get("estimated_safe_budget_gb") is not None:
+                c.emit(c.field("analytic budget", _fmt_gb(m["estimated_safe_budget_gb"], 1),
+                               "before measured correction", label_width=16))
+        else:
+            c.emit(c.field("provenance", "analytic estimate", "read-only hardware facts"))
     if m.get("headroom_gb") is not None:
         c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
     if m["overhead_gb"] is not None:
         gloss = "default estimate" if not m["calibrated"] else \
-            f"measured cold-start · calibrated {m['calibrated_at']}"
+            f"measured cold-start · calibrated {m.get('calibrated_at') or 'unknown'}"
         c.emit(c.field("overhead", _fmt_gb(m["overhead_gb"], 1), gloss))
     if m["swap_free_gb"] is not None:
         c.emit(c.field("swap", f"{m['swap_free_gb']:.1f} GB free"))
@@ -2420,9 +2435,9 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
 
 def _emit_characterized(c: Console, engine_key: str | None) -> None:
     """Show models ARA has characterized on this machine + engine (from the store)."""
-    if engine_key is None:
+    if engine_key is None or not db._db_path().is_file():
         return
-    with db.connected() as con:
+    with db.connected_readonly() as con:
         rows = db.list_characterizations(con, profile.machine_key(), engine_key)
     if not rows:
         return
@@ -2452,9 +2467,13 @@ def _model_fit(lim: dict, model: str) -> dict | None:
     meta = catalog.describe(model)
     if meta is None:
         return None
-    with db.connected() as con:
-        row = catalog.get(con, model) or catalog.remember(con, model)
+    row = None
+    if db._db_path().is_file():
+        with db.connected_readonly() as con:
+            row = catalog.get(con, model)
     weights_gb = row.get("weights_gb") if row else None
+    if weights_gb is None:
+        weights_gb = catalog._cache_size_gb(model)
     if weights_gb is None:
         weights_gb = acquire.repo_size_gb(model)
     return estimate.model_fit(lim, meta, weights_gb)
@@ -2491,9 +2510,9 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
 def render_profile(c: Console, *, as_json: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
     """Analytic capability assessment — engine-free. Reasons over ``detect.machine()`` facts +
-    ARA's heuristics to estimate the memory budget, persists the profile, and (with ``--model``)
-    checks whether a model's weights + context window fit the estimate. It never loads an engine
-    or a model; ``characterize`` does that to measure the real ceiling.
+    ARA's heuristics to estimate the memory budget and (with ``--model``) checks whether a model's
+    weights + context window fit the estimate. It never loads an engine or model and never mutates
+    ARA's store; ``characterize`` does that to measure and persist the real ceiling.
     Spec 2026-06-23-capability-pipeline."""
     try:
         sel = resolve_engine(engine)
@@ -2506,13 +2525,12 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     # Ground the estimate in reality: if this engine has a measured wall stored from a prior
     # characterize, report the MEASURED budget (labelled), not the heuristic. Read-only — still
     # engine-free (no engine import/load). Spec 2026-06-23-capability-pipeline.
-    with db.connected() as con:
-        measured = calibration.get_calibration(con, sel.engine_key)
-    lim = estimate.limits(m, measured=measured)
-
-    # profile is the persister (detect stays ephemeral): record this analytic snapshot, history kept.
-    with db.connected() as con:
-        profile.capture(con)
+    measured = None
+    if db._db_path().is_file():
+        with db.connected_readonly() as con:
+            measured = calibration.get_calibration(con, sel.engine_key)
+    lim = {"engine": sel.engine_key,
+           **estimate.limits(m, measured=measured, backend=sel.backend)}
 
     if as_json:
         payload = {**lim}
@@ -3046,13 +3064,15 @@ def _click_characterize(ctx: click.Context, model: str, engine: str | None, kv_q
 
 
 @_click_cli.command("profile", context_settings=_HELP_SETTINGS)
-@click.option("--model", help="Assess whether this model fits.")
-@_engine_option
+@click.option("--model", metavar="MODEL",
+              help="Estimate whether MODEL fits and its usable context.")
+@click.option("--engine", callback=_engine_callback, metavar="ENGINE",
+              help="Estimate for ENGINE; defaults to the detected engine.")
 @_json_verbose_options
 @click.pass_context
 def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
                    verbose: bool, as_json: bool) -> int:
-    """Estimate machine capability analytically without loading an engine."""
+    """Estimate this machine's safe memory budget without loading an engine or model."""
     return render_profile(_mark_json(ctx, as_json), as_json=as_json, model=model, engine=engine)
 
 

@@ -1089,7 +1089,17 @@ def test_profile_never_loads_an_engine(make_console, monkeypatch, set_platform, 
     out = buf.getvalue()
     assert "SAFE LIMITS" in out and "estimated" in out
     assert "ara characterize" in out                              # points at the empirical step
-    assert cli.db.get_latest_profile(store, "mkey") is not None   # profile is the persister
+    assert cli.db.get_latest_profile(store, "mkey") is None       # profile is read-only
+
+
+def test_profile_does_not_create_database(tmp_path, make_console, monkeypatch, set_platform):
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    _wire_profile(monkeypatch, set_platform)
+
+    c, _ = make_console()
+    assert cli.render_profile(c) == 0
+    assert not path.exists()
 
 
 def test_profile_estimated_budget_mirrors_wall(make_console, monkeypatch, set_platform):
@@ -1109,6 +1119,41 @@ def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
     assert payload["basis"] == "estimated"
     assert payload["calibrated"] is False
     assert payload["safe_budget_gb"] == 48.0 * 0.75 - 2.0
+
+
+def test_profile_explicit_cpu_uses_system_ram_on_cuda_host(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        backend="cuda", ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "RTX 2070", 8.0, "CUDA", count=1),
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cpu") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["engine"] == "cpu"
+    assert payload["total_gb"] == 64.0
+    assert payload["wall_gb"] == 64.0
+
+
+def test_profile_text_names_selected_engine(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cpu") == 0
+    assert "engine      cpu" in buf.getvalue()
+
+
+def test_profile_text_handles_unknown_memory(make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform,
+                  _machine(backend="cpu", ram_total_gb=None, chip="Unknown CPU"))
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cpu") == 0
+    out = buf.getvalue()
+    assert "Unknown CPU · unknown" in out
+    assert "crash wall unknown" in " ".join(out.split())
 
 
 def test_profile_reports_measured_wall_after_calibration(make_console, monkeypatch, set_platform, store):
@@ -1136,6 +1181,37 @@ def test_profile_json_reports_measured_basis(monkeypatch, set_platform, capsys, 
     assert payload["basis"] == "measured"
     assert payload["calibrated"] is True
     assert payload["wall_gb"] == 41.3 and payload["safe_budget_gb"] == 39.3
+
+
+def test_profile_reads_legacy_calibration_without_migrating(
+        monkeypatch, set_platform, capsys, store):
+    from ara import db
+
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    store.execute(
+        "INSERT INTO calibrations "
+        "(machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("mkey", "wmx", 1.7, "2026-06-19T12:00:00+00:00", 41.3, 39.3),
+    )
+    store.execute("PRAGMA user_version = 2")
+    store.commit()
+    store.close()
+    path = db._db_path()
+    backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    backup_path.unlink(missing_ok=True)
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_profile(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["engine"] == "mlx"
+    assert payload["basis"] == "measured"
+    assert payload["wall_gb"] == 41.3
+    with sqlite3.connect(path) as check:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert check.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
+    assert not backup_path.exists()
 
 
 def test_profile_uncalibrated_stays_estimated(monkeypatch, set_platform, capsys, store):
@@ -1226,7 +1302,8 @@ def test_profile_model_undescribable(make_console, monkeypatch, set_platform):
     assert "couldn't describe org/mystery" in buf.getvalue()
 
 
-def test_profile_model_uses_cataloged_weight_no_network(make_console, monkeypatch, set_platform):
+def test_profile_model_uses_cataloged_weight_no_network(
+        make_console, monkeypatch, set_platform, store):
     # profile --model and recommend must compute identically: a cataloged model's weight comes
     # from the local catalog (catalog.get → weights_gb), never a network repo_size_gb call.
     # Spec 2026-06-23-capability-pipeline.
@@ -1248,7 +1325,9 @@ def test_profile_model_falls_back_to_network_when_uncataloged(make_console, monk
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
-    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli.catalog, "remember",
+                        lambda con, m: pytest.fail("profile wrote to the model catalog"))
+    monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
     called = []
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: called.append(m) or 4.0)
     c, buf = make_console()
@@ -1273,6 +1352,15 @@ def test_main_profile_passes_engine(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["profile", "--engine", "mlx"])
     assert rec["profile"]["engine"] == "mlx"
+
+
+def test_profile_help_explains_analytic_boundary_and_options(capsys):
+    assert cli.main(["profile", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Estimate this machine's safe memory budget" in out
+    assert "without loading an engine or model" in out
+    assert "Estimate whether MODEL fits and its usable context" in out
+    assert "Estimate for ENGINE; defaults to the detected engine" in out
 
 
 def test_profile_unknown_engine_errors(make_console, monkeypatch):
@@ -1339,6 +1427,34 @@ def test_emit_limits_estimated_says_estimated(make_console):
     c, buf = make_console()
     cli._emit_limits(c, _limits(calibrated=False, basis="estimated"))
     assert "not calibrated" in buf.getvalue()
+
+
+def test_emit_limits_verbose_estimated_names_readonly_provenance(make_console):
+    c, buf = make_console(verbose=True)
+    cli._emit_limits(c, _limits(calibrated=False, basis="estimated"))
+    out = " ".join(buf.getvalue().split())
+    assert "provenance analytic estimate read-only hardware facts" in out
+
+
+def test_emit_limits_verbose_measured_shows_calibration_and_analytic_baseline(make_console):
+    c, buf = make_console(verbose=True)
+    cli._emit_limits(c, _limits(
+        calibrated=True, basis="measured", calibrated_at="2026-07-02T19:25:54+00:00",
+        estimated_wall_gb=36.0, estimated_safe_budget_gb=34.0,
+    ))
+    out = " ".join(buf.getvalue().split())
+    assert "provenance stored measurement calibrated 2026-07-02T19:25:54+00:00" in out
+    assert "analytic wall 36.0 GB before measured correction" in out
+    assert "analytic budget 34.0 GB before measured correction" in out
+
+
+def test_emit_limits_verbose_measured_keeps_missing_provenance_unknown(make_console):
+    c, buf = make_console(verbose=True)
+    cli._emit_limits(c, _limits(calibrated=True, basis="measured", calibrated_at=None))
+    out = " ".join(buf.getvalue().split())
+    assert "provenance stored measurement calibrated unknown" in out
+    assert "analytic wall" not in out and "analytic budget" not in out
+    assert "None" not in out
 
 
 # --------------------------------------------------------------------------- #
