@@ -182,9 +182,16 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     f = fit(points)
     ceiling = safe_ceiling(f, budget_gb, ref_baseline_gb)
     binding = "memory"
+    # A flat/falling fit can be measurement noise, so it cannot justify extrapolation. But when
+    # the model's actual context-window maximum was itself measured safe, that direct observation
+    # is stronger evidence than the unusable slope: retain the measured window rather than
+    # reporting a false null ceiling.
+    measured_window = max_context is not None and max_context in safe_points
     # Honesty: a memory ceiling past the model's own context window is unusable — cap it,
     # and say the limit is the window, not memory.
     if ceiling is not None and max_context is not None and ceiling > max_context:
+        ceiling, binding = max_context, "context_window"
+    elif ceiling is None and measured_window:
         ceiling, binding = max_context, "context_window"
     return RampResult(ceiling, f, points, "ok", binding)
 

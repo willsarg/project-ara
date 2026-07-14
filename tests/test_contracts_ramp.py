@@ -156,6 +156,20 @@ def test_run_collects_points_fits_and_solves():
     assert res.stopped_reason == "ok"
 
 
+def test_run_keeps_safely_measured_model_window_when_noise_makes_fit_fall():
+    # Real MLX reproduction (SmolLM-135M, 2026-07-14): both contexts loaded safely, but normal
+    # footprint noise made the 2048 reading 0.011 GiB lower than the 2000 reading. A negative fit
+    # cannot be extrapolated, yet the model's actual maximum was directly measured safe — retain
+    # that stronger fact instead of reporting a false null ceiling.
+    readings = {2000: 1.084, 2048: 1.073}
+    res = ramp.run(lambda ctx: FakeM(mem_gb=readings[ctx]),
+                   schedule=[2000, 2048], base_gb=5.991,
+                   slope_gb_per_k=0.01, budget_gb=15.18, max_context=2048)
+    assert res.fit is not None and res.fit.slope_gb_per_k < 0
+    assert res.safe_context == 2048
+    assert res.binding == "context_window"
+
+
 def test_run_returns_none_when_scheduler_refuses_immediately():
     # base already over budget → plan_next gives nothing, no measurement attempted
     calls = []
