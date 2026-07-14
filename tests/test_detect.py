@@ -586,8 +586,6 @@ def test_user_python_strips_venv_bin(monkeypatch):
     other = os.path.normpath("/usr/bin")
     monkeypatch.setenv("VIRTUAL_ENV", venv)
     monkeypatch.setenv("PATH", os.pathsep.join([vbin, other]))
-    monkeypatch.setattr(detect.sys, "executable", os.path.join(vbin, "python3"))
-    monkeypatch.setattr(detect.os.path, "realpath", lambda p, *a, **k: p)  # identity
     seen = {}
 
     def fake_which(name, path=None):
@@ -614,17 +612,29 @@ def test_venv_stripped_path_strips_windows_scripts(monkeypatch):
 
 def test_venv_stripped_path_no_venv_returns_path_unchanged(monkeypatch):
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", "/usr/local")
+    monkeypatch.setattr(sys, "base_prefix", "/usr/local")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     assert detect._venv_stripped_path() == "/usr/bin:/bin"
 
 
-def test_user_python_none_when_resolves_back_to_ara(monkeypatch):
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+def test_venv_stripped_path_uses_sys_prefix_without_virtual_env(monkeypatch):
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    monkeypatch.setattr(detect.sys, "executable", "/venv/bin/python3")
-    monkeypatch.setattr(detect.os.path, "realpath", lambda p, *a, **k: p)
-    monkeypatch.setattr("shutil.which", lambda name, path=None: "/venv/bin/python3")
-    assert detect._user_python() is None
+    monkeypatch.setattr(sys, "prefix", "/opt/ara-env")
+    monkeypatch.setattr(sys, "base_prefix", "/usr/local")
+    monkeypatch.setenv("PATH", "/opt/ara-env/bin:/usr/bin")
+    assert detect._venv_stripped_path() == "/usr/bin"
+
+
+def test_user_python_keeps_outside_invocation_with_same_real_interpreter(monkeypatch):
+    monkeypatch.setenv("VIRTUAL_ENV", "/venv")
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/local/bin")
+    monkeypatch.setattr(sys, "prefix", "/venv")
+    monkeypatch.setattr(sys, "base_prefix", "/base")
+    monkeypatch.setattr(sys, "executable", "/venv/bin/python3")
+    monkeypatch.setattr(detect.os.path, "realpath", lambda path: "/base/bin/python3")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/usr/local/bin/python3")
+    assert detect._user_python() == "/usr/local/bin/python3"
 
 
 def test_user_python_none_when_no_python(monkeypatch):

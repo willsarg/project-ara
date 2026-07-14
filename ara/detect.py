@@ -15,7 +15,6 @@ import platform
 import re
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from ara import (
     engines as _engines,
     hardware as _hardware,
     ollama,
+    pythons as _pythons,
     versions as _versions,
 )
 
@@ -138,19 +138,15 @@ def _disk_free_gb() -> float | None:
 
 
 def _venv_stripped_path() -> str:
-    """The user's PATH with ARA's active venv bin dir removed.
+    """The user's PATH with ARA's active environment directories removed.
 
-    Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH; removing its bin
-    dir lets us resolve the USER's python/tools, not ARA's bundled ones. That bin dir
-    is ``Scripts`` on Windows, ``bin`` everywhere else.
+    ``VIRTUAL_ENV`` identifies ordinary activated environments; ``sys.prefix`` also
+    catches installed-tool environments whose launcher does not export that variable.
     """
     path = os.environ.get("PATH", "")
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
-        vbin = os.path.normpath(os.path.join(venv, "Scripts" if os.name == "nt" else "bin"))
-        path = os.pathsep.join(p for p in path.split(os.pathsep)
-                               if os.path.normpath(p) != vbin)
-    return path
+    roots = _pythons._active_env_roots()
+    return os.pathsep.join(part for part in path.split(os.pathsep)
+                           if not any(_pythons._path_within(part, root) for root in roots))
 
 
 def _user_python() -> str | None:
@@ -159,13 +155,11 @@ def _user_python() -> str | None:
     Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH, so a naive
     ``which python3`` returns ARA's interpreter and reports ARA's bundled deps as if
     they were the user's. Strip the venv's bin and re-resolve to find the real one.
-    Returns None when the only python available is ARA's own.
+    Returns None when the only python available is ARA's own. An invocation outside
+    that environment stays valid even when it resolves to the same base executable.
     """
     path = _venv_stripped_path()
-    py = shutil.which("python3", path=path) or shutil.which("python", path=path)
-    if py and os.path.realpath(py) == os.path.realpath(sys.executable):
-        return None  # resolved straight back to ARA's interpreter
-    return py
+    return shutil.which("python3", path=path) or shutil.which("python", path=path)
 
 
 def _python_packages(py: str | None, names: tuple[str, ...]) -> dict[str, str | None]:

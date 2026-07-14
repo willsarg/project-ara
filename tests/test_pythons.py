@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import types
+
+import pytest
 
 import ara.pythons as pythons
 from ara.pythons import Interpreter
@@ -386,6 +389,65 @@ def test_candidates_excludes_zero_byte_alias(tmp_path, monkeypatch):
 def test_count_matches_candidate_groups(monkeypatch):
     monkeypatch.setattr(pythons, "_candidates", lambda: {"/a": {"/a"}, "/b": {"/b"}})
     assert pythons.count() == 2
+
+
+@pytest.mark.parametrize(("os_name", "venv", "active", "outside", "neighbor"), [
+    ("posix", "/opt/ara-env", "/opt/ara-env/bin/python3",
+     "/usr/local/bin/python3", "/opt/ara-env2/bin/python3"),
+    ("nt", r"C:\ARA-ENV", r"c:\ara-env\Scripts\python.exe",
+     r"D:\Python312\python.exe", r"C:\ARA-ENV2\Scripts\python.exe"),
+])
+def test_user_candidates_drop_only_active_environment_invocations(
+        monkeypatch, os_name, venv, active, outside, neighbor):
+    monkeypatch.setattr(pythons.os, "name", os_name)
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setattr(sys, "prefix", venv)
+    monkeypatch.setattr(sys, "base_prefix", "/base" if os_name == "posix" else r"C:\Base")
+    groups = {
+        "/real/shared": {active, outside},
+        "/real/active-only": {active.replace("python", "python3")},
+        "/real/neighbor": {neighbor},
+    }
+    monkeypatch.setattr(pythons, "_candidates", lambda: groups)
+
+    assert pythons._user_candidates() == {
+        "/real/shared": {outside},
+        "/real/neighbor": {neighbor},
+    }
+
+
+def test_user_candidates_unchanged_without_active_environment(monkeypatch):
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", "/usr/local")
+    monkeypatch.setattr(sys, "base_prefix", "/usr/local")
+    groups = {"/real/user": {"/usr/local/bin/python3"}}
+    monkeypatch.setattr(pythons, "_candidates", lambda: groups)
+    assert pythons._user_candidates() == groups
+
+
+def test_discover_and_count_filter_sys_prefix_venv_without_virtual_env(monkeypatch):
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", "/opt/ara-installed-env")
+    monkeypatch.setattr(sys, "base_prefix", "/usr/local")
+    groups = {
+        "/real/ara": {"/opt/ara-installed-env/bin/python3"},
+        "/real/user": {"/usr/local/bin/python3"},
+    }
+    monkeypatch.setattr(pythons, "_candidates", lambda: groups)
+    monkeypatch.setattr(pythons, "_user_default_real", lambda: "/real/user")
+    probed = []
+
+    def probe(real):
+        probed.append(real)
+        return "3.12.8", {"torch": None}, False
+
+    monkeypatch.setattr(pythons, "_probe", probe)
+
+    assert pythons.count() == 1
+    assert [item.real for item in pythons.discover(probe=False)] == ["/real/user"]
+    assert probed == []
+    assert [item.real for item in pythons.discover(probe=True)] == ["/real/user"]
+    assert probed == ["/real/user"]
 
 
 # --------------------------------------------------------------------------- #

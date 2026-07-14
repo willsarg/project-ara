@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from ara import cli
+from ara import cli, mlx, pythons
 from ara.detect import Accelerator, Machine, Runtime
 from ara.mlx import MlxInterpreter
 
@@ -151,6 +152,55 @@ def test_detect_runtime_explains_ready_isolated_mlx_and_absent_user_runtime(
     assert "MLX" in out and "not found" in out
     assert "no separate user Python found" in out
     assert "read-only user ecosystem probes" in out
+
+
+def test_runtime_user_fallback_excludes_active_ara_venv_torch(monkeypatch, capsys):
+    venv = "/opt/ara-env"
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setenv("PATH", os.path.join(venv, "bin"))
+    monkeypatch.setattr(pythons, "_known_patterns", lambda: [])
+    monkeypatch.setattr(
+        pythons, "_candidates",
+        lambda: {"/real/base-python": {os.path.join(venv, "bin", "python3")}},
+    )
+
+    def forbidden_probe(real):
+        raise AssertionError(f"excluded ARA interpreter was probed: {real}")
+
+    monkeypatch.setattr(pythons, "_probe", forbidden_probe)
+    machine = replace(
+        _machine(), system="Linux", backend="cpu", engine="cpu",
+        framework_python=None,
+        runtimes=[Runtime("PyTorch", False, kind="framework")],
+    )
+    monkeypatch.setattr(cli.detect, "machine", lambda: machine)
+
+    assert cli.main(["detect", "--runtime"]) == 0
+    out = capsys.readouterr().out
+    assert "no separate user Python found" in out
+    assert "torch" not in out.lower()
+
+
+def test_runtime_mlx_json_excludes_active_ara_venv_interpreter(monkeypatch, capsys):
+    venv = "/opt/ara-env"
+    monkeypatch.setenv("VIRTUAL_ENV", venv)
+    monkeypatch.setenv("PATH", os.path.join(venv, "bin"))
+    monkeypatch.setattr(
+        pythons, "_candidates",
+        lambda: {"/real/base-python": {os.path.join(venv, "bin", "python3")}},
+    )
+
+    def forbidden_probe(real):
+        raise AssertionError(f"excluded ARA interpreter was probed: {real}")
+
+    monkeypatch.setattr(mlx, "_probe", forbidden_probe)
+    monkeypatch.setattr(mlx, "mlx_community_model_count", lambda: 0)
+    monkeypatch.setattr(mlx, "lmstudio_mlx_runtimes", lambda: [])
+    monkeypatch.setattr(cli.detect, "machine", lambda: replace(_machine(), framework_python=None))
+
+    assert cli.main(["detect", "--runtime", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mlx_ecosystem"]["interpreters"] == []
 
 
 @pytest.mark.parametrize(("cores", "lmstudio", "packages", "anchors"), [
