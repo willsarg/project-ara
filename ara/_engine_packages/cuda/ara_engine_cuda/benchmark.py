@@ -12,11 +12,11 @@ torch + transformers (imported LAZILY) instead of llama.cpp.
     per-prompt refusal:  {"prompt_index": i, "refused": true, "reason": "<why>"}
     whole-run refusal:   {"context": <int>, "refused": true, "reason": "<why>"}
 
-Like ``generate``, each prompt is gated on its EFFECTIVE context (``min(ctx, prompt_tokens +
-max_tokens)``), not the raw ceiling — transformers grows the KV cache dynamically, so a one-shot
-from a short prompt only reaches that much context. The gate uses the tokenizer ONLY (no weights),
-and the weights are loaded LAZILY on the first prompt whose gate passes — so a run that can't fit
-even its first prompt never loads a byte of weights (RULE #1: refuse before load).
+Like ``generate``, each accepted prompt is gated on its exact EFFECTIVE context
+(``prompt_tokens + max_tokens``), not the raw ceiling — transformers grows the KV cache dynamically.
+Requests beyond the characterized ceiling are refused per item. The gate uses the tokenizer ONLY
+(no weights), and the weights are loaded LAZILY on the first prompt whose gate passes — so a run
+that can't fit even its first prompt never loads a byte of weights (RULE #1: refuse before load).
 
 Usage: ``python -m ara_engine_cuda.benchmark <hf_id> <ctx> --margin G --overhead G --max-tokens N``
        (the PROMPTS are a JSON array read from stdin, never argv.)
@@ -67,9 +67,9 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
     """Gate each prompt on its effective context, then (load-once) complete the ones that fit.
 
     The three whole-run guards (model in cache, causal LM, GPU visible) mirror ``generate.run`` and
-    return before any torch/transformers import. Then, for each prompt, the L4 ``safety_gate`` is
-    evaluated against ``min(ctx, prompt_tokens + max_tokens)`` — a per-prompt refusal records that
-    index and continues (it does NOT abort the run). The model is loaded LAZILY on the first prompt
+    return before any torch/transformers import. Each request beyond *ctx* is refused; otherwise,
+    the L4 ``safety_gate`` evaluates ``prompt_tokens + max_tokens``. A per-prompt refusal records
+    that index and continues (it does NOT abort the run). The model is loaded LAZILY on the first prompt
     whose gate passes (its gate already proved the weights-base fits), then reused for every later
     prompt — so the load happens at most once, and never before a gate has cleared it. Reports the
     ceiling *ctx* (consistent with the mlx/cpu/vulkan verbs), not the smaller effective context."""
@@ -89,9 +89,15 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
     tokenizer = AutoTokenizer.from_pretrained(hf_id)        # tokenizer only — no weights, no GPU
     model = None                                            # loaded lazily on the first passing gate
     results = []
+    from .generate import _count_rendered_prompt_tokens
     for i, prompt in enumerate(prompts):
-        prompt_tokens = len(tokenizer.encode(prompt))
-        effective_ctx = min(ctx, prompt_tokens + max_tokens)
+        prompt_tokens = _count_rendered_prompt_tokens(tokenizer, prompt)
+        effective_ctx = prompt_tokens + max_tokens
+        if prompt_tokens >= ctx or effective_ctx > ctx:
+            results.append({"prompt_index": i, "refused": True,
+                            "reason": f"request exceeds characterized context ceiling {ctx} "
+                                      f"(needed {effective_ctx})"})
+            continue
         reason = measure_one.safety_gate(info, limits, effective_ctx, margin_gb=margin_gb,
                                          overhead_gb=overhead_gb, live_base=limits.used_gb,
                                          kv_bits=eff_kv_bits, weight_quant=weight_quant)

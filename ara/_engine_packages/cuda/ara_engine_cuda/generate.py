@@ -12,9 +12,9 @@ discipline, but torch + transformers (imported LAZILY) instead of mlx_lm.
 
 Crucially we gate the EFFECTIVE context, not the raw ceiling. transformers/torch grow the KV cache
 dynamically during generation, so a one-shot from a short prompt only reaches
-``prompt_tokens + max_tokens`` of context — not the full ceiling. Gating the ceiling over-predicts
-memory and would refuse runs that ``characterize`` already certified. The token count uses the
-tokenizer ONLY (no model weights), so the gate runs before a single byte of weights loads (RULE #1).
+``prompt_tokens + max_tokens`` of context — not the full ceiling. A request beyond the ceiling is
+refused before load; gating the raw ceiling would over-predict memory for accepted requests. The
+token count uses the tokenizer ONLY (no model weights), so the gate runs before weights load.
 
 Usage: ``python -m ara_engine_cuda.generate <hf_id> <ctx> --margin G --overhead G --max-tokens N``
        (PROMPT is read from stdin, never argv.)
@@ -32,7 +32,7 @@ _refused = measure_one._refused
 
 
 def _count_prompt_tokens(hf_id: str, prompt: str) -> int:
-    """Prompt length in tokens via the tokenizer ONLY — no model weights touched.
+    """Rendered prompt length in tokens via the tokenizer ONLY — no model weights touched.
 
     Empty prompt short-circuits to 0 before any import, so the no-prompt case never pays the
     transformers import cost (and never needs the cache warm)."""
@@ -40,7 +40,21 @@ def _count_prompt_tokens(hf_id: str, prompt: str) -> int:
         return 0
     from transformers import AutoTokenizer  # lazy: heavy, CUDA-box-only extra
 
-    return len(AutoTokenizer.from_pretrained(hf_id).encode(prompt))
+    return _count_rendered_prompt_tokens(AutoTokenizer.from_pretrained(hf_id), prompt)
+
+
+def _render_prompt(tokenizer, prompt: str) -> str:
+    """Apply the same instruct-model chat template used by generation; base models stay raw."""
+    if getattr(tokenizer, "chat_template", None) is not None:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True, tokenize=False)
+    return prompt
+
+
+def _count_rendered_prompt_tokens(tokenizer, prompt: str) -> int:
+    """Count the exact rendered prompt form that :func:`_apply_prompt` will tokenize."""
+    return len(tokenizer.encode(_render_prompt(tokenizer, prompt)))
 
 
 def _greedy_decode(model, cache, last_logits, torch, *, max_tokens, start_pos, eos_id) -> list:
@@ -73,12 +87,8 @@ def _apply_prompt(tokenizer, prompt):
     ``BatchEncoding`` (dict-like), not a bare tensor, so ``.shape`` would crash (caught live on
     transformers 5.12.1). Rendering to a string keeps both branches identical and version-stable.
     """
-    if getattr(tokenizer, "chat_template", None) is not None:
-        text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, tokenize=False)
-        return tokenizer(text, return_tensors="pt").to("cuda").input_ids
-    return tokenizer(prompt, return_tensors="pt").to("cuda").input_ids
+    text = _render_prompt(tokenizer, prompt)
+    return tokenizer(text, return_tensors="pt").to("cuda").input_ids
 
 
 def _generate(hf_id: str, prompt: str, max_tokens: int, kv_bits: int | None = None,
@@ -136,9 +146,13 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float, max_token
         return _refused(ctx, "no NVIDIA GPU visible to nvidia-smi")
 
     eff_kv_bits = measure_one._effective_kv_bits(info, kv_bits)
-    # A one-shot only reaches prompt + new tokens of context; never gate the raw ceiling.
+    # Refuse before load if prompt + output crosses the measured wall; accepted requests are gated
+    # on their exact effective context, never the larger raw ceiling.
     prompt_tokens = _count_prompt_tokens(hf_id, prompt)
-    effective_ctx = min(ctx, prompt_tokens + max_tokens)
+    effective_ctx = prompt_tokens + max_tokens
+    if prompt_tokens >= ctx or effective_ctx > ctx:
+        return _refused(ctx, f"request exceeds characterized context ceiling {ctx} "
+                             f"(needed {effective_ctx})")
 
     live_base = limits.used_gb              # mirrors measure_one.run's exact call site
     reason = measure_one.safety_gate(info, limits, effective_ctx, margin_gb=margin_gb,

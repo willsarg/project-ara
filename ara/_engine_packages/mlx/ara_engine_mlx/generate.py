@@ -3,10 +3,10 @@
 """Governed one-shot text generation — the engine-side generate verb for ARA's `run`.
 
 Same Safety-first (Rule #1) discipline as ``measure_one``: describe the model and run the
-existing L4 safety gate *before* loading any weights. An unknown/non-causal model, or a
-gate that vetoes, refuses with no load. The gate runs at the *effective* context the
-one-shot will actually reach — ``min(ctx, prompt_tokens + max_tokens)`` — because MLX
-grows its KV cache dynamically; the ceiling ``ctx`` stays the hard cap. Prompt tokens are
+existing L4 safety gate *before* loading any weights. An unknown/non-causal model, a
+request beyond the characterized ceiling, or a gate that vetoes refuses with no load. The
+gate runs at the *effective* context the one-shot will actually reach —
+``prompt_tokens + max_tokens`` — because MLX grows its KV cache dynamically. Prompt tokens are
 counted with the tokenizer only (no weights). Only a safe (model, ctx) reaches mlx_lm. The
 prompt is read from **stdin**, never argv. Emits one JSON line:
 
@@ -80,10 +80,10 @@ def generate(hf_id: str, ctx: int, *, prompt: str, margin_gb: float,
 
     ``ctx`` is the characterized ceiling — the hard cap we never gate or generate beyond.
     But MLX grows its KV cache dynamically, so a one-shot from a short prompt only reaches
-    ``prompt_tokens + max_tokens`` of context, not the full ceiling. We therefore gate on
-    the *effective* context the run will actually reach, capped at the ceiling::
+    ``prompt_tokens + max_tokens`` of context, not the full ceiling. Requests beyond the ceiling
+    are refused before load; accepted requests are gated on the exact effective context::
 
-        effective_ctx = min(ctx, prompt_tokens + max_tokens)
+        effective_ctx = prompt_tokens + max_tokens
 
     Gating the raw ceiling here would over-predict memory and refuse runs that
     ``characterize`` already certified safe. The reported context stays the ceiling.
@@ -96,9 +96,12 @@ def generate(hf_id: str, ctx: int, *, prompt: str, margin_gb: float,
 
     # Apply the chat template (tokenizer only, no weights) then count the rendered tokens.
     # Instruct models need the template; base/completion models fall back to raw.
-    # Gate on the *effective* context the one-shot will actually reach — capped at ceiling.
+    # Refuse before load if the request would cross the characterized hard ceiling.
     prompt_input, prompt_tokens = _prepare_prompt(hf_id, prompt)
-    effective_ctx = min(ctx, prompt_tokens + max_tokens)
+    effective_ctx = prompt_tokens + max_tokens
+    if prompt_tokens >= ctx or effective_ctx > ctx:
+        return _refused(ctx, f"request exceeds characterized context ceiling {ctx} "
+                             f"(needed {effective_ctx})")
 
     # fp16 (None) unless the cache type can quantize — keeps run consistent with characterize
     # and never quantizes a RotatingKVCache model (which would crash past the quant threshold).
