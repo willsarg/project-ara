@@ -3,7 +3,7 @@
 """ARA command-line front door.
 
 ``ara`` with no arguments renders the landing screen. The full command roster —
-detect/status/apps/python/mlx recon, models/search, profile/characterize/recommend,
+detect recon, live ARA activity, models/search, profile/characterize/recommend,
 governed run/serve, benchmark, install/uninstall, hf auth, node (fleet), doctor — is
 dispatched below; an unrecognized command falls through to a clear error.
 """
@@ -18,9 +18,9 @@ from pathlib import Path
 
 import click
 
-from ara import (acquire, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
+from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
-                 staleness, status, versions)
+                 staleness, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
@@ -84,13 +84,12 @@ _RECON_SECTIONS: dict[str, tuple[str, ...]] = {
                "engines", "frameworks", "models", "apps", "ara"),
     "apps": ("runner", "image", "speech", "toolkit", "assistant", "coding"),
     "mlx": ("readiness", "libraries"),
-    "status": ("processes", "apps"),
     "python": ("interpreters",),
 }
 _SECTION_ALIASES = {
     "gpu": "accelerator", "app": "apps", "framework": "frameworks", "engine": "engines",
     "model": "models", "lib": "libraries", "libs": "libraries", "library": "libraries",
-    "ready": "readiness", "proc": "processes", "procs": "processes", "process": "processes",
+    "ready": "readiness",
     "interpreter": "interpreters", "interps": "interpreters", "interp": "interpreters",
     "runners": "runner", "toolkits": "toolkit", "assistants": "assistant",
     "models-runner": "runner",
@@ -175,7 +174,7 @@ def render_landing(c: Console) -> None:
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(c.style("dim", "                  --python · --apps · --runtime · --models · --json"))
-    c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
+    c.emit(_cmd(c, "status", "show what ARA is doing right now"))
     c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
     c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
     c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
@@ -649,76 +648,33 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# status (live recon — running AI/ML processes; never crosses the engine seam)
+# status (only ARA-owned live activity; never infers unrelated machine state)
 # --------------------------------------------------------------------------- #
-def _fmt_uptime(s: float) -> str:
-    s = int(s)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        return f"{s // 3600}h"
-    return f"{s // 86400}d"
+def _activity_text(item: activity.Activity) -> str:
+    if item.kind == "searching":
+        return "searching for models"
+    return f"{item.kind} {item.model or 'a model'}"
 
 
-def _fmt_mem(gb: float) -> str:
-    """Process RSS, MB under a gigabyte and GB above (binary, matching detect)."""
-    return f"{gb * 1024:.0f} MB" if gb < 1 else f"{gb:.1f} GB"
-
-
-def _emit_workloads(c: Console, procs) -> None:
-    """RUNNING AI/ML — local inference workloads consuming memory/GPU right now."""
-    c.emit()
-    c.emit(c.section("  RUNNING AI/ML"))
-    if not procs:
-        c.emit(c.style("dim", "  nothing running right now"))
-        c.emit()
-        return
-    for p in procs:
-        bits = [f"pid {p.pid}", f"up {_fmt_uptime(p.uptime_s)}"]
-        if p.port:
-            bits.append(f":{p.port}")
-        if p.gpu_mb:
-            bits.append(f"{p.gpu_mb:.0f} MB GPU")
-        if p.detail:
-            bits.append(p.detail)
-        c.emit(c.field(p.label, _fmt_mem(p.rss_gb), " · ".join(bits), value_role="metric"))
-    total = sum(p.rss_gb for p in procs)
-    plural = "process" if len(procs) == 1 else "processes"
-    c.emit()
-    c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
-                   value_role="good"))
-    c.emit()
-
-
-def _emit_apps(c: Console, apps_) -> None:
-    """AI APPS — running client apps (remote-API GUIs/CLIs). RSS is ordinary RAM, not ML."""
-    c.emit(c.section("  AI APPS"))
-    if not apps_:
-        c.emit(c.style("dim", "  no AI apps running right now"))
-        c.emit()
-        return
-    for a in apps_:
-        plural = "proc" if a.n_procs == 1 else "procs"
-        bits = [f"{a.n_procs} {plural}", f"up {_fmt_uptime(a.uptime_s)}"]
-        c.emit(c.field(a.label, _fmt_mem(a.rss_gb), " · ".join(bits), value_role="metric"))
-    c.emit()
-
-
-def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
-    procs, apps_ = status._scan_all()  # one process_iter pass feeds both sections
-
+def render_status(c: Console, *, as_json: bool = False) -> None:
+    activities = activity.snapshot()
     if as_json:
-        print(json.dumps({"workloads": [asdict(p) for p in procs],
-                          "apps": [asdict(a) for a in apps_]}, indent=2))
+        state = "idle" if not activities else activities[0].kind \
+            if len(activities) == 1 else "active"
+        public = [{"kind": item.kind,
+                   **({"model": item.model} if item.model is not None else {}),
+                   "pid": item.pid, "started_at": item.started_at}
+                  for item in activities]
+        print(json.dumps({"state": state, "activities": public}, indent=2))
         return
-
-    show = want or (lambda _key: True)
-    if show("processes"):
-        _emit_workloads(c, procs)
-    if show("apps"):
-        _emit_apps(c, apps_)
+    if not activities:
+        c.emit("ARA is idle.")
+    elif len(activities) == 1:
+        c.emit(f"ARA is {_activity_text(activities[0])}.")
+    else:
+        c.emit("ARA is active:")
+        for item in activities:
+            c.emit(f"  {_activity_text(item)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2708,12 +2664,12 @@ def _invoke_recon(ctx: click.Context, name: str, renderer, include: list[str],
 
 
 @_click_cli.command("status", context_settings=_HELP_SETTINGS)
-@_recon_options
+@_json_verbose_options
 @click.pass_context
-def _click_status(ctx: click.Context, include: list[str], exclude: list[str],
-                  verbose: bool, as_json: bool) -> int:
-    """Show AI and ML processes running right now."""
-    return _invoke_recon(ctx, "status", render_status, include, exclude, as_json)
+def _click_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Show what ARA is doing right now."""
+    render_status(_mark_json(ctx, as_json), as_json=as_json)
+    return 0
 
 
 @_click_cli.command("python", hidden=True, context_settings=_HELP_SETTINGS)

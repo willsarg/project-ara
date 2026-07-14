@@ -66,8 +66,7 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.detect, "accelerator",
                         lambda chip: Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16))
     monkeypatch.setattr(cli.apps, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
     monkeypatch.setattr(cli.pythons, "discover", lambda: [])
     monkeypatch.setattr(cli.pythons, "count", lambda: 0)
     monkeypatch.setattr(cli.mlx, "scan", lambda: [])
@@ -93,7 +92,7 @@ def mocked_world(monkeypatch, store):
 CONTRACT = [
     (["detect", "--json"], dict, "backend"),
     (["detect", "--models", "--json"], list, None),
-    (["status", "--json"], dict, "workloads"),
+    (["status", "--json"], dict, "state"),
     (["python", "--json"], list, None),
     (["apps", "--json"], list, None),
     (["mlx", "--json"], dict, "apple_silicon"),
@@ -237,6 +236,15 @@ def test_repeatable_include_exclude_accept_space_and_equals_forms(
         "cmd": "detect", "include": ["system", "memory", "accelerator"],
         "exclude": ["apps", "models"], "as_json": True,
     }
+
+
+@pytest.mark.parametrize("option", ["--include", "--exclude"])
+def test_status_rejects_recon_filters_as_click_usage_errors(mocked_world, capsys, option):
+    assert cli.main(["status", option, "processes"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara status" in captured.err
+    assert f"No such option '{option}'" in captured.err
 
 
 @pytest.mark.parametrize("group", ["hf", "node"])

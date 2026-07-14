@@ -54,26 +54,6 @@ def test_fmt_size(gb, out):
     assert cli._fmt_size(gb) == out
 
 
-@pytest.mark.parametrize("secs,out", [
-    (5, "5s"), (59, "59s"),
-    (60, "1m"),       # boundary: 60s rolls over to minutes (s < 60 is exclusive)
-    (90, "1m"), (3600, "1h"),
-    (86400, "1d"),    # boundary: 86400s rolls over to days (s < 86400 is exclusive)
-    (90000, "1d"),
-])
-def test_fmt_uptime(secs, out):
-    assert cli._fmt_uptime(secs) == out
-
-
-@pytest.mark.parametrize("gb,out", [
-    (0.5, "512 MB"),   # binary MB under a gigabyte
-    (1.0, "1.0 GB"),   # boundary: gb == 1 takes the GB branch (gb < 1 is exclusive)
-    (2.0, "2.0 GB"),
-])
-def test_fmt_mem(gb, out):
-    assert cli._fmt_mem(gb) == out
-
-
 # --------------------------------------------------------------------------- #
 # main(): arg parsing + dispatch
 # --------------------------------------------------------------------------- #
@@ -82,7 +62,7 @@ def _capture_dispatch(monkeypatch):
     rec = {}
     monkeypatch.setattr(cli, "render_landing", lambda c: rec.update(landing=True))
     monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False, want=None: rec.update(detect=as_json, detect_want=want))
-    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False, want=None: rec.update(status=as_json))
+    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False: rec.update(status=as_json))
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
@@ -759,67 +739,77 @@ def test_render_detect_json(monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# render_status
+# render_status — ARA-owned activity only
 # --------------------------------------------------------------------------- #
-def _proc(**over):
-    from ara.status import Proc
-    base = dict(pid=1234, label="Ollama", detail="llama3", rss_gb=2.0,
-                uptime_s=120.0, gpu_mb=None, port=11434)
+def _activity(**over):
+    from ara.activity import Activity
+    base = dict(kind="running", model="org/model", pid=1234, started_at=100.0)
     base.update(over)
-    return Proc(**base)
-
-
-def _app(**over):
-    from ara.status import AppProc
-    base = dict(label="Claude", n_procs=8, rss_gb=1.2, uptime_s=300.0)
-    base.update(over)
-    return AppProc(**base)
-
-
-def test_render_status_with_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([_proc(), _proc(pid=5, label="vLLM", rss_gb=4.0)], []))
-    c, buf = make_console()
-    cli.render_status(c)
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" in out
-    assert "Ollama" in out and "vLLM" in out
-    assert "pid 1234" in out and ":11434" in out
-    assert "total" in out and "2 processes" in out
+    return Activity(**base)
 
 
 def test_render_status_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([], []))
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
     c, buf = make_console()
     cli.render_status(c)
-    assert "nothing running right now" in buf.getvalue()
+    assert buf.getvalue() == "ARA is idle.\n"
 
 
-def test_render_status_shows_ai_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([], [_app(), _app(label="Claude Code", n_procs=1, rss_gb=0.2)]))
+@pytest.mark.parametrize("kind,model,expected", [
+    ("characterizing", "org/model", "ARA is characterizing org/model.\n"),
+    ("benchmarking", "org/model", "ARA is benchmarking org/model.\n"),
+    ("searching", None, "ARA is searching for models.\n"),
+    ("running", "org/model", "ARA is running org/model.\n"),
+    ("serving", "org/model", "ARA is serving org/model.\n"),
+])
+def test_render_status_single_activity_text(make_console, monkeypatch, kind, model, expected):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [_activity(kind=kind, model=model)])
     c, buf = make_console()
     cli.render_status(c)
-    out = buf.getvalue()
-    assert "AI APPS" in out
-    assert "Claude" in out and "Claude Code" in out
-    assert "8 procs" in out and "1 proc" in out
+    assert buf.getvalue() == expected
 
 
-def test_render_status_ai_apps_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
+def test_render_status_multiple_activities_shows_every_activity(make_console, monkeypatch):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [
+        _activity(kind="benchmarking", model="org/a", pid=1, started_at=10.0),
+        _activity(kind="serving", model="org/b", pid=2, started_at=20.0),
+    ])
     c, buf = make_console()
     cli.render_status(c)
-    assert "no AI apps running" in buf.getvalue()
+    assert buf.getvalue() == (
+        "ARA is active:\n"
+        "  benchmarking org/a\n"
+        "  serving org/b\n"
+    )
 
 
-def test_render_status_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
+@pytest.mark.parametrize("activities,state", [
+    ([], "idle"),
+    ([_activity(kind="characterizing")], "characterizing"),
+    ([_activity(kind="benchmarking")], "benchmarking"),
+    ([_activity(kind="searching", model=None)], "searching"),
+    ([_activity(kind="running")], "running"),
+    ([_activity(kind="serving")], "serving"),
+    ([_activity(), _activity(kind="serving", pid=5)], "active"),
+])
+def test_render_status_json_has_exact_state_and_activity_shape(
+        monkeypatch, capsys, activities, state):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: activities)
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_status(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["workloads"][0]["label"] == "Ollama" and payload["workloads"][0]["port"] == 11434
-    assert payload["apps"][0]["label"] == "Claude" and payload["apps"][0]["n_procs"] == 8
+    assert payload == {
+        "state": state,
+        "activities": [
+            {
+                "kind": item.kind,
+                **({"model": item.model} if item.model is not None else {}),
+                "pid": item.pid,
+                "started_at": item.started_at,
+            }
+            for item in activities
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1234,16 +1224,6 @@ def test_render_detect_frameworks_surfaced_from_other_interpreter(
     assert "ara python" in out
 
 
-def test_render_status_gpu_and_no_port(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([_proc(gpu_mb=8192.0, port=None, detail=None)], []))
-    c, buf = make_console()
-    cli.render_status(c)
-    out = buf.getvalue()
-    assert "8192 MB GPU" in out
-    assert ":" not in out.split("Ollama")[-1].split("\n")[0].replace("pid", "")
-
-
 # --------------------------------------------------------------------------- #
 # _confirm — the interactive y/N prompt
 # --------------------------------------------------------------------------- #
@@ -1640,22 +1620,6 @@ def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pyt
     cli.render_detect(c, want=lambda k: k == "system")
     out = buf.getvalue()
     assert "SYSTEM" in out and "MEMORY" not in out and "ACCELERATOR" not in out
-
-
-def test_render_status_want_excludes_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
-    c, buf = make_console()
-    cli.render_status(c, want=lambda k: k != "processes")   # workloads section filtered out
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" not in out and "AI APPS" in out  # apps section still shows
-
-
-def test_render_status_want_excludes_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
-    c, buf = make_console()
-    cli.render_status(c, want=lambda k: k != "apps")        # apps section filtered out
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" in out and "AI APPS" not in out
 
 
 def test_render_python_want_excludes_interpreters(make_console, monkeypatch):
