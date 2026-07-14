@@ -242,6 +242,18 @@ def test_main_detect_apps_facet_routes_to_render_apps(monkeypatch):
     assert "apps" in rec and "detect" not in rec
 
 
+def test_main_detect_first_facet_wins_python_then_apps(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--python", "--apps"])
+    assert "python" in rec and "apps" not in rec
+
+
+def test_main_detect_first_facet_wins_apps_then_python(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--apps", "--python"])
+    assert "apps" in rec and "python" not in rec
+
+
 def test_main_detect_runtime_facet_routes_to_render_mlx(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["detect", "--runtime"])
@@ -270,6 +282,18 @@ def test_main_status(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["status"])
     assert rec["status"] is False
+
+
+def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_model_detail",
+        lambda c, model_id, **kwargs: seen.update(model_id=model_id, **kwargs) or 0,
+    )
+    assert _run_main(monkeypatch, ["models", "org/m", "--include", "system"]) == 0
+    assert seen == {"model_id": "org/m", "as_json": False}
+    assert "--include/--exclude don't apply to 'models'" in capsys.readouterr().out
 
 
 # --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention

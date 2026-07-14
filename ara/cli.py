@@ -2601,6 +2601,21 @@ def _csv_values(_ctx: click.Context, _param: click.Parameter,
     return [item for value in values for item in _csv(value)]
 
 
+_DETECT_FACETS = {
+    "python_facet": "python",
+    "apps_facet": "apps",
+    "runtime_facet": "runtime",
+    "models_facet": "models",
+}
+
+
+def _record_detect_facet(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+    """Keep the first facet in Click's parameter-processing order (the argv order)."""
+    if value and "detect_facet" not in ctx.meta:
+        ctx.meta["detect_facet"] = _DETECT_FACETS[param.name]
+    return value
+
+
 def _json_verbose_options(func):
     func = click.option("--json", "as_json", is_flag=True,
                         help="Emit machine-readable JSON.")(func)
@@ -2655,18 +2670,23 @@ def _click_cli(ctx: click.Context, version: bool) -> int:
 
 
 @_click_cli.command("detect", context_settings=_HELP_SETTINGS)
-@click.option("--python", "facet", flag_value="python", help="Show Python interpreters.")
-@click.option("--apps", "facet", flag_value="apps", help="Show installed AI/ML apps.")
-@click.option("--runtime", "facet", flag_value="runtime", help="Show runtime readiness.")
-@click.option("--models", "facet", flag_value="models", help="Show cached models.")
+@click.option("--python", "python_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show Python interpreters.")
+@click.option("--apps", "apps_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show installed AI/ML apps.")
+@click.option("--runtime", "runtime_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show runtime readiness.")
+@click.option("--models", "models_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show cached models.")
 @_recon_options
 @click.pass_context
-def _click_detect(ctx: click.Context, facet: str | None, include: list[str],
-                  exclude: list[str], verbose: bool, as_json: bool) -> int:
+def _click_detect(ctx: click.Context, include: list[str], exclude: list[str],
+                  verbose: bool, as_json: bool) -> int:
     """Inspect this machine without loading an AI engine."""
     c = _mark_json(ctx, as_json)
     want = _resolve_want("detect", include, exclude, c, as_json=as_json) \
         if (include or exclude) else None
+    facet = ctx.meta.get("detect_facet")
     renderer = {"python": render_python, "apps": render_apps, "runtime": render_mlx,
                 "models": render_models}.get(facet, render_detect)
     renderer(c, as_json=as_json, want=want)
@@ -2726,10 +2746,10 @@ def _click_models(ctx: click.Context, model_id: str | None, include: list[str],
                   exclude: list[str], verbose: bool, as_json: bool) -> int:
     """List cached models or show one model's details."""
     c = _mark_json(ctx, as_json)
-    if model_id is not None:
-        return render_model_detail(c, model_id, as_json=as_json)
     want = _resolve_want("models", include, exclude, c, as_json=as_json) \
         if (include or exclude) else None
+    if model_id is not None:
+        return render_model_detail(c, model_id, as_json=as_json)
     render_models(c, as_json=as_json, want=want)
     return 0
 
