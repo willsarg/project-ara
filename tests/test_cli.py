@@ -2327,12 +2327,14 @@ def test_render_models_lists_catalog(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 16000,
-                                             "decode_context": None}])
+                                             "decode_context": None,
+                                             "config": {"weight_quant": "int4"}}])
     c, buf = make_console()
     cli.render_models(c)
     out = buf.getvalue()
     assert "MODEL CATALOG" in out
     assert "org/A" in out and "16000" in out
+    assert "weight-quant=int4" in out
     assert "org/B" in out and "not characterized" in out
     assert "2 cataloged" in out
 
@@ -2380,11 +2382,13 @@ def test_render_models_json(monkeypatch, capsys, store):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: [{"model_id": "org/A", "safe_context": 9000,
-                                             "decode_context": None}])
+                                             "decode_context": None,
+                                             "config": {"weight_quant": "int4"}}])
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_models(c, as_json=True)
     data = json.loads(capsys.readouterr().out)
     assert data[0]["safe_context"] == 9000
+    assert data[0]["config"] == {"weight_quant": "int4"}
 
 
 def test_render_models_json_has_characterized_flag(monkeypatch, capsys, store):
@@ -2419,8 +2423,10 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
                         lambda con: [{"model_id": "org/L", "modality": "text"}])
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")     # default engine = cuda
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    per_engine = {"cuda": [{"model_id": "org/L", "safe_context": 3500, "decode_context": None}],
-                  "cpu": [{"model_id": "org/L", "safe_context": 8192, "decode_context": None}]}
+    per_engine = {"cuda": [{"model_id": "org/L", "safe_context": 3500,
+                             "decode_context": None, "config": {}}],
+                  "cpu": [{"model_id": "org/L", "safe_context": 8192,
+                            "decode_context": None, "config": {}}]}
     monkeypatch.setattr(cli.db, "list_characterizations",
                         lambda con, mk, e: per_engine.get(e, []))
     c, buf = make_console()
@@ -2840,6 +2846,30 @@ def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, s
     assert "characterize" in buf.getvalue()
 
 
+def test_serve_mlx_refuses_ceiling_measured_with_nondefault_config(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
+        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
+    })
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
+
+
+def test_serve_mlx_explicit_ctx_still_refuses_mismatched_measurement_config(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
+        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
+    })
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", ctx=4000, assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
+
+
 # --- measured-provenance slope (2026-07-02-mlx-serve-measured-provenance-gate) -- #
 def test_measured_ramp_slope_fits_and_skips_incomplete_points():
     row = {"points": [{"context": 2000, "mem_gb": 1.5},
@@ -3107,6 +3137,33 @@ def test_run_characterized_only_on_unsupported_engine(make_console, monkeypatch)
     assert "ara characterize" not in out         # it IS characterized — don't point at characterize
 
 
+def test_run_auto_refuses_when_only_runnable_ceiling_has_different_config(
+        make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="apple",
+        chars={"mlx": {"model_id": "org/m", "safe_context": 8192,
+                       "config": {"kv_quant": "q4_0"}}},
+        supports={"apple": True})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
+
+
+def test_run_auto_skips_larger_engine_that_cannot_honor_requested_lever(
+        make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cpu",
+        chars={
+            "cpu": {"model_id": "org/m", "safe_context": 32000, "config": {}},
+            "vulkan": {"model_id": "org/m", "safe_context": 16000,
+                       "config": {"kv_quant": "q4_0"}},
+        },
+        supports={"cpu": True, "vulkan": True})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", kv_quant="q4_0", assume_yes=True) == 0
+    assert "ran on vulkan" in buf.getvalue()
+
+
 def test_run_uncharacterized_on_every_engine_refuses(make_console, monkeypatch):
     # Characterized nowhere → refuse, pointing at characterize.
     _wire_run_cross(monkeypatch, detected="apple", chars={}, supports={"cpu": True})
@@ -3267,6 +3324,21 @@ def test_weight_quant_hw_error_fp8():
     assert cli._weight_quant_hw_error(object(), "cpu", "fp8") is None       # non-cuda never reaches
 
 
+def test_measurement_config_captures_all_cuda_deviations():
+    assert cli._measurement_config(
+        "cuda", kv_quant="q8_0", flash_attn_optin=True,
+        weight_quant="int4", prefill_chunk=256,
+    ) == {
+        "kv_quant": "q8_0", "flash_attn": True,
+        "weight_quant": "int4", "prefill_chunk": 256,
+    }
+
+
+def test_legacy_nonconfigurable_measurement_remains_usable():
+    assert cli._measurement_config_error(
+        {"config": None}, {}, "cpu", "org/m") is None
+
+
 # --------------------------------------------------------------------------- #
 # characterize --engine ollama: residency ramp → measured ceiling (Slice 2)
 # Spec 2026-07-04-characterize-through-ollama-ramp
@@ -3324,28 +3396,126 @@ def test_ollama_measure_ceiling_stops_when_governance_not_taken(monkeypatch):
     assert best is None and points[0]["fit"] is False
 
 
+@pytest.mark.parametrize("size,vram", [
+    (None, 1000), (1000, None), ("1000", 1000), (1000, "1000"),
+    (True, 1000), (1000, True), (0, 0), (-1, 0), (1000, -1),
+])
+def test_ollama_measure_ceiling_rejects_unverified_residency(monkeypatch, size, vram):
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
+    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "pr", "context_length": 2048, "size": size, "size_vram": vram,
+    }])
+    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    assert best is None and points[0]["fit"] is False
+
+
+def test_cleanup_ollama_probe_unloads_verifies_then_deletes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1: calls.append(("load", name, keep_alive)) or {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
+    monkeypatch.setattr(cli.ollama, "delete",
+                        lambda name: calls.append(("delete", name)) or True)
+    assert cli._cleanup_ollama_probe("probe") is None
+    assert calls == [("load", "probe", 0), ("delete", "probe")]
+
+
+def test_cleanup_ollama_probe_reports_still_resident_and_deletes(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{"name": "probe"}])
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    assert "still resident" in cli._cleanup_ollama_probe("probe")
+    assert deleted == []
+
+
+def test_cleanup_ollama_probe_polls_until_absent_before_delete(monkeypatch):
+    states = iter([[{"name": "probe"}], [{"name": "probe:latest"}], []])
+    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: next(states))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    assert cli._cleanup_ollama_probe("probe") is None
+    assert deleted == ["probe"]
+
+
+def test_cleanup_ollama_probe_reports_api_failures(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: None)
+    monkeypatch.setattr(cli.ollama, "ps", lambda: None)
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or False)
+    error = cli._cleanup_ollama_probe("probe")
+    assert "request probe unload" in error
+    assert "verify probe unload" in error
+    assert deleted == []
+
+
+def test_cleanup_ollama_probe_reports_delete_failure_after_verified_unload(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: False)
+    assert "delete probe model" in cli._cleanup_ollama_probe("probe")
+
+
 def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
     monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: None)
 
 
-def test_characterize_ollama_measures_records_and_cleans_up(store, monkeypatch, capsys):
+def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
     _wire_char_ollama(monkeypatch)
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
                         lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
-    deleted = {}
-    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.update(n=name) or True)
     c = cli.Console.from_env()
     # a bare Ollama name (colon) must NOT be rejected as an invalid HF ref — the ollama path
     # branches before valid_model_ref.
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama", as_json=True) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["safe_context"] == 4096 and out["source"] == "measured" and out["engine"] == "ollama"
-    assert deleted["n"].endswith("-probe")                 # probe model cleaned up
     with cli.db.connected() as con:
         assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")["safe_context"] == 4096
+
+
+def test_characterize_ollama_refuses_to_store_when_cleanup_is_unverified(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", lambda *a: (4096, []))
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: "probe is still resident")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "still resident" in buf.getvalue()
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b") is None
+
+
+def test_characterize_ollama_measurement_exception_still_cleans_up(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("probe failed")))
+    cleaned = []
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: cleaned.append(probe) or None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "probe failed" in buf.getvalue()
+    assert cleaned and cleaned[0].endswith("-probe")
+
+
+def test_characterize_ollama_reports_measurement_and_cleanup_failures(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("probe failed")))
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: "probe still resident")
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "probe failed" in buf.getvalue() and "still resident" in buf.getvalue()
 
 
 def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, make_console):
@@ -3468,9 +3638,31 @@ def test_render_characterize_rejects_fp8_on_incapable_gpu(make_console, monkeypa
     assert "Ada/Hopper" in buf.getvalue()
 
 
+def test_characterize_cuda_persists_effective_sdpa_fallback_config(
+        make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cuda")
+    seen = {}
+
+    def characterize(model, *, progress=False, flash_attn=False, **kwargs):
+        seen["flash_attn_requested"] = flash_attn
+        return {"model": model, "safe_context": 4096, "decode_context": None, "points": []}
+
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        flash_attn_capable=lambda: False, characterize=characterize,
+        calibration_model_cached=lambda model: True,
+        download_calibration_model=lambda model, *, progress=False: None,
+    ))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/M", engine="cuda", flash_attn_optin=True) == 0
+    assert seen["flash_attn_requested"] is True  # backend performs the documented SDPA fallback
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mkey", "cuda", "org/M")["config"] == {}
+
+
 def test_render_run_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
     _wire_run_cross(monkeypatch, detected="cuda",
-                    chars={"cuda": {"model_id": "org/m", "safe_context": 4096}},
+                    chars={"cuda": {"model_id": "org/m", "safe_context": 4096,
+                                    "config": {"weight_quant": "fp8"}}},
                     supports={"cuda": True})
     # the fake backend must expose generate (run-selectable) + fp8_capable (False → reject fp8)
     bk = types.SimpleNamespace(generate=lambda *a, **k: {"completion": "x"},
@@ -3610,6 +3802,16 @@ def test_render_run_rejects_unsupported_lever(monkeypatch, capsys):
     assert "kv-quant" in json.loads(capsys.readouterr().out)["error"]
 
 
+def test_render_run_pinned_rejects_unsupported_lever(monkeypatch, capsys):
+    _wire_run_cross(monkeypatch, detected="cpu",
+                    chars={"cpu": {"model_id": "org/m", "safe_context": 4096}},
+                    supports={"cpu": True})
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu", as_json=True,
+                          assume_yes=True, kv_quant="q4_0") == 1
+    assert "kv-quant" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_flash_sdpa_note_warns_when_cuda_incapable(make_console):
     c, buf = make_console()
     bk = types.SimpleNamespace(flash_attn_capable=lambda: False)
@@ -3730,7 +3932,9 @@ def test_model_detail_full(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": 16000, "decode_context": None})
+                        lambda con, mk, e, mid: {
+                            "safe_context": 16000, "decode_context": None, "config": {}
+                        })
     c, buf = make_console()
     assert cli.render_model_detail(c, "org/Smol") == 0
     out = buf.getvalue()
@@ -3799,12 +4003,31 @@ def test_model_detail_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, mid: {"safe_context": 9000, "decode_context": None})
+                        lambda con, mk, e, mid: {
+                            "safe_context": 9000, "decode_context": None,
+                            "config": {"kv_quant": "q4_0"},
+                        })
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_model_detail(c, "org/A", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["model_id"] == "org/A" and data["safe_context"] == 9000
     assert data["decode_context"] is None
+    assert all(config == {"kv_quant": "q4_0"}
+               for config in data["engine_configs"].values())
+
+
+def test_model_detail_text_discloses_nondefault_measurement_config(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, mid: (
+        {"safe_context": 16000, "decode_context": None,
+         "config": {"kv_quant": "q4_0", "flash_attn": False}}
+        if e == "vulkan" else None
+    ))
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "org/A") == 0
+    assert "flash-attn=false" in buf.getvalue()
+    assert "kv-quant=q4_0" in buf.getvalue()
 
 
 def test_model_detail_reads_legacy_characterization_without_migrating(
@@ -4246,6 +4469,7 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
         "model": "org/M", "engine": "mlx", "safe_context": 2048, "decode_context": 2048,
+        "config": {},
         "calibration_error": "calibration unavailable: boom",
         "calibration_fallback": True,
     }
@@ -4401,6 +4625,17 @@ def test_render_characterize_prefetch_uncached_transformers(make_console, store,
     assert "16000" in buf.getvalue()                  # characterize result shown
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 16000               # result persisted
+
+
+def test_render_characterize_prefetch_json_stdout_is_pure(store, monkeypatch, capsys):
+    bk = FakeBackend(_limits(), cached=False)
+    bk.calibrate_result = None
+    bk.characterize = _fake_bk_characterize
+    _wire_characterize_bk(monkeypatch, bk)
+    c = cli.Console.from_env()
+    assert cli.render_characterize(c, "org/Model", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_context"] == 16000
 
 
 def test_render_characterize_prefetch_already_cached(make_console, store, monkeypatch):
@@ -5627,7 +5862,10 @@ def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "llama.cpp (Vulkan)"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000})
+                        lambda con, mk, e, m: {
+                            "safe_context": 8000,
+                            "config": {"kv_quant": "q4_0", "flash_attn": False}
+                        })
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
     def gen(model, prompt, *, max_context, max_tokens, flash_attn=True, kv_quant="f16"):
@@ -5669,6 +5907,10 @@ def test_characterize_threads_kv_quant_to_apple_backend(make_console, store, mon
     c, _ = make_console()
     assert cli.render_characterize(c, "org/m", engine="mlx", kv_quant="q8_0") == 0
     assert seen["kv_quant"] == "q8_0"
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mkey", "mlx", "org/m")["config"] == {
+            "kv_quant": "q8_0"
+        }
 
 
 def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
@@ -5678,7 +5920,9 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000})
+                        lambda con, mk, e, m: {
+                            "safe_context": 8000, "config": {"kv_quant": "q4_0"}
+                        })
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
     def gen(model, prompt, *, max_context, max_tokens, kv_quant="f16"):  # no flash_attn
@@ -5689,6 +5933,36 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
     c, _ = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", engine="mlx", kv_quant="q4_0") == 0
     assert seen["kv_quant"] == "q4_0"
+
+
+def test_run_refuses_ceiling_measured_with_different_config(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={**_CHAR, "config": {"kv_quant": "q4_0"}})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="mlx", assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
+    assert "characterize" in buf.getvalue()
+
+
+def test_run_accepts_ceiling_measured_with_same_config(make_console, monkeypatch):
+    seen = {}
+
+    def generate(*args, **kwargs):
+        seen.update(kwargs)
+        return {"completion": "ok"}
+
+    _wire_run(monkeypatch, generate=generate,
+              characterization={**_CHAR, "config": {"kv_quant": "q4_0"}})
+    c, _ = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="mlx", kv_quant="q4_0",
+                          assume_yes=True) == 0
+    assert seen["kv_quant"] == "q4_0"
+
+
+def test_run_refuses_legacy_configurable_ceiling(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={**_CHAR, "config": None})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="mlx", assume_yes=True) == 1
+    assert "predates engine-setting tracking" in buf.getvalue()
 
 
 # =========================================================================== #
@@ -6323,10 +6597,17 @@ def test_ollama_safe_ceiling_first_engine_largest(monkeypatch):
         8000, "measured", "2026-06-01T00:00:00+00:00")
 
 
-def test_ollama_safe_ceiling_second_engine_larger(monkeypatch):
+def test_ollama_safe_ceiling_does_not_transfer_vulkan_measurements(monkeypatch):
     chars = {"cpu": {"safe_context": 5000}, "vulkan": {"safe_context": 8000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (8000, "measured", None)
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (5000, "measured", None)
+
+
+def test_ollama_safe_ceiling_vulkan_only_is_none(monkeypatch):
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: (
+        {"safe_context": 8000, "config": {}} if e == "vulkan" else None
+    ))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") is None
 
 
 def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
@@ -6342,6 +6623,16 @@ def test_ollama_safe_ceiling_cuda_gguf_wins(monkeypatch):
              "cuda-gguf": {"safe_context": 12000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
     assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured", None)
+
+
+def test_ollama_safe_ceiling_skips_nondefault_vulkan_measurement(monkeypatch):
+    rows = {
+        "vulkan": {"safe_context": 16000, "config": {"kv_quant": "q4_0"}},
+        "cpu": {"safe_context": 4000, "config": {}},
+    }
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, key, model: rows.get(key))
+    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (4000, "measured", None)
 
 
 # _ollama_estimated_ceiling — engine-free fallback via Ollama's own /api/show
@@ -6713,6 +7004,29 @@ def test_render_benchmark_refuses_no_ceiling(make_console, monkeypatch):
     rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
     assert "no measured ceiling" in buf.getvalue() and "ara characterize" in buf.getvalue()
+
+
+def test_render_benchmark_refuses_ceiling_measured_with_nondefault_config(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
+        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
+    })
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
+
+
+def test_render_benchmark_explicit_ctx_still_refuses_mismatched_measurement_config(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
+        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
+    })
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+                                assume_yes=True) == 1
+    assert "different engine settings" in buf.getvalue()
 
 
 def test_render_benchmark_unsupported_backend(make_console, monkeypatch):

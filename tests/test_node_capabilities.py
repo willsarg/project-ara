@@ -231,6 +231,22 @@ def test_advertised_capabilities_from_characterizations(monkeypatch):
         _validate(cap, "https://ara.dev/wire/capability.json")
 
 
+def test_advertised_capabilities_skip_nondefault_or_unknown_configurable_rows(monkeypatch):
+    monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
+    monkeypatch.setattr(capabilities.db, "list_characterizations", lambda con, mk: [
+        {"model_id": "default", "engine": "mlx", "config": {}, "safe_context": 2048},
+        {"model_id": "q4", "engine": "mlx", "config": {"kv_quant": "q4_0"},
+         "safe_context": 4096},
+        {"model_id": "legacy-mlx", "engine": "mlx", "config": None, "safe_context": 2048},
+        {"model_id": "legacy-cpu", "engine": "cpu", "config": None, "safe_context": 2048},
+        {"model_id": "unfit", "engine": "cpu", "config": {}, "safe_context": None},
+        {"model_id": "zero", "engine": "cpu", "config": {}, "safe_context": 0},
+    ])
+    assert [cap["id"] for cap in capabilities.advertised_capabilities()] == [
+        "default", "legacy-cpu"
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # self_description() — full payload against the enroll.request contract
 # --------------------------------------------------------------------------- #

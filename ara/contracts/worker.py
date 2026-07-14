@@ -15,6 +15,7 @@ llama.cpp script); the adapter maps the engine's raw output into this canonical 
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -40,6 +41,8 @@ def parse(payload: dict) -> Measurement:
     ctx = payload.get("context")
     if not isinstance(ctx, int) or isinstance(ctx, bool):
         raise WorkerProtocolError("worker payload missing integer 'context'")
+    if ctx <= 0:
+        raise WorkerProtocolError("worker 'context' must be a positive integer")
     if payload.get("refused"):
         reason = payload.get("reason")
         if not isinstance(reason, str) or not reason:
@@ -48,4 +51,7 @@ def parse(payload: dict) -> Measurement:
     mem = payload.get("mem_gb")
     if not _is_number(mem):
         raise WorkerProtocolError("measurement needs numeric 'mem_gb'")
-    return Measurement(context=ctx, mem_gb=float(mem), refused=False, reason=None)
+    mem = float(mem)
+    if not math.isfinite(mem) or mem < 0:
+        raise WorkerProtocolError("measurement 'mem_gb' must be finite non-negative")
+    return Measurement(context=ctx, mem_gb=mem, refused=False, reason=None)

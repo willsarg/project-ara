@@ -42,11 +42,12 @@ def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
     """
     if max_context is None:
         return list(schedule)
+    if max_context <= 0:
+        return []
     rungs = {c for c in schedule if c <= max_context} | {max_context}
     if len(rungs) < 2:
         anchor = max(1, max_context // 2)
-        if anchor <= max_context:          # never add a rung above the model's own window
-            rungs.add(anchor)
+        rungs.add(anchor)                  # max_context > 0, so this never exceeds the window
     return sorted(rungs)
 
 
@@ -66,6 +67,9 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
 
     def measure_fn(ctx: int):
         m = worker.parse(measure(model, ctx))
+        if m.context != ctx:
+            raise worker.WorkerProtocolError(
+                f"worker context mismatch: requested {ctx}, returned {m.context}")
         # L2 (independent of L1's prediction): mem_gb is the model DELTA, so the ACTUAL
         # absolute footprint is ref_baseline + delta. If that reached the budget, stop
         # escalating and don't trust higher contexts — even though L1 predicted it safe.

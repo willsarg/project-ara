@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from collections.abc import Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
@@ -1009,7 +1010,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         return 1
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
-    per_engine = {}                       # engine_key -> (safe_context, decode_context, measured_at)
+    per_engine = {}              # engine_key -> (safe_context, decode_context, measured_at, config)
     with ExitStack() as stack:
         scratch = sqlite3.connect(":memory:")
         scratch.row_factory = sqlite3.Row
@@ -1021,10 +1022,10 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
             row = db.get_characterization(con, mk, key, model_id)
             if row is not None:
                 per_engine[key] = (row["safe_context"], row.get("decode_context"),
-                                   row.get("measured_at"))
+                                   row.get("measured_at"), row.get("config"))
     # Best (largest) ceiling, carrying its decode_context AND measured_at so the top-level scalars
     # and the staleness flag all describe the SAME engine — not independent max() picks.
-    best_triple = max(((sc, dc, at) for (sc, dc, at) in per_engine.values() if sc is not None),
+    best_triple = max(((sc, dc, at) for (sc, dc, at, _) in per_engine.values() if sc is not None),
                       key=lambda t: t[0], default=None)
     best = best_triple[0] if best_triple else None
     best_decode = best_triple[1] if best_triple else None
@@ -1034,7 +1035,8 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
                           "decode_context": best_decode, "stale_ceiling": best_stale,
-                          "engines": {k: sc for k, (sc, _, _) in per_engine.items()},
+                          "engines": {k: sc for k, (sc, _, _, _) in per_engine.items()},
+                          "engine_configs": {k: cfg for k, (_, _, _, cfg) in per_engine.items()},
                           "characterized": bool(per_engine)}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
@@ -1046,12 +1048,16 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
     if per_engine:                        # one ceiling line per engine that measured it
-        for key, (sc, dc, at) in per_engine.items():
+        for key, (sc, dc, at, config) in per_engine.items():
             ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
             if sc and dc and dc > sc:
                 ceiling_str += f"  · ~{dc} stream-only (est.)"
             if sc and staleness.ceiling_is_stale(model_id, at):
                 ceiling_str += "  · ⚠ stale — re-characterize"
+            if config is None:
+                ceiling_str += "  · settings unknown — re-characterize"
+            elif config:
+                ceiling_str += "  · " + _measurement_config_text(config)
             if c.verbose:
                 ceiling_str += f"  · measured {at or 'unknown'}"
             c.emit(c.field(f"{key} ceiling", ceiling_str))
@@ -1113,6 +1119,69 @@ def _kv_fa_kwargs(backend: str, *, flash_attn: bool, flash_attn_optin: bool,
     return {}
 
 
+def _measurement_config(backend: str, *, flash_attn: bool = True,
+                        flash_attn_optin: bool = False, kv_quant: str = "f16",
+                        weight_quant: str = "none",
+                        prefill_chunk: int | None = None) -> dict:
+    """Canonical non-default settings that materially define a measured ceiling."""
+    config = {}
+    if backend in {"apple", "cuda", "vulkan"} and kv_quant != "f16":
+        config["kv_quant"] = kv_quant
+    if backend == "cuda":
+        if flash_attn_optin:
+            config["flash_attn"] = True
+        if weight_quant != "none":
+            config["weight_quant"] = weight_quant
+        if prefill_chunk is not None:
+            config["prefill_chunk"] = prefill_chunk
+    elif backend == "vulkan" and not flash_attn:
+        config["flash_attn"] = False
+    return config
+
+
+def _effective_measurement_config(bk, backend: str, *, flash_attn: bool = True,
+                                  flash_attn_optin: bool = False,
+                                  kv_quant: str = "f16", weight_quant: str = "none",
+                                  prefill_chunk: int | None = None) -> dict:
+    """Normalize requested settings to the allocation path the backend will actually use."""
+    effective_flash = flash_attn_optin
+    if (backend == "cuda" and effective_flash and hasattr(bk, "flash_attn_capable")
+            and not bk.flash_attn_capable()):
+        effective_flash = False
+    return _measurement_config(
+        backend, flash_attn=flash_attn, flash_attn_optin=effective_flash,
+        kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+
+
+def _measurement_config_error(row: dict, expected: dict, backend: str,
+                              model: str) -> str | None:
+    """Refuse a ceiling whose memory-affecting settings do not match this operation."""
+    if "config" not in row:  # lightweight test/dynamic callers represent the default this way
+        actual = {}
+    else:
+        actual = row["config"]
+    if actual is None:
+        if _ENGINE_LEVERS.get(backend):
+            return (f"the measured ceiling for {model} predates engine-setting tracking — "
+                    f"re-run: ara characterize {model}")
+        return None
+    if actual != expected:
+        return (f"the measured ceiling for {model} used different engine settings "
+                f"({actual or 'defaults'}; this operation uses {expected or 'defaults'}) — "
+                f"re-run ara characterize with matching settings")
+    return None
+
+
+def _measurement_config_text(config: dict) -> str:
+    """Compact, stable disclosure for non-default measurement settings."""
+    parts = []
+    for key, value in sorted(config.items()):
+        flag = key.replace("_", "-")
+        rendered = str(value).lower() if isinstance(value, bool) else value
+        parts.append(f"{flag}={rendered}")
+    return "settings " + ", ".join(parts)
+
+
 def _flash_sdpa_note(c: Console, bk, backend: str, flash_attn_optin: bool,
                      as_json: bool) -> None:
     """Honesty (Rule #3): when the user opts into --flash-attn but this GPU can't run FA2, say so
@@ -1153,7 +1222,8 @@ def _download_prefetched_weights(c: Console, model: str, bk, size_gb: float | No
                                  *, as_json: bool, progress: bool) -> int | None:
     """Perform the actual HF download after the caller has started live tracking."""
     _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
-    c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
+    if not as_json:
+        c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
     try:
         bk.download_calibration_model(model, progress=progress)
     except Exception as exc:
@@ -1246,6 +1316,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if hw_err is not None:
         print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
         return 1
+    measured_config = _effective_measurement_config(
+        bk, sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+        kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     if c.verbose and not as_json:
         c.emit(c.field("engine", sel.engine_key, engine_label))
         c.emit(c.field("KV cache", kv_quant))
@@ -1336,11 +1409,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  model, safe_context=ceiling, points=result["points"],
-                                 decode_context=result.get("decode_context"))
+                                 decode_context=result.get("decode_context"),
+                                 config=measured_config)
         catalog.remember(con, model)
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
+                     "config": measured_config,
                      "decode_context": result.get("decode_context")}
         if calibration_error:
             out.update(calibration_error=calibration_error, calibration_fallback=True)
@@ -1410,15 +1485,15 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     return 0
 
 
-def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
-    """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key, decode_context)}``.
+def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None, dict | None]]:
+    """Best safe-context per model with its engine, decode ceiling, and measurement config.
 
     A model can be characterized under several engines on one machine (GPU + CPU); ``ara models show``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
     mk = profile.machine_key()
     default = engines.for_backend(detect.backend_name())
-    best: dict[str, tuple[int | None, str, int | None]] = {}
+    best: dict[str, tuple[int | None, str, int | None, dict | None]] = {}
     for key in dict.fromkeys([default, *engines.ENGINES]):
         if key is None:
             continue
@@ -1426,7 +1501,7 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
             mid, sc = r["model_id"], r["safe_context"]
             cur = best.get(mid)
             if cur is None or (sc is not None and (cur[0] is None or sc > cur[0])):
-                best[mid] = (sc, key, r.get("decode_context"))
+                best[mid] = (sc, key, r.get("decode_context"), r.get("config"))
     return best
 
 
@@ -1441,7 +1516,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     finally:
         cache_con.close()
 
-    best: dict[str, tuple[int | None, str, int | None]] = {}
+    best: dict[str, tuple[int | None, str, int | None, dict | None]] = {}
     if db._db_path().is_file():
         with db.connected_readonly() as stored:
             best = _best_ceilings(stored)
@@ -1452,6 +1527,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
               "safe_context": best[m["model_id"]][0] if m["model_id"] in best else None,
               "engine": best[m["model_id"]][1] if m["model_id"] in best else None,
               "decode_context": best[m["model_id"]][2] if m["model_id"] in best else None,
+              "config": best[m["model_id"]][3] if m["model_id"] in best else None,
               "characterized": m["model_id"] in best} for m in models], indent=2))
         return
 
@@ -1460,10 +1536,14 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     for m in models:
         mid = m["model_id"]
         if mid in best:                           # measured under at least one engine
-            ceiling, ekey, decode = best[mid]
+            ceiling, ekey, decode, config = best[mid]
             tail = f"~{ceiling} tokens ({ekey})" if ceiling else "no safe ceiling"
             if ceiling and decode and decode > ceiling:
                 tail = f"~{ceiling} tokens ({ekey}) · ~{decode} stream-only (est.)"
+            if config is None:
+                tail += " · settings unknown"
+            elif config:
+                tail += " · " + _measurement_config_text(config)
             role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
         else:
             tail, role = "not characterized", "dim"
@@ -1506,7 +1586,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         measured = (calibration.get_calibration(evidence_con, default_engine)
                     if default_engine is not None else None)
         lim = estimate.limits(detect.machine(), measured=measured)
-        best = _best_ceilings(evidence_con)  # model_id -> (safe_context, engine_key, decode_context)
+        best = _best_ceilings(evidence_con)  # model_id -> (safe_context, engine, decode, config)
 
         recs = []
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
@@ -1660,11 +1740,15 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         return err(f"benchmark isn't supported on the {be_name} engine")
 
     mk = profile.machine_key()
+    expected_config = _measurement_config(backend)
     with db.connected() as con:
         if ctx is not None:
             if ctx <= 0:
                 return err("--ctx must be a positive integer")
             _row = db.get_characterization(con, mk, key, model)
+            if _row and (msg := _measurement_config_error(
+                    _row, expected_config, backend, model)):
+                return err(msg)
             if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
                 return err(msg)
             safe = ctx
@@ -1674,6 +1758,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             if not row or row.get("safe_context") is None:
                 return err(f"no measured ceiling for {model} — run: ara characterize {model} "
                            f"(or pass --ctx N)")
+            if msg := _measurement_config_error(row, expected_config, backend, model):
+                return err(msg)
             safe = row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
 
@@ -1842,6 +1928,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 
     mk = profile.machine_key()
     suffix = "" if engine is None else f" --engine {sel.engine_key}"
+    requested_config = _effective_measurement_config(
+        get_backend(sel.backend), sel.backend, flash_attn=flash_attn,
+        flash_attn_optin=flash_attn_optin, kv_quant=kv_quant,
+        weight_quant=weight_quant, prefill_chunk=prefill_chunk)
 
     with db.connected() as con:
         if engine is not None:
@@ -1853,6 +1943,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if row.get("safe_context") is None:
                 return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
                            f"too big for this machine")
+            if msg := _measurement_config_error(row, requested_config, sel.backend, model):
+                return err(msg)
             engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
         else:
@@ -1863,7 +1955,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             # is never None here — resolve_engine(None) above would have raised if the detected backend
             # had no engine — so [default, *ENGINES] holds only real keys.
             default = engines.for_backend(detect.backend_name())
-            per_engine = {}                  # engine_key -> (safe_context, backend, can_run)
+            per_engine = {}                  # engine_key -> (safe_context, backend, can_run, time, row)
             for key in dict.fromkeys([default, *engines.ENGINES]):
                 row = db.get_characterization(con, mk, key, model)
                 if row is None:
@@ -1871,7 +1963,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 backend = engines.ENGINES[key]["backend"]
                 per_engine[key] = (row.get("safe_context"), backend,
                                    hasattr(get_backend(backend), "generate"),
-                                   row.get("measured_at"))
+                                   row.get("measured_at"), row)
             if not per_engine:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
                            f"ara characterize {model}")
@@ -1879,8 +1971,43 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if not fitted:
                 return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
                            f"too big for this machine")
-            runnable = {k: v for k, v in fitted.items() if v[2]}
+            lever_supported = {
+                k: v for k, v in fitted.items()
+                if v[2] and _unsupported_lever_error(
+                    v[1], kv_quant=kv_quant, flash_attn=flash_attn,
+                    flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                    prefill_chunk=prefill_chunk) is None
+            }
+            runnable = {
+                k: v for k, v in lever_supported.items()
+                if _measurement_config_error(
+                    v[4], _effective_measurement_config(
+                        get_backend(v[1]), v[1], flash_attn=flash_attn,
+                        flash_attn_optin=flash_attn_optin,
+                        kv_quant=kv_quant, weight_quant=weight_quant,
+                        prefill_chunk=prefill_chunk), v[1], model) is None
+            }
             if not runnable:
+                mismatches = [
+                    _measurement_config_error(
+                        v[4], _effective_measurement_config(
+                            get_backend(v[1]), v[1], flash_attn=flash_attn,
+                            flash_attn_optin=flash_attn_optin,
+                            kv_quant=kv_quant, weight_quant=weight_quant,
+                            prefill_chunk=prefill_chunk), v[1], model)
+                    for v in lever_supported.values()
+                ]
+                if any(mismatches):
+                    return err(next(msg for msg in mismatches if msg is not None))
+                lever_errors = [
+                    _unsupported_lever_error(
+                        v[1], kv_quant=kv_quant, flash_attn=flash_attn,
+                        flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                        prefill_chunk=prefill_chunk)
+                    for v in fitted.values() if v[2]
+                ]
+                if any(lever_errors):
+                    return err(next(msg for msg in lever_errors if msg is not None))
                 # Characterized + fits, but only on engine(s) ARA can't run through yet (apple/cuda).
                 # Be honest about that — don't masquerade as uncharacterized.
                 where = ", ".join(fitted)
@@ -1888,7 +2015,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                            f"that engine yet")
             # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
             engine_key = max(runnable, key=lambda k: runnable[k][0])
-            safe, backend, _, ceiling_measured_at = runnable[engine_key]
+            safe, backend, _, ceiling_measured_at, _ = runnable[engine_key]
 
     stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
@@ -1945,7 +2072,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # --------------------------------------------------------------------------- #
 # Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
 # engines transfers; the MLX ceiling does NOT (different allocation model — the seam mismatch).
-_OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "vulkan", "cuda-gguf")
+_OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "cuda-gguf")
 
 
 def _ollama_safe_ceiling(con, mk: str, model: str):
@@ -1955,7 +2082,9 @@ def _ollama_safe_ceiling(con, mk: str, model: str):
     best = None
     for key in _OLLAMA_CEILING_ENGINES:
         row = db.get_characterization(con, mk, key, model)
-        if (row and row.get("safe_context") is not None
+        config = row.get("config", {}) if row else None
+        config_matches = config in ({}, None)
+        if (row and config_matches and row.get("safe_context") is not None
                 and (best is None or row["safe_context"] > best[0])):
             best = (row["safe_context"], "measured", row.get("measured_at"))
     return best
@@ -2037,12 +2166,39 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
             points.append({"context": ctx, "fit": False})
             break
         size, vram = entry.get("size"), entry.get("size_vram")
-        spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
-        points.append({"context": ctx, "fit": not spilled, "size": size, "size_vram": vram})
-        if spilled:                                   # hit the wall — a higher rung can't recover
+        residency_verified = (
+            isinstance(size, int) and not isinstance(size, bool) and size > 0
+            and isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0
+        )
+        fit = residency_verified and vram >= size
+        points.append({"context": ctx, "fit": fit, "size": size, "size_vram": vram})
+        if not fit:                                   # hit/failed to verify the wall — stop safely
             break
         best = ctx
     return best, points
+
+
+def _cleanup_ollama_probe(probe: str) -> str | None:
+    """Unload, verify absence, then delete a characterization probe; return any cleanup error."""
+    errors = []
+    if ollama.load(probe, keep_alive=0) is None:
+        errors.append("couldn't request probe unload")
+    absent = False
+    for attempt in range(10):
+        entries = ollama.ps()
+        if entries is None:
+            errors.append("couldn't verify probe unload")
+            break
+        if _find_loaded(entries, probe) is None:
+            absent = True
+            break
+        if attempt < 9:
+            time.sleep(0.1)
+    if not absent and not any("verify" in error for error in errors):
+        errors.append("probe is still resident after unload")
+    if absent and not ollama.delete(probe):
+        errors.append("couldn't delete probe model")
+    return "; ".join(errors) if errors else None
 
 
 def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int:
@@ -2070,11 +2226,22 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         c.emit(c.field("model limit", f"{max_ctx} tokens", "architecture maximum"))
 
     probe = _governed_name(model) + "-probe"
+    cleanup_error = None
+    measurement_error = None
     with activity.track("characterizing", model):
         try:
             best, points = _ollama_measure_ceiling(model, max_ctx, probe)
+        except (SystemExit, Exception) as exc:
+            measurement_error = exc
         finally:
-            ollama.delete(probe)                      # never leave the throwaway probe behind
+            cleanup_error = _cleanup_ollama_probe(probe)
+    if measurement_error is not None:
+        msg = f"Ollama characterization failed: {measurement_error}"
+        if cleanup_error:
+            msg += f"; probe cleanup also failed: {cleanup_error}"
+        return err(msg)
+    if cleanup_error:
+        return err(f"Ollama probe cleanup failed: {cleanup_error}")
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None)
@@ -2149,11 +2316,15 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
         return 1
 
     mk = profile.machine_key()
+    expected_config = _measurement_config("apple", kv_quant=kv_quant)
     with db.connected() as con:
         if ctx is not None:
             if ctx <= 0:
                 return err("--ctx must be a positive integer")
             _row = db.get_characterization(con, mk, engine_key, model)
+            if _row and (msg := _measurement_config_error(
+                    _row, expected_config, "apple", model)):
+                return err(msg)
             if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
                 return err(msg)
             safe, source = ctx, "requested"
@@ -2164,6 +2335,8 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
             if not row or row.get("safe_context") is None:
                 return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
                            f"(or pass --ctx N).")
+            if msg := _measurement_config_error(row, expected_config, "apple", model):
+                return err(msg)
             safe, source = row["safe_context"], "measured"
             ceiling_measured_at = row.get("measured_at")
             # Serving the model's OWN measured ceiling: fit the real ramp slope so the pre-load gate

@@ -324,6 +324,40 @@ def test_list_characterizations_includes_decode_context(store):
     assert by_id["b"]["decode_context"] is None
 
 
+def test_characterization_round_trips_measurement_config(store):
+    db.save_characterization(
+        store, "m", "mlx", "org/model", safe_context=8192, points=[],
+        config={"kv_quant": "q4_0"},
+    )
+    row = db.get_characterization(store, "m", "mlx", "org/model")
+    assert row["config"] == {"kv_quant": "q4_0"}
+    assert json.loads(row["config_json"]) == {"kv_quant": "q4_0"}
+
+
+def test_characterization_defaults_to_default_measurement_config(store):
+    db.save_characterization(store, "m", "cpu", "org/model",
+                             safe_context=8192, points=[])
+    assert db.get_characterization(store, "m", "cpu", "org/model")["config"] == {}
+
+
+def test_legacy_characterization_config_remains_unknown(tmp_path, monkeypatch):
+    path = tmp_path / "legacy-config.db"
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    INSERT INTO characterizations VALUES ('m', 'mlx', 'org/model', 8192, NULL, '[]', 'then');
+    """)
+    con.close()
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    with db.connected() as migrated:
+        row = db.get_characterization(migrated, "m", "mlx", "org/model")
+        assert row["config"] is None
+
+
 def test_migration_adds_decode_context_column_to_old_schema(tmp_path, monkeypatch):
     """An existing DB without decode_context gets the column after connect()."""
     import sqlite3 as _sqlite3
@@ -541,7 +575,10 @@ def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monk
          '[[512, 3.25], [4096, 7.5]]', "2026-03-02"),
         ("cuda-machine", "cuda", "org/cuda-model", None, 8192, None, None),
     ]
-    con.executemany("INSERT INTO characterizations VALUES (?,?,?,?,?,?,?)", characterizations)
+    con.executemany(
+        "INSERT INTO characterizations (machine_key, engine, model_id, safe_context, "
+        "decode_context, points_json, measured_at) VALUES (?,?,?,?,?,?,?)",
+        characterizations)
     con.commit()
     con.close()
 
@@ -572,7 +609,10 @@ def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_pa
         ("collision", "wcx", "b", 100, 101, '["legacy"]', "2026-01-01"),
         ("collision", "cuda", "b", 200, 202, '["complete-winner"]', "2026-02-01"),
     ]
-    con.executemany("INSERT INTO characterizations VALUES (?,?,?,?,?,?,?)", characterizations)
+    con.executemany(
+        "INSERT INTO characterizations (machine_key, engine, model_id, safe_context, "
+        "decode_context, points_json, measured_at) VALUES (?,?,?,?,?,?,?)",
+        characterizations)
     con.execute(
         "INSERT INTO benchmark_results (machine_key, model_id, use_case, engine_key, score, source, measured_at) "
         "VALUES ('m','model','coding','wcx',1.0,'wcx probe','2026-01-01')")

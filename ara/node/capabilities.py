@@ -112,10 +112,16 @@ def advertised_capabilities() -> list[dict]:
     #1: report only what we've empirically measured). Empty when nothing is characterized yet."""
     with db.connected() as con:
         rows = db.list_characterizations(con, profile.machine_key())
+    configurable = {"mlx", "cuda", "vulkan"}
     return [
         {"kind": "serve_model", "id": row["model_id"], "engine": row["engine"],
          "evidence": "characterized"}
         for row in rows
+        if (isinstance(row.get("safe_context"), int)
+            and not isinstance(row["safe_context"], bool) and row["safe_context"] > 0
+            and (row.get("config", {}) == {}
+            or (row.get("config") is None and row["engine"] not in configurable))
+            )
     ]
 
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from ara import catalog
-from ara.contracts import driver
+from ara.contracts import driver, worker
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +129,16 @@ def test_l2_stops_when_measured_reaches_budget():
     # each over-budget rung BEFORE it's appended, so nothing is recorded. Without L2 both rungs
     # would land here as (2000, 40.0)/(4000, 40.0). This assertion is what ties the test to L2.
     assert r["points"] == []
+
+
+def test_rejects_worker_response_for_a_different_context():
+    est = _est(max_context=4096)
+    with pytest.raises(worker.WorkerProtocolError, match="requested 2000.*returned 1"):
+        driver.characterize(
+            "org/model", preflight=lambda m: est,
+            measure=lambda m, ctx: {"context": 1, "mem_gb": 1.0},
+            schedule=[2000, 4096],
+        )
 
 
 def test_null_safe_context_includes_stopped_reason_and_preflight():
