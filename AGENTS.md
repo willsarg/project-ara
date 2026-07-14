@@ -31,11 +31,10 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
 
 - **Well-scoped tools.** Each command does one clear job with a predictable boundary:
   - `detect` — **read-only recon**. Observes the machine; never stresses, benchmarks, or
-    loads an ML engine.
-  - `status` — running AI/ML processes, right now.
-  - `python` — every interpreter + its AI libraries + install cautions.
-  - `apps` — installed AI/ML apps, versions, source, and Homebrew drift.
-  - `mlx` — the MLX ecosystem + Apple readiness.
+    loads an ML engine. Its `--python`, `--apps`, `--runtime`, and `--models` facets report
+    interpreter/library inventory, installed apps, runtime/backend readiness, and physical model
+    caches respectively.
+  - `status` — live ARA-owned activity, right now; never a generic process monitor.
   - `profile` — **engine-free** analytic capability assessment: estimates the safe memory
     budget from recon facts; never loads an engine or a model.
   - `characterize` — **the command that measures**: opt-in; crosses the seam into the engine to
@@ -46,17 +45,32 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
     proves a model *fits*, `benchmark` measures how *well* it performs. `--max-tokens N` lifts the
     generation cap for thinking models. Coding is execution-consent-gated (and sandboxed only where
     a sandbox exists — macOS Seatbelt; skipped on un-sandboxable hosts).
-  - `recommend` — ranks cached models that fit this machine's budget, by estimated usable context
+  - `models recommend` — ranks cached models that fit this machine's budget, by estimated usable context
     (and measured capability, where `benchmark` has run, via `--use-case`).
   - `run` — governed one-shot inference, capped under the measured safe ceiling (CPU · MLX · CUDA).
   - `serve` — governed OpenAI-compatible endpoint, capped under the measured ceiling (on Ollama / MLX).
-  - `models` / `search` — catalog cached models (with measured ceilings) / search the HF Hub.
+  - `models show` / `models search` — inspect one model (with measured ceilings) / search the HF Hub.
   - `hf login` / `logout` / `status` — manage the Hugging Face token (needed for gated models). An
     **action** command (writes the standard HF token store, so every fetch + worker reads it), not
     recon; verifies via the Hub and never prints the token.
 - **Broad compatibility.** Cover the open-source AI ecosystem widely — engines (MLX,
   llama.cpp, Ollama, LM Studio, vLLM), model stores (HF, Ollama, LM Studio, Jan, GPT4All),
   frameworks (PyTorch, transformers, TensorFlow), and apps — not one vendor's corner.
+
+### Frozen public command tree
+
+The visible tree is `detect` (facets `--python`, `--apps`, `--runtime`, `--models`), `profile`,
+`status`, `models {search,recommend,show}`, `run`, `serve`, `characterize`, `benchmark`, `install`,
+`uninstall`, `node {enroll,install,run,start,status,stop,uninstall}`,
+`hf {login,logout,status}`, and `doctor`.
+`models list` is deferred. `status` reports only live ARA-owned activity; it is not a generic
+process monitor. `detect --runtime` reports common runtime/backend inventory on every platform and
+adds MLX ecosystem detail only on Apple Silicon.
+
+For one compatibility release, top-level `python`, `apps`, `mlx`, `search`, and `recommend`, plus
+`models MODEL`, remain hidden aliases with deprecation warnings. New code and docs use only the
+canonical tree. The console script `ara` and `python -m ara` share the one blessed main; production
+subprocesses and service templates use `python -m ara`, never the internal `ara.cli` module.
 
 ## The architecture boundary (don't break this)
 

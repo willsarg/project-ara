@@ -28,8 +28,8 @@ def test_run_cli_success_parses_json(monkeypatch):
 
     monkeypatch.setattr(wiring.subprocess, "run", fake_run)
     assert wiring._run_cli(["detect"]) == {"ok": True}
-    # The boundary always runs the module CLI and appends --json itself.
-    assert captured["cmd"] == [sys.executable, "-m", "ara.cli", "detect", "--json"]
+    # The boundary always runs the canonical module CLI and appends --json itself.
+    assert captured["cmd"] == [sys.executable, "-m", "ara", "detect", "--json"]
 
 
 def test_run_cli_nonzero_exit_returns_error_dict(monkeypatch):
@@ -66,43 +66,43 @@ def test_characterize_worker_builds_args(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._characterize({"model": "org/m"})
-    assert seen["a"] == ["characterize", "org/m"]
+    assert seen["a"] == ["characterize", "--", "org/m"]
 
 
 def test_characterize_worker_with_engine(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._characterize({"model": "org/m", "engine": "cpu"})
-    assert seen["a"] == ["characterize", "org/m", "--engine", "cpu"]
+    assert seen["a"] == ["characterize", "--engine", "cpu", "--", "org/m"]
 
 
 def test_run_worker_builds_args_with_engine_and_prompt(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._run({"model": "org/m", "engine": "cuda", "prompt": "hello world"})
-    assert seen["a"] == ["run", "org/m", "--engine", "cuda", "--yes", "hello world"]
+    assert seen["a"] == ["run", "--engine", "cuda", "--yes", "--", "org/m", "hello world"]
 
 
 def test_run_worker_without_optional_fields(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._run({"model": "org/m"})
-    assert seen["a"] == ["run", "org/m", "--yes"]
+    assert seen["a"] == ["run", "--yes", "--", "org/m"]
 
 
 def test_serve_worker_full_args(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._serve({"model": "org/m", "engine": "cpu", "ctx": 4096, "name": "svc"})
-    assert seen["a"] == ["serve", "org/m", "--engine", "cpu", "--ctx", "4096",
-                         "--name", "svc", "--yes"]
+    assert seen["a"] == ["serve", "--engine", "cpu", "--ctx", "4096",
+                         "--name", "svc", "--yes", "--", "org/m"]
 
 
 def test_serve_worker_minimal(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._serve({"model": "org/m"})
-    assert seen["a"] == ["serve", "org/m", "--yes"]
+    assert seen["a"] == ["serve", "--yes", "--", "org/m"]
 
 
 def test_benchmark_worker_full_args(monkeypatch):
@@ -110,8 +110,9 @@ def test_benchmark_worker_full_args(monkeypatch):
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._benchmark({"model": "org/m", "use_case": "coding", "engine": "cuda",
                        "ctx": 8192, "max_tokens": 512, "exec_consent": True})
-    assert seen["a"] == ["benchmark", "org/m", "--use-case", "coding", "--engine", "cuda",
-                         "--ctx", "8192", "--max-tokens", "512", "--exec-consent", "--yes"]
+    assert seen["a"] == ["benchmark", "--use-case", "coding", "--engine", "cuda",
+                         "--ctx", "8192", "--max-tokens", "512", "--exec-consent", "--yes",
+                         "--", "org/m"]
 
 
 def test_benchmark_worker_minimal_no_exec_consent(monkeypatch):
@@ -119,7 +120,20 @@ def test_benchmark_worker_minimal_no_exec_consent(monkeypatch):
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
     wiring._benchmark({"model": "org/m", "use_case": "rag"})
     # --exec-consent is never auto-added; the gate stays intact.
-    assert seen["a"] == ["benchmark", "org/m", "--use-case", "rag", "--yes"]
+    assert seen["a"] == ["benchmark", "--use-case", "rag", "--yes", "--", "org/m"]
+
+
+def test_run_cli_inserts_json_before_end_of_options_separator(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, capture_output, text):
+        captured["cmd"] = cmd
+        return _FakeProc(0, stdout="{}")
+
+    monkeypatch.setattr(wiring.subprocess, "run", fake_run)
+    wiring._run_cli(["run", "--yes", "--", "org/m", "--prompt-like-text"])
+    assert captured["cmd"] == [sys.executable, "-m", "ara", "run", "--yes", "--json", "--",
+                               "org/m", "--prompt-like-text"]
 
 
 def test_default_workers_keys():

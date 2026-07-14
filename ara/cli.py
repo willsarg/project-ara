@@ -176,12 +176,12 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(c.style("dim", "                  --python · --apps · --runtime · --models · --json"))
     c.emit(_cmd(c, "status", "show what ARA is doing right now"))
-    c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
-    c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
+    c.emit(_cmd(c, "models search", "find models on the Hugging Face Hub"))
+    c.emit(_cmd(c, "detect --models", "catalog models physically cached on this machine"))
     c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "estimate this machine's capability (analytic — no engine)"))
-    c.emit(_cmd(c, "recommend", "catalog models that fit, ranked by usable context"))
+    c.emit(_cmd(c, "models recommend", "catalog models that fit, ranked by usable context"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
@@ -551,7 +551,8 @@ def _det_ara(c: Console, m) -> None:
     c.emit(c.field("hf cli",
                    ("not found" if not m.hf_cli
                     else f"present {m.hf_cli_version}" if m.hf_cli_version else "present"),
-                   "the hf command" if m.hf_cli else "pip install huggingface_hub",
+                   "the hf command" if m.hf_cli else
+                   "missing from ARA's environment — source checkout: uv sync --frozen",
                    value_role="good" if m.hf_cli else "dim"))
     c.emit(c.field("hf token", "present" if m.hf_token else "none",
                    None if m.hf_token else "needed for gated models",
@@ -588,6 +589,68 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     for key, fn in _DETECT_RENDERERS:
         if want(key):
             fn(c, m)
+
+
+def _mlx_runtime_detail(m) -> dict:
+    """Observed Apple-only MLX ecosystem detail for the common runtime report."""
+    interps = mlx.scan()
+    return {
+        "gpu": {"name": m.accel.name, "cores": m.accel.cores},
+        "mlx_community_models": mlx.mlx_community_model_count(),
+        "lmstudio_mlx_runtimes": mlx.lmstudio_mlx_runtimes(),
+        "interpreters": [
+            {"path": item.path, "origin": item.origin, "version": item.version,
+             "packages": item.packages}
+            for item in interps
+        ],
+    }
+
+
+def render_runtime(c: Console, *, as_json: bool = False, want=None) -> None:
+    """Cross-platform runtime/backend inventory; MLX ecosystem detail is Darwin-only.
+
+    This is recon over :func:`detect.machine` plus the existing read-only MLX probes. It never
+    resolves, imports, installs, or loads a hardware engine.
+    """
+    del want  # Facet reports one fixed inventory; include/exclude belong to the full detect report.
+    m = detect.machine()
+    apple_mlx = m.system == "Darwin" and m.accel.kind == "apple"
+    detail = _mlx_runtime_detail(m) if apple_mlx else None
+    if as_json:
+        payload = {
+            "system": m.system,
+            "backend": m.backend,
+            "engine": m.engine,
+            "engine_ready": m.engine_ready,
+            "runtimes": [asdict(runtime) for runtime in m.runtimes],
+        }
+        if detail is not None:
+            payload["mlx"] = detail
+        print(json.dumps(payload, indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  RUNTIME"))
+    c.emit(c.field("backend", m.backend, "selected from observed hardware"))
+    c.emit(c.field("ARA engine", m.engine,
+                   "ready" if m.engine_ready else "not installed",
+                   value_role="good" if m.engine_ready else "warn"))
+    c.emit()
+    _det_engines(c, m)
+    _det_frameworks(c, m)
+    if detail is not None:
+        c.emit(c.section("  MLX ECOSYSTEM") + c.style("dim", "  (Apple Silicon)"))
+        gpu = detail["gpu"]
+        cores = f"{gpu['cores']}-core Metal" if gpu["cores"] else "Metal"
+        c.emit(c.field("GPU", gpu["name"], cores))
+        c.emit(c.field("models", f"{detail['mlx_community_models']} cached",
+                       "mlx-community models in the HF cache"))
+        runtimes = detail["lmstudio_mlx_runtimes"]
+        c.emit(c.field("LM Studio", f"MLX runtime {runtimes[0]}" if runtimes else "not found"))
+        packages = sorted({name for item in detail["interpreters"]
+                           for name in item["packages"]})
+        c.emit(c.field("libraries", " · ".join(packages) if packages else "none found"))
+        c.emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -791,8 +854,8 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
         c.emit(c.style("dim", "  LIBRARIES"))
         if not interps:
             c.emit("  " + c.style("dim", "No MLX packages installed in any interpreter."))
-            c.emit("  " + c.style("dim", "Install into a venv, e.g. ")
-                   + c.style("accent", "pip install mlx-lm"))
+            c.emit("  " + c.style("dim", "Use a uv-managed project environment, e.g. ")
+                   + c.style("accent", "uv add mlx-lm"))
         else:
             present: set[str] = set()
             for mi in interps:
@@ -1258,12 +1321,12 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     with activity.track("searching"):
         results = hub.search(query)
     if results is None:
+        msg = ("couldn't search — check your connection and the hf command; in a source checkout, "
+               "repair ARA with `uv sync --frozen`, then `uv run ara models search`")
         if as_json:
-            print(json.dumps({"error": "couldn't search — is the hf CLI installed? "
-                                       "(pip install huggingface_hub)"}))
+            print(json.dumps({"error": msg}))
         else:
-            c.emit(c.style("warn", "  couldn't search — is the hf CLI installed? ")
-                   + c.style("accent", "pip install huggingface_hub"))
+            c.emit(c.style("warn", f"  {msg}"))
         return 1
     if as_json:
         print(json.dumps(results, indent=2))
@@ -2706,7 +2769,8 @@ def _click_cli(ctx: click.Context, version: bool) -> int:
     return 0
 
 
-@_click_cli.command("detect", context_settings=_HELP_SETTINGS)
+@_click_cli.command("detect", context_settings=_HELP_SETTINGS,
+                    epilog="Examples:\n\n\b\n  ara detect --runtime\n  ara detect --runtime --json")
 @click.option("--python", "python_facet", is_flag=True, expose_value=False,
               callback=_record_detect_facet, help="Show Python interpreters.")
 @click.option("--apps", "apps_facet", is_flag=True, expose_value=False,
@@ -2724,7 +2788,7 @@ def _click_detect(ctx: click.Context, include: list[str], exclude: list[str],
     want = _resolve_want("detect", include, exclude, c, as_json=as_json) \
         if (include or exclude) else None
     facet = ctx.meta.get("detect_facet")
-    renderer = {"python": render_python, "apps": render_apps, "runtime": render_mlx,
+    renderer = {"python": render_python, "apps": render_apps, "runtime": render_runtime,
                 "models": render_models}.get(facet, render_detect)
     renderer(c, as_json=as_json, want=want)
     return 0
@@ -2812,7 +2876,8 @@ def _click_models(ctx: click.Context) -> int:
     return 0
 
 
-@_click_models.command("search", context_settings=_HELP_SETTINGS)
+@_click_models.command("search", context_settings=_HELP_SETTINGS,
+                       epilog='Example:\n  ara models search "small vision model" --json')
 @click.argument("query", nargs=-1, required=True)
 @_json_verbose_options
 @click.pass_context
@@ -2894,7 +2959,8 @@ def _click_recommend(ctx: click.Context, use_case: str | None,
     return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
 
 
-@_click_cli.command("run", context_settings=_HELP_SETTINGS)
+@_click_cli.command("run", context_settings=_HELP_SETTINGS,
+                    epilog='Example:\n  ara run org/model "Explain this" --json')
 @click.argument("model")
 @click.argument("prompt", nargs=-1, required=False)
 @_engine_option
@@ -3038,13 +3104,15 @@ def _click_node() -> None:
     """Run or manage the push-only ARA node daemon."""
 
 
-@_click_node.command("enroll", context_settings=_HELP_SETTINGS)
+@_click_node.command("enroll", context_settings=_HELP_SETTINGS,
+                     epilog="Example:\n  ara node enroll https://ara.example --token TOKEN")
 @click.argument("server_url")
 @click.option("--token", required=True, help="One-time coordinator enrollment token.")
 @_json_verbose_options
 @click.pass_context
 def _click_node_enroll(ctx: click.Context, server_url: str, token: str,
                        verbose: bool, as_json: bool) -> int:
+    """Enroll this node with a coordinator."""
     return render_node(_mark_json(ctx, as_json), ["node", "enroll", server_url],
                        token=token, as_json=as_json)
 
@@ -3136,5 +3204,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise
 
 
-if __name__ == "__main__":   # pragma: no cover — so `python -m ara.cli ...` works (node wiring shells out this way)
+if __name__ == "__main__":   # pragma: no cover — compatibility only; production uses `python -m ara`
     sys.exit(main())

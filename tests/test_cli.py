@@ -65,6 +65,7 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_status", lambda c, as_json=False: rec.update(status=as_json))
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
+    monkeypatch.setattr(cli, "render_runtime", lambda c, as_json=False, want=None: rec.update(runtime=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
@@ -234,10 +235,10 @@ def test_main_detect_first_facet_wins_apps_then_python(monkeypatch):
     assert "apps" in rec and "python" not in rec
 
 
-def test_main_detect_runtime_facet_routes_to_render_mlx(monkeypatch):
+def test_main_detect_runtime_facet_routes_to_cross_platform_runtime_report(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["detect", "--runtime"])
-    assert "mlx" in rec and "detect" not in rec
+    assert "runtime" in rec and "detect" not in rec and "mlx" not in rec
 
 
 def test_main_detect_models_facet_routes_to_render_models(monkeypatch):
@@ -2682,7 +2683,7 @@ def test_render_search_hf_missing(make_console, monkeypatch):
     monkeypatch.setattr(cli.hub, "search", lambda q: None)
     c, buf = make_console()
     assert cli.render_search(c, "x") == 1
-    assert "hf CLI" in buf.getvalue()
+    assert "hf command" in buf.getvalue() and "uv sync --frozen" in buf.getvalue()
 
 
 def test_render_search_json(monkeypatch, capsys):

@@ -56,7 +56,7 @@ def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     service.install()
     unit = tmp_path / "sd" / "ara-node.service"
     text = unit.read_text()
-    assert f"ExecStart={service.sys.executable} -m ara.cli node run" in text   # push-only agent loop
+    assert f"ExecStart={service.sys.executable} -m ara node run" in text   # push-only agent loop
     assert "Type=notify" in text                             # watchdog needs sd_notify handshake
     assert f"WatchdogSec={service.WATCHDOG_SEC}" in text
     assert "WantedBy=default.target" in text

@@ -60,9 +60,9 @@ WATCHDOG_SEC = 30
 def _unit_text() -> str:
     """The systemd unit for the push-only node. ExecStart runs the phone-home agent loop
     (``ara node run``) — the loop that pets systemd's watchdog via sd_notify, hence ``Type=notify``
-    and ``WatchdogSec``. ExecStart uses the *current* interpreter (``sys.executable -m ara.cli``) so
-    it points at whichever venv ARA is installed in — a pip ``--user`` install, a uv project venv, a
-    conda env — rather than assuming a fixed ``~/.local/bin/ara`` that may not exist there."""
+    and ``WatchdogSec``. ExecStart uses the *current* interpreter (``sys.executable -m ara``) so
+    it points at whichever uv-managed environment ARA is installed in rather than assuming a fixed
+    ``~/.local/bin/ara`` that may not exist there."""
     return (
         "[Unit]\n"
         "Description=ARA node daemon\n"
@@ -71,7 +71,7 @@ def _unit_text() -> str:
         "\n"
         "[Service]\n"
         "Type=notify\n"
-        f"ExecStart={sys.executable} -m ara.cli node run\n"
+        f"ExecStart={sys.executable} -m ara node run\n"
         f"WatchdogSec={WATCHDOG_SEC}\n"
         "Restart=on-failure\n"
         "\n"

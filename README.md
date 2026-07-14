@@ -58,30 +58,39 @@ No arguments shows what ARA can do for this machine. Everything below is a subco
 The hardware engine isn't a dependency — `ara install` adds it on demand, so `uv sync`
 stays lean and works the same on every platform.
 
+Use `ara detect --runtime` for cross-platform runtime/backend readiness and
+`ara detect --runtime --json` for its machine-readable form.
+
+The installed `ara` console script and `python -m ara` are the two supported spellings of the
+same production entrypoint. In a checkout, prefix either with `uv run`.
+
 ---
 
 ## 🔭 Commands
 
 | Command | What it does |
 |---|---|
-| `ara detect` | Read-only machine recon: chip, memory, accelerator, storage, **engines** (what can launch models), **frameworks** (your Python's AI libs), **models** (HF / Ollama / LM Studio / Jan / GPT4All), and an **AI/ML apps** summary. Never stresses the machine or loads an engine. |
-| `ara status` | Live view of AI/ML processes running *right now* — what's holding memory before you launch something. |
-| `ara python` | Every Python interpreter on the system (macOS / Homebrew / python.org / pyenv / conda / uv / asdf), which has which AI libraries, and which you shouldn't `pip install` into. |
-| `ara apps` | Full inventory of installed AI/ML apps with versions and install source (App / Homebrew cask / formula), flagging real duplicates and self-update-vs-Homebrew drift. |
-| `ara mlx` | The MLX ecosystem (Apple Silicon): libraries by modality + readiness (Metal GPU, cached `mlx-community` models, LM Studio's MLX runtime). |
+| `ara detect` | Read-only machine recon: chip, memory, accelerator, storage, engines, frameworks, cached models, and installed AI/ML apps. Facets: `--python`, `--apps`, `--runtime`, and `--models`. Runtime inventory is cross-platform; MLX ecosystem detail is added only on Apple Silicon. Never stresses the machine or loads an engine. |
+| `ara status` | What ARA itself is doing right now: idle, searching, characterizing, benchmarking, running, or serving. It is not a generic process monitor. |
 | `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on an AMD iGPU's shared memory), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
-| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under the engine that refuses before it risks the memory wall, then stores the ceiling for `recommend` / `run`. The command that crosses into the engine. |
-| `ara recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
+| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under the engine that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into the engine. |
+| `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
+| `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
+| `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. |
 | `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on every engine (CPU, MLX, CUDA, Vulkan, cuda-gguf). |
 | `ara benchmark <model> --use-case <coding\|reasoning\|agentic\|extraction\|rag>` | **Governed capability benchmark**: run a probe set for that use-case under the engine (capped at the safe ceiling, like `run`) and store the measured score. The model's own chat template is applied, so template-strict instruct models score honestly. |
 | `ara serve <model>` | Stand the model up as a **governed OpenAI-compatible endpoint** — on Ollama, or the MLX server with `--engine mlx` — capped at the model's safe context ceiling, and return the endpoint. |
-| `ara models [<model>]` | Catalog the models in your HF cache with each one's best measured safe-context ceiling; pass a model id for its architecture + per-engine ceiling detail. |
-| `ara search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 | `ara hf login` / `logout` / `status` | Manage your Hugging Face token (needed for gated models). `login` reads it from a hidden prompt, piped stdin, or `--token`, verifies it against the Hub, and stores it in the **standard HF token file** — so every fetch and engine worker picks it up. `status` shows who you're logged in as (never the token); `logout` removes it. |
+| `ara node enroll` / `install` / `run` / `start` / `status` / `stop` / `uninstall` | Enroll and operate ARA's push-only node daemon. |
+| `ara doctor` | Inspect ARA's stored machine identity and local record counts. |
 
-Recon commands share `--json` (machine-readable) and `--include` / `--exclude` (show only
-or hide specific sections, e.g. `ara detect --exclude models`).
+Commands that support structured output expose command-level `--json`; Click owns invalid syntax
+and usage errors. `detect` also supports `--include` / `--exclude` for its full report.
+
+For one compatibility release, the old top-level `search`, `recommend`, `python`, `apps`, and `mlx`
+spellings and `models MODEL` remain callable with deprecation warnings, but are hidden from help.
+Use the canonical tree above in scripts and documentation. `models list` is deferred.
 
 ---
 
@@ -113,8 +122,8 @@ The catalog of engines and the install logic live in [`ara/engines.py`](./ara/en
 | OS | Engines verified |
 |---|---|
 | **macOS (Apple Silicon)** | CPU + MLX — the primary development machine |
-| **Windows** | CPU + CUDA (full-GPU `cuda` **and** the `cuda-gguf` partial-offload hybrid) — full test suite green, inference verified on an RTX 2070 |
-| **Linux** | CPU + Vulkan — full suite + integration tests green; Vulkan (AMD iGPU) inference verified on a Ryzen Z1 Extreme |
+| **Windows** | CPU + CUDA — full test suite green, inference verified on an RTX 2070 |
+| **Linux** | CPU — full suite and CPU integration tests green |
 
 CUDA on Linux shares the same native CUDA engine path as Windows, but isn't claimed here until the
 full suite is green on an NVIDIA-on-Linux box.
@@ -123,8 +132,8 @@ full suite is green on an NVIDIA-on-Linux box.
 
 ## 🛟 Safety
 
-`ara detect` and the other recon commands (`status` / `python` / `apps` / `mlx`) are **strictly
-read-only** — they observe, never stress, benchmark, or load a model. Measuring is opt-in:
+`ara detect` (including `--python`, `--apps`, `--runtime`, and `--models`) and `ara status` are
+**strictly read-only** — they observe, never stress, benchmark, or load a model. Measuring is opt-in:
 `ara characterize` is the command that crosses into the engine, and it finds a model's safe
 context ceiling by **refusing before it ever loads past the memory wall** and aborting a probe
 the moment usage approaches the limit. Each engine governs against the right wall — physical RAM
