@@ -92,13 +92,14 @@ def mocked_world(monkeypatch, store):
 # (argv, expected JSON type, an anchor key that must be present | None for a list)
 CONTRACT = [
     (["detect", "--json"], dict, "backend"),
+    (["detect", "--models", "--json"], list, None),
     (["status", "--json"], dict, "workloads"),
     (["python", "--json"], list, None),
     (["apps", "--json"], list, None),
     (["mlx", "--json"], dict, "apple_silicon"),
-    (["models", "--json"], list, None),
-    (["models", "org/m", "--json"], dict, "model_id"),
-    (["search", "smol", "--json"], list, None),
+    (["models", "show", "org/m", "--json"], dict, "model_id"),
+    (["models", "search", "smol", "--json"], list, None),
+    (["models", "recommend", "--json"], list, None),
     (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
     (["install", "--engine", "mlx", "--json"], dict, "status"),
@@ -130,6 +131,55 @@ def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "No such command 'frobnicate'" in captured.err
+
+
+def test_models_group_bare_and_help_show_generated_help(mocked_world, capsys):
+    for argv in (["models"], ["models", "--help"]):
+        assert cli.main(argv) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "Usage: ara models [OPTIONS] COMMAND [ARGS]..." in captured.out
+        assert "search" in captured.out
+        assert "recommend" in captured.out
+        assert "show" in captured.out
+
+
+def test_models_list_is_a_click_usage_error_not_a_model_alias(mocked_world, capsys):
+    assert cli.main(["models", "list", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'list'" in captured.err
+
+
+@pytest.mark.parametrize("argv, warning", [
+    (["search", "smol", "--json"],
+     "ara: search is deprecated; use models search\n"),
+    (["recommend", "--json"],
+     "ara: recommend is deprecated; use models recommend\n"),
+    (["models", "org/m", "--json"],
+     "ara: models MODEL is deprecated; use models show MODEL\n"),
+    (["python", "--json"],
+     "ara: python is deprecated; use detect --python\n"),
+    (["apps", "--json"],
+     "ara: apps is deprecated; use detect --apps\n"),
+    (["mlx", "--json"],
+     "ara: mlx is deprecated; use detect --runtime\n"),
+])
+def test_deprecated_aliases_warn_only_on_stderr_and_keep_json_exact(
+        mocked_world, capsys, argv, warning):
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert captured.err == warning
+
+
+def test_deprecated_aliases_are_hidden_from_root_help(mocked_world, capsys):
+    assert cli.main(["--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    command_names = {line.split()[0] for line in captured.out.split("Commands:\n", 1)[1].splitlines()
+                     if line.startswith("  ")}
+    assert command_names.isdisjoint({"search", "recommend", "python", "apps", "mlx"})
 
 
 @pytest.mark.parametrize("argv, message", [

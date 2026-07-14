@@ -2591,6 +2591,11 @@ def _canonical_engine_arg(value: str | None) -> str | None:
     return value
 
 
+def _warn_deprecated(alias: str, replacement: str) -> None:
+    """Emit one-release command-alias guidance without contaminating stdout."""
+    print(f"ara: {alias} is deprecated; use {replacement}", file=sys.stderr)
+
+
 def _engine_callback(_ctx: click.Context, _param: click.Parameter,
                      value: str | None) -> str | None:
     return _canonical_engine_arg(value)
@@ -2711,55 +2716,107 @@ def _click_status(ctx: click.Context, include: list[str], exclude: list[str],
     return _invoke_recon(ctx, "status", render_status, include, exclude, as_json)
 
 
-@_click_cli.command("python", context_settings=_HELP_SETTINGS)
+@_click_cli.command("python", hidden=True, context_settings=_HELP_SETTINGS)
 @_recon_options
 @click.pass_context
 def _click_python(ctx: click.Context, include: list[str], exclude: list[str],
                   verbose: bool, as_json: bool) -> int:
     """List Python interpreters and their AI libraries."""
+    _warn_deprecated("python", "detect --python")
     return _invoke_recon(ctx, "python", render_python, include, exclude, as_json)
 
 
-@_click_cli.command("apps", context_settings=_HELP_SETTINGS)
+@_click_cli.command("apps", hidden=True, context_settings=_HELP_SETTINGS)
 @_recon_options
 @click.pass_context
 def _click_apps(ctx: click.Context, include: list[str], exclude: list[str],
                 verbose: bool, as_json: bool) -> int:
     """List installed AI and ML applications."""
+    _warn_deprecated("apps", "detect --apps")
     return _invoke_recon(ctx, "apps", render_apps, include, exclude, as_json)
 
 
-@_click_cli.command("mlx", context_settings=_HELP_SETTINGS)
+@_click_cli.command("mlx", hidden=True, context_settings=_HELP_SETTINGS)
 @_recon_options
 @click.pass_context
 def _click_mlx(ctx: click.Context, include: list[str], exclude: list[str],
                verbose: bool, as_json: bool) -> int:
     """Inspect MLX ecosystem readiness."""
+    _warn_deprecated("mlx", "detect --runtime")
     return _invoke_recon(ctx, "mlx", render_mlx, include, exclude, as_json)
 
 
-@_click_cli.command("models", context_settings=_HELP_SETTINGS)
-@click.argument("model_id", required=False)
+@click.command("MODEL", hidden=True, context_settings=_HELP_SETTINGS)
 @_recon_options
 @click.pass_context
-def _click_models(ctx: click.Context, model_id: str | None, include: list[str],
-                  exclude: list[str], verbose: bool, as_json: bool) -> int:
-    """List cached models or show one model's details."""
+def _click_legacy_model(ctx: click.Context, include: list[str], exclude: list[str],
+                        verbose: bool, as_json: bool) -> int:
+    """Route the one-release ``models MODEL`` compatibility spelling."""
+    model_id = ctx.info_name or ""
+    _warn_deprecated("models MODEL", "models show MODEL")
     c = _mark_json(ctx, as_json)
-    want = _resolve_want("models", include, exclude, c, as_json=as_json) \
-        if (include or exclude) else None
-    if model_id is not None:
-        return render_model_detail(c, model_id, as_json=as_json)
-    render_models(c, as_json=as_json, want=want)
+    if include or exclude:
+        _resolve_want("models", include, exclude, c, as_json=as_json)
+    return render_model_detail(c, model_id, as_json=as_json)
+
+
+class _ModelsGroup(click.Group):
+    """Resolve unknown model IDs through the one-release detail compatibility route."""
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        command = super().get_command(ctx, cmd_name)
+        if command is not None or cmd_name == "list":
+            return command
+        return _click_legacy_model
+
+
+@_click_cli.group("models", cls=_ModelsGroup, invoke_without_command=True,
+                  no_args_is_help=False, context_settings=_HELP_SETTINGS)
+@click.pass_context
+def _click_models(ctx: click.Context) -> int:
+    """Search, rank, or inspect model catalog entries."""
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
     return 0
 
 
-@_click_cli.command("search", context_settings=_HELP_SETTINGS)
+@_click_models.command("search", context_settings=_HELP_SETTINGS)
+@click.argument("query", nargs=-1, required=True)
+@_json_verbose_options
+@click.pass_context
+def _click_models_search(ctx: click.Context, query: tuple[str, ...],
+                         verbose: bool, as_json: bool) -> int:
+    """Find models on the Hugging Face Hub."""
+    return render_search(_mark_json(ctx, as_json), " ".join(query), as_json=as_json)
+
+
+@_click_models.command("recommend", context_settings=_HELP_SETTINGS)
+@click.option("--use-case", help="Rank by a measured capability dimension.")
+@_json_verbose_options
+@click.pass_context
+def _click_models_recommend(ctx: click.Context, use_case: str | None,
+                            verbose: bool, as_json: bool) -> int:
+    """Rank cached models that fit this machine."""
+    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+
+
+@_click_models.command("show", context_settings=_HELP_SETTINGS)
+@click.argument("model")
+@_json_verbose_options
+@click.pass_context
+def _click_models_show(ctx: click.Context, model: str,
+                       verbose: bool, as_json: bool) -> int:
+    """Show one model's catalog and characterization details."""
+    return render_model_detail(_mark_json(ctx, as_json), model, as_json=as_json)
+
+
+@_click_cli.command("search", hidden=True, context_settings=_HELP_SETTINGS)
 @click.argument("query", nargs=-1, required=True)
 @_json_verbose_options
 @click.pass_context
 def _click_search(ctx: click.Context, query: tuple[str, ...], verbose: bool, as_json: bool) -> int:
     """Find models on the Hugging Face Hub."""
+    _warn_deprecated("search", "models search")
     return render_search(_mark_json(ctx, as_json), " ".join(query), as_json=as_json)
 
 
@@ -2794,13 +2851,14 @@ def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
     return render_profile(_mark_json(ctx, as_json), as_json=as_json, model=model, engine=engine)
 
 
-@_click_cli.command("recommend", context_settings=_HELP_SETTINGS)
+@_click_cli.command("recommend", hidden=True, context_settings=_HELP_SETTINGS)
 @click.option("--use-case", help="Rank by a measured capability dimension.")
 @_json_verbose_options
 @click.pass_context
 def _click_recommend(ctx: click.Context, use_case: str | None,
                      verbose: bool, as_json: bool) -> int:
     """Rank cached models that fit this machine."""
+    _warn_deprecated("recommend", "models recommend")
     return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
 
 

@@ -296,6 +296,35 @@ def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, 
     assert "--include/--exclude don't apply to 'models'" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("argv, expected", [
+    (["models", "search", "smol model", "--json", "-v"],
+     {"query": "smol model", "as_json": True}),
+    (["models", "recommend", "--use-case", "coding", "--json", "--verbose"],
+     {"as_json": True, "use_case": "coding"}),
+    (["models", "show", "org/m", "--json", "-v"],
+     {"model_id": "org/m", "as_json": True}),
+])
+def test_models_subcommands_dispatch_to_existing_renderers(monkeypatch, argv, expected):
+    seen = {}
+    if argv[1] == "search":
+        monkeypatch.setattr(
+            cli, "render_search",
+            lambda c, query, **kwargs: seen.update(query=query, **kwargs) or 0,
+        )
+    elif argv[1] == "recommend":
+        monkeypatch.setattr(
+            cli, "render_recommend",
+            lambda c, **kwargs: seen.update(**kwargs) or 0,
+        )
+    else:
+        monkeypatch.setattr(
+            cli, "render_model_detail",
+            lambda c, model_id, **kwargs: seen.update(model_id=model_id, **kwargs) or 0,
+        )
+    assert _run_main(monkeypatch, argv) == 0
+    assert seen == expected
+
+
 # --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention
 def test_main_run_flash_attn_on_by_default(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
@@ -1978,10 +2007,11 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
     assert "8192" in line and "(cpu)" in line and "3500" not in line
 
 
-def test_main_models_dispatch(monkeypatch):
+def test_main_models_bare_does_not_dispatch_cached_inventory(monkeypatch, capsys):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["models", "--json"])
-    assert rec["models"] is True
+    assert _run_main(monkeypatch, ["models"]) == 0
+    assert "models" not in rec
+    assert "Usage: ara models" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #
