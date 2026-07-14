@@ -423,6 +423,16 @@ def test_main_characterize_flash_attn_on_by_default(monkeypatch):
     assert rec["characterize_fa"] is True
 
 
+def test_characterize_help_explains_measurement_and_engine_specific_choices(capsys):
+    assert cli.main(["characterize", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Safely measure MODEL's real context ceiling by loading it on an engine" in out
+    assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf, ollama" in out
+    assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
+    assert "CUDA weight format: none, int8, int4, or fp8" in out
+    assert "selected engine's safety boundary" in out
+
+
 # --kv-quant flag threading (default f16). Slug: 2026-06-25-vulkan-kv-cache-quant
 def test_main_characterize_kv_quant_value(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
@@ -3349,6 +3359,44 @@ def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, m
     assert "measured ceiling" in out and "4096" in out
 
 
+def test_characterize_ollama_verbose_discloses_runtime_and_model_limit(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
+    c, buf = make_console(verbose=True)
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
+    out = " ".join(buf.getvalue().split())
+    assert "engine ollama external runtime" in out
+    assert "model limit 8192 tokens architecture maximum" in out
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"kv_quant": "q4_0"},
+    {"weight_quant": "int4"},
+    {"prefill_chunk": 256},
+    {"flash_attn": False},
+    {"flash_attn_optin": True},
+])
+def test_characterize_ollama_rejects_unsupported_context_levers(
+        store, monkeypatch, make_console, kwargs):
+    _wire_char_ollama(monkeypatch)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama", **kwargs) == 1
+    out = buf.getvalue()
+    assert "supported" in out or "tunable" in out
+
+
+def test_characterize_ollama_rejects_unsupported_context_lever_json(
+        store, monkeypatch, capsys):
+    _wire_char_ollama(monkeypatch)
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_characterize(
+        c, "qwen3:0.6b", engine="ollama", kv_quant="q4_0", as_json=True) == 1
+    assert "supported" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_characterize_ollama_records_none_when_it_spills(store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
@@ -3496,6 +3544,15 @@ def test_main_characterize_prefill_chunk_eq_form(monkeypatch):
     assert rec["characterize_chunk"] == 384
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_main_characterize_rejects_nonpositive_prefill_chunk(monkeypatch, capsys, value):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", value]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Invalid value for '--prefill-chunk'" in captured.err
+
+
 def test_main_prefill_chunk_non_integer_is_click_error(monkeypatch, capsys):
     _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"]) == 2
@@ -3529,6 +3586,18 @@ def test_render_characterize_rejects_unsupported_lever_json(monkeypatch, capsys)
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_characterize(c, "org/M", kv_quant="q4_0", as_json=True) == 1
     assert "kv-quant" in json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_render_characterize_rejects_conflicting_flash_flags(
+        make_console, monkeypatch, capsys, as_json):
+    _wire_characterize(monkeypatch, backend="cuda", characterize=lambda m: {
+        "model": m, "safe_context": 1, "decode_context": None, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(
+        c, "org/M", as_json=as_json, flash_attn=False, flash_attn_optin=True) == 1
+    out = json.loads(capsys.readouterr().out)["error"] if as_json else buf.getvalue()
+    assert "--flash-attn" in out and "--no-flash-attn" in out
 
 
 def test_render_run_rejects_unsupported_lever(monkeypatch, capsys):
@@ -3860,7 +3929,7 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     if characterize is not None:
         # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
         _char = characterize
-        def _char_wrapper(m, *, progress=False, kv_quant="f16"):
+        def _char_wrapper(m, *, progress=False, **_kwargs):
             return _char(m)
         monkeypatch.setattr(cli, "get_backend",
                             lambda b=None: types.SimpleNamespace(
@@ -3876,9 +3945,21 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
                                                "decode_context": None, "points": [[512, 1.4]]})
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Model") == 0
-    assert "20000" in buf.getvalue()
+    assert "20000" in buf.getvalue() and "mlx" in buf.getvalue()
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
+
+
+def test_characterize_verbose_discloses_engine_and_effective_kv_cache(
+        make_console, store, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                               "decode_context": None, "points": []})
+    c, buf = make_console(verbose=True)
+    assert cli.render_characterize(c, "org/Model", kv_quant="q8_0") == 0
+    out = " ".join(buf.getvalue().split())
+    assert "engine mlx" in out
+    assert "KV cache q8_0" in out
 
 
 def test_characterize_self_calibrates_when_uncalibrated(make_console, store, monkeypatch):
@@ -4040,13 +4121,16 @@ def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
                                                "decode_context": None, "points": []})
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Big") == 0
-    assert "couldn't fit" in buf.getvalue()
+    out = buf.getvalue()
+    assert "couldn't fit" in out and "pre-quantized MLX model" in out
+    assert "--weight-quant" not in out
     assert cli.db.get_characterization(store, "mkey", "mlx", "org/Big")["safe_context"] is None
 
 
 def test_render_characterize_no_ceiling_explains_with_budget(make_console, store, monkeypatch):
     # When the driver surfaces base_gb/budget_gb for a null ceiling (#105), the message explains
-    # why (base near budget) and suggests weight-quant — not the vague "too big or borderline".
+    # why (base near budget) and suggests an engine-valid recovery — not the vague
+    # "too big or borderline" or CUDA-only advice on MLX.
     _wire_characterize(monkeypatch,
                        characterize=lambda m: {"model": m, "safe_context": None,
                                                "decode_context": None, "points": [],
@@ -4055,7 +4139,23 @@ def test_render_characterize_no_ceiling_explains_with_budget(make_console, store
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Big") == 0
     out = buf.getvalue()
-    assert "6.68" in out and "7.0" in out and "weight-quant" in out
+    assert "6.68" in out and "7.0" in out and "pre-quantized MLX model" in out
+    assert "--weight-quant" not in out
+
+
+@pytest.mark.parametrize(("backend", "expected"), [
+    ("cuda", "--weight-quant int4 or int8"),
+    ("cpu", "more heavily quantized GGUF model"),
+])
+def test_render_characterize_no_ceiling_gives_engine_valid_recovery(
+        make_console, store, monkeypatch, backend, expected):
+    _wire_characterize(
+        monkeypatch, backend=backend,
+        characterize=lambda m: {"model": m, "safe_context": None,
+                                 "decode_context": None, "points": []})
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Big") == 0
+    assert expected in buf.getvalue()
 
 
 def test_render_characterize_no_ceiling_json_forwards_diagnostics(make_console, store, monkeypatch, capsys):
@@ -4121,6 +4221,7 @@ def test_render_characterize_json(monkeypatch, capsys, store):
     assert cli.render_characterize(c, "org/M", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["safe_context"] == 9000
+    assert data["engine"] == "mlx"
     assert "decode_context" in data
 
 
@@ -4144,7 +4245,7 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
 
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
-        "model": "org/M", "safe_context": 2048, "decode_context": 2048,
+        "model": "org/M", "engine": "mlx", "safe_context": 2048, "decode_context": 2048,
         "calibration_error": "calibration unavailable: boom",
         "calibration_fallback": True,
     }

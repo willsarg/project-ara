@@ -1194,7 +1194,27 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     ``--engine ollama`` routes to a dedicated residency-ramp path (Slice 2): Ollama isn't a registry
     engine, and its model names (``qwen3:0.6b``) aren't HF refs — so it branches before both
     ``resolve_engine`` and ``valid_model_ref``. Spec 2026-07-04-characterize-through-ollama-ramp."""
+    if kv_quant not in _KV_QUANT_CHOICES:
+        msg = _kv_quant_error(kv_quant)
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    if weight_quant not in _WEIGHT_QUANT_CHOICES:
+        msg = f"invalid --weight-quant {weight_quant!r} — choose one of: {', '.join(_WEIGHT_QUANT_CHOICES)}"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    if not flash_attn and flash_attn_optin:
+        msg = "--flash-attn and --no-flash-attn cannot be used together"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
     if engine == "ollama":
+        lever_err = _unsupported_lever_error(
+            "ollama", kv_quant=kv_quant, flash_attn=flash_attn,
+            flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+            prefill_chunk=prefill_chunk)
+        if lever_err is not None:
+            print(json.dumps({"error": lever_err})) if as_json else c.emit(
+                c.style("bad", f"  {lever_err}"))
+            return 1
         return _render_characterize_ollama(c, model, as_json=as_json)
     try:
         sel = resolve_engine(engine)
@@ -1205,14 +1225,6 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if not acquire.valid_model_ref(model):
         msg = (f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                f"or a local .gguf file path")
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
-    if kv_quant not in _KV_QUANT_CHOICES:
-        msg = _kv_quant_error(kv_quant)
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
-    if weight_quant not in _WEIGHT_QUANT_CHOICES:
-        msg = f"invalid --weight-quant {weight_quant!r} — choose one of: {', '.join(_WEIGHT_QUANT_CHOICES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
     lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant, flash_attn=flash_attn,
@@ -1234,6 +1246,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     if hw_err is not None:
         print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
         return 1
+    if c.verbose and not as_json:
+        c.emit(c.field("engine", sel.engine_key, engine_label))
+        c.emit(c.field("KV cache", kv_quant))
     progress = (not as_json) and sys.stderr.isatty()
     # Deterministic pre-fetch gates run before ARA claims live work. The actual network download
     # stays in the same lifecycle record as calibration and measurement.
@@ -1325,7 +1340,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         catalog.remember(con, model)
 
     if as_json:
-        out: dict = {"model": model, "safe_context": ceiling,
+        out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
                      "decode_context": result.get("decode_context")}
         if calibration_error:
             out.update(calibration_error=calibration_error, calibration_fallback=True)
@@ -1339,7 +1354,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 0
     if ceiling:
         c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
-               + c.style("dim", f"  · stored (see ara models show {model})"))
+               + c.style("dim", f"  · {sel.engine_key} · stored (see ara models show {model})"))
         dc = result.get("decode_context")
         if dc and dc > ceiling:
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
@@ -1349,11 +1364,19 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         budget = result.get("budget_gb")
         if base is not None and budget is not None:
             c.emit(c.style("warn",
-                           f"  couldn't fit a ceiling — estimated base {base:.2f} GiB"
+                           f"  couldn't fit a ceiling on {sel.engine_key} — estimated base {base:.2f} GiB"
                            f" already near {budget:.1f} GiB safe budget"))
         else:
-            c.emit(c.style("warn", "  couldn't fit a ceiling — the model may be too big or borderline"))
-        c.emit(c.style("dim", "  try: --weight-quant int4 or int8, or a smaller/quantized model"))
+            c.emit(c.style("warn", f"  couldn't fit a ceiling on {sel.engine_key} — "
+                                    "the model may be too big or borderline"))
+        recovery = {
+            "mlx": "a smaller or more heavily pre-quantized MLX model",
+            "cuda": "--weight-quant int4 or int8, or a smaller model",
+            "cpu": "a smaller or more heavily quantized GGUF model",
+            "vulkan": "a smaller or more heavily quantized GGUF model",
+            "cuda-gguf": "a smaller or more heavily quantized GGUF model",
+        }
+        c.emit(c.style("dim", f"  try: {recovery[sel.engine_key]}"))
     c.emit()
     return 0
 
@@ -2042,6 +2065,9 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     max_ctx = _ollama_max_context(model)
     if not max_ctx:
         return err(f"couldn't read {model}'s context length from Ollama — can't bound the ramp.")
+    if c.verbose and not as_json:
+        c.emit(c.field("engine", "ollama", "external runtime"))
+        c.emit(c.field("model limit", f"{max_ctx} tokens", "architecture maximum"))
 
     probe = _governed_name(model) + "-probe"
     with activity.track("characterizing", model):
@@ -2887,6 +2913,41 @@ def _engine_option(func):
                         help="Select an execution engine.")(func)
 
 
+def _characterize_engine_option(func):
+    return click.option(
+        "--engine", callback=_engine_callback, metavar="ENGINE",
+        help=("Measure with ENGINE; defaults to auto. Choices: auto, mlx, cuda, cpu, vulkan, "
+              "cuda-gguf, ollama."),
+    )(func)
+
+
+def _characterize_generation_options(func):
+    func = click.option(
+        "--kv-quant", default="f16", show_default=True, metavar="FORMAT",
+        help="KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0.",
+    )(func)
+    func = click.option(
+        "--weight-quant", default="none", show_default=True, metavar="FORMAT",
+        help="CUDA weight format: none, int8, int4, or fp8.",
+    )(func)
+    func = click.option(
+        "--prefill-chunk", type=click.IntRange(min=1), metavar="N",
+        help="Positive CUDA prefill chunk size.",
+    )(func)
+    func = click.option(
+        "--chunked-prefill", is_flag=True,
+        help=f"Enable CUDA chunked prefill with the default size ({_DEFAULT_PREFILL_CHUNK}).",
+    )(func)
+    func = click.option(
+        "--no-flash-attn", is_flag=True,
+        help="Disable Vulkan flash attention.",
+    )(func)
+    return click.option(
+        "--flash-attn", is_flag=True,
+        help="Request CUDA FlashAttention 2 (Ampere or newer).",
+    )(func)
+
+
 def _generation_options(func):
     func = click.option("--kv-quant", default="f16", show_default=True,
                         metavar="FORMAT", help="KV-cache quantization format.")(func)
@@ -3071,15 +3132,19 @@ def _click_search(ctx: click.Context, query: tuple[str, ...], verbose: bool, as_
 
 @_click_cli.command("characterize", context_settings=_HELP_SETTINGS)
 @click.argument("model")
-@_engine_option
-@_generation_options
+@_characterize_engine_option
+@_characterize_generation_options
 @_json_verbose_options
 @click.pass_context
 def _click_characterize(ctx: click.Context, model: str, engine: str | None, kv_quant: str,
                         weight_quant: str, prefill_chunk: int | None,
                         chunked_prefill: bool, no_flash_attn: bool, flash_attn: bool,
                         verbose: bool, as_json: bool) -> int:
-    """Measure MODEL's real safe context ceiling (loads the model)."""
+    """Safely measure MODEL's real context ceiling by loading it on an engine.
+
+    ARA ramps context within the selected engine's safety boundary, then stores the measured
+    ceiling as evidence for later governed operations.
+    """
     c = _mark_json(ctx, as_json)
     with locking.measurement_lock():
         return render_characterize(
