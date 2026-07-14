@@ -1915,8 +1915,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         sel = resolve_engine(engine)
     except UnknownEngine:
         return err(f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}")
-    if not prompt:
+    if not prompt or not prompt.strip():
         return err("usage: ara run <model> <prompt>")
+    if max_tokens <= 0:
+        return err("--max-tokens must be a positive integer")
     if not acquire.valid_model_ref(model):
         return err(f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                    f"or a local .gguf file path")
@@ -2051,10 +2053,16 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
+    if not isinstance(result, dict):
+        return err("run failed: engine returned an invalid completion")
     if result.get("refused"):
         return err(f"the {engine_label} refused: {result.get('reason', 'no reason given')}")
+    if result.get("error"):
+        return err(f"run failed: {result['error']}")
 
-    completion = result.get("completion", "")
+    completion = result.get("completion")
+    if not isinstance(completion, str):
+        return err("run failed: engine returned an invalid completion")
     if as_json:
         print(json.dumps({"model": model, "engine": engine_key,
                           "safe_context": safe, "stale_ceiling": stale_ceiling,
@@ -3086,6 +3094,14 @@ def _engine_option(func):
                         help="Select an execution engine.")(func)
 
 
+def _run_engine_option(func):
+    return click.option(
+        "--engine", callback=_engine_callback, metavar="ENGINE",
+        help=("Pin ENGINE; omitted selects the compatible characterized engine with the largest "
+              "safe ceiling. Choices: auto, mlx, cuda, cpu, vulkan, cuda-gguf."),
+    )(func)
+
+
 def _characterize_engine_option(func):
     return click.option(
         "--engine", callback=_engine_callback, metavar="ENGINE",
@@ -3122,18 +3138,30 @@ def _characterize_generation_options(func):
 
 
 def _generation_options(func):
-    func = click.option("--kv-quant", default="f16", show_default=True,
-                        metavar="FORMAT", help="KV-cache quantization format.")(func)
-    func = click.option("--weight-quant", default="none", show_default=True,
-                        metavar="FORMAT", help="Weight quantization format.")(func)
-    func = click.option("--prefill-chunk", type=int, metavar="N",
-                        help="CUDA prefill chunk size.")(func)
-    func = click.option("--chunked-prefill", is_flag=True,
-                        help="Enable chunked prefill with the default size.")(func)
+    func = click.option(
+        "--max-tokens", type=click.IntRange(min=1), default=RUN_MAX_TOKENS,
+        show_default=True, metavar="N", help="Maximum new tokens to generate.",
+    )(func)
+    func = click.option(
+        "--kv-quant", default="f16", show_default=True, metavar="FORMAT",
+        help="KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0.",
+    )(func)
+    func = click.option(
+        "--weight-quant", default="none", show_default=True, metavar="FORMAT",
+        help="CUDA weight format: none, int8, int4, or fp8.",
+    )(func)
+    func = click.option(
+        "--prefill-chunk", type=click.IntRange(min=1), metavar="N",
+        help="Positive CUDA prefill chunk size.",
+    )(func)
+    func = click.option(
+        "--chunked-prefill", is_flag=True,
+        help=f"Enable CUDA chunked prefill with the default size ({_DEFAULT_PREFILL_CHUNK}).",
+    )(func)
     func = click.option("--no-flash-attn", is_flag=True,
                         help="Disable Vulkan flash attention.")(func)
     return click.option("--flash-attn", is_flag=True,
-                        help="Enable CUDA FlashAttention 2.")(func)
+                        help="Request CUDA FlashAttention 2 (Ampere or newer).")(func)
 
 
 def _prefill_chunk(prefill_chunk: int | None, chunked_prefill: bool) -> int | None:
@@ -3354,20 +3382,25 @@ def _click_recommend(ctx: click.Context, use_case: str | None,
 @_click_cli.command("run", context_settings=_HELP_SETTINGS,
                     epilog='Example:\n  ara run org/model "Explain this" --json')
 @click.argument("model")
-@click.argument("prompt", nargs=-1, required=False)
-@_engine_option
+@click.argument("prompt", nargs=-1, required=True)
+@_run_engine_option
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_generation_options
 @_json_verbose_options
 @click.pass_context
 def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: str | None,
-               assume_yes: bool, kv_quant: str, weight_quant: str,
+               assume_yes: bool, max_tokens: int, kv_quant: str, weight_quant: str,
                prefill_chunk: int | None, chunked_prefill: bool, no_flash_attn: bool,
                flash_attn: bool, verbose: bool, as_json: bool) -> int:
-    """Run governed one-shot inference: MODEL [PROMPT...]."""
+    """Generate one governed completion under MODEL's characterized safe ceiling.
+
+    ARA selects a compatible characterized engine unless --engine pins one, and refuses before
+    loading when the requested settings do not match the measurement.
+    """
     return render_run(
         _mark_json(ctx, as_json), model, prompt=" ".join(prompt) or None, engine=engine,
-        assume_yes=assume_yes, as_json=as_json, flash_attn=not no_flash_attn,
+        assume_yes=assume_yes, as_json=as_json, max_tokens=max_tokens,
+        flash_attn=not no_flash_attn,
         flash_attn_optin=flash_attn, kv_quant=kv_quant, weight_quant=weight_quant,
         prefill_chunk=_prefill_chunk(prefill_chunk, chunked_prefill),
     )

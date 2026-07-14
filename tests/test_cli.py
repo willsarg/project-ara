@@ -391,6 +391,15 @@ def test_main_run_no_flash_attn_disables_and_is_not_in_prompt(monkeypatch):
     assert rec["run"]["prompt"] == "hello"   # the flag is filtered out of the positional prompt
 
 
+def test_run_help_explains_governance_and_generation_controls(capsys):
+    assert cli.main(["run", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "characterized safe ceiling" in out
+    assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf" in out
+    assert "--max-tokens N" in out and "Maximum new tokens" in out
+    assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
+
+
 @contextlib.contextmanager
 def _busy_lock():
     raise cli.MeasurementBusy("another ARA measurement is already running on this machine")
@@ -3044,6 +3053,22 @@ def test_run_failure(make_console, monkeypatch):
     assert "run failed" in buf.getvalue()
 
 
+def test_run_worker_error_payload_is_failure(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *a, **k: {"error": "generation exploded"})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "generation exploded" in buf.getvalue()
+
+
+@pytest.mark.parametrize("result", [None, [], {}, {"completion": None}, {"completion": 7}])
+def test_run_rejects_malformed_completion_payload(make_console, monkeypatch, result):
+    _wire_run(monkeypatch, characterization=_CHAR, generate=lambda *a, **k: result)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "invalid completion" in buf.getvalue()
+
+
 def test_run_json(monkeypatch, capsys):
     _wire_run(monkeypatch, characterization=_CHAR,
               generate=lambda *a, **k: {"completion": "hello"})
@@ -3058,6 +3083,21 @@ def test_run_usage_without_prompt(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt=None) == 1
     assert "usage" in buf.getvalue()
+
+
+def test_run_rejects_whitespace_only_prompt(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="   ") == 1
+    assert "usage" in buf.getvalue()
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1])
+def test_run_rejects_nonpositive_max_tokens(make_console, monkeypatch, max_tokens):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", max_tokens=max_tokens) == 1
+    assert "max-tokens" in buf.getvalue()
 
 
 def test_run_unknown_engine(make_console):
@@ -3201,6 +3241,30 @@ def test_main_run_dispatch(monkeypatch):
     _run_main(monkeypatch, ["run", "org/m", "hello", "world"])
     assert rec["run"]["model"] == "org/m"
     assert rec["run"]["prompt"] == "hello world"
+
+
+def test_main_run_parses_max_tokens(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["run", "org/m", "hello", "--max-tokens", "32"]) == 0
+    assert rec["run"]["max_tokens"] == 32
+
+
+def test_main_run_requires_prompt(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["run", "org/m"]) == 2
+    assert "run" not in rec
+    assert "Missing argument 'PROMPT...'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("flag", "value"), [
+    ("--max-tokens", "0"), ("--max-tokens", "-1"),
+    ("--prefill-chunk", "0"), ("--prefill-chunk", "-1"),
+])
+def test_main_run_rejects_nonpositive_generation_limits(monkeypatch, capsys, flag, value):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["run", "org/m", "hello", flag, value]) == 2
+    assert "run" not in rec
+    assert "Invalid value" in capsys.readouterr().err
 
 
 def test_main_run_usage_no_model(make_console, monkeypatch):
