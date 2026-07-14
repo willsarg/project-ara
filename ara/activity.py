@@ -74,7 +74,7 @@ def _note_cleanup_failure(original: BaseException, action: str, cleanup: OSError
 
 def _atomic_write(path: Path, record: dict) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.stem}.tmp")
+    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
@@ -150,9 +150,22 @@ def _valid_serving_record(record) -> bool:
             and _number(record.get("started_at")))
 
 
+def validate_ollama_serving(*, served_name: str, model: str, context: int,
+                            endpoint: str) -> None:
+    """Validate public persistent-ownership fields without touching the filesystem."""
+    record = {
+        "runtime": "ollama", "served_name": served_name, "model": model,
+        "context": context, "endpoint": endpoint, "started_at": 0.0,
+    }
+    if not _valid_serving_record(record):
+        raise ValueError("invalid Ollama serving activity")
+
+
 def record_ollama_serving(*, served_name: str, model: str, context: int,
                           endpoint: str, started_at: float | None = None) -> Path:
     """Atomically own one exactly identified governed model on an Ollama endpoint."""
+    validate_ollama_serving(
+        served_name=served_name, model=model, context=context, endpoint=endpoint)
     record = {
         "runtime": "ollama",
         "served_name": served_name,
@@ -161,11 +174,14 @@ def record_ollama_serving(*, served_name: str, model: str, context: int,
         "endpoint": endpoint,
         "started_at": time.time() if started_at is None else started_at,
     }
-    if not _valid_serving_record(record):
+    if not _number(record["started_at"]):
         raise ValueError("invalid Ollama serving activity")
     identity = hashlib.sha256(
         f"{endpoint}\0{served_name}".encode("utf-8")).hexdigest()
-    path = activity_dir() / "serving" / f"{identity}.json"
+    serving = activity_dir() / "serving"
+    if serving.is_symlink():
+        raise OSError("ARA serving activity directory must not be a symlink")
+    path = serving / f"{identity}.json"
     _atomic_write(path, record)
     return path
 
@@ -206,6 +222,8 @@ def _read_record(path: Path) -> Activity | None:
 
 
 def _read_serving_records(directory: Path) -> list[tuple[dict, str]]:
+    if directory.is_symlink():
+        return []
     try:
         paths = sorted(path for path in directory.iterdir()
                        if path.suffix == ".json" and not path.is_symlink()
@@ -244,8 +262,13 @@ def _live_ollama_serving(directory: Path) -> list[tuple[Activity, str]]:
     for record, name in matching:
         served = record["served_name"]
         entry = next((item for item in loaded if isinstance(item, dict)
-                      and item.get("name") in {served, served + ":latest"}), None)
-        if entry is None or entry.get("context_length") != record["context"]:
+                      and isinstance(item.get("name"), str)
+                      and item["name"] in (served, served + ":latest")), None)
+        if entry is None:
+            continue
+        live_context = entry.get("context_length")
+        if (not isinstance(live_context, int) or isinstance(live_context, bool)
+                or live_context <= 0 or live_context != record["context"]):
             continue
         live.append((Activity(
             kind="serving", model=record["model"], pid=None,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -127,6 +128,15 @@ def test_snapshot_suppresses_every_uncorroborated_manifest(
     assert activity.snapshot() == []
 
 
+@pytest.mark.parametrize("name", [None, [], {}, 7])
+@pytest.mark.parametrize("context", [4096, True, "4096", 0, -1, None])
+def test_snapshot_suppresses_malformed_loaded_name_and_context_without_crashing(
+        registry, monkeypatch, name, context):
+    _record()
+    _wire_live(monkeypatch, [{"name": name, "context_length": context}])
+    assert activity.snapshot() == []
+
+
 def test_unrelated_live_models_never_appear(registry, monkeypatch):
     _record()
     _wire_live(monkeypatch, [
@@ -185,3 +195,74 @@ def test_status_text_and_json_expose_persistent_serving_without_pid(
         "runtime": "ollama", "served_name": "org-model-ara", "context": 4096,
         "endpoint": "http://127.0.0.1:11434",
     }]}
+
+
+def test_serving_child_symlink_is_never_read_or_written(registry, monkeypatch, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    serving = registry / "serving"
+    registry.mkdir()
+    try:
+        serving.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    outside_record = outside / "owned.json"
+    outside_record.write_text(json.dumps({
+        "runtime": "ollama", "served_name": "org-model-ara", "model": "org/model",
+        "context": 4096, "endpoint": "http://127.0.0.1:11434", "started_at": 1.0,
+    }))
+    monkeypatch.setattr("ara.ollama.ps", lambda: pytest.fail("followed serving symlink"))
+    assert activity.snapshot() == []
+
+    outside_record.unlink()
+    with pytest.raises(OSError):
+        _record()
+    assert list(outside.iterdir()) == []
+
+
+def test_stale_atomic_temp_never_wedges_future_manifest_update(registry, monkeypatch):
+    path = _record()
+    path.unlink()
+    stale = path.with_name(f".{path.stem}.tmp")
+    stale.write_text("SIGKILL residue")
+
+    assert _record(context=8192) == path
+    assert json.loads(path.read_text())["context"] == 8192
+    assert stale.read_text() == "SIGKILL residue"
+    _wire_live(monkeypatch, [])
+    assert all(item.name != stale.name for item in activity.snapshot())
+
+
+def test_concurrent_same_identity_manifest_writers_both_complete_atomically(
+        registry, monkeypatch):
+    barrier = threading.Barrier(2)
+    real_replace = activity.os.replace
+
+    def replace(source, target):
+        try:
+            barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        real_replace(source, target)
+
+    monkeypatch.setattr(activity.os, "replace", replace)
+    errors = []
+
+    def write(context):
+        try:
+            _record(context=context, started_at=float(context))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(context,)) for context in (4096, 8192)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    files = list((registry / "serving").glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["context"] in {4096, 8192}

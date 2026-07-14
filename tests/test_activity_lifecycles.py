@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 import types
 
@@ -108,6 +109,22 @@ def _wire_characterize(monkeypatch, backend):
     monkeypatch.setattr(cli.catalog, "remember", lambda *_a: None)
 
 
+@pytest.mark.parametrize("cached,expected_downloads", [(True, []), (False, ["org/model"])])
+def test_prefetch_wrapper_preserves_cached_and_download_contract(
+        make_console, monkeypatch, cached, expected_downloads):
+    downloads = []
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: cached,
+        download_calibration_model=lambda model, **_kwargs: downloads.append(model),
+    )
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: None)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    c, _ = make_console()
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=False, progress=False) is None
+    assert downloads == expected_downloads
+
+
 def test_characterize_tracks_calibration_and_backend_measurement(
         make_console, monkeypatch, activity_registry):
     calls = []
@@ -133,6 +150,48 @@ def test_characterize_tracks_calibration_and_backend_measurement(
     assert cli.render_characterize(c, "org/model", engine="cpu") == 0
     assert calls == ["calibrate", "characterize"]
     assert activity.snapshot() == []
+
+
+def test_characterize_download_calibration_and_measurement_share_one_activity(
+        make_console, monkeypatch, activity_registry):
+    record_names = []
+
+    def observe(stage):
+        _assert_activity("characterizing", "org/model")
+        record_names.append((stage, next(activity_registry.glob("*.json")).name))
+
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _m: False,
+        download_calibration_model=lambda *_a, **_k: observe("download"),
+        calibrate=lambda: (observe("calibrate") or {
+            "overhead_gb": None, "wall_gb": None}),
+        characterize=lambda *_a, **_k: (observe("characterize") or {
+            "safe_context": 4096, "decode_context": None, "points": []}),
+    )
+    _wire_characterize(monkeypatch, backend)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: None)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/model", engine="cpu") == 0
+    assert [stage for stage, _name in record_names] == [
+        "download", "calibrate", "characterize"]
+    assert len({name for _stage, name in record_names}) == 1
+
+
+def test_characterize_disk_refusal_never_starts_tracking(
+        make_console, monkeypatch, activity_registry):
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _m: False,
+        download_calibration_model=lambda *_a, **_k: pytest.fail("download called"),
+        characterize=lambda *_a, **_k: pytest.fail("characterize called"),
+    )
+    _wire_characterize(monkeypatch, backend)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: 10.0)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
+    monkeypatch.setattr(cli.activity, "track", lambda *_a, **_k: pytest.fail("track called"))
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/model", engine="cpu") == 1
+    assert not activity_registry.exists()
 
 
 def test_characterize_prefetch_refusal_never_creates_activity(
@@ -252,6 +311,45 @@ def test_benchmark_one_activity_covers_prefetch_and_every_repeat(
                                 engine="cpu", repeat=2) == 0
     assert len(set(record_names)) == 1
     assert len(record_names) == 3
+    assert activity.snapshot() == []
+
+
+def test_benchmark_cache_check_and_disk_refusal_happen_before_tracking(
+        make_console, monkeypatch, activity_registry):
+    def cached(_model):
+        assert activity.snapshot() == []
+        return False
+
+    backend = types.SimpleNamespace(
+        calibration_model_cached=cached,
+        download_calibration_model=lambda *_a, **_k: pytest.fail("download called"),
+        benchmark=lambda *_a, **_k: pytest.fail("benchmark called"),
+    )
+    _wire_benchmark(monkeypatch, backend)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: 10.0)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
+    monkeypatch.setattr(cli.activity, "track", lambda *_a, **_k: pytest.fail("track called"))
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/model", use_case="reasoning", engine="cpu") == 1
+    assert not activity_registry.exists()
+
+
+def test_benchmark_download_failure_is_tracked_then_cleaned_without_backend_call(
+        make_console, monkeypatch, activity_registry):
+    def download(*_a, **_k):
+        _assert_activity("benchmarking", "org/model")
+        raise RuntimeError("offline")
+
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _m: False,
+        download_calibration_model=download,
+        benchmark=lambda *_a, **_k: pytest.fail("benchmark called"),
+    )
+    _wire_benchmark(monkeypatch, backend)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: None)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/model", use_case="reasoning", engine="cpu") == 1
     assert activity.snapshot() == []
 
 
@@ -452,6 +550,29 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     assert not list(activity_registry.glob("*.json"))
 
 
+def test_ollama_reserve_same_live_identity_never_duplicates_status(
+        make_console, monkeypatch, activity_registry):
+    _wire_ollama_serve(monkeypatch)
+    activity.record_ollama_serving(
+        served_name="base-model-ara", model="base:model", context=4096,
+        endpoint="http://127.0.0.1:11434", started_at=1.0)
+    loaded = [{"name": "base-model-ara:latest", "context_length": 4096,
+               "size": 10, "size_vram": 10}]
+    monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
+
+    def create(*_a, **_k):
+        found = activity.snapshot()
+        assert [(item.kind, item.model, item.runtime) for item in found] == [
+            ("serving", "base:model", "ollama")]
+        assert not list(activity_registry.glob("*.json"))
+        return True
+
+    monkeypatch.setattr(cli.ollama, "create", create)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {"done": True})
+    c, _ = make_console()
+    assert cli.render_serve(c, "base:model", ctx=4096) == 0
+
+
 def test_ollama_serve_declined_consent_never_claims_activity(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch, isatty=True)
@@ -480,6 +601,35 @@ def test_ollama_manifest_failure_reports_loaded_but_untrackable_service(
     assert activity.snapshot() == []
 
 
+def test_ollama_manifest_validation_failure_is_honest_json_not_raw_exception(
+        make_console, monkeypatch, activity_registry, capsys):
+    _wire_ollama_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [
+        {"name": "base-model-ara:latest", "context_length": 4096,
+         "size": 10, "size_vram": 10}])
+    monkeypatch.setattr(cli.activity, "record_ollama_serving",
+                        lambda **_fields: (_ for _ in ()).throw(ValueError("invalid identity")))
+    c, _ = make_console()
+    assert cli.render_serve(c, "base:model", ctx=4096, as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "base-model-ara loaded at 4096 ctx, but ARA ownership could not be recorded: "
+                 "invalid identity"}
+    assert activity.snapshot() == []
+
+
+@pytest.mark.parametrize("name", ["x" * 513, "bad\nname"])
+def test_ollama_invalid_custom_served_name_refuses_before_create_without_raw_exception(
+        make_console, monkeypatch, activity_registry, name):
+    _wire_ollama_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: pytest.fail("create called"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "base:model", ctx=4096, name=name) == 1
+    assert "invalid" in buf.getvalue().lower()
+    assert activity.snapshot() == []
+
+
 @pytest.mark.parametrize("raised", [KeyboardInterrupt(), SystemExit(6)])
 def test_ollama_setup_activity_cleans_up_on_base_exceptions(
         make_console, monkeypatch, activity_registry, raised):
@@ -504,3 +654,13 @@ def test_find_loaded_accepts_only_exact_name_or_latest_normalization():
     ]
     assert cli._find_loaded(entries, "svc") == {"name": "svc:latest"}
     assert cli._find_loaded(entries[:2], "svc") is None
+
+
+@pytest.mark.parametrize("name", [None, [], {}, 7])
+def test_find_loaded_ignores_malformed_names_without_crashing(name):
+    assert cli._find_loaded([{"name": name}], "svc") is None
+
+
+@pytest.mark.parametrize("entry", [None, [], "bad", 7])
+def test_find_loaded_ignores_non_object_entries_without_crashing(entry):
+    assert cli._find_loaded([entry], "svc") is None

@@ -13,6 +13,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1026,6 +1027,37 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
     return None
 
 
+def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
+                   *, as_json: bool) -> tuple[bool, float | None, int | None]:
+    """Run deterministic cache/compatibility/disk gates before live work is claimed."""
+    incompatible = engines.engine_for_model(model) not in (None, engine_key)
+    cached = getattr(bk, "calibration_model_cached", None)
+    if incompatible or cached is None or cached(model):
+        return False, None, None
+    size_gb = acquire.repo_size_gb(model)
+    free_gb = acquire.free_disk_gb()
+    if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
+        msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
+               f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return False, size_gb, 1
+    return True, size_gb, None
+
+
+def _download_prefetched_weights(c: Console, model: str, bk, size_gb: float | None,
+                                 *, as_json: bool, progress: bool) -> int | None:
+    """Perform the actual HF download after the caller has started live tracking."""
+    _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
+    c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
+    try:
+        bk.download_calibration_model(model, progress=progress)
+    except Exception as exc:
+        msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    return None
+
+
 def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
                       *, as_json: bool, progress: bool) -> int | None:
     """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
@@ -1037,26 +1069,11 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
     cuda-gguf report cached (they acquire the GGUF in-worker), so this only fetches for apple/cuda.
     Returns 1 (after printing) on a disk-space or fetch error, else None.
     """
-    incompatible = engines.engine_for_model(model) not in (None, engine_key)
-    cached = getattr(bk, "calibration_model_cached", None)
-    if incompatible or cached is None or cached(model):
-        return None
-    size_gb = acquire.repo_size_gb(model)
-    free_gb = acquire.free_disk_gb()
-    if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
-        msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
-               f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
-    _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
-    c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
-    try:
-        bk.download_calibration_model(model, progress=progress)
-    except Exception as exc:
-        msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
-    return None
+    needed, size_gb, rc = _prefetch_plan(c, model, bk, engine_key, as_json=as_json)
+    if rc is not None or not needed:
+        return rc
+    return _download_prefetched_weights(
+        c, model, bk, size_gb, as_json=as_json, progress=progress)
 
 
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
@@ -1113,14 +1130,20 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
         return 1
     progress = (not as_json) and sys.stderr.isatty()
-    # Pre-fetch weights into the HF cache before the engine's preflight runs (#109).
-    if (rc := _prefetch_weights(c, model, bk, sel.engine_key,
-                                as_json=as_json, progress=progress)) is not None:
+    # Deterministic pre-fetch gates run before ARA claims live work. The actual network download
+    # stays in the same lifecycle record as calibration and measurement.
+    prefetch, prefetch_size, rc = _prefetch_plan(
+        c, model, bk, sel.engine_key, as_json=as_json)
+    if rc is not None:
         return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     calibration_error = None
     with activity.track("characterizing", model):
+        if prefetch and (rc := _download_prefetched_weights(
+                c, model, bk, prefetch_size,
+                as_json=as_json, progress=progress)) is not None:
+            return rc
         with db.connected() as cal_con:
             if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
                 if not as_json:
@@ -1522,9 +1545,13 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     progress = (not as_json) and sys.stderr.isatty()
     # One record owns the complete operational lifecycle: an on-demand fetch and every repeat
     # backend call. All deterministic gates above run before ARA claims that work is live.
+    prefetch, prefetch_size, rc = _prefetch_plan(c, model, bk, key, as_json=as_json)
+    if rc is not None:
+        return rc
     with activity.track("benchmarking", model):
-        if (rc := _prefetch_weights(c, model, bk, key,
-                                    as_json=as_json, progress=progress)) is not None:
+        if prefetch and (rc := _download_prefetched_weights(
+                c, model, bk, prefetch_size,
+                as_json=as_json, progress=progress)) is not None:
             return rc
         # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
         # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
@@ -1849,7 +1876,10 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
             break
         ollama.load(probe)
         entry = _find_loaded(ollama.ps() or [], probe)
-        if entry is None or entry.get("context_length") != ctx:   # didn't load / governance slipped
+        loaded_ctx = entry.get("context_length") if entry is not None else None
+        if (entry is None or not isinstance(loaded_ctx, int)
+                or isinstance(loaded_ctx, bool) or loaded_ctx <= 0
+                or loaded_ctx != ctx):   # didn't load / governance slipped
             points.append({"context": ctx, "fit": False})
             break
         size, vram = entry.get("size"), entry.get("size_vram")
@@ -1927,8 +1957,9 @@ def _governed_name(model: str) -> str:
 
 def _find_loaded(entries: list[dict], served: str) -> dict | None:
     """The ``/api/ps`` entry for our derived model (Ollama tags it ``:latest``), or ``None``."""
-    return next((m for m in entries
-                 if m.get("name") in {served, served + ":latest"}), None)
+    return next((m for m in entries if isinstance(m, dict)
+                 and isinstance(m.get("name"), str)
+                 and m["name"] in (served, served + ":latest")), None)
 
 
 def _free_port() -> int:
@@ -2118,7 +2149,18 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     # 4. bake the ceiling into a derived model. This is temporary process-owned work until exact
     # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
     served = name or _governed_name(model)
-    with activity.track("serving", model):
+    endpoint_base = ollama.base_url()
+    try:
+        activity.validate_ollama_serving(
+            served_name=served, model=model, context=safe, endpoint=endpoint_base)
+    except ValueError as exc:
+        return err(f"invalid serving identity: {exc}")
+    already_owned = any(
+        item.runtime == "ollama" and item.served_name == served
+        and item.context == safe and item.endpoint == endpoint_base
+        for item in activity.snapshot())
+    setup_activity = nullcontext() if already_owned else activity.track("serving", model)
+    with setup_activity:
         if not ollama.create(served, model, safe):
             return err(f"couldn't create the governed model {served!r} on Ollama.")
 
@@ -2128,16 +2170,16 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         if entry is None:
             return err(f"{served} didn't load — Ollama may be out of memory.")
         served_ctx = entry.get("context_length")
-        if served_ctx != safe:
+        if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
+                or served_ctx <= 0 or served_ctx != safe):
             return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
         size, vram = entry.get("size"), entry.get("size_vram")
         spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
 
-    endpoint_base = ollama.base_url()
     try:
         activity.record_ollama_serving(
             served_name=served, model=model, context=safe, endpoint=endpoint_base)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return err(f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
 
     # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
