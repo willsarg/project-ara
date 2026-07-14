@@ -126,6 +126,56 @@ def test_non_linux_runtime_error_is_clean(con, monkeypatch):
     assert "Linux-only" in con[1].getvalue()
 
 
+@pytest.mark.parametrize("sub,exc", [
+    ("install", PermissionError("mkdir denied")),
+    ("install", OSError("write failed")),
+    ("install", ValueError("unit rendering failed")),
+    ("uninstall", OSError("unlink failed")),
+])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_service_filesystem_and_rendering_errors_are_honest(
+        con, capsys, monkeypatch, sub, exc, as_json):
+    monkeypatch.setattr(
+        service, sub, lambda: (_ for _ in ()).throw(exc),
+    )
+    assert _node(con, sub, as_json=as_json) == 1
+    if as_json:
+        assert str(exc) in json.loads(capsys.readouterr().out)["error"]
+    else:
+        assert str(exc) in con[1].getvalue()
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_service_base_exceptions_still_propagate(con, monkeypatch, raised):
+    monkeypatch.setattr(
+        service, "install", lambda: (_ for _ in ()).throw(raised("stop")),
+    )
+    with pytest.raises(raised, match="stop"):
+        _node(con, "install")
+
+
+@pytest.mark.parametrize("sub", ["start", "stop"])
+def test_service_failure_is_actionable_text(con, monkeypatch, sub):
+    monkeypatch.setattr(
+        service, sub,
+        lambda: (_ for _ in ()).throw(RuntimeError("systemctl: daemon message")),
+    )
+    assert _node(con, sub) == 1
+    assert "systemctl: daemon message" in con[1].getvalue()
+
+
+@pytest.mark.parametrize("sub", ["start", "stop"])
+def test_service_failure_is_actionable_json(con, capsys, monkeypatch, sub):
+    monkeypatch.setattr(
+        service, sub,
+        lambda: (_ for _ in ()).throw(RuntimeError("systemctl: daemon message")),
+    )
+    assert _node(con, sub, as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "systemctl: daemon message",
+    }
+
+
 # --- usage ---
 def test_no_subcommand_is_usage_error(con):
     assert _node(con) == 1

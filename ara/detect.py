@@ -15,9 +15,7 @@ import platform
 import re
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass, field, replace
-from importlib.util import find_spec
 from pathlib import Path
 
 import psutil
@@ -27,6 +25,7 @@ from ara import (
     engines as _engines,
     hardware as _hardware,
     ollama,
+    pythons as _pythons,
     versions as _versions,
 )
 
@@ -139,19 +138,15 @@ def _disk_free_gb() -> float | None:
 
 
 def _venv_stripped_path() -> str:
-    """The user's PATH with ARA's active venv bin dir removed.
+    """The user's PATH with ARA's active environment directories removed.
 
-    Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH; removing its bin
-    dir lets us resolve the USER's python/tools, not ARA's bundled ones. That bin dir
-    is ``Scripts`` on Windows, ``bin`` everywhere else.
+    ``VIRTUAL_ENV`` identifies ordinary activated environments; ``sys.prefix`` also
+    catches installed-tool environments whose launcher does not export that variable.
     """
     path = os.environ.get("PATH", "")
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
-        vbin = os.path.normpath(os.path.join(venv, "Scripts" if os.name == "nt" else "bin"))
-        path = os.pathsep.join(p for p in path.split(os.pathsep)
-                               if os.path.normpath(p) != vbin)
-    return path
+    roots = _pythons._active_env_roots()
+    return os.pathsep.join(part for part in path.split(os.pathsep)
+                           if not any(_pythons._path_within(part, root) for root in roots))
 
 
 def _user_python() -> str | None:
@@ -160,13 +155,11 @@ def _user_python() -> str | None:
     Under ``uv run`` the active venv (``VIRTUAL_ENV``) shadows PATH, so a naive
     ``which python3`` returns ARA's interpreter and reports ARA's bundled deps as if
     they were the user's. Strip the venv's bin and re-resolve to find the real one.
-    Returns None when the only python available is ARA's own.
+    Returns None when the only python available is ARA's own. An invocation outside
+    that environment stays valid even when it resolves to the same base executable.
     """
     path = _venv_stripped_path()
-    py = shutil.which("python3", path=path) or shutil.which("python", path=path)
-    if py and os.path.realpath(py) == os.path.realpath(sys.executable):
-        return None  # resolved straight back to ARA's interpreter
-    return py
+    return shutil.which("python3", path=path) or shutil.which("python", path=path)
 
 
 def _python_packages(py: str | None, names: tuple[str, ...]) -> dict[str, str | None]:
@@ -191,15 +184,6 @@ def _python_packages(py: str | None, names: tuple[str, ...]) -> dict[str, str | 
         return json.loads(raw)
     except Exception:
         return blank
-
-
-def _ara_pkg_version(name: str) -> str | None:
-    """Version of a package in ARA's OWN environment (for engines ARA bundles)."""
-    try:
-        import importlib.metadata as md
-        return md.version(name)
-    except Exception:
-        return None
 
 
 def _python_version(py: str | None = None) -> str | None:
@@ -309,7 +293,7 @@ class Runtime:
 
 _ACCEL_LABEL = {"nvidia": "CUDA", "apple": "Apple Silicon"}
 
-# Probed in the USER's python (frameworks/libraries) — engines also fall back to CLIs/ARA.
+# Probed only in an explicitly resolved USER python; no user interpreter means all are absent.
 _FRAMEWORK_PKGS = ("torch", "transformers", "tensorflow")
 _ENGINE_PKGS = ("mlx-lm", "vllm")
 
@@ -317,18 +301,18 @@ _ENGINE_PKGS = ("mlx-lm", "vllm")
 def runtimes(accel_kind: str = "none", user_py: str | None = None) -> list[Runtime]:
     """Inference engines (launch targets) and ML frameworks (libraries underneath).
 
-    Frameworks are probed in the *user's* python (``user_py``) so they report the user's
-    environment, not ARA's bundled deps. Engines also consult PATH CLIs and — for the MLX
-    engine ARA ships — ARA's own env, since that's a real capability on this machine.
+    Python packages are probed only in the explicitly resolved *user* interpreter. Launchers are
+    resolved on the user's venv-stripped PATH. ARA's isolated engine readiness is intentionally
+    excluded; :attr:`Machine.engine_ready` reports that separate capability.
     """
     pkgs = _python_packages(user_py, _FRAMEWORK_PKGS + _ENGINE_PKGS)
-    llama = shutil.which("llama-cli") or shutil.which("llama-server")
-    lms = shutil.which("lms") or Path("/Applications/LM Studio.app").exists()
+    llama = _user_which("llama-cli") or _user_which("llama-server")
+    lms = _user_which("lms") or Path("/Applications/LM Studio.app").exists()
 
-    mlx_ver = pkgs.get("mlx-lm") or _ara_pkg_version("mlx-lm")  # ARA bundles the MLX engine
-    mlx_present = mlx_ver is not None or find_spec("mlx_lm") is not None
+    mlx_ver = pkgs.get("mlx-lm")
+    mlx_present = mlx_ver is not None
     # vLLM ships a `vllm` CLI; check PATH too — the user may have it outside any probed env.
-    vllm_present = pkgs.get("vllm") is not None or shutil.which("vllm") is not None
+    vllm_present = pkgs.get("vllm") is not None or _user_which("vllm") is not None
 
     # Versions for the non-python engines, from the reliable sources (brew / .app plist).
     _, lms_ver = _versions.find_app(["LM Studio"])
@@ -337,7 +321,7 @@ def runtimes(accel_kind: str = "none", user_py: str | None = None) -> list[Runti
     specs: list[tuple[str, bool, str | None, str, tuple[str, ...]]] = [
         ("MLX", mlx_present, mlx_ver, "engine", ("apple",)),
         ("llama.cpp", llama is not None, _versions.brew_version("llama.cpp"), "engine", ()),
-        ("Ollama", shutil.which("ollama") is not None or (Path.home() / ".ollama").exists(),
+        ("Ollama", _user_which("ollama") is not None or (Path.home() / ".ollama").exists(),
          _versions.brew_version("ollama"), "engine", ()),
         ("LM Studio", bool(lms), lms_ver, "engine", ()),
         ("vLLM", vllm_present, pkgs.get("vllm"), "engine", ("nvidia",)),
@@ -406,7 +390,7 @@ def _hf_inventory() -> ModelStore:
 
 def _ollama_inventory() -> ModelStore:
     base = Path.home() / ".ollama" / "models"
-    present = shutil.which("ollama") is not None or base.exists()
+    present = _user_which("ollama") is not None or base.exists()
     if not base.exists():
         return ModelStore("Ollama", present)
     manifests = base / "manifests"

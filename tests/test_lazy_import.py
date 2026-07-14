@@ -25,7 +25,7 @@ def _run_snippet(code: str) -> str:
 def test_importing_ara_does_not_load_native_engine_packages():
     out = _run_snippet(
         "import sys\n"
-        "import ara, ara.detect, ara.status, ara.cli, ara.registry, ara.acquire, ara.ui\n"
+        "import ara, ara.activity, ara.detect, ara.cli, ara.registry, ara.acquire, ara.ui\n"
         "import ara.backends.apple, ara.backends.cuda\n"
         "loaded = {'ara_engine_mlx', 'ara_engine_cuda'} & sys.modules.keys()\n"
         "print(','.join(sorted(loaded)) if loaded else 'clean')\n"

@@ -43,7 +43,11 @@ def _result_payload(result: dict) -> dict:
     ``{"error": ...}`` dict (the wiring convention), which becomes a ``failed`` result."""
     env = capabilities.environment()
     if isinstance(result, dict) and "error" in result:
-        return {"status": "failed", "error": str(result["error"]), "environment": env}
+        payload = {"status": "failed", "error": str(result["error"]), "environment": env}
+        stderr = result.get("stderr")
+        if isinstance(stderr, str) and stderr:
+            payload["stderr"] = stderr
+        return payload
     return {"status": "done", "result": result, "environment": env}
 
 

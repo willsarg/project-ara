@@ -8,6 +8,8 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Will Sarg" }]
 requires-python = ">=3.12"
 dependencies = [
+    # command grammar and the shared console/module/programmatic entrypoint
+    "click>=8.1",
     # cross-platform system recon for `ara detect` (read-only; runs on any box)
     "psutil>=5.9",
     # model acquisition — snapshot_download + cache layout; no auth needed for ungated models
@@ -24,7 +26,7 @@ dependencies = [
 [project.scripts]
 ara = "ara.cli:main"
 
-# Optional web stacks — NEVER base deps, so `pip install project-ara` stays the 4 lean deps above.
+# Optional web stacks — NEVER base deps, so `pip install project-ara` stays the 5 lean deps above.
 # The push-only node dials out to its coordinator over httpx — no inbound server, so no FastAPI.
 [project.optional-dependencies]
 node = ["httpx>=0.27"]

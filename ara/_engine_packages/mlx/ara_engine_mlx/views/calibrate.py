@@ -77,5 +77,5 @@ def render_summary(console, data: dict) -> None:
     c.emit(c.field("stored", f"{data['fixed_overhead_gb']:.2f} GB", note))
     c.emit(c.next_block([
         ("ara profile", "confirm the updated machine estimate"),
-        ("ara models", "re-check per-model ceilings"),
+        ("ara models show MODEL", "re-check a model's per-engine ceiling"),
     ]))

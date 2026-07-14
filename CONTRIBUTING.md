@@ -5,7 +5,7 @@ for AI work and running local models safely — but the goal is for it to work a
 of hardware and lots of AI software**, so contributions are genuinely wanted, especially:
 
 - recon coverage for tools/interpreters/model stores/apps ARA doesn't know about yet,
-- new **backends** (NVIDIA/CUDA is the next frontier),
+- new **backends** and verified platform coverage,
 - and reports from machines unlike the M-series reference box.
 
 Please read [AGENTS.md](./AGENTS.md) first — it's the source of truth for the project's
@@ -17,6 +17,7 @@ workflow*.
 ```bash
 uv sync                       # install into .venv (incl. dev tools)
 uv run ara                    # landing screen
+uv run python -m ara --help   # the same canonical main through module execution
 uv run pytest                 # tests (100% statement + branch coverage is the bar)
 ```
 
@@ -29,8 +30,9 @@ neither engine.
 
 From [AGENTS.md](./AGENTS.md) — a change must not violate these:
 
-- **Recon is read-only.** `detect` / `status` / `python` / `apps` / `mlx` observe; they never
-  stress the machine, load a model, or mutate state.
+- **Recon is read-only.** `detect` and its `--python` / `--apps` / `--runtime` / `--models`
+  facets observe; they never stress the machine, load a model, or mutate state. `status` is a
+  read-only view of ARA-owned activity, not a generic process monitor.
 - **`characterize` is consent-gated.** It measures (and may download model weights) only with
   explicit opt-in; `profile` remains engine-free and read-only.
 - **Advisory, never destructive.** ARA surfaces facts; it never runs or prescribes
@@ -48,6 +50,14 @@ From [AGENTS.md](./AGENTS.md) — a change must not violate these:
 - **Match the surrounding style** — semantic console roles (`accent`/`dim`/`good`/`warn`),
   honest copy, and the `--json` / `--include` / `--exclude` flags where a recon command adds
   output.
+
+The public command tree is `detect`, `profile`, `status`, `models {search,recommend,show}`, `run`,
+`serve`, `characterize`, `benchmark`, `install`, `uninstall`, `node`, `hf`, and `doctor`. Hidden
+one-release compatibility aliases must not be used in new examples. Production subprocesses use
+the same `python -m ara` main as the `ara` console script.
+
+Platform claims are evidence-based: macOS is verified with CPU + MLX, Windows with CPU + CUDA on
+an RTX 2070, and Linux with CPU. CUDA-on-Linux is not claimed until it is tested there.
 
 ## Landing a change
 

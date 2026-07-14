@@ -66,8 +66,7 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.detect, "accelerator",
                         lambda chip: Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16))
     monkeypatch.setattr(cli.apps, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan", lambda: [])
-    monkeypatch.setattr(cli.status, "scan_apps", lambda: [])
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
     monkeypatch.setattr(cli.pythons, "discover", lambda: [])
     monkeypatch.setattr(cli.pythons, "count", lambda: 0)
     monkeypatch.setattr(cli.mlx, "scan", lambda: [])
@@ -92,13 +91,14 @@ def mocked_world(monkeypatch, store):
 # (argv, expected JSON type, an anchor key that must be present | None for a list)
 CONTRACT = [
     (["detect", "--json"], dict, "backend"),
-    (["status", "--json"], dict, "workloads"),
+    (["detect", "--models", "--json"], list, None),
+    (["status", "--json"], dict, "state"),
     (["python", "--json"], list, None),
     (["apps", "--json"], list, None),
     (["mlx", "--json"], dict, "apple_silicon"),
-    (["models", "--json"], list, None),
-    (["models", "org/m", "--json"], dict, "model_id"),
-    (["search", "smol", "--json"], list, None),
+    (["models", "show", "org/m", "--json"], dict, "model_id"),
+    (["models", "search", "smol", "--json"], list, None),
+    (["models", "recommend", "--json"], list, None),
     (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
     (["install", "--engine", "mlx", "--json"], dict, "status"),
@@ -125,11 +125,160 @@ def test_command_emits_valid_json(mocked_world, monkeypatch, capsys, argv, kind,
         assert anchor in payload, f"{argv} JSON missing '{anchor}'"
 
 
-def test_unknown_command_is_nonzero_and_not_json(mocked_world, monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["ara", "frobnicate"])
-    assert cli.main() == 1
+def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
+    assert cli.main(["frobnicate", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'frobnicate'" in captured.err
+
+
+def test_models_group_bare_and_help_show_generated_help(mocked_world, capsys):
+    for argv in (["models"], ["models", "--help"]):
+        assert cli.main(argv) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "Usage: ara models [OPTIONS] COMMAND [ARGS]..." in captured.out
+        assert "search" in captured.out
+        assert "recommend" in captured.out
+        assert "show" in captured.out
+
+
+def test_models_list_is_a_click_usage_error_not_a_model_alias(mocked_world, capsys):
+    assert cli.main(["models", "list", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'list'" in captured.err
+
+
+@pytest.mark.parametrize("argv, warning", [
+    (["search", "smol", "--json"],
+     "ara: search is deprecated; use models search\n"),
+    (["recommend", "--json"],
+     "ara: recommend is deprecated; use models recommend\n"),
+    (["models", "org/m", "--json"],
+     "ara: models MODEL is deprecated; use models show MODEL\n"),
+    (["python", "--json"],
+     "ara: python is deprecated; use detect --python\n"),
+    (["apps", "--json"],
+     "ara: apps is deprecated; use detect --apps\n"),
+    (["mlx", "--json"],
+     "ara: mlx is deprecated; use detect --runtime\n"),
+])
+def test_deprecated_aliases_warn_only_on_stderr_and_keep_json_exact(
+        mocked_world, capsys, argv, warning):
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert captured.err == warning
+
+
+def test_deprecated_aliases_are_hidden_from_root_help(mocked_world, capsys):
+    assert cli.main(["--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    command_names = {line.split()[0] for line in captured.out.split("Commands:\n", 1)[1].splitlines()
+                     if line.startswith("  ")}
+    assert command_names.isdisjoint({"search", "recommend", "python", "apps", "mlx"})
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["characterize", "--json"], "Missing argument 'MODEL'"),
+    (["benchmark", "org/m", "--json"], "Missing option '--use-case'"),
+    (["profile", "--json", "--model"], "Option '--model' requires an argument"),
+    (["serve", "org/m", "--json", "--ctx", "many"], "Invalid value for '--ctx'"),
+    (["benchmark", "org/m", "--json", "--use-case", "reasoning", "--repeat", "lots"],
+     "Invalid value for '--repeat'"),
+    (["detect", "--json", "--made-up"], "No such option '--made-up'"),
+])
+def test_click_grammar_errors_are_stderr_exit_two_and_never_json(
+        mocked_world, capsys, argv, message):
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert message in captured.err
     with pytest.raises(json.JSONDecodeError):
-        json.loads(capsys.readouterr().out.strip())
+        json.loads(captured.err)
+
+
+def test_typed_options_and_trailing_json_reach_callback(mocked_world, monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_benchmark",
+        lambda c, model, **kwargs: seen.update(model=model, **kwargs) or 7,
+    )
+    assert cli.main([
+        "benchmark", "org/m", "--use-case=reasoning", "--ctx", "4096",
+        "--max-tokens=512", "--repeat", "3", "--yes", "--json",
+    ]) == 7
+    assert seen == {
+        "model": "org/m", "use_case": "reasoning", "engine": None, "ctx": 4096,
+        "max_tokens": 512, "repeat": 3, "assume_yes": True,
+        "exec_consent": False, "as_json": True,
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_repeatable_include_exclude_accept_space_and_equals_forms(
+        mocked_world, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "_resolve_want",
+        lambda cmd, include, exclude, c, **kw: seen.update(
+            cmd=cmd, include=include, exclude=exclude, **kw) or (lambda section: True),
+    )
+    assert cli.main([
+        "detect", "--include", "system,memory", "--include=accelerator",
+        "--exclude", "apps", "--exclude=models", "--json",
+    ]) == 0
+    assert seen == {
+        "cmd": "detect", "include": ["system", "memory", "accelerator"],
+        "exclude": ["apps", "models"], "as_json": True,
+    }
+
+
+@pytest.mark.parametrize("option", ["--include", "--exclude"])
+def test_status_rejects_recon_filters_as_click_usage_errors(mocked_world, capsys, option):
+    assert cli.main(["status", option, "processes"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara status" in captured.err
+    assert f"No such option '{option}'" in captured.err
+
+
+@pytest.mark.parametrize("group", ["hf", "node"])
+def test_explicit_groups_require_a_subcommand(mocked_world, capsys, group):
+    assert cli.main([group]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"Usage: ara {group}" in captured.err
+    assert "Missing command" in captured.err
+
+
+@pytest.mark.parametrize("subcommand", ["logout", "status"])
+def test_hf_subcommands_dispatch_through_click(mocked_world, monkeypatch, subcommand):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_hf",
+        lambda c, sub, **kwargs: seen.update(sub=sub, **kwargs) or 0,
+    )
+    assert cli.main(["hf", subcommand, "--json"]) == 0
+    assert seen == {"sub": subcommand, "as_json": True}
+
+
+@pytest.mark.parametrize("subcommand", ["install", "start", "stop", "status", "uninstall"])
+def test_node_lifecycle_subcommands_dispatch_through_click(
+        mocked_world, monkeypatch, subcommand):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_node",
+        lambda c, rest, **kwargs: seen.update(rest=rest, **kwargs) or 0,
+    )
+    assert cli.main(["node", subcommand, "--json"]) == 0
+    assert seen == {"rest": ["node", subcommand], "as_json": True}
 
 
 def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):

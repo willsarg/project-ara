@@ -54,26 +54,6 @@ def test_fmt_size(gb, out):
     assert cli._fmt_size(gb) == out
 
 
-@pytest.mark.parametrize("secs,out", [
-    (5, "5s"), (59, "59s"),
-    (60, "1m"),       # boundary: 60s rolls over to minutes (s < 60 is exclusive)
-    (90, "1m"), (3600, "1h"),
-    (86400, "1d"),    # boundary: 86400s rolls over to days (s < 86400 is exclusive)
-    (90000, "1d"),
-])
-def test_fmt_uptime(secs, out):
-    assert cli._fmt_uptime(secs) == out
-
-
-@pytest.mark.parametrize("gb,out", [
-    (0.5, "512 MB"),   # binary MB under a gigabyte
-    (1.0, "1.0 GB"),   # boundary: gb == 1 takes the GB branch (gb < 1 is exclusive)
-    (2.0, "2.0 GB"),
-])
-def test_fmt_mem(gb, out):
-    assert cli._fmt_mem(gb) == out
-
-
 # --------------------------------------------------------------------------- #
 # main(): arg parsing + dispatch
 # --------------------------------------------------------------------------- #
@@ -81,12 +61,11 @@ def _capture_dispatch(monkeypatch):
     """Replace the render_* entry points with recorders; return the record dict."""
     rec = {}
     monkeypatch.setattr(cli, "render_landing", lambda c: rec.update(landing=True))
-    monkeypatch.setattr(cli, "render_help",
-                        lambda c, cmd, as_json=False: rec.update(help=cmd, help_called=True) or 0)
     monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False, want=None: rec.update(detect=as_json, detect_want=want))
-    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False, want=None: rec.update(status=as_json))
+    monkeypatch.setattr(cli, "render_status", lambda c, as_json=False: rec.update(status=as_json))
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
     monkeypatch.setattr(cli, "render_apps", lambda c, as_json=False, want=None: rec.update(apps=as_json))
+    monkeypatch.setattr(cli, "render_runtime", lambda c, as_json=False, want=None: rec.update(runtime=as_json))
     monkeypatch.setattr(cli, "render_mlx", lambda c, as_json=False, want=None: rec.update(mlx=as_json))
     monkeypatch.setattr(cli, "render_models", lambda c, as_json=False, want=None: rec.update(models=as_json))
     monkeypatch.setattr(cli, "render_characterize",
@@ -214,10 +193,10 @@ def test_main_no_args_shows_landing(monkeypatch):
 
 
 def test_main_help_shows_landing(monkeypatch):
-    # bare -h (no command) routes through render_help with no command → the landing catalog.
+    # Click owns the root grammar and both conventional help spellings.
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["-h"]) == 0
-    assert rec.get("help_called") and rec["help"] is None
+    assert rec == {}
 
 
 def test_main_detect(monkeypatch):
@@ -244,10 +223,22 @@ def test_main_detect_apps_facet_routes_to_render_apps(monkeypatch):
     assert "apps" in rec and "detect" not in rec
 
 
-def test_main_detect_runtime_facet_routes_to_render_mlx(monkeypatch):
+def test_main_detect_first_facet_wins_python_then_apps(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--python", "--apps"])
+    assert "python" in rec and "apps" not in rec
+
+
+def test_main_detect_first_facet_wins_apps_then_python(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    _run_main(monkeypatch, ["detect", "--apps", "--python"])
+    assert "apps" in rec and "python" not in rec
+
+
+def test_main_detect_runtime_facet_routes_to_cross_platform_runtime_report(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["detect", "--runtime"])
-    assert "mlx" in rec and "detect" not in rec
+    assert "runtime" in rec and "detect" not in rec and "mlx" not in rec
 
 
 def test_main_detect_models_facet_routes_to_render_models(monkeypatch):
@@ -272,6 +263,47 @@ def test_main_status(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     _run_main(monkeypatch, ["status"])
     assert rec["status"] is False
+
+
+def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_model_detail",
+        lambda c, model_id, **kwargs: seen.update(model_id=model_id, **kwargs) or 0,
+    )
+    assert _run_main(monkeypatch, ["models", "org/m", "--include", "system"]) == 0
+    assert seen == {"model_id": "org/m", "as_json": False}
+    assert "--include/--exclude don't apply to 'models'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["models", "search", "smol model", "--json", "-v"],
+     {"query": "smol model", "as_json": True}),
+    (["models", "recommend", "--use-case", "coding", "--json", "--verbose"],
+     {"as_json": True, "use_case": "coding"}),
+    (["models", "show", "org/m", "--json", "-v"],
+     {"model_id": "org/m", "as_json": True}),
+])
+def test_models_subcommands_dispatch_to_existing_renderers(monkeypatch, argv, expected):
+    seen = {}
+    if argv[1] == "search":
+        monkeypatch.setattr(
+            cli, "render_search",
+            lambda c, query, **kwargs: seen.update(query=query, **kwargs) or 0,
+        )
+    elif argv[1] == "recommend":
+        monkeypatch.setattr(
+            cli, "render_recommend",
+            lambda c, **kwargs: seen.update(**kwargs) or 0,
+        )
+    else:
+        monkeypatch.setattr(
+            cli, "render_model_detail",
+            lambda c, model_id, **kwargs: seen.update(model_id=model_id, **kwargs) or 0,
+        )
+    assert _run_main(monkeypatch, argv) == 0
+    assert seen == expected
 
 
 # --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention
@@ -353,11 +385,12 @@ def test_main_profile_model_separate_value(monkeypatch):
     assert rec["profile"]["model"] == "org/repo"
 
 
-def test_main_profile_model_flag_as_last_arg(monkeypatch):
-    # boundary: `--model` with no following value must yield None, not IndexError.
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["profile", "--model"]) == 0
-    assert rec["profile"]["model"] is None
+def test_main_profile_model_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["profile", "--model"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Option '--model' requires an argument" in captured.err
 
 
 def test_main_profile_model_equals_form(monkeypatch):
@@ -373,10 +406,12 @@ def test_main_profile_passes_json(monkeypatch):
     assert rec["profile"]["as_json"] is True
 
 
-def test_main_unknown_command_returns_1(monkeypatch, capsys):
+def test_main_unknown_command_is_click_usage_error(monkeypatch, capsys):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["frobnicate"]) == 1
-    assert "isn't a known ARA command" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["frobnicate"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'frobnicate'" in captured.err
 
 
 def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
@@ -397,50 +432,27 @@ def test_ara_version_falls_back_when_not_installed(monkeypatch):
 def test_main_subcommand_help_routes_to_help_not_action(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["install", "--help"]) == 0
-    assert rec.get("help_called") and rec["help"] == "install"
-    assert "install" not in rec                 # the install action never ran (no side effect)
+    assert "install" not in rec                 # Click exits before the action callback
 
 
 def test_main_dash_h_after_command_routes_to_help(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["characterize", "-h"]) == 0
-    assert rec["help"] == "characterize" and "characterize" not in rec
+    assert "characterize" not in rec
 
 
 def test_main_bare_help_routes_to_help_with_no_command(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["--help"]) == 0
-    assert rec.get("help_called") and rec["help"] is None
+    assert rec == {}
 
 
-def test_render_help_known_command_prints_usage(make_console):
-    c, buf = make_console()
-    assert cli.render_help(c, "install") == 0
-    out = buf.getvalue()
-    assert "usage" in out and "ara install" in out
-
-
-def test_render_help_benchmark_lists_exec_consent(make_console):
-    """The coding benchmark REQUIRES --exec-consent; its usage line must advertise it."""
-    c, buf = make_console()
-    assert cli.render_help(c, "benchmark") == 0
-    assert "--exec-consent" in buf.getvalue()
-
-
-def test_render_help_no_or_unknown_command_falls_back_to_landing(monkeypatch, make_console):
-    c, _ = make_console()
-    seen = {}
-    monkeypatch.setattr(cli, "render_landing", lambda c: seen.update(landing=True))
-    assert cli.render_help(c, None) == 0 and seen.get("landing")
-    seen.clear()
-    assert cli.render_help(c, "frobnicate") == 0 and seen.get("landing")
-
-
-def test_render_help_json(capsys):
-    c = cli.Console(color=False, stream=sys.stderr)
-    assert cli.render_help(c, "install", as_json=True) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["command"] == "install" and "ara install" in out["usage"]
+def test_generated_install_help_is_stdout(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "Usage: ara install [OPTIONS] [ENGINE_ARG]" in captured.out
+    assert "--engine ENGINE" in captured.out
 
 
 # ---- install / uninstall take a positional engine (not just --engine) ---------------------
@@ -645,7 +657,8 @@ def test_render_detect_text(make_console, monkeypatch, stub_pythons):
     assert "PyTorch" in out              # framework on the default python
     assert "needs CUDA" in out          # vLLM unusable reason rendered
     assert "/usr/bin/python3" in out    # default interpreter shown under FRAMEWORKS
-    assert "interpreters on this machine" in out  # count > 1 → pointer to `ara python`
+    assert "interpreters on this machine" in out
+    assert "ara detect --python" in out
     assert "3 models" in out
 
 
@@ -728,67 +741,77 @@ def test_render_detect_json(monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# render_status
+# render_status — ARA-owned activity only
 # --------------------------------------------------------------------------- #
-def _proc(**over):
-    from ara.status import Proc
-    base = dict(pid=1234, label="Ollama", detail="llama3", rss_gb=2.0,
-                uptime_s=120.0, gpu_mb=None, port=11434)
+def _activity(**over):
+    from ara.activity import Activity
+    base = dict(kind="running", model="org/model", pid=1234, started_at=100.0)
     base.update(over)
-    return Proc(**base)
-
-
-def _app(**over):
-    from ara.status import AppProc
-    base = dict(label="Claude", n_procs=8, rss_gb=1.2, uptime_s=300.0)
-    base.update(over)
-    return AppProc(**base)
-
-
-def test_render_status_with_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([_proc(), _proc(pid=5, label="vLLM", rss_gb=4.0)], []))
-    c, buf = make_console()
-    cli.render_status(c)
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" in out
-    assert "Ollama" in out and "vLLM" in out
-    assert "pid 1234" in out and ":11434" in out
-    assert "total" in out and "2 processes" in out
+    return Activity(**base)
 
 
 def test_render_status_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([], []))
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
     c, buf = make_console()
     cli.render_status(c)
-    assert "nothing running right now" in buf.getvalue()
+    assert buf.getvalue() == "ARA is idle.\n"
 
 
-def test_render_status_shows_ai_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([], [_app(), _app(label="Claude Code", n_procs=1, rss_gb=0.2)]))
+@pytest.mark.parametrize("kind,model,expected", [
+    ("characterizing", "org/model", "ARA is characterizing org/model.\n"),
+    ("benchmarking", "org/model", "ARA is benchmarking org/model.\n"),
+    ("searching", None, "ARA is searching for models.\n"),
+    ("running", "org/model", "ARA is running org/model.\n"),
+    ("serving", "org/model", "ARA is serving org/model.\n"),
+])
+def test_render_status_single_activity_text(make_console, monkeypatch, kind, model, expected):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [_activity(kind=kind, model=model)])
     c, buf = make_console()
     cli.render_status(c)
-    out = buf.getvalue()
-    assert "AI APPS" in out
-    assert "Claude" in out and "Claude Code" in out
-    assert "8 procs" in out and "1 proc" in out
+    assert buf.getvalue() == expected
 
 
-def test_render_status_ai_apps_empty(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
+def test_render_status_multiple_activities_shows_every_activity(make_console, monkeypatch):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [
+        _activity(kind="benchmarking", model="org/a", pid=1, started_at=10.0),
+        _activity(kind="serving", model="org/b", pid=2, started_at=20.0),
+    ])
     c, buf = make_console()
     cli.render_status(c)
-    assert "no AI apps running" in buf.getvalue()
+    assert buf.getvalue() == (
+        "ARA is active:\n"
+        "  benchmarking org/a\n"
+        "  serving org/b\n"
+    )
 
 
-def test_render_status_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
+@pytest.mark.parametrize("activities,state", [
+    ([], "idle"),
+    ([_activity(kind="characterizing")], "characterizing"),
+    ([_activity(kind="benchmarking")], "benchmarking"),
+    ([_activity(kind="searching", model=None)], "searching"),
+    ([_activity(kind="running")], "running"),
+    ([_activity(kind="serving")], "serving"),
+    ([_activity(), _activity(kind="serving", pid=5)], "active"),
+])
+def test_render_status_json_has_exact_state_and_activity_shape(
+        monkeypatch, capsys, activities, state):
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: activities)
     c = cli.Console(color=False, stream=sys.stderr)
     cli.render_status(c, as_json=True)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["workloads"][0]["label"] == "Ollama" and payload["workloads"][0]["port"] == 11434
-    assert payload["apps"][0]["label"] == "Claude" and payload["apps"][0]["n_procs"] == 8
+    assert payload == {
+        "state": state,
+        "activities": [
+            {
+                "kind": item.kind,
+                **({"model": item.model} if item.model is not None else {}),
+                "pid": item.pid,
+                "started_at": item.started_at,
+            }
+            for item in activities
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1174,8 +1197,8 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pytho
     # no third-party launchers, non-verbose: the note must NOT read as a bare "none" that
     # contradicts the ARA section's own-engine readiness — it points there instead (bug fix).
     assert "own engine" in out and "ENGINES" in out
-    assert "has no AI frameworks" in out                  # default python is bare
-    assert "ARA's env (no separate user python)" in out   # framework_python is None
+    assert "no separate user Python found" in out
+    assert "Your default python" not in out
     assert "None found in any interpreter" in out         # discover surfaced nothing
     assert "HF cache" not in out                           # absent store hidden (non-verbose)
 
@@ -1200,17 +1223,7 @@ def test_render_detect_frameworks_surfaced_from_other_interpreter(
     assert "But you've got them in" in out
     assert "Homebrew 3.12.4" in out
     assert "torch 2.1.0" in out and "transformers 4.40.0" in out
-    assert "ara python" in out
-
-
-def test_render_status_gpu_and_no_port(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all",
-                        lambda: ([_proc(gpu_mb=8192.0, port=None, detail=None)], []))
-    c, buf = make_console()
-    cli.render_status(c)
-    out = buf.getvalue()
-    assert "8192 MB GPU" in out
-    assert ":" not in out.split("Ollama")[-1].split("\n")[0].replace("pid", "")
+    assert "ara detect --python" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -1543,6 +1556,7 @@ def test_det_apps_summary(make_console, monkeypatch):
     out = buf.getvalue()
     assert "AI/ML APPS" in out and "model runners" in out
     assert "(+1 more)" in out   # 4 runners, top 3 shown
+    assert "ara detect --apps" in out
 
 
 def test_det_apps_empty(make_console):
@@ -1609,22 +1623,6 @@ def test_render_detect_want_filters_sections(make_console, monkeypatch, stub_pyt
     cli.render_detect(c, want=lambda k: k == "system")
     out = buf.getvalue()
     assert "SYSTEM" in out and "MEMORY" not in out and "ACCELERATOR" not in out
-
-
-def test_render_status_want_excludes_processes(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], []))
-    c, buf = make_console()
-    cli.render_status(c, want=lambda k: k != "processes")   # workloads section filtered out
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" not in out and "AI APPS" in out  # apps section still shows
-
-
-def test_render_status_want_excludes_apps(make_console, monkeypatch):
-    monkeypatch.setattr(cli.status, "_scan_all", lambda: ([_proc()], [_app()]))
-    c, buf = make_console()
-    cli.render_status(c, want=lambda k: k != "apps")        # apps section filtered out
-    out = buf.getvalue()
-    assert "RUNNING AI/ML" in out and "AI APPS" not in out
 
 
 def test_render_python_want_excludes_interpreters(make_console, monkeypatch):
@@ -1976,10 +1974,11 @@ def test_render_models_best_fit_across_engines(make_console, store, monkeypatch)
     assert "8192" in line and "(cpu)" in line and "3500" not in line
 
 
-def test_main_models_dispatch(monkeypatch):
+def test_main_models_bare_does_not_dispatch_cached_inventory(monkeypatch, capsys):
     rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["models", "--json"])
-    assert rec["models"] is True
+    assert _run_main(monkeypatch, ["models"]) == 0
+    assert "models" not in rec
+    assert "Usage: ara models" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #
@@ -2660,7 +2659,7 @@ def test_main_run_dispatch(monkeypatch):
 
 def test_main_run_usage_no_model(make_console, monkeypatch):
     monkeypatch.setattr("sys.argv", ["ara", "run"])
-    assert cli.main() == 1
+    assert cli.main() == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -2686,7 +2685,7 @@ def test_render_search_hf_missing(make_console, monkeypatch):
     monkeypatch.setattr(cli.hub, "search", lambda q: None)
     c, buf = make_console()
     assert cli.render_search(c, "x") == 1
-    assert "hf CLI" in buf.getvalue()
+    assert "hf command" in buf.getvalue() and "uv sync --frozen" in buf.getvalue()
 
 
 def test_render_search_json(monkeypatch, capsys):
@@ -2713,8 +2712,10 @@ def test_main_search_dispatch(monkeypatch):
 
 
 def test_main_search_no_query(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["search"]) == 1
-    assert "usage: ara search" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["search"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara search" in captured.err
 
 
 # --------------------------------------------------------------------------- #
@@ -3007,11 +3008,12 @@ def test_main_characterize_prefill_chunk_eq_form(monkeypatch):
     assert rec["characterize_chunk"] == 384
 
 
-def test_main_prefill_chunk_non_integer_disables_lever(monkeypatch):
-    # A non-integer value parses to None (off) rather than crashing the CLI (Rule #1 fail-safe).
-    rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"])
-    assert rec["characterize_chunk"] is None
+def test_main_prefill_chunk_non_integer_is_click_error(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Invalid value for '--prefill-chunk'" in captured.err
 
 
 def test_int_or_none_parses_and_rejects():
@@ -3092,19 +3094,26 @@ def test_main_characterize_flash_attn_optin_default_false(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# --json honesty (Rule #3): usage errors, unknown commands, and uncaught
-# exceptions must all emit {"error": ...} under --json, never styled text or a
-# traceback that breaks a JSON consumer.
+# --json honesty (Rule #3): Click grammar errors stay stderr/2; operational
+# exceptions after a valid command emit {"error": ...} under --json.
 # --------------------------------------------------------------------------- #
 def test_main_usage_errors_json(monkeypatch, capsys):
-    for argv in (["search"], ["characterize"], ["run"]):
-        assert _run_main(monkeypatch, [*argv, "--json"]) == 1
-        assert "error" in json.loads(capsys.readouterr().out)
+    assert _run_main(monkeypatch, ["search", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Missing argument" in captured.err
+    for argv in (["characterize"], ["run"]):
+        assert _run_main(monkeypatch, [*argv, "--json"]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Missing argument" in captured.err
 
 
-def test_main_unknown_command_json(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["bogus", "--json"]) == 1
-    assert "isn't a known ARA command" in json.loads(capsys.readouterr().out)["error"]
+def test_main_unknown_command_json_flag_does_not_override_click(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["bogus", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'bogus'" in captured.err
 
 
 def _raise_engine_env(*a, **k):
@@ -3695,8 +3704,10 @@ def test_main_characterize_passes_engine(monkeypatch):
 
 
 def test_main_characterize_no_model(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["characterize"]) == 1
-    assert "usage: ara characterize" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["characterize"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara characterize" in captured.err
 
 
 # --------------------------------------------------------------------------- #
@@ -5843,20 +5854,20 @@ def test_main_serve_empty_name_is_none(monkeypatch):
     assert rec["serve"]["name"] is None and rec["serve"]["ctx"] == 8
 
 
-def test_main_serve_ctx_flag_at_end_is_none(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
+def test_main_serve_ctx_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_serve",
-                        lambda c, model, **kw: rec.update(serve=kw) or 0)
-    _run_main(monkeypatch, ["serve", "m", "--ctx"])
-    assert rec["serve"]["ctx"] is None
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["serve", "m", "--ctx"]) == 2
+    assert "Option '--ctx' requires an argument" in capsys.readouterr().err
 
 
-def test_main_serve_name_flag_at_end_is_none(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
+def test_main_serve_name_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_serve",
-                        lambda c, model, **kw: rec.update(serve=kw) or 0)
-    _run_main(monkeypatch, ["serve", "m", "--name"])
-    assert rec["serve"]["name"] is None
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["serve", "m", "--name"]) == 2
+    assert "Option '--name' requires an argument" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -5916,6 +5927,7 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
+    assert "ara models recommend --use-case coding" in out
 
 
 def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, monkeypatch):
@@ -6091,12 +6103,12 @@ def test_render_benchmark_rejects_nonpositive_max_tokens(make_console, monkeypat
 
 def test_main_benchmark_missing_use_case_returns_error(monkeypatch):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["benchmark", "org/m"]) == 1
+    assert _run_main(monkeypatch, ["benchmark", "org/m"]) == 2
 
 
 def test_main_benchmark_missing_model_returns_error(monkeypatch):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["benchmark"]) == 1
+    assert _run_main(monkeypatch, ["benchmark"]) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -6784,13 +6796,13 @@ def test_main_benchmark_parses_repeat_equals_form(monkeypatch):
     assert rec["benchmark"]["repeat"] == 5
 
 
-def test_main_benchmark_noninteger_repeat_folds_to_invalid(monkeypatch):
-    # A non-integer --repeat parses to 0, which render_benchmark rejects (positive-integer gate).
-    rec = _capture_dispatch(monkeypatch)
+def test_main_benchmark_noninteger_repeat_is_click_error(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_benchmark",
-                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
-    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--repeat", "lots"])
-    assert rec["benchmark"]["repeat"] == 0
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning",
+                                   "--repeat", "lots"]) == 2
+    assert "Invalid value for '--repeat'" in capsys.readouterr().err
 
 
 # --- serve: MLX (mlx) governed-server path ---

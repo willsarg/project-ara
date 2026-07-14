@@ -3,7 +3,7 @@
 """ARA command-line front door.
 
 ``ara`` with no arguments renders the landing screen. The full command roster —
-detect/status/apps/python/mlx recon, models/search, profile/characterize/recommend,
+detect recon, live ARA activity, models/search, profile/characterize/recommend,
 governed run/serve, benchmark, install/uninstall, hf auth, node (fleet), doctor — is
 dispatched below; an unrecognized command falls through to a clear error.
 """
@@ -12,12 +12,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
-from ara import (acquire, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
+import click
+
+from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
-                 staleness, status, versions)
+                 staleness, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
@@ -81,23 +85,16 @@ _RECON_SECTIONS: dict[str, tuple[str, ...]] = {
                "engines", "frameworks", "models", "apps", "ara"),
     "apps": ("runner", "image", "speech", "toolkit", "assistant", "coding"),
     "mlx": ("readiness", "libraries"),
-    "status": ("processes", "apps"),
     "python": ("interpreters",),
 }
 _SECTION_ALIASES = {
     "gpu": "accelerator", "app": "apps", "framework": "frameworks", "engine": "engines",
     "model": "models", "lib": "libraries", "libs": "libraries", "library": "libraries",
-    "ready": "readiness", "proc": "processes", "procs": "processes", "process": "processes",
+    "ready": "readiness",
     "interpreter": "interpreters", "interps": "interpreters", "interp": "interpreters",
     "runners": "runner", "toolkits": "toolkit", "assistants": "assistant",
     "models-runner": "runner",
 }
-# `ara detect --<flag>` facets — read-only inspection views collapsed under the one recon
-# command; each maps to the render_* that used to be its own top-level command (still dispatched
-# below as hidden back-compat aliases). "runtime" is the user-facing rename of the old "mlx" facet.
-_FACET_FLAGS = {"--python": "python", "--apps": "apps", "--runtime": "runtime", "--models": "models"}
-
-
 def _csv(value: str) -> list[str]:
     """Split a comma-separated flag value into trimmed, non-empty parts."""
     return [s.strip() for s in value.split(",") if s.strip()]
@@ -132,48 +129,6 @@ def _resolve_want(cmd: str, include: list[str], exclude: list[str], c: Console, 
         c.emit(c.style("dim", f"  valid: {', '.join(valid)}"))
         c.emit()
     return _section_filter([s for s in inc if s in valid], [s for s in exc if s in valid])
-
-
-# --------------------------------------------------------------------------- #
-# help (per-subcommand usage for `ara <cmd> --help` / `-h`)
-# --------------------------------------------------------------------------- #
-_COMMAND_HELP = {
-    "detect": "ara detect [--python|--apps|--runtime|--models] [--json] — system report for this machine",
-    "status": "ara status [--json] — AI/ML processes running right now",
-    "python": "ara python [--json] — interpreters + their AI libraries",
-    "apps": "ara apps [--json] — installed AI/ML apps",
-    "mlx": "ara mlx [--json] — MLX ecosystem readiness",
-    "search": "ara search <query> [--json] — find models on the Hugging Face Hub",
-    "models": "ara models [<model-id>] [--json] — model catalog + safe ceilings",
-    "characterize": ("ara characterize <model> [--engine E] [--kv-quant f16|q8_0|q4_0] "
-                     "[--weight-quant none|int8|int4|fp8] [--chunked-prefill] [--json]"),
-    "install": "ara install [<engine>] [--engine E] — install an engine (default: matched to this machine)",
-    "uninstall": "ara uninstall [<engine>] [--engine E] — remove an engine",
-    "profile": "ara profile [--model M] [--engine E] [--json] — analytic capability estimate",
-    "recommend": "ara recommend [--json] — models that fit here, ranked by usable context",
-    "run": ("ara run <model> <prompt> [--engine E] [--kv-quant ...] [--weight-quant ...] "
-            "[--chunked-prefill] [--json]"),
-    "serve": ("ara serve <model> [--ctx N] [--name X] [--yes] [--json] — stand a model up on "
-              "Ollama, governed at a safe context ceiling, and return the OpenAI-compatible endpoint"),
-    "benchmark": ("ara benchmark <model> --use-case <coding|reasoning|agentic|extraction|rag> "
-                  "[--exec-consent] [--engine E] [--ctx N] [--max-tokens N] [--repeat N] [--yes] "
-                  "[--json] — run a capability probe set and store the measured score "
-                  "(--exec-consent is REQUIRED for the coding probe, which runs model-written code)"),
-    "hf": "ara hf <login|logout|status> [--token T] [--json] — Hugging Face auth",
-}
-
-
-def render_help(c: Console, cmd: str | None, *, as_json: bool = False) -> int:
-    """`ara <cmd> --help` — print *cmd*'s usage. No/unknown command → the full landing catalog."""
-    usage = _COMMAND_HELP.get(cmd) if cmd else None
-    if usage is None:
-        render_landing(c)
-        return 0
-    if as_json:
-        print(json.dumps({"command": cmd, "usage": usage}))
-    else:
-        c.emit(c.style("dim", f"  usage: {usage}"))
-    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -220,13 +175,13 @@ def render_landing(c: Console) -> None:
     c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
     c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
     c.emit(c.style("dim", "                  --python · --apps · --runtime · --models · --json"))
-    c.emit(_cmd(c, "status", "show AI/ML processes running right now"))
-    c.emit(_cmd(c, "search <query>", "find models on the Hugging Face Hub"))
-    c.emit(_cmd(c, "models", "catalog the models on this machine + their safe ceilings"))
+    c.emit(_cmd(c, "status", "show what ARA is doing right now"))
+    c.emit(_cmd(c, "models search", "find models on the Hugging Face Hub"))
+    c.emit(_cmd(c, "detect --models", "catalog models physically cached on this machine"))
     c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
     c.emit(_cmd(c, "install", "install the engine matched to this machine"))
     c.emit(_cmd(c, "profile", "estimate this machine's capability (analytic — no engine)"))
-    c.emit(_cmd(c, "recommend", "catalog models that fit, ranked by usable context"))
+    c.emit(_cmd(c, "models recommend", "catalog models that fit, ranked by usable context"))
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
@@ -263,7 +218,8 @@ def _det_system(c: Console, m) -> None:
         c.emit(c.field("python", m.python_version, gloss))
     n_py = pythons.count()
     if n_py > 1:
-        c.emit(c.field("pythons", str(n_py), "interpreters on this machine — run: ara python"))
+        c.emit(c.field("pythons", str(n_py),
+                       "interpreters on this machine — run: ara detect --python"))
     c.emit()
 
 
@@ -480,7 +436,7 @@ def _det_board(c: Console, m) -> None:
     c.emit()
 
 
-def _det_engines(c: Console, m) -> None:
+def _det_engines(c: Console, m, *, show_absent: bool = False) -> None:
     engines = [rt for rt in m.runtimes if rt.kind == "engine"]
     c.emit(c.section("  ENGINES") + c.style("dim", "  (third-party launchers found on this system)"))
     for rt in engines:
@@ -495,7 +451,7 @@ def _det_engines(c: Console, m) -> None:
                 c.emit(c.field("·", val, "serving", value_role="good"))
             else:
                 c.emit(c.field("·", val, "found", value_role="good"))
-        elif c.verbose:
+        elif c.verbose or show_absent:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
     if not any(rt.present for rt in engines) and not c.verbose:
         # NOT a bare "none" — that read as contradicting the ARA section's own-engine readiness.
@@ -508,16 +464,18 @@ def _det_frameworks(c: Console, m) -> None:
     frameworks = [rt for rt in m.runtimes if rt.kind == "framework"]
     c.emit(c.section("  FRAMEWORKS"))
     present_fw = [rt for rt in frameworks if rt.present]
-    default_py = m.framework_python or "ARA's env (no separate user python)"
 
     if present_fw:
         libs = " · ".join(f"{rt.name} {rt.version}".strip() for rt in present_fw)
         c.emit(c.style("dim", "  Your default python has AI frameworks:"))
-        c.emit("      " + c.style("accent", default_py))
+        c.emit("      " + c.style("accent", m.framework_python))
         c.emit("      " + c.style("good", libs))
     else:
-        c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
-        c.emit("      " + c.style("accent", default_py))
+        if m.framework_python:
+            c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
+            c.emit("      " + c.style("accent", m.framework_python))
+        else:
+            c.emit(c.style("dim", "  no separate user Python found"))
         # An empty section is misleading when the stack actually lives in another
         # interpreter — surface the richest one (probe paid only in this empty case).
         others = sorted((i for i in pythons.discover() if i.ai_present and not i.is_default),
@@ -534,7 +492,7 @@ def _det_frameworks(c: Console, m) -> None:
             c.emit()
             more = len(others) - 1
             tail = f" ({more} more with AI libraries)" if more else ""
-            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara python")
+            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara detect --python")
                    + c.style("dim", f" to see every interpreter{tail}."))
         else:
             c.emit(c.style("dim", "  None found in any interpreter on this machine."))
@@ -555,7 +513,7 @@ def _det_models(c: Console, m) -> None:
 
 
 def _det_apps(c: Console, m) -> None:
-    # Detect shows a per-category summary; `ara apps` has the full list with versions.
+    # Detect shows a per-category summary; `ara detect --apps` has the full list with versions.
     c.emit(c.section("  AI/ML APPS"))
     if not m.apps:
         c.emit(c.style("dim", "  none detected"))
@@ -576,7 +534,8 @@ def _det_apps(c: Console, m) -> None:
         c.emit("  " + c.style("metric", f"{apps.CATEGORY_LABEL[cat]:17}")
                + c.style("good", f"{len(items):>2}") + c.style("dim", f"   {names}"))
     c.emit(c.style("dim", "  newest first per category — run ")
-           + c.style("accent", "ara apps") + c.style("dim", " for the full list with versions"))
+           + c.style("accent", "ara detect --apps")
+           + c.style("dim", " for the full list with versions"))
     c.emit()
 
 
@@ -596,7 +555,8 @@ def _det_ara(c: Console, m) -> None:
     c.emit(c.field("hf cli",
                    ("not found" if not m.hf_cli
                     else f"present {m.hf_cli_version}" if m.hf_cli_version else "present"),
-                   "the hf command" if m.hf_cli else "pip install huggingface_hub",
+                   "the hf command" if m.hf_cli else
+                   "missing from ARA's environment — source checkout: uv sync --frozen",
                    value_role="good" if m.hf_cli else "dim"))
     c.emit(c.field("hf token", "present" if m.hf_token else "none",
                    None if m.hf_token else "needed for gated models",
@@ -633,6 +593,82 @@ def render_detect(c: Console, *, as_json: bool = False, want=None) -> None:
     for key, fn in _DETECT_RENDERERS:
         if want(key):
             fn(c, m)
+
+
+def _mlx_runtime_detail(m) -> dict:
+    """Observed Apple-only MLX ecosystem detail for the common runtime report."""
+    interps = mlx.scan()
+    return {
+        "source": "read-only user ecosystem probes",
+        "gpu": {"name": m.accel.name, "cores": m.accel.cores},
+        "mlx_community_models": mlx.mlx_community_model_count(),
+        "lmstudio_mlx_runtimes": mlx.lmstudio_mlx_runtimes(),
+        "interpreters": [
+            {"path": item.path, "origin": item.origin, "version": item.version,
+             "packages": item.packages}
+            for item in interps
+        ],
+    }
+
+
+def render_runtime(c: Console, *, as_json: bool = False, want=None) -> None:
+    """Cross-platform runtime/backend inventory; MLX ecosystem detail is Darwin-only.
+
+    This is recon over :func:`detect.machine` plus the existing read-only MLX probes. It never
+    resolves, imports, installs, or loads a hardware engine.
+    """
+    del want  # Facet reports one fixed inventory; include/exclude belong to the full detect report.
+    m = detect.machine()
+    apple_mlx = m.system == "Darwin" and m.accel.kind == "apple"
+    detail = _mlx_runtime_detail(m) if apple_mlx else None
+    if as_json:
+        payload = {
+            "system": m.system,
+            "backend_selection": {
+                "name": m.backend,
+                "source": "observed hardware selection",
+            },
+            "ara_engine": {
+                "name": m.engine,
+                "ready": m.engine_ready,
+                "source": "ARA isolated engine environment",
+            },
+            "user_environment": {
+                "source": "user environment",
+                "runtimes": [asdict(runtime) for runtime in m.runtimes],
+            },
+        }
+        if detail is not None:
+            payload["mlx_ecosystem"] = detail
+        print(json.dumps(payload, indent=2))
+        return
+
+    c.emit()
+    c.emit(c.section("  RUNTIME"))
+    c.emit(c.field("backend selection", m.backend, "observed hardware selection", label_width=19))
+    c.emit()
+    c.emit(c.section("  ARA ISOLATED ENGINE ENVIRONMENT"))
+    c.emit(c.field("engine", m.engine, "ready" if m.engine_ready else "not installed",
+                   value_role="good" if m.engine_ready else "warn"))
+    c.emit()
+    c.emit(c.section("  USER ENVIRONMENT") + c.style("dim", "  (user environment)"))
+    c.emit()
+    _det_engines(c, m, show_absent=True)
+    _det_frameworks(c, m)
+    if detail is not None:
+        c.emit(c.section("  MLX ECOSYSTEM")
+               + c.style("dim", "  (read-only user ecosystem probes · Apple Silicon)"))
+        gpu = detail["gpu"]
+        cores = f"{gpu['cores']}-core Metal" if gpu["cores"] else "Metal"
+        c.emit(c.field("GPU", gpu["name"], cores))
+        c.emit(c.field("models", f"{detail['mlx_community_models']} cached",
+                       "mlx-community models in the HF cache"))
+        runtimes = detail["lmstudio_mlx_runtimes"]
+        c.emit(c.field("LM Studio", f"MLX runtime {runtimes[0]}" if runtimes else "not found"))
+        packages = sorted({name for item in detail["interpreters"]
+                           for name in item["packages"]})
+        c.emit(c.field("libraries", " · ".join(packages) if packages else "none found"))
+        c.emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -694,76 +730,39 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# status (live recon — running AI/ML processes; never crosses the engine seam)
+# status (only ARA-owned live activity; never infers unrelated machine state)
 # --------------------------------------------------------------------------- #
-def _fmt_uptime(s: float) -> str:
-    s = int(s)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        return f"{s // 3600}h"
-    return f"{s // 86400}d"
+def _activity_text(item: activity.Activity) -> str:
+    if item.kind == "searching":
+        return "searching for models"
+    return f"{item.kind} {item.model or 'a model'}"
 
 
-def _fmt_mem(gb: float) -> str:
-    """Process RSS, MB under a gigabyte and GB above (binary, matching detect)."""
-    return f"{gb * 1024:.0f} MB" if gb < 1 else f"{gb:.1f} GB"
-
-
-def _emit_workloads(c: Console, procs) -> None:
-    """RUNNING AI/ML — local inference workloads consuming memory/GPU right now."""
-    c.emit()
-    c.emit(c.section("  RUNNING AI/ML"))
-    if not procs:
-        c.emit(c.style("dim", "  nothing running right now"))
-        c.emit()
-        return
-    for p in procs:
-        bits = [f"pid {p.pid}", f"up {_fmt_uptime(p.uptime_s)}"]
-        if p.port:
-            bits.append(f":{p.port}")
-        if p.gpu_mb:
-            bits.append(f"{p.gpu_mb:.0f} MB GPU")
-        if p.detail:
-            bits.append(p.detail)
-        c.emit(c.field(p.label, _fmt_mem(p.rss_gb), " · ".join(bits), value_role="metric"))
-    total = sum(p.rss_gb for p in procs)
-    plural = "process" if len(procs) == 1 else "processes"
-    c.emit()
-    c.emit(c.field("total", _fmt_mem(total), f"RSS across {len(procs)} {plural}",
-                   value_role="good"))
-    c.emit()
-
-
-def _emit_apps(c: Console, apps_) -> None:
-    """AI APPS — running client apps (remote-API GUIs/CLIs). RSS is ordinary RAM, not ML."""
-    c.emit(c.section("  AI APPS"))
-    if not apps_:
-        c.emit(c.style("dim", "  no AI apps running right now"))
-        c.emit()
-        return
-    for a in apps_:
-        plural = "proc" if a.n_procs == 1 else "procs"
-        bits = [f"{a.n_procs} {plural}", f"up {_fmt_uptime(a.uptime_s)}"]
-        c.emit(c.field(a.label, _fmt_mem(a.rss_gb), " · ".join(bits), value_role="metric"))
-    c.emit()
-
-
-def render_status(c: Console, *, as_json: bool = False, want=None) -> None:
-    procs, apps_ = status._scan_all()  # one process_iter pass feeds both sections
-
+def render_status(c: Console, *, as_json: bool = False) -> None:
+    activities = activity.snapshot()
     if as_json:
-        print(json.dumps({"workloads": [asdict(p) for p in procs],
-                          "apps": [asdict(a) for a in apps_]}, indent=2))
+        state = "idle" if not activities else activities[0].kind \
+            if len(activities) == 1 else "active"
+        public = [{"kind": item.kind,
+                   **({"model": item.model} if item.model is not None else {}),
+                   **({"pid": item.pid} if item.pid is not None else {}),
+                   "started_at": item.started_at,
+                   **({"runtime": item.runtime} if item.runtime is not None else {}),
+                   **({"served_name": item.served_name}
+                      if item.served_name is not None else {}),
+                   **({"context": item.context} if item.context is not None else {}),
+                   **({"endpoint": item.endpoint} if item.endpoint is not None else {})}
+                  for item in activities]
+        print(json.dumps({"state": state, "activities": public}, indent=2))
         return
-
-    show = want or (lambda _key: True)
-    if show("processes"):
-        _emit_workloads(c, procs)
-    if show("apps"):
-        _emit_apps(c, apps_)
+    if not activities:
+        c.emit("ARA is idle.")
+    elif len(activities) == 1:
+        c.emit(f"ARA is {_activity_text(activities[0])}.")
+    else:
+        c.emit("ARA is active:")
+        for item in activities:
+            c.emit(f"  {_activity_text(item)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -873,8 +872,8 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
         c.emit(c.style("dim", "  LIBRARIES"))
         if not interps:
             c.emit("  " + c.style("dim", "No MLX packages installed in any interpreter."))
-            c.emit("  " + c.style("dim", "Install into a venv, e.g. ")
-                   + c.style("accent", "pip install mlx-lm"))
+            c.emit("  " + c.style("dim", "Use a uv-managed project environment, e.g. ")
+                   + c.style("accent", "uv add mlx-lm"))
         else:
             present: set[str] = set()
             for mi in interps:
@@ -1109,28 +1108,26 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
     return None
 
 
-def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
-                      *, as_json: bool, progress: bool) -> int | None:
-    """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
-
-    So the CUDA/MLX engines fetch on demand like the GGUF engines (which download in-worker), instead of the
-    worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
-    ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
-    No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
-    cuda-gguf report cached (they acquire the GGUF in-worker), so this only fetches for apple/cuda.
-    Returns 1 (after printing) on a disk-space or fetch error, else None.
-    """
+def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
+                   *, as_json: bool) -> tuple[bool, float | None, int | None]:
+    """Run deterministic cache/compatibility/disk gates before live work is claimed."""
     incompatible = engines.engine_for_model(model) not in (None, engine_key)
     cached = getattr(bk, "calibration_model_cached", None)
     if incompatible or cached is None or cached(model):
-        return None
+        return False, None, None
     size_gb = acquire.repo_size_gb(model)
     free_gb = acquire.free_disk_gb()
     if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
         msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
                f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
+        return False, size_gb, 1
+    return True, size_gb, None
+
+
+def _download_prefetched_weights(c: Console, model: str, bk, size_gb: float | None,
+                                 *, as_json: bool, progress: bool) -> int | None:
+    """Perform the actual HF download after the caller has started live tracking."""
     _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
     c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
     try:
@@ -1142,6 +1139,24 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
     return None
 
 
+def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
+                      *, as_json: bool, progress: bool) -> int | None:
+    """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
+
+    So the CUDA/MLX engines fetch on demand like the GGUF engines (which download in-worker), instead of the
+    worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
+    ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
+    No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
+    cuda-gguf report cached (they acquire the GGUF in-worker), so this only fetches for apple/cuda.
+    Returns 1 (after printing) on a disk-space or fetch error, else None.
+    """
+    needed, size_gb, rc = _prefetch_plan(c, model, bk, engine_key, as_json=as_json)
+    if rc is not None or not needed:
+        return rc
+    return _download_prefetched_weights(
+        c, model, bk, size_gb, as_json=as_json, progress=progress)
+
+
 def render_characterize(c: Console, model: str, *, engine: str | None = None,
                         as_json: bool = False, flash_attn: bool = True,
                         flash_attn_optin: bool = False, kv_quant: str = "f16",
@@ -1150,7 +1165,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
     backend (e.g. the CPU fallback on a GPU box). ARA owns the result, so it shows up in
-    `ara models` regardless of which engine measured it.
+    `ara models show` regardless of which engine measured it.
 
     ``--engine ollama`` routes to a dedicated residency-ramp path (Slice 2): Ollama isn't a registry
     engine, and its model names (``qwen3:0.6b``) aren't HF refs — so it branches before both
@@ -1196,64 +1211,71 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps({"error": hw_err})) if as_json else c.emit(c.style("bad", f"  {hw_err}"))
         return 1
     progress = (not as_json) and sys.stderr.isatty()
-    # Pre-fetch weights into the HF cache before the engine's preflight runs (#109).
-    if (rc := _prefetch_weights(c, model, bk, sel.engine_key,
-                                as_json=as_json, progress=progress)) is not None:
+    # Deterministic pre-fetch gates run before ARA claims live work. The actual network download
+    # stays in the same lifecycle record as calibration and measurement.
+    prefetch, prefetch_size, rc = _prefetch_plan(
+        c, model, bk, sel.engine_key, as_json=as_json)
+    if rc is not None:
         return rc
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     calibration_error = None
-    with db.connected() as cal_con:
-        if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
-            if not as_json:
-                c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
-            cal = bk.calibrate()
-            overhead = (cal or {}).get("overhead_gb")
-            wall = (cal or {}).get("wall_gb")
-            # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
-            # never let the conservative default masquerade as a measurement. The ramp still proceeds
-            # safely on the default overhead; we just don't hide that it's a fallback.
-            cal_err = (cal or {}).get("calibration_error")
-            calibration_error = cal_err
-            if cal_err and not as_json:
-                c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
-                                       " — using conservative default overhead"))
-            # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
-            # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
-            # wall regardless of overhead is what lets profile/recommend report reality on every engine,
-            # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
-            if overhead is not None or wall is not None:
-                calibration.save_calibration(
-                    cal_con, sel.engine_key, fixed_overhead_gb=overhead,
-                    wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
-            # Surface the measured wall right where it's measured — otherwise the user sees only the
-            # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
-            # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
-            if wall is not None and not as_json:
-                budget = (cal or {}).get("safe_budget_gb")
-                line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
-                if budget is not None:
-                    line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
-                c.emit(line)
-    if not as_json:
-        c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
-    _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
-    try:
-        result = bk.characterize(model, progress=progress, **fa_kw)
-    except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
-        msg = f"characterization failed: {exc}"
-        # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
-        # styled text or a traceback that would break the parse.
-        if as_json:
-            payload = {"error": msg}
-            if calibration_error:
-                payload.update(calibration_error=calibration_error, calibration_fallback=True)
-            print(json.dumps(payload))
-        else:
-            c.emit(c.style("bad", f"  {msg}"))
-        return 1
+    with activity.track("characterizing", model):
+        if prefetch and (rc := _download_prefetched_weights(
+                c, model, bk, prefetch_size,
+                as_json=as_json, progress=progress)) is not None:
+            return rc
+        with db.connected() as cal_con:
+            if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
+                if not as_json:
+                    c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+                cal = bk.calibrate()
+                overhead = (cal or {}).get("overhead_gb")
+                wall = (cal or {}).get("wall_gb")
+                # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
+                # never let the conservative default masquerade as a measurement. The ramp still proceeds
+                # safely on the default overhead; we just don't hide that it's a fallback.
+                cal_err = (cal or {}).get("calibration_error")
+                calibration_error = cal_err
+                if cal_err and not as_json:
+                    c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
+                                           " — using conservative default overhead"))
+                # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
+                # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
+                # wall regardless of overhead is what lets profile/recommend report reality on every engine,
+                # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
+                if overhead is not None or wall is not None:
+                    calibration.save_calibration(
+                        cal_con, sel.engine_key, fixed_overhead_gb=overhead,
+                        wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
+                # Surface the measured wall right where it's measured — otherwise the user sees only the
+                # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
+                # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
+                if wall is not None and not as_json:
+                    budget = (cal or {}).get("safe_budget_gb")
+                    line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
+                    if budget is not None:
+                        line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
+                    c.emit(line)
+        if not as_json:
+            c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+        fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                              kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+        _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
+        try:
+            result = bk.characterize(model, progress=progress, **fa_kw)
+        except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
+            msg = f"characterization failed: {exc}"
+            # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
+            # styled text or a traceback that would break the parse.
+            if as_json:
+                payload = {"error": msg}
+                if calibration_error:
+                    payload.update(calibration_error=calibration_error, calibration_fallback=True)
+                print(json.dumps(payload))
+            else:
+                c.emit(c.style("bad", f"  {msg}"))
+            return 1
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
     # persist a misleading null row. Suggest a compatible engine when we can tell cheaply (e.g. a
@@ -1293,7 +1315,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 0
     if ceiling:
         c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
-               + c.style("dim", "  · stored (see ara models)"))
+               + c.style("dim", f"  · stored (see ara models show {model})"))
         dc = result.get("decode_context")
         if dc and dc > ceiling:
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
@@ -1314,14 +1336,15 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
 def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     """Search the Hugging Face Hub for models (engine-agnostic)."""
-    results = hub.search(query)
+    with activity.track("searching"):
+        results = hub.search(query)
     if results is None:
+        msg = ("couldn't search — check your connection and the hf command; in a source checkout, "
+               "repair ARA with `uv sync --frozen`, then `uv run ara models search`")
         if as_json:
-            print(json.dumps({"error": "couldn't search — is the hf CLI installed? "
-                                       "(pip install huggingface_hub)"}))
+            print(json.dumps({"error": msg}))
         else:
-            c.emit(c.style("warn", "  couldn't search — is the hf CLI installed? ")
-                   + c.style("accent", "pip install huggingface_hub"))
+            c.emit(c.style("warn", f"  {msg}"))
         return 1
     if as_json:
         print(json.dumps(results, indent=2))
@@ -1341,7 +1364,7 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
 def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
     """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key, decode_context)}``.
 
-    A model can be characterized under several engines on one machine (GPU + CPU); ``ara models``
+    A model can be characterized under several engines on one machine (GPU + CPU); ``ara models show``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
     mk = profile.machine_key()
@@ -1601,28 +1624,36 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
-    if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
+    # One record owns the complete operational lifecycle: an on-demand fetch and every repeat
+    # backend call. All deterministic gates above run before ARA claims that work is live.
+    prefetch, prefetch_size, rc = _prefetch_plan(c, model, bk, key, as_json=as_json)
+    if rc is not None:
         return rc
-    # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
-    # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
-    # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
-    run_scores: list[float] = []
-    refused_n = 0
-    errored_n = 0
-    for _ in range(repeat):
-        result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
-        if result.get("refused"):
-            # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
-            return err(f"the engine refused: {result.get('reason', 'no reason given')}")
-        results = result.get("results", [])
-        refused_n += sum(1 for r in results if r.get("refused"))
-        errored_n += sum(1 for r in results if r.get("error"))
-        completions = [""] * len(prompts)
-        for r in results:
-            idx = r.get("prompt_index")
-            if isinstance(idx, int) and 0 <= idx < len(completions):
-                completions[idx] = r.get("completion", "")
-        run_scores.append(benchmark.score_probe_set(use_case, items, completions))
+    with activity.track("benchmarking", model):
+        if prefetch and (rc := _download_prefetched_weights(
+                c, model, bk, prefetch_size,
+                as_json=as_json, progress=progress)) is not None:
+            return rc
+        # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
+        # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
+        # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
+        run_scores: list[float] = []
+        refused_n = 0
+        errored_n = 0
+        for _ in range(repeat):
+            result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+            if result.get("refused"):
+                # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
+                return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+            results = result.get("results", [])
+            refused_n += sum(1 for r in results if r.get("refused"))
+            errored_n += sum(1 for r in results if r.get("error"))
+            completions = [""] * len(prompts)
+            for r in results:
+                idx = r.get("prompt_index")
+                if isinstance(idx, int) and 0 <= idx < len(completions):
+                    completions[idx] = r.get("completion", "")
+            run_scores.append(benchmark.score_probe_set(use_case, items, completions))
 
     total = n * repeat                       # total generations attempted across every run
     if prompts and (refused_n + errored_n) == total:
@@ -1691,7 +1722,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             partial.append(f"{errored_n} errored")
         score_line += f" (partial: {', '.join(partial)})"
     c.emit(c.style("good", score_line))
-    c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
+    c.emit(c.style("dim", f"  stored — ara models recommend --use-case {use_case} now shows it"))
     if repeat > 1 and lo == hi:
         # Zero variance under greedy decoding is determinism, not measured robustness — say so
         # honestly rather than let an identical-across-runs band read as evidence of stability.
@@ -1816,7 +1847,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
-        result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+        with activity.track("running", model):
+            result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if result.get("refused"):
@@ -1924,8 +1956,11 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
         if not ollama.create(probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
             break
         ollama.load(probe)
-        entry = _find_loaded(ollama.ps() or [], probe)
-        if entry is None or entry.get("context_length") != ctx:   # didn't load / governance slipped
+        entry = _find_loaded(ollama.ps() or [], probe, expected_context=ctx)
+        loaded_ctx = entry.get("context_length") if entry is not None else None
+        if (entry is None or not isinstance(loaded_ctx, int)
+                or isinstance(loaded_ctx, bool) or loaded_ctx <= 0
+                or loaded_ctx != ctx):   # didn't load / governance slipped
             points.append({"context": ctx, "fit": False})
             break
         size, vram = entry.get("size"), entry.get("size_vram")
@@ -1959,10 +1994,11 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         return err(f"couldn't read {model}'s context length from Ollama — can't bound the ramp.")
 
     probe = _governed_name(model) + "-probe"
-    try:
-        best, points = _ollama_measure_ceiling(model, max_ctx, probe)
-    finally:
-        ollama.delete(probe)                          # never leave the throwaway probe behind
+    with activity.track("characterizing", model):
+        try:
+            best, points = _ollama_measure_ceiling(model, max_ctx, probe)
+        finally:
+            ollama.delete(probe)                      # never leave the throwaway probe behind
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None)
@@ -2000,10 +2036,20 @@ def _governed_name(model: str) -> str:
     return safe + "-ara"
 
 
-def _find_loaded(entries: list[dict], served: str) -> dict | None:
+def _find_loaded(entries: list[dict], served: str, *,
+                 expected_context: int | None = None) -> dict | None:
     """The ``/api/ps`` entry for our derived model (Ollama tags it ``:latest``), or ``None``."""
-    return next((m for m in entries if m.get("name") == served
-                 or m.get("name", "").startswith(served + ":")), None)
+    matches = [m for m in entries if isinstance(m, dict)
+               and isinstance(m.get("name"), str)
+               and m["name"] in (served, served + ":latest")]
+    if expected_context is None:
+        return matches[0] if matches else None
+    valid = next((m for m in matches
+                  if isinstance(m.get("context_length"), int)
+                  and not isinstance(m["context_length"], bool)
+                  and m["context_length"] > 0
+                  and m["context_length"] == expected_context), None)
+    return valid if valid is not None else (matches[0] if matches else None)
 
 
 def _free_port() -> int:
@@ -2087,7 +2133,8 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
 
     old = signal.signal(signal.SIGTERM, _stop)
     try:
-        proc.wait()                                # our child IS the server; stay alive to serve
+        with activity.track("serving", model):
+            proc.wait()                            # our child IS the server; stay alive to serve
     finally:
         signal.signal(signal.SIGTERM, old)
     return 0
@@ -2189,21 +2236,42 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", "  skipped."))
             return 0
 
-    # 4. bake the ceiling into a derived model
+    # 4. bake the ceiling into a derived model. This is temporary process-owned work until exact
+    # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
     served = name or _governed_name(model)
-    if not ollama.create(served, model, safe):
-        return err(f"couldn't create the governed model {served!r} on Ollama.")
+    endpoint_base = ollama.base_url()
+    try:
+        activity.validate_ollama_serving(
+            served_name=served, model=model, context=safe, endpoint=endpoint_base)
+    except ValueError as exc:
+        return err(f"invalid serving identity: {exc}")
+    already_owned = any(
+        item.runtime == "ollama" and item.served_name == served
+        and item.context == safe and item.endpoint == endpoint_base
+        and item.model == model
+        for item in activity.snapshot())
+    setup_activity = nullcontext() if already_owned else activity.track("serving", model)
+    with setup_activity:
+        if not ollama.create(served, model, safe):
+            return err(f"couldn't create the governed model {served!r} on Ollama.")
 
-    # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
-    ollama.load(served)
-    entry = _find_loaded(ollama.ps() or [], served)
-    if entry is None:
-        return err(f"{served} didn't load — Ollama may be out of memory.")
-    served_ctx = entry.get("context_length")
-    if served_ctx != safe:
-        return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
-    size, vram = entry.get("size"), entry.get("size_vram")
-    spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+        # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
+        ollama.load(served)
+        entry = _find_loaded(ollama.ps() or [], served, expected_context=safe)
+        if entry is None:
+            return err(f"{served} didn't load — Ollama may be out of memory.")
+        served_ctx = entry.get("context_length")
+        if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
+                or served_ctx <= 0 or served_ctx != safe):
+            return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
+        size, vram = entry.get("size"), entry.get("size_vram")
+        spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+
+    try:
+        activity.record_ollama_serving(
+            served_name=served, model=model, context=safe, endpoint=endpoint_base)
+    except (OSError, ValueError) as exc:
+        return err(f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
 
     # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
     # that is an empirical measurement, not a guess. Record it (engine "ollama") so the next serve
@@ -2220,7 +2288,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         recorded_measured = True
 
     # 6. the handoff — connection info, then ARA exits (the model stays served)
-    endpoint = ollama.base_url() + "/v1"
+    endpoint = endpoint_base + "/v1"
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
@@ -2577,7 +2645,7 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
                 return 0
             getattr(service, sub)()            # start | stop | uninstall
             return _node_say(c, as_json, f"{sub} ok")
-        except RuntimeError as exc:             # the systemd path is Linux-only
+        except (RuntimeError, OSError, ValueError) as exc:
             return _node_err(c, as_json, str(exc))
 
     return _node_err(c, as_json,
@@ -2618,21 +2686,532 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
     return 0
 
 
-def main() -> int:
+_HELP_SETTINGS = {"help_option_names": ["-h", "--help"]}
+
+
+def _mark_json(ctx: click.Context, as_json: bool) -> Console:
+    """Record output mode only after Click has accepted a real command invocation."""
+    ctx.find_root().meta["as_json"] = as_json
+    return Console.from_env(verbose=ctx.params.get("verbose", False))
+
+
+def _canonical_engine_arg(value: str | None) -> str | None:
+    """Map one-release engine aliases while keeping deprecation text off stdout."""
+    if value in engine_identity.LEGACY_ENGINE_ALIASES:
+        canonical = engine_identity.LEGACY_ENGINE_ALIASES[value]
+        print(f"ara: --engine {value} is deprecated; use --engine {canonical}", file=sys.stderr)
+        return canonical
+    return value
+
+
+def _warn_deprecated(alias: str, replacement: str) -> None:
+    """Emit one-release command-alias guidance without contaminating stdout."""
+    print(f"ara: {alias} is deprecated; use {replacement}", file=sys.stderr)
+
+
+def _engine_callback(_ctx: click.Context, _param: click.Parameter,
+                     value: str | None) -> str | None:
+    return _canonical_engine_arg(value)
+
+
+def _csv_values(_ctx: click.Context, _param: click.Parameter,
+                values: tuple[str, ...]) -> list[str]:
+    return [item for value in values for item in _csv(value)]
+
+
+_DETECT_FACETS = {
+    "python_facet": "python",
+    "apps_facet": "apps",
+    "runtime_facet": "runtime",
+    "models_facet": "models",
+}
+
+
+def _record_detect_facet(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+    """Keep the first facet in Click's parameter-processing order (the argv order)."""
+    if value and "detect_facet" not in ctx.meta:
+        ctx.meta["detect_facet"] = _DETECT_FACETS[param.name]
+    return value
+
+
+def _json_verbose_options(func):
+    func = click.option("--json", "as_json", is_flag=True,
+                        help="Emit machine-readable JSON.")(func)
+    return click.option("-v", "--verbose", is_flag=True,
+                        help="Show additional detail.")(func)
+
+
+def _recon_options(func):
+    func = click.option("--include", multiple=True, callback=_csv_values, metavar="SECTIONS",
+                        help="Include sections (repeatable; comma-separated).")(func)
+    func = click.option("--exclude", multiple=True, callback=_csv_values, metavar="SECTIONS",
+                        help="Exclude sections (repeatable; comma-separated).")(func)
+    return _json_verbose_options(func)
+
+
+def _engine_option(func):
+    return click.option("--engine", callback=_engine_callback, metavar="ENGINE",
+                        help="Select an execution engine.")(func)
+
+
+def _generation_options(func):
+    func = click.option("--kv-quant", default="f16", show_default=True,
+                        metavar="FORMAT", help="KV-cache quantization format.")(func)
+    func = click.option("--weight-quant", default="none", show_default=True,
+                        metavar="FORMAT", help="Weight quantization format.")(func)
+    func = click.option("--prefill-chunk", type=int, metavar="N",
+                        help="CUDA prefill chunk size.")(func)
+    func = click.option("--chunked-prefill", is_flag=True,
+                        help="Enable chunked prefill with the default size.")(func)
+    func = click.option("--no-flash-attn", is_flag=True,
+                        help="Disable Vulkan flash attention.")(func)
+    return click.option("--flash-attn", is_flag=True,
+                        help="Enable CUDA FlashAttention 2.")(func)
+
+
+def _prefill_chunk(prefill_chunk: int | None, chunked_prefill: bool) -> int | None:
+    return prefill_chunk if prefill_chunk is not None else (
+        _DEFAULT_PREFILL_CHUNK if chunked_prefill else None)
+
+
+@click.group(invoke_without_command=True, context_settings=_HELP_SETTINGS)
+@click.option("--version", is_flag=True, is_eager=True, help="Show the installed version and exit.")
+@click.pass_context
+def _click_cli(ctx: click.Context, version: bool) -> int:
+    """AI Runs Anywhere: inspect this machine and run local models safely."""
+    if version:
+        click.echo(_ara_version())
+        ctx.exit(0)
+    if ctx.invoked_subcommand is None:
+        render_landing(Console.from_env())
+    return 0
+
+
+@_click_cli.command("detect", context_settings=_HELP_SETTINGS,
+                    epilog="Examples:\n\n\b\n  ara detect --runtime\n  ara detect --runtime --json")
+@click.option("--python", "python_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show Python interpreters.")
+@click.option("--apps", "apps_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show installed AI/ML apps.")
+@click.option("--runtime", "runtime_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show runtime readiness.")
+@click.option("--models", "models_facet", is_flag=True, expose_value=False,
+              callback=_record_detect_facet, help="Show cached models.")
+@_recon_options
+@click.pass_context
+def _click_detect(ctx: click.Context, include: list[str], exclude: list[str],
+                  verbose: bool, as_json: bool) -> int:
+    """Inspect this machine without loading an AI engine."""
+    c = _mark_json(ctx, as_json)
+    want = _resolve_want("detect", include, exclude, c, as_json=as_json) \
+        if (include or exclude) else None
+    facet = ctx.meta.get("detect_facet")
+    renderer = {"python": render_python, "apps": render_apps, "runtime": render_runtime,
+                "models": render_models}.get(facet, render_detect)
+    renderer(c, as_json=as_json, want=want)
+    return 0
+
+
+def _invoke_recon(ctx: click.Context, name: str, renderer, include: list[str],
+                  exclude: list[str], as_json: bool) -> int:
+    c = _mark_json(ctx, as_json)
+    want = _resolve_want(name, include, exclude, c, as_json=as_json) \
+        if (include or exclude) else None
+    renderer(c, as_json=as_json, want=want)
+    return 0
+
+
+@_click_cli.command("status", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Show what ARA is doing right now."""
+    render_status(_mark_json(ctx, as_json), as_json=as_json)
+    return 0
+
+
+@_click_cli.command("python", hidden=True, context_settings=_HELP_SETTINGS)
+@_recon_options
+@click.pass_context
+def _click_python(ctx: click.Context, include: list[str], exclude: list[str],
+                  verbose: bool, as_json: bool) -> int:
+    """List Python interpreters and their AI libraries."""
+    _warn_deprecated("python", "detect --python")
+    return _invoke_recon(ctx, "python", render_python, include, exclude, as_json)
+
+
+@_click_cli.command("apps", hidden=True, context_settings=_HELP_SETTINGS)
+@_recon_options
+@click.pass_context
+def _click_apps(ctx: click.Context, include: list[str], exclude: list[str],
+                verbose: bool, as_json: bool) -> int:
+    """List installed AI and ML applications."""
+    _warn_deprecated("apps", "detect --apps")
+    return _invoke_recon(ctx, "apps", render_apps, include, exclude, as_json)
+
+
+@_click_cli.command("mlx", hidden=True, context_settings=_HELP_SETTINGS)
+@_recon_options
+@click.pass_context
+def _click_mlx(ctx: click.Context, include: list[str], exclude: list[str],
+               verbose: bool, as_json: bool) -> int:
+    """Inspect MLX ecosystem readiness."""
+    _warn_deprecated("mlx", "detect --runtime")
+    return _invoke_recon(ctx, "mlx", render_mlx, include, exclude, as_json)
+
+
+@click.command("MODEL", hidden=True, context_settings=_HELP_SETTINGS)
+@_recon_options
+@click.pass_context
+def _click_legacy_model(ctx: click.Context, include: list[str], exclude: list[str],
+                        verbose: bool, as_json: bool) -> int:
+    """Route the one-release ``models MODEL`` compatibility spelling."""
+    model_id = ctx.info_name or ""
+    _warn_deprecated("models MODEL", "models show MODEL")
+    c = _mark_json(ctx, as_json)
+    if include or exclude:
+        _resolve_want("models", include, exclude, c, as_json=as_json)
+    return render_model_detail(c, model_id, as_json=as_json)
+
+
+class _ModelsGroup(click.Group):
+    """Resolve unknown model IDs through the one-release detail compatibility route."""
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        command = super().get_command(ctx, cmd_name)
+        if command is not None or cmd_name == "list":
+            return command
+        return _click_legacy_model
+
+
+@_click_cli.group("models", cls=_ModelsGroup, invoke_without_command=True,
+                  no_args_is_help=False, context_settings=_HELP_SETTINGS)
+@click.pass_context
+def _click_models(ctx: click.Context) -> int:
+    """Search, rank, or inspect model catalog entries."""
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+    return 0
+
+
+@_click_models.command("search", context_settings=_HELP_SETTINGS,
+                       epilog='Example:\n  ara models search "small vision model" --json')
+@click.argument("query", nargs=-1, required=True)
+@_json_verbose_options
+@click.pass_context
+def _click_models_search(ctx: click.Context, query: tuple[str, ...],
+                         verbose: bool, as_json: bool) -> int:
+    """Find models on the Hugging Face Hub."""
+    return render_search(_mark_json(ctx, as_json), " ".join(query), as_json=as_json)
+
+
+@_click_models.command("recommend", context_settings=_HELP_SETTINGS)
+@click.option("--use-case", help="Rank by a measured capability dimension.")
+@_json_verbose_options
+@click.pass_context
+def _click_models_recommend(ctx: click.Context, use_case: str | None,
+                            verbose: bool, as_json: bool) -> int:
+    """Rank cached models that fit this machine."""
+    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+
+
+@_click_models.command("show", context_settings=_HELP_SETTINGS)
+@click.argument("model")
+@_json_verbose_options
+@click.pass_context
+def _click_models_show(ctx: click.Context, model: str,
+                       verbose: bool, as_json: bool) -> int:
+    """Show one model's catalog and characterization details."""
+    return render_model_detail(_mark_json(ctx, as_json), model, as_json=as_json)
+
+
+@_click_cli.command("search", hidden=True, context_settings=_HELP_SETTINGS)
+@click.argument("query", nargs=-1, required=True)
+@_json_verbose_options
+@click.pass_context
+def _click_search(ctx: click.Context, query: tuple[str, ...], verbose: bool, as_json: bool) -> int:
+    """Find models on the Hugging Face Hub."""
+    _warn_deprecated("search", "models search")
+    return render_search(_mark_json(ctx, as_json), " ".join(query), as_json=as_json)
+
+
+@_click_cli.command("characterize", context_settings=_HELP_SETTINGS)
+@click.argument("model")
+@_engine_option
+@_generation_options
+@_json_verbose_options
+@click.pass_context
+def _click_characterize(ctx: click.Context, model: str, engine: str | None, kv_quant: str,
+                        weight_quant: str, prefill_chunk: int | None,
+                        chunked_prefill: bool, no_flash_attn: bool, flash_attn: bool,
+                        verbose: bool, as_json: bool) -> int:
+    """Measure MODEL's real safe context ceiling (loads the model)."""
+    c = _mark_json(ctx, as_json)
+    with locking.measurement_lock():
+        return render_characterize(
+            c, model, engine=engine, as_json=as_json, flash_attn=not no_flash_attn,
+            flash_attn_optin=flash_attn, kv_quant=kv_quant, weight_quant=weight_quant,
+            prefill_chunk=_prefill_chunk(prefill_chunk, chunked_prefill),
+        )
+
+
+@_click_cli.command("profile", context_settings=_HELP_SETTINGS)
+@click.option("--model", help="Assess whether this model fits.")
+@_engine_option
+@_json_verbose_options
+@click.pass_context
+def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
+                   verbose: bool, as_json: bool) -> int:
+    """Estimate machine capability analytically without loading an engine."""
+    return render_profile(_mark_json(ctx, as_json), as_json=as_json, model=model, engine=engine)
+
+
+@_click_cli.command("recommend", hidden=True, context_settings=_HELP_SETTINGS)
+@click.option("--use-case", help="Rank by a measured capability dimension.")
+@_json_verbose_options
+@click.pass_context
+def _click_recommend(ctx: click.Context, use_case: str | None,
+                     verbose: bool, as_json: bool) -> int:
+    """Rank cached models that fit this machine."""
+    _warn_deprecated("recommend", "models recommend")
+    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+
+
+@_click_cli.command("run", context_settings=_HELP_SETTINGS,
+                    epilog='Example:\n  ara run org/model "Explain this" --json')
+@click.argument("model")
+@click.argument("prompt", nargs=-1, required=False)
+@_engine_option
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
+@_generation_options
+@_json_verbose_options
+@click.pass_context
+def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: str | None,
+               assume_yes: bool, kv_quant: str, weight_quant: str,
+               prefill_chunk: int | None, chunked_prefill: bool, no_flash_attn: bool,
+               flash_attn: bool, verbose: bool, as_json: bool) -> int:
+    """Run governed one-shot inference: MODEL [PROMPT...]."""
+    return render_run(
+        _mark_json(ctx, as_json), model, prompt=" ".join(prompt) or None, engine=engine,
+        assume_yes=assume_yes, as_json=as_json, flash_attn=not no_flash_attn,
+        flash_attn_optin=flash_attn, kv_quant=kv_quant, weight_quant=weight_quant,
+        prefill_chunk=_prefill_chunk(prefill_chunk, chunked_prefill),
+    )
+
+
+@_click_cli.command("serve", context_settings=_HELP_SETTINGS)
+@click.argument("model", required=False)
+@click.option("--ctx", "serve_ctx", type=int, metavar="N", help="Governed context ceiling.")
+@click.option("--name", "serve_name", help="Name exposed by the endpoint.")
+@_engine_option
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
+@_json_verbose_options
+@click.pass_context
+def _click_serve(ctx: click.Context, model: str | None, serve_ctx: int | None,
+                 serve_name: str | None, engine: str | None, assume_yes: bool,
+                 verbose: bool, as_json: bool) -> int:
+    """Serve a model behind a governed OpenAI-compatible endpoint."""
+    return render_serve(_mark_json(ctx, as_json), model, ctx=serve_ctx,
+                        name=serve_name or None, engine=engine, assume_yes=assume_yes,
+                        as_json=as_json)
+
+
+_USE_CASE = click.Choice(["coding", "reasoning", "agentic", "extraction", "rag"])
+
+
+@_click_cli.command("benchmark", context_settings=_HELP_SETTINGS)
+@click.argument("model")
+@click.option("--use-case", type=_USE_CASE, required=True,
+              help="Capability probe set to execute.")
+@_engine_option
+@click.option("--ctx", "serve_ctx", type=int, metavar="N", help="Context used for probes.")
+@click.option("--max-tokens", type=int, metavar="N", help="Generation-token cap.")
+@click.option("--repeat", "repeat_count", type=int, default=1, show_default=True,
+              metavar="N", help="Repeat count for a variance band.")
+@click.option("--exec-consent", is_flag=True,
+              help="Allow coding probes to execute model-written code.")
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
+@_json_verbose_options
+@click.pass_context
+def _click_benchmark(ctx: click.Context, model: str, use_case: str, engine: str | None,
+                     serve_ctx: int | None, max_tokens: int | None, repeat_count: int,
+                     exec_consent: bool, assume_yes: bool, verbose: bool, as_json: bool) -> int:
+    """Measure MODEL capability against a canonical probe set."""
+    c = _mark_json(ctx, as_json)
+    with locking.measurement_lock():
+        return render_benchmark(
+            c, model, use_case=use_case, engine=engine, ctx=serve_ctx,
+            max_tokens=max_tokens, repeat=repeat_count, assume_yes=assume_yes,
+            exec_consent=exec_consent, as_json=as_json,
+        )
+
+
+def _selected_engine(engine_arg: str | None, engine_option: str | None) -> str:
+    return _canonical_engine_arg(engine_arg) if engine_arg is not None else (engine_option or "auto")
+
+
+@_click_cli.command("install", context_settings=_HELP_SETTINGS)
+@click.argument("engine_arg", required=False)
+@click.option("--engine", "engine_option", callback=_engine_callback, metavar="ENGINE",
+              help="Engine to install (also accepted positionally).")
+@click.option("--refresh", is_flag=True, help="Reinstall even when already present.")
+@_json_verbose_options
+@click.pass_context
+def _click_install(ctx: click.Context, engine_arg: str | None, engine_option: str | None,
+                   refresh: bool, verbose: bool, as_json: bool) -> int:
+    """Install an engine on demand."""
+    return render_install(_mark_json(ctx, as_json),
+                          engine=_selected_engine(engine_arg, engine_option),
+                          refresh=refresh, as_json=as_json)
+
+
+@_click_cli.command("uninstall", context_settings=_HELP_SETTINGS)
+@click.argument("engine_arg", required=False)
+@click.option("--engine", "engine_option", callback=_engine_callback, metavar="ENGINE",
+              help="Engine to remove (also accepted positionally).")
+@_json_verbose_options
+@click.pass_context
+def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: str | None,
+                     verbose: bool, as_json: bool) -> int:
+    """Remove an installed engine environment."""
+    return render_uninstall(_mark_json(ctx, as_json),
+                            engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
+
+
+@_click_cli.command("doctor", context_settings=_HELP_SETTINGS)
+@click.option("--rekey", is_flag=True, help="Migrate legacy machine identity keys.")
+@_json_verbose_options
+@click.pass_context
+def _click_doctor(ctx: click.Context, rekey: bool, verbose: bool, as_json: bool) -> int:
+    """Inspect ARA's stored identity and record counts."""
+    return render_doctor(_mark_json(ctx, as_json), rekey=rekey, as_json=as_json)
+
+
+@_click_cli.group("hf", no_args_is_help=False, context_settings=_HELP_SETTINGS)
+def _click_hf() -> None:
+    """Manage the Hugging Face token used for gated models."""
+
+
+@_click_hf.command("login", context_settings=_HELP_SETTINGS)
+@click.option("--token", help="Hugging Face token (interactive when omitted).")
+@_json_verbose_options
+@click.pass_context
+def _click_hf_login(ctx: click.Context, token: str | None,
+                    verbose: bool, as_json: bool) -> int:
+    return render_hf(_mark_json(ctx, as_json), "login", token=token, as_json=as_json)
+
+
+@_click_hf.command("logout", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_hf_logout(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Remove the stored Hugging Face token."""
+    return render_hf(_mark_json(ctx, as_json), "logout", as_json=as_json)
+
+
+@_click_hf.command("status", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_hf_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Show Hugging Face authentication status."""
+    return render_hf(_mark_json(ctx, as_json), "status", as_json=as_json)
+
+
+@_click_cli.group("node", no_args_is_help=False, context_settings=_HELP_SETTINGS)
+def _click_node() -> None:
+    """Run or manage the push-only ARA node daemon."""
+
+
+@_click_node.command("enroll", context_settings=_HELP_SETTINGS,
+                     epilog="Example:\n  ara node enroll https://ara.example --token TOKEN")
+@click.argument("server_url")
+@click.option("--token", required=True, help="One-time coordinator enrollment token.")
+@_json_verbose_options
+@click.pass_context
+def _click_node_enroll(ctx: click.Context, server_url: str, token: str,
+                       verbose: bool, as_json: bool) -> int:
+    """Enroll this node with a coordinator."""
+    return render_node(_mark_json(ctx, as_json), ["node", "enroll", server_url],
+                       token=token, as_json=as_json)
+
+
+def _invoke_node(ctx: click.Context, name: str, as_json: bool) -> int:
+    return render_node(_mark_json(ctx, as_json), ["node", name], as_json=as_json)
+
+
+@_click_node.command("run", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_run(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Run the push-only node work loop."""
+    return _invoke_node(ctx, "run", as_json)
+
+
+@_click_node.command("install", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_install(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Install and start the user service."""
+    return _invoke_node(ctx, "install", as_json)
+
+
+@_click_node.command("start", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_start(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Start the user service."""
+    return _invoke_node(ctx, "start", as_json)
+
+
+@_click_node.command("stop", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_stop(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Stop the user service."""
+    return _invoke_node(ctx, "stop", as_json)
+
+
+@_click_node.command("status", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Show user-service status."""
+    return _invoke_node(ctx, "status", as_json)
+
+
+@_click_node.command("uninstall", context_settings=_HELP_SETTINGS)
+@_json_verbose_options
+@click.pass_context
+def _click_node_uninstall(ctx: click.Context, verbose: bool, as_json: bool) -> int:
+    """Remove the user service."""
+    return _invoke_node(ctx, "uninstall", as_json)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
     can't parse. Without ``--json``, an :class:`~ara.engine_env.EngineEnvError` (the common
     engine-env failure — a broken/missing env, a dead worker) prints a friendly one-line diagnostic
     instead of a raw traceback; any other exception still propagates. KeyboardInterrupt / SystemExit
     are not caught."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    ctx: click.Context | None = None
     try:
-        return _main_impl()
+        with _click_cli.make_context("ara", args) as ctx:
+            result = _click_cli.invoke(ctx)
+        return int(result or 0)
+    except click.exceptions.Exit as exc:
+        return exc.exit_code
+    except click.ClickException as exc:
+        exc.show(file=sys.stderr)
+        return exc.exit_code
     except Exception as exc:   # noqa: BLE001 — deliberate front-door honesty guard
+        as_json = bool(ctx and ctx.meta.get("as_json"))
         if isinstance(exc, MeasurementBusy):   # a concurrent measurement holds the lock — say so
-            print(json.dumps({"error": str(exc)})) if "--json" in sys.argv[1:] \
+            print(json.dumps({"error": str(exc)})) if as_json \
                 else Console.from_env().emit(Console.from_env().style("warn", f"  {exc}"))
             return 1
-        if "--json" in sys.argv[1:]:
+        if as_json:
             print(json.dumps({"error": f"ara failed: {exc}"}))
             return 1
         if isinstance(exc, EngineEnvError):
@@ -2643,280 +3222,5 @@ def main() -> int:
         raise
 
 
-def _main_impl() -> int:
-    argv = sys.argv[1:]
-    if "--version" in argv:
-        print(_ara_version())
-        return 0
-    wants_help = "-h" in argv or "--help" in argv
-    verbose = "--verbose" in argv or "-v" in argv
-    as_json = "--json" in argv
-    assume_yes = "--yes" in argv or "-y" in argv
-    exec_consent = "--exec-consent" in argv      # explicit opt-in to model-code execution (benchmark)
-    refresh = "--refresh" in argv                 # `install --refresh`: force reinstall of a present engine
-    rekey = "--rekey" in argv                     # `doctor --rekey`: migrate legacy machine_keys
-    flash_attn = "--no-flash-attn" not in argv   # vulkan engine: FA on by default, this disables it
-    flash_attn_optin = "--flash-attn" in argv    # cuda engine: SDPA by default, this opts into FA2
-    chunked_prefill = "--chunked-prefill" in argv  # cuda engine: opt into chunked prefill (def 512)
-
-    def _canonical_engine_arg(value: str | None) -> str | None:
-        if value in engine_identity.LEGACY_ENGINE_ALIASES:
-            canonical = engine_identity.LEGACY_ENGINE_ALIASES[value]
-            print(f"ara: --engine {value} is deprecated; use --engine {canonical}", file=sys.stderr)
-            return canonical
-        return value
-
-    # --model / --engine / --token / --include / --exclude / --kv-quant take values; pull them first.
-    model: str | None = None
-    engine: str | None = None
-    token: str | None = None
-    kv_quant: str = "f16"
-    weight_quant: str = "none"
-    prefill_chunk_val: int | None = None         # explicit --prefill-chunk N (overrides the default)
-    serve_ctx: int | None = None                 # `serve --ctx N`: explicit governed context
-    serve_name: str | None = None                # `serve --name X`: derived served-model name
-    use_case: str | None = None                  # `recommend --use-case X`: capability dimension
-    max_tokens_val: int | None = None            # `benchmark --max-tokens N`: lift the generation cap
-    repeat_val: int = 1                          # `benchmark --repeat N`: runs for the variance band
-    include: list[str] = []
-    exclude: list[str] = []
-    rest: list[str] = []
-    skip = False
-    for i, a in enumerate(argv):
-        if skip:
-            skip = False
-            continue
-        if a == "--model":
-            model = argv[i + 1] if i + 1 < len(argv) else None
-            skip = True
-            continue
-        if a.startswith("--model="):
-            model = a.split("=", 1)[1] or None
-            continue
-        if a == "--engine":
-            engine = _canonical_engine_arg(argv[i + 1] if i + 1 < len(argv) else None)
-            skip = True
-            continue
-        if a.startswith("--engine="):
-            engine = _canonical_engine_arg(a.split("=", 1)[1] or None)
-            continue
-        if a == "--token":
-            token = argv[i + 1] if i + 1 < len(argv) else None
-            skip = True
-            continue
-        if a.startswith("--token="):
-            token = a.split("=", 1)[1]
-            continue
-        if a == "--kv-quant":
-            kv_quant = argv[i + 1] if i + 1 < len(argv) else ""
-            skip = True
-            continue
-        if a.startswith("--kv-quant="):
-            kv_quant = a.split("=", 1)[1]
-            continue
-        if a == "--weight-quant":
-            weight_quant = argv[i + 1] if i + 1 < len(argv) else ""
-            skip = True
-            continue
-        if a.startswith("--weight-quant="):
-            weight_quant = a.split("=", 1)[1]
-            continue
-        if a == "--prefill-chunk":
-            prefill_chunk_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
-            skip = True
-            continue
-        if a.startswith("--prefill-chunk="):
-            prefill_chunk_val = _int_or_none(a.split("=", 1)[1])
-            continue
-        if a == "--ctx":
-            serve_ctx = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
-            skip = True
-            continue
-        if a.startswith("--ctx="):
-            serve_ctx = _int_or_none(a.split("=", 1)[1])
-            continue
-        if a == "--max-tokens":
-            max_tokens_val = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
-            skip = True
-            continue
-        if a.startswith("--max-tokens="):
-            max_tokens_val = _int_or_none(a.split("=", 1)[1])
-            continue
-        if a == "--repeat":
-            # Bad/non-integer value → 0, which render_benchmark rejects (the positive-integer gate).
-            p = _int_or_none(argv[i + 1] if i + 1 < len(argv) else "")
-            repeat_val = p if p is not None else 0
-            skip = True
-            continue
-        if a.startswith("--repeat="):
-            p = _int_or_none(a.split("=", 1)[1])
-            repeat_val = p if p is not None else 0
-            continue
-        if a == "--name":
-            serve_name = argv[i + 1] if i + 1 < len(argv) else None
-            skip = True
-            continue
-        if a.startswith("--name="):
-            serve_name = a.split("=", 1)[1] or None
-            continue
-        if a == "--use-case":
-            use_case = argv[i + 1] if i + 1 < len(argv) else None
-            skip = True
-            continue
-        if a.startswith("--use-case="):
-            use_case = a.split("=", 1)[1] or None
-            continue
-        if a in ("--include", "--exclude"):
-            (include if a == "--include" else exclude).extend(
-                _csv(argv[i + 1] if i + 1 < len(argv) else ""))
-            skip = True
-            continue
-        if a.startswith("--include="):
-            include.extend(_csv(a.split("=", 1)[1]))
-            continue
-        if a.startswith("--exclude="):
-            exclude.extend(_csv(a.split("=", 1)[1]))
-            continue
-        if a in ("--verbose", "-v", "--json", "--yes", "-y", "--exec-consent", "--refresh",
-                 "--rekey", "--no-flash-attn", "--flash-attn",
-                 "--chunked-prefill", "-h", "--help",
-                 "--python", "--apps", "--runtime", "--models"):
-            continue
-        rest.append(a)
-
-    # `ara detect --<flag>` facet routing — first matching flag wins; None → the bare full report.
-    detect_facet = next((_FACET_FLAGS[a] for a in argv if a in _FACET_FLAGS), None)
-    c = Console.from_env(verbose=verbose)
-
-    # Resolve the chunked-prefill lever: an explicit size wins; a bare --chunked-prefill uses the
-    # default; neither → off (single-shot). One source of truth passed down to the cuda worker.
-    prefill_chunk = prefill_chunk_val if prefill_chunk_val is not None else (
-        _DEFAULT_PREFILL_CHUNK if chunked_prefill else None)
-
-    def _arg_err(msg: str) -> int:
-        """Usage / dispatch error: structured JSON under --json, styled warn otherwise (Rule #3)."""
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("warn", f"  {msg}"))
-        return 1
-
-    if wants_help:                          # `ara <cmd> --help` / `-h` → that command's usage
-        return render_help(c, rest[0] if rest else None, as_json=as_json)
-    if not rest:
-        render_landing(c)
-        return 0
-
-    cmd = rest[0]
-    # Section filtering is shared across the recon commands; build the predicate once.
-    want = (_resolve_want(cmd, include, exclude, c, as_json=as_json)
-            if (include or exclude) else None)
-
-    if cmd == "detect":
-        if detect_facet == "python":
-            render_python(c, as_json=as_json, want=want)
-        elif detect_facet == "apps":
-            render_apps(c, as_json=as_json, want=want)
-        elif detect_facet == "runtime":
-            render_mlx(c, as_json=as_json, want=want)
-        elif detect_facet == "models":
-            render_models(c, as_json=as_json, want=want)
-        else:
-            render_detect(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "status":
-        render_status(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "python":
-        render_python(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "apps":
-        render_apps(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "mlx":
-        render_mlx(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "models":
-        if len(rest) > 1:                       # `ara models <id>` → one model's detail
-            return render_model_detail(c, rest[1], as_json=as_json)
-        render_models(c, as_json=as_json, want=want)
-        return 0
-
-    if cmd == "search":
-        if len(rest) < 2:
-            return _arg_err("usage: ara search <query>")
-        return render_search(c, " ".join(rest[1:]), as_json=as_json)
-
-    if cmd == "characterize":
-        if len(rest) < 2:
-            return _arg_err("usage: ara characterize <model>")
-        # Hold the machine's measurement lock: a concurrent characterize/benchmark would read this
-        # one's memory footprint into its own reading and store a corrupted ceiling (Rule #1, G9).
-        with locking.measurement_lock():
-            return render_characterize(c, rest[1], engine=engine, as_json=as_json,
-                                       flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                                       kv_quant=kv_quant, weight_quant=weight_quant,
-                                       prefill_chunk=prefill_chunk)
-
-    if cmd == "profile":
-        return render_profile(c, as_json=as_json, model=model, engine=engine)
-
-    if cmd == "recommend":
-        return render_recommend(c, as_json=as_json, use_case=use_case)
-
-    if cmd == "run":
-        if len(rest) < 2:
-            return _arg_err("usage: ara run <model> <prompt>")
-        return render_run(c, rest[1], prompt=" ".join(rest[2:]) or None,
-                          engine=engine, assume_yes=assume_yes, as_json=as_json,
-                          flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant,
-                          prefill_chunk=prefill_chunk)
-
-    if cmd == "serve":
-        # no model → zero-arg: recommend among the Ollama store, then serve the best fit
-        return render_serve(c, rest[1] if len(rest) >= 2 else None, ctx=serve_ctx,
-                            name=serve_name, engine=engine, assume_yes=assume_yes, as_json=as_json)
-
-    if cmd == "benchmark":
-        if len(rest) < 2 or use_case is None:
-            return _arg_err("usage: ara benchmark <model> "
-                            "--use-case <coding|reasoning|agentic|extraction|rag>")
-        with locking.measurement_lock():        # same measurement lock as characterize (Rule #1, G9)
-            return render_benchmark(c, rest[1], use_case=use_case, engine=engine, ctx=serve_ctx,
-                                    max_tokens=max_tokens_val, repeat=repeat_val,
-                                    assume_yes=assume_yes,
-                                    exec_consent=exec_consent, as_json=as_json)
-
-    if cmd == "install":
-        # engine from a positional (`ara install mlx`), else --engine, else the auto-matched one.
-        return render_install(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
-                              refresh=refresh, as_json=as_json)
-
-    if cmd == "uninstall":
-        return render_uninstall(c, engine=_canonical_engine_arg(rest[1]) if len(rest) > 1 else (engine or "auto"),
-                                as_json=as_json)
-
-    if cmd == "hf":
-        return render_hf(c, rest[1] if len(rest) > 1 else None, token=token, as_json=as_json)
-
-    if cmd == "node":
-        return render_node(c, rest, token=token, as_json=as_json)
-
-    if cmd == "doctor":
-        return render_doctor(c, rekey=rekey, as_json=as_json)
-
-    if as_json:
-        return _arg_err(f"'{rest[0]}' isn't a known ARA command — run `ara` for the command list.")
-    c.emit(c.style("warn", f"  '{rest[0]}' isn't a known ARA command — run `ara` for the command list."))
-    c.emit(
-        c.style("dim", "  run ") + c.style("accent", "ara")
-        + c.style("dim", " with no arguments to see the planned commands.")
-    )
-    return 1
-
-
-if __name__ == "__main__":   # pragma: no cover — so `python -m ara.cli ...` works (node wiring shells out this way)
+if __name__ == "__main__":   # pragma: no cover — compatibility only; production uses `python -m ara`
     sys.exit(main())

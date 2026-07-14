@@ -84,6 +84,19 @@ def test_result_payload_failed_when_worker_returns_error():
     assert "result" not in payload
 
 
+def test_result_payload_failed_retains_actionable_stderr():
+    payload = agent._result_payload({"error": "boom", "stderr": "daemon detail"})
+    assert payload["status"] == "failed"
+    assert payload["error"] == "boom"
+    assert payload["stderr"] == "daemon detail"
+
+
+@pytest.mark.parametrize("stderr", ["", None, 7])
+def test_result_payload_ignores_non_actionable_stderr(stderr):
+    payload = agent._result_payload({"error": "boom", "stderr": stderr})
+    assert "stderr" not in payload
+
+
 # --- run_loop ---
 def test_one_iteration_runs_job_and_posts_done():
     fake = FakeClient([{"id": "j1", "kind": "run", "args": {"model": "m"}}])
@@ -98,6 +111,25 @@ def test_worker_error_dict_is_reported_failed():
     fake = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
     agent.run_loop(_cfg(), client=fake, runner=lambda k, a: {"error": "nope"}, max_iterations=1)
     assert fake.posted[0][1]["status"] == "failed"
+
+
+@pytest.mark.parametrize("stdout", [
+    "", "not json", json.dumps([]), json.dumps({}), json.dumps({"warning": "partial"}),
+])
+def test_real_wiring_nonzero_result_is_always_reported_failed(monkeypatch, stdout):
+    class Proc:
+        returncode = 5
+        stderr = "actionable stderr\n"
+
+        def __init__(self):
+            self.stdout = stdout
+
+    monkeypatch.setattr(agent.wiring.subprocess, "run", lambda *_a, **_k: Proc())
+    result = agent.default_runner()("status", {})
+    payload = agent._result_payload(result)
+    assert payload["status"] == "failed"
+    assert "exited 5" in payload["error"]
+    assert payload["stderr"] == "actionable stderr"
 
 
 def test_runner_exception_is_reported_failed():

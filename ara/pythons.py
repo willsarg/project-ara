@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import glob
 import json
+import ntpath
 import os
 import platform
+import posixpath
 import re
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,12 +206,9 @@ def _origin(real: str, invocations: list[str]) -> str:
 def _user_default_real() -> str | None:
     """Resolved path of the user's shell default python3, with ARA's venv stripped."""
     path = os.environ.get("PATH", "")
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
-        # venvs put the interpreter in Scripts\ on Windows, bin/ elsewhere.
-        vbin = os.path.normpath(os.path.join(venv, "Scripts" if os.name == "nt" else "bin"))
-        path = os.pathsep.join(p for p in path.split(os.pathsep)
-                               if os.path.normpath(p) != vbin)
+    roots = _active_env_roots()
+    path = os.pathsep.join(part for part in path.split(os.pathsep)
+                           if not any(_path_within(part, root) for root in roots))
     py = shutil.which("python3", path=path) or shutil.which("python", path=path)
     return os.path.realpath(py) if py else None
 
@@ -257,6 +257,48 @@ def _candidates() -> dict[str, set[str]]:
     return groups
 
 
+def _normal_path(path: str) -> str:
+    """Absolute, case-normalized path using the active platform's path grammar."""
+    paths = ntpath if os.name == "nt" else posixpath
+    return paths.normcase(paths.abspath(paths.normpath(path)))
+
+
+def _active_env_roots() -> tuple[str, ...]:
+    """Roots belonging to ARA's active environment, including installed-tool launches."""
+    roots = []
+    if venv := os.environ.get("VIRTUAL_ENV"):
+        roots.append(venv)
+    if sys.prefix != sys.base_prefix:
+        roots.append(sys.prefix)
+    return tuple(dict.fromkeys(_normal_path(root) for root in roots))
+
+
+def _path_within(path: str, root: str) -> bool:
+    """Whether *path* is inside *root*, without vulnerable string-prefix matching."""
+    paths = ntpath if os.name == "nt" else posixpath
+    path = _normal_path(path)
+    root = _normal_path(root)
+    try:
+        return paths.commonpath((path, root)) == root
+    except ValueError:  # Windows paths on different drives cannot share a common path.
+        return False
+
+
+def _user_candidates() -> dict[str, set[str]]:
+    """Candidate invocations with only ARA's current active environment removed."""
+    groups = _candidates()
+    roots = _active_env_roots()
+    if not roots:
+        return groups
+    filtered = {}
+    for real, invocations in groups.items():
+        kept = {path for path in invocations
+                if not any(_path_within(path, root) for root in roots)}
+        if kept:
+            filtered[real] = kept
+    return filtered
+
+
 def _display_path(invocations: set[str], path_dirs: set[str]) -> str:
     """The most user-meaningful path: prefer one on PATH, then the shortest."""
     return min(invocations, key=lambda p: (os.path.dirname(p) not in path_dirs, len(p)))
@@ -292,7 +334,7 @@ def discover(probe: bool = True) -> list[Interpreter]:
     ``probe=True`` runs one short subprocess per interpreter (in parallel) to read the
     version and AI-library set. ``probe=False`` skips that — paths/origin only, instant.
     """
-    groups = _candidates()
+    groups = _user_candidates()
     path_dirs = {d for d in os.environ.get("PATH", "").split(os.pathsep) if d}
     default_real = _user_default_real()
 
@@ -323,4 +365,4 @@ def discover(probe: bool = True) -> list[Interpreter]:
 
 def count() -> int:
     """How many distinct interpreters exist (cheap — no subprocess)."""
-    return len(_candidates())
+    return len(_user_candidates())

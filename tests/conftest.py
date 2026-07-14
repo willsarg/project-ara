@@ -40,6 +40,12 @@ def _isolate_db(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("ARA_DB_PATH", str(tmp_path_factory.mktemp("aradb") / "ara.db"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_activity(tmp_path_factory, monkeypatch):
+    """Keep lifecycle and persistent serving records out of the user's real data directory."""
+    monkeypatch.setenv("ARA_ACTIVITY_DIR", str(tmp_path_factory.mktemp("activity")))
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     """A fresh on-disk ARA db in a tmp dir (via the ARA_DB_PATH override)."""
