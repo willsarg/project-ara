@@ -41,12 +41,18 @@ def _run_cli(args: list[str]) -> dict:
 
 
 def default_providers() -> dict[str, Callable[[], dict]]:
-    """The read-endpoint providers: each key maps to a zero-arg call of the same-named CLI verb.
+    """Map read-endpoint keys to their canonical CLI argv.
 
-    The ``v=verb`` default binds the loop variable per-lambda (else every closure would capture the
-    last verb)."""
-    return {verb: (lambda v=verb: _run_cli([v]))
-            for verb in ("status", "detect", "profile", "models")}
+    Most providers use a same-named verb; physical model inventory is the ``detect --models``
+    facet. The ``a=args`` default binds each argv list per lambda (else every closure would capture
+    the last mapping)."""
+    commands = {
+        "status": ["status"],
+        "detect": ["detect"],
+        "profile": ["profile"],
+        "models": ["detect", "--models"],
+    }
+    return {key: (lambda a=args: _run_cli(a)) for key, args in commands.items()}
 
 
 def _safe(value: str, field: str) -> str:

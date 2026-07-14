@@ -45,15 +45,20 @@ def test_run_cli_unparseable_output_returns_error_dict(monkeypatch):
     assert out == {"error": "`ara models` produced unparseable output", "stderr": "noise"}
 
 
-def test_default_providers_map_each_verb(monkeypatch):
+def test_default_providers_map_each_key_to_its_canonical_cli_args(monkeypatch):
     calls = []
     monkeypatch.setattr(wiring, "_run_cli", lambda args: calls.append(args) or {"v": args[0]})
     providers = wiring.default_providers()
     assert set(providers) == {"status", "detect", "profile", "models"}
-    # Each closure binds its OWN verb (no late-binding bug).
-    for verb in ("status", "detect", "profile", "models"):
-        assert providers[verb]() == {"v": verb}
-    assert calls == [["status"], ["detect"], ["profile"], ["models"]]
+    expected = {
+        "status": ["status"],
+        "detect": ["detect"],
+        "profile": ["profile"],
+        "models": ["detect", "--models"],
+    }
+    for key, args in expected.items():
+        assert providers[key]() == {"v": args[0]}
+    assert calls == list(expected.values())
 
 
 def test_characterize_worker_builds_args(monkeypatch):
