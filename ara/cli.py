@@ -2634,13 +2634,18 @@ def _compat_command(name: str) -> click.Command:
     per-command argument collectors with typed Click parameters; until then they deliberately
     preserve the current option surface without duplicating its parsing rules here.
     """
-    @click.command(name=name, context_settings={
+    @click.command(name=name, add_help_option=False, context_settings={
         "ignore_unknown_options": True,
         "allow_extra_args": True,
-        "help_option_names": ["-h", "--help"],
     })
     @click.argument("legacy_args", nargs=-1, type=click.UNPROCESSED)
     def command(legacy_args: tuple[str, ...]) -> int:
+        if "-h" in legacy_args or "--help" in legacy_args:
+            return render_help(
+                Console.from_env(verbose="-v" in legacy_args or "--verbose" in legacy_args),
+                name,
+                as_json="--json" in legacy_args,
+            )
         return _main_impl([name, *legacy_args])
 
     return command
@@ -2680,8 +2685,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     are not caught."""
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        result = _click_cli.main(args=args, prog_name="ara", standalone_mode=False)
+        with _click_cli.make_context("ara", args) as ctx:
+            result = _click_cli.invoke(ctx)
         return int(result or 0)
+    except click.exceptions.Exit as exc:
+        return exc.exit_code
     except click.ClickException as exc:
         exc.show(file=sys.stderr)
         return exc.exit_code

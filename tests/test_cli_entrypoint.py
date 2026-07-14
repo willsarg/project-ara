@@ -76,6 +76,25 @@ def test_click_usage_error_is_stderr_exit_two_and_never_json():
         json.loads(result.stderr)
 
 
+def test_compat_command_help_preserves_safety_requirements():
+    result = _direct(["benchmark", "--help"])
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "ara benchmark <model>" in result.stdout
+    assert "--exec-consent" in result.stdout
+    assert "LEGACY_ARGS" not in result.stdout
+
+
+@pytest.mark.parametrize("argv", [["detect"], ["detect", "--json"]])
+def test_keyboard_interrupt_propagates_across_click_boundary(monkeypatch, argv):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "render_detect", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(argv)
+
+
 def test_mocked_operational_failure_is_json_at_the_execution_boundary(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("worker crashed")
