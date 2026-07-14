@@ -2370,6 +2370,10 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
     else:  # failed
         c.emit(c.style("bad", f"  removing {pkg} failed:"))
         c.emit(c.style("dim", f"  {result.detail}"))
+    if c.verbose:
+        path = engines.engine_env.env_path(engines.ENGINES[key]["backend"])
+        c.emit(c.style("dim", f"  environment: {path}"))
+        c.emit(c.style("dim", "  kept: models, shared uv cache, ARA data, and other engines"))
     return 0 if result.status in ("removed", "absent") else 1
 
 
@@ -3071,14 +3075,19 @@ def _click_install(ctx: click.Context, engine_arg: str | None, engine_option: st
 
 
 @_click_cli.command("uninstall", context_settings=_HELP_SETTINGS)
-@click.argument("engine_arg", required=False)
+@click.argument("engine_arg", required=False, metavar="[ENGINE]")
 @click.option("--engine", "engine_option", callback=_engine_callback, metavar="ENGINE",
               help="Engine to remove (also accepted positionally).")
 @_json_verbose_options
 @click.pass_context
 def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: str | None,
                      verbose: bool, as_json: bool) -> int:
-    """Remove an installed engine environment."""
+    """Remove an installed engine environment.
+
+    Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf.
+
+    Keeps models, the shared uv cache, ARA data, and other engines.
+    """
     return render_uninstall(_mark_json(ctx, as_json),
                             engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
 

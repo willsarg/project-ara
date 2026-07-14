@@ -582,20 +582,35 @@ def test_uninstall_unknown_engine_reports_unknown():
 
 
 def test_uninstall_absent_engine_is_noop(monkeypatch):
-    monkeypatch.setattr(engines.engine_env, "exists", lambda name: False)
-    removed = []
-    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(engines.engine_env, "remove", lambda _name: False)
     assert engines.uninstall("mlx").status == "absent"
-    assert removed == []   # nothing installed → nothing to remove
 
 
 def test_uninstall_removes_the_env(monkeypatch):
-    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     removed = []
-    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(
+        engines.engine_env, "remove", lambda name: removed.append(name) or True)
     r = engines.uninstall("mlx")
     assert r.status == "removed"
     assert removed == ["apple"]   # the backend/env name, not the dist
+
+
+def test_uninstall_reports_filesystem_failure(monkeypatch):
+    def fail(_name):
+        raise PermissionError("engine is in use")
+
+    monkeypatch.setattr(engines.engine_env, "remove", fail)
+
+    result = engines.uninstall("mlx")
+
+    assert result.status == "failed"
+    assert result.detail == "engine is in use"
+
+
+def test_uninstall_treats_disappearing_env_as_absent(monkeypatch):
+    monkeypatch.setattr(engines.engine_env, "remove", lambda _name: False)
+
+    assert engines.uninstall("mlx").status == "absent"
 
 
 def test_uninstall_removes_present_env_with_missing_schema_stamp(monkeypatch):
@@ -604,7 +619,8 @@ def test_uninstall_removes_present_env_with_missing_schema_stamp(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
     monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
     removed = []
-    monkeypatch.setattr(engines.engine_env, "remove", lambda name: removed.append(name))
+    monkeypatch.setattr(
+        engines.engine_env, "remove", lambda name: removed.append(name) or True)
     assert engines.is_installed("mlx") is False
 
     result = engines.uninstall("mlx")

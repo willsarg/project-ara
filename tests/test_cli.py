@@ -459,6 +459,17 @@ def test_generated_install_help_is_stdout(monkeypatch, capsys):
     assert "Backend/env:" not in captured.out
 
 
+def test_generated_uninstall_help_names_public_argument_and_removal_boundary(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["uninstall", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Usage: ara uninstall [OPTIONS] [ENGINE]" in captured.out
+    assert "ENGINE_ARG" not in captured.out
+    assert "Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf." in captured.out
+    assert "Keeps models, the shared uv cache, ARA data, and other engines." in captured.out
+
+
 def test_install_engine_help_lists_every_canonical_choice(monkeypatch, capsys):
     monkeypatch.setattr(
         cli.engines, "auto_decision",
@@ -1911,6 +1922,18 @@ def test_render_uninstall_absent_is_success(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_uninstall(c, engine="mlx") == 0
     assert "not installed" in buf.getvalue().lower()
+
+
+def test_render_uninstall_verbose_shows_exact_scope(make_console, monkeypatch):
+    _stub_uninstall(monkeypatch, "mlx", "removed")
+    monkeypatch.setattr(cli.engines.engine_env, "env_path", lambda name: cli.Path("/engines") / name)
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_uninstall(c, engine="mlx") == 0
+
+    out = buf.getvalue()
+    assert "environment: /engines/apple" in out
+    assert "kept: models, shared uv cache, ARA data, and other engines" in out
 
 
 def test_render_uninstall_failed_exits_nonzero(make_console, monkeypatch):

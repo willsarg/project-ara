@@ -442,10 +442,11 @@ def uninstall(key: str) -> InstallResult:
     The shared uv cache and other engines' envs are untouched."""
     if key not in ENGINES:
         return InstallResult(key, "unknown")
-    if not engine_env.exists(ENGINES[key]["backend"]):
-        return InstallResult(key, "absent")
-    engine_env.remove(ENGINES[key]["backend"])
-    return InstallResult(key, "removed")
+    try:
+        removed = engine_env.remove(ENGINES[key]["backend"])
+    except OSError as exc:
+        return InstallResult(key, "failed", str(exc))
+    return InstallResult(key, "removed" if removed else "absent")
 
 
 def _is_gguf(ref: str) -> bool:
