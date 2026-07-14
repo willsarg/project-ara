@@ -59,7 +59,6 @@ ENGINES: dict[str, dict] = {
         # single-BOS + turn-end stop fixes).
         # ARA_WMX_SOURCE still overrides to a local checkout (editable) for engine dev. MLX +
         # transformers stay engine-env-only — never ARA dependencies.
-        "vendored": True,
         "python": "3.12",          # ara-engine-mlx requires >=3.12
         "model_kinds": ("transformers",),
     },
@@ -76,7 +75,6 @@ ENGINES: dict[str, dict] = {
         "legacy_source_env": "ARA_WCX_SOURCE",
         # Nested: the native CUDA engine source ships under ara/_engine_packages/cuda and installs
         # into the isolated `cuda` env from there. Folded 2026-06-30 from wcx-suite@3a43f63.
-        "vendored": True,
         "extras": "cuda",                        # pulls torch + transformers (into the env, not ARA)
         # uv auto-detects the GPU and picks the matching CUDA torch wheel (the default
         # PyPI torch on Windows/Linux is CPU-only).
@@ -208,7 +206,7 @@ def is_installed(key: str) -> bool:
     return schema is None or engine_env.stamped_schema(engine["backend"]) == schema
 
 
-def _vendored_source(key: str) -> Path:
+def _bundled_source(key: str) -> Path:
     """The catalog-declared nested package source for engine *key*.
 
     This directory holds the engine's ``pyproject.toml`` and is handed to ``uv pip install``.
@@ -237,7 +235,7 @@ def source_for(key: str) -> str:
             file=sys.stderr,
         )
         return legacy_override
-    return str(_vendored_source(key))
+    return str(_bundled_source(key))
 
 
 @dataclass(frozen=True)
@@ -283,8 +281,8 @@ def _install_targets(key: str) -> list[str]:
     """The trailing ``uv pip install`` args (pip flags + targets) for engine *key*'s env.
 
     Built-in engines install a plain package list (with per-platform prebuilt-wheel handling — see
-    :func:`_builtin_targets`). External suites install from a local path, with any ``extras`` group
-    appended (e.g. ``[cuda]``): the **vendored** source installed plain (read-only inside ARA's
+    :func:`_builtin_targets`). Native engine packages install from a local path, with any ``extras``
+    group appended (e.g. ``[cuda]``): the bundled source installed plain (read-only inside ARA's
     wheel), or a dev-override local checkout installed editable (``-e``). Any ``pip_args``
     (e.g. ``--torch-backend=auto`` to fetch the right CUDA torch wheel) come first.
     """
@@ -294,7 +292,7 @@ def _install_targets(key: str) -> list[str]:
     pip_args = list(engine.get("pip_args", []))
     extras = engine.get("extras")
     suffix = f"[{extras}]" if extras else ""
-    # A dev override (ARA_<KEY>_SOURCE) installs editable so engine edits are live; the vendored
+    # A dev override (ARA_<KEY>_SOURCE) installs editable so engine edits are live; the bundled
     # default installs plain — its source is read-only inside ARA's wheel.
     target = f"{source_for(key)}{suffix}"
     if os.environ.get(engine["source_env"]) or os.environ.get(engine["legacy_source_env"]):

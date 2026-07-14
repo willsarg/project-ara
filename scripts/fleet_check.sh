@@ -12,7 +12,7 @@
 #   OUTSIDE GitHub's trust boundary. No CI runner ever gets credentials to reach them, and
 #   this script never runs unattended from a workflow. A human runs it, from a machine that
 #   already has the fleet's SSH aliases trusted in ~/.ssh/known_hosts, before cutting a
-#   release (or after touching an engine adapter / vendored engine source).
+#   release (or after touching an engine adapter / bundled engine source).
 #
 # WHAT IT DOES
 #   For each target (a real, host-native machine — never a container, ARA's engines are

@@ -70,7 +70,7 @@ def env_path(name: str) -> Path:
 
 def _stamp_path(name: str) -> Path:
     """The version-stamp file inside engine *name*'s env (``.ara-version``): the ARA release that
-    installed it. Lets ``ara install`` tell a stale vendored engine (older ARA wheel) from a current
+    installed it. Lets ``ara install`` tell a stale bundled engine (older ARA wheel) from a current
     one, so a new wheel's nested engine source actually reaches a box that already has the env."""
     return env_path(name) / ".ara-version"
 

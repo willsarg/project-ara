@@ -142,17 +142,17 @@ def test_is_installed_true_when_declared_schema_stamp_matches(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# source_for() — the install source, with a dev env-var override (external suites)
+# source_for() — the bundled install source, with a dev env-var override
 # --------------------------------------------------------------------------- #
-def test_source_for_defaults_to_vendored_path(monkeypatch):
-    # A folded engine (no git spec) installs from the package source ARA ships in its wheel,
-    # under ara/_vendor/<key> — reproducible and offline. The dir (with its pyproject) must exist.
+def test_source_for_defaults_to_bundled_path(monkeypatch):
+    # A native engine installs from the package source ARA ships in its wheel under
+    # ara/_engine_packages/<key> — reproducible and offline. Its pyproject must exist.
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
-    assert "spec" not in engines.ENGINES["mlx"]            # folded in — no git source
+    assert "spec" not in engines.ENGINES["mlx"]            # native package — no git source
     src = engines.source_for("mlx")
-    assert src == str(engines._vendored_source("mlx"))
-    assert (engines._vendored_source("mlx") / "pyproject.toml").is_file()
+    assert src == str(engines._bundled_source("mlx"))
+    assert (engines._bundled_source("mlx") / "pyproject.toml").is_file()
 
 
 def test_source_for_uses_env_override(monkeypatch):
@@ -247,14 +247,14 @@ def test_install_targets_vulkan_plain_on_macos(monkeypatch):
     assert engines._install_targets("vulkan") == engines.ENGINES["vulkan"]["packages"]
 
 
-def test_install_targets_vendored_is_plain_path(monkeypatch):
-    # A folded engine installs from its vendored dir — a plain (non-editable) path, since the source
+def test_install_targets_bundled_is_plain_path(monkeypatch):
+    # A native engine installs from its bundled dir — a plain (non-editable) path, since the source
     # is read-only inside ARA's wheel. No extras for mlx.
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
-    assert engines._install_targets("mlx") == [str(engines._vendored_source("mlx"))]
+    assert engines._install_targets("mlx") == [str(engines._bundled_source("mlx"))]
 
 
-def test_install_targets_external_local_is_editable(monkeypatch):
+def test_install_targets_dev_override_is_editable(monkeypatch):
     monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-suite")
     assert engines._install_targets("mlx") == ["-e", "../mlx-suite"]
 
@@ -265,12 +265,12 @@ def test_install_targets_legacy_local_source_remains_editable(monkeypatch):
     assert engines._install_targets("mlx") == ["-e", "../legacy-wmx-suite"]
 
 
-def test_install_targets_cuda_folds_extra_and_torch_backend(monkeypatch):
-    # Vendored cuda installs from its path with the [cuda] extra appended and the torch-backend
+def test_install_targets_cuda_adds_extra_and_torch_backend(monkeypatch):
+    # Bundled cuda installs from its path with the [cuda] extra appended and the torch-backend
     # selector leading — plain (non-editable), since it's read-only inside ARA's wheel.
     monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
     assert engines._install_targets("cuda") == [
-        "--torch-backend=auto", f"{engines._vendored_source('cuda')}[cuda]"]
+        "--torch-backend=auto", f"{engines._bundled_source('cuda')}[cuda]"]
 
 
 def test_install_targets_cuda_local_is_editable_with_extra(monkeypatch):
@@ -297,7 +297,7 @@ def test_cuda_is_available_and_installs_into_its_cuda_env(monkeypatch):
     assert engines.install("cuda").status == "installed"
     assert seen["name"] == "cuda" and seen["python"] == "3.12"
     assert seen["packages"] == [
-        "--torch-backend=auto", f"{engines._vendored_source('cuda')}[cuda]"]
+        "--torch-backend=auto", f"{engines._bundled_source('cuda')}[cuda]"]
 
 
 def test_install_unknown_engine_reports_unknown():
@@ -415,7 +415,7 @@ def test_install_creates_env_with_targets_and_python_pin(monkeypatch):
     r = engines.install("mlx")
     assert r.status == "installed"
     assert seen == {"name": "apple",
-                    "packages": [str(engines._vendored_source("mlx"))],
+                    "packages": [str(engines._bundled_source("mlx"))],
                     "python": "3.12"}
 
 
