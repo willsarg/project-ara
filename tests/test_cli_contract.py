@@ -132,6 +132,97 @@ def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
     assert "No such command 'frobnicate'" in captured.err
 
 
+@pytest.mark.parametrize("argv, message", [
+    (["characterize", "--json"], "Missing argument 'MODEL'"),
+    (["benchmark", "org/m", "--json"], "Missing option '--use-case'"),
+    (["profile", "--json", "--model"], "Option '--model' requires an argument"),
+    (["serve", "org/m", "--json", "--ctx", "many"], "Invalid value for '--ctx'"),
+    (["benchmark", "org/m", "--json", "--use-case", "reasoning", "--repeat", "lots"],
+     "Invalid value for '--repeat'"),
+    (["detect", "--json", "--made-up"], "No such option '--made-up'"),
+])
+def test_click_grammar_errors_are_stderr_exit_two_and_never_json(
+        mocked_world, capsys, argv, message):
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert message in captured.err
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured.err)
+
+
+def test_typed_options_and_trailing_json_reach_callback(mocked_world, monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_benchmark",
+        lambda c, model, **kwargs: seen.update(model=model, **kwargs) or 7,
+    )
+    assert cli.main([
+        "benchmark", "org/m", "--use-case=reasoning", "--ctx", "4096",
+        "--max-tokens=512", "--repeat", "3", "--yes", "--json",
+    ]) == 7
+    assert seen == {
+        "model": "org/m", "use_case": "reasoning", "engine": None, "ctx": 4096,
+        "max_tokens": 512, "repeat": 3, "assume_yes": True,
+        "exec_consent": False, "as_json": True,
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_repeatable_include_exclude_accept_space_and_equals_forms(
+        mocked_world, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "_resolve_want",
+        lambda cmd, include, exclude, c, **kw: seen.update(
+            cmd=cmd, include=include, exclude=exclude, **kw) or (lambda section: True),
+    )
+    assert cli.main([
+        "detect", "--include", "system,memory", "--include=accelerator",
+        "--exclude", "apps", "--exclude=models", "--json",
+    ]) == 0
+    assert seen == {
+        "cmd": "detect", "include": ["system", "memory", "accelerator"],
+        "exclude": ["apps", "models"], "as_json": True,
+    }
+
+
+@pytest.mark.parametrize("group", ["hf", "node"])
+def test_explicit_groups_require_a_subcommand(mocked_world, capsys, group):
+    assert cli.main([group]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"Usage: ara {group}" in captured.err
+    assert "Missing command" in captured.err
+
+
+@pytest.mark.parametrize("subcommand", ["logout", "status"])
+def test_hf_subcommands_dispatch_through_click(mocked_world, monkeypatch, subcommand):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_hf",
+        lambda c, sub, **kwargs: seen.update(sub=sub, **kwargs) or 0,
+    )
+    assert cli.main(["hf", subcommand, "--json"]) == 0
+    assert seen == {"sub": subcommand, "as_json": True}
+
+
+@pytest.mark.parametrize("subcommand", ["install", "start", "stop", "status", "uninstall"])
+def test_node_lifecycle_subcommands_dispatch_through_click(
+        mocked_world, monkeypatch, subcommand):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_node",
+        lambda c, rest, **kwargs: seen.update(rest=rest, **kwargs) or 0,
+    )
+    assert cli.main(["node", subcommand, "--json"]) == 0
+    assert seen == {"rest": ["node", subcommand], "as_json": True}
+
+
 def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):
     # asdict() skips the @property; the CPU-fallback distinction must still reach --json consumers
     monkeypatch.setattr("sys.argv", ["ara", "detect", "--json"])

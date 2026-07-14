@@ -81,8 +81,6 @@ def _capture_dispatch(monkeypatch):
     """Replace the render_* entry points with recorders; return the record dict."""
     rec = {}
     monkeypatch.setattr(cli, "render_landing", lambda c: rec.update(landing=True))
-    monkeypatch.setattr(cli, "render_help",
-                        lambda c, cmd, as_json=False: rec.update(help=cmd, help_called=True) or 0)
     monkeypatch.setattr(cli, "render_detect", lambda c, as_json=False, want=None: rec.update(detect=as_json, detect_want=want))
     monkeypatch.setattr(cli, "render_status", lambda c, as_json=False, want=None: rec.update(status=as_json))
     monkeypatch.setattr(cli, "render_python", lambda c, as_json=False, want=None: rec.update(python=as_json))
@@ -353,11 +351,12 @@ def test_main_profile_model_separate_value(monkeypatch):
     assert rec["profile"]["model"] == "org/repo"
 
 
-def test_main_profile_model_flag_as_last_arg(monkeypatch):
-    # boundary: `--model` with no following value must yield None, not IndexError.
-    rec = _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["profile", "--model"]) == 0
-    assert rec["profile"]["model"] is None
+def test_main_profile_model_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["profile", "--model"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Option '--model' requires an argument" in captured.err
 
 
 def test_main_profile_model_equals_form(monkeypatch):
@@ -414,34 +413,12 @@ def test_main_bare_help_routes_to_help_with_no_command(monkeypatch):
     assert rec == {}
 
 
-def test_render_help_known_command_prints_usage(make_console):
-    c, buf = make_console()
-    assert cli.render_help(c, "install") == 0
-    out = buf.getvalue()
-    assert "usage" in out and "ara install" in out
-
-
-def test_render_help_benchmark_lists_exec_consent(make_console):
-    """The coding benchmark REQUIRES --exec-consent; its usage line must advertise it."""
-    c, buf = make_console()
-    assert cli.render_help(c, "benchmark") == 0
-    assert "--exec-consent" in buf.getvalue()
-
-
-def test_render_help_no_or_unknown_command_falls_back_to_landing(monkeypatch, make_console):
-    c, _ = make_console()
-    seen = {}
-    monkeypatch.setattr(cli, "render_landing", lambda c: seen.update(landing=True))
-    assert cli.render_help(c, None) == 0 and seen.get("landing")
-    seen.clear()
-    assert cli.render_help(c, "frobnicate") == 0 and seen.get("landing")
-
-
-def test_render_help_json(capsys):
-    c = cli.Console(color=False, stream=sys.stderr)
-    assert cli.render_help(c, "install", as_json=True) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["command"] == "install" and "ara install" in out["usage"]
+def test_generated_install_help_is_stdout(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "Usage: ara install [OPTIONS] [ENGINE_ARG]" in captured.out
+    assert "--engine ENGINE" in captured.out
 
 
 # ---- install / uninstall take a positional engine (not just --engine) ---------------------
@@ -2661,7 +2638,7 @@ def test_main_run_dispatch(monkeypatch):
 
 def test_main_run_usage_no_model(make_console, monkeypatch):
     monkeypatch.setattr("sys.argv", ["ara", "run"])
-    assert cli.main() == 1
+    assert cli.main() == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -3010,11 +2987,12 @@ def test_main_characterize_prefill_chunk_eq_form(monkeypatch):
     assert rec["characterize_chunk"] == 384
 
 
-def test_main_prefill_chunk_non_integer_disables_lever(monkeypatch):
-    # A non-integer value parses to None (off) rather than crashing the CLI (Rule #1 fail-safe).
-    rec = _capture_dispatch(monkeypatch)
-    _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"])
-    assert rec["characterize_chunk"] is None
+def test_main_prefill_chunk_non_integer_is_click_error(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["characterize", "org/M", "--prefill-chunk", "big"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Invalid value for '--prefill-chunk'" in captured.err
 
 
 def test_int_or_none_parses_and_rejects():
@@ -3095,9 +3073,8 @@ def test_main_characterize_flash_attn_optin_default_false(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# --json honesty (Rule #3): usage errors, unknown commands, and uncaught
-# exceptions must all emit {"error": ...} under --json, never styled text or a
-# traceback that breaks a JSON consumer.
+# --json honesty (Rule #3): Click grammar errors stay stderr/2; operational
+# exceptions after a valid command emit {"error": ...} under --json.
 # --------------------------------------------------------------------------- #
 def test_main_usage_errors_json(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["search", "--json"]) == 2
@@ -3105,8 +3082,10 @@ def test_main_usage_errors_json(monkeypatch, capsys):
     assert captured.out == ""
     assert "Missing argument" in captured.err
     for argv in (["characterize"], ["run"]):
-        assert _run_main(monkeypatch, [*argv, "--json"]) == 1
-        assert "error" in json.loads(capsys.readouterr().out)
+        assert _run_main(monkeypatch, [*argv, "--json"]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Missing argument" in captured.err
 
 
 def test_main_unknown_command_json_flag_does_not_override_click(monkeypatch, capsys):
@@ -3704,8 +3683,10 @@ def test_main_characterize_passes_engine(monkeypatch):
 
 
 def test_main_characterize_no_model(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["characterize"]) == 1
-    assert "usage: ara characterize" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["characterize"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara characterize" in captured.err
 
 
 # --------------------------------------------------------------------------- #
@@ -5852,20 +5833,20 @@ def test_main_serve_empty_name_is_none(monkeypatch):
     assert rec["serve"]["name"] is None and rec["serve"]["ctx"] == 8
 
 
-def test_main_serve_ctx_flag_at_end_is_none(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
+def test_main_serve_ctx_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_serve",
-                        lambda c, model, **kw: rec.update(serve=kw) or 0)
-    _run_main(monkeypatch, ["serve", "m", "--ctx"])
-    assert rec["serve"]["ctx"] is None
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["serve", "m", "--ctx"]) == 2
+    assert "Option '--ctx' requires an argument" in capsys.readouterr().err
 
 
-def test_main_serve_name_flag_at_end_is_none(monkeypatch):
-    rec = _capture_dispatch(monkeypatch)
+def test_main_serve_name_flag_requires_value(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_serve",
-                        lambda c, model, **kw: rec.update(serve=kw) or 0)
-    _run_main(monkeypatch, ["serve", "m", "--name"])
-    assert rec["serve"]["name"] is None
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["serve", "m", "--name"]) == 2
+    assert "Option '--name' requires an argument" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -6100,12 +6081,12 @@ def test_render_benchmark_rejects_nonpositive_max_tokens(make_console, monkeypat
 
 def test_main_benchmark_missing_use_case_returns_error(monkeypatch):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["benchmark", "org/m"]) == 1
+    assert _run_main(monkeypatch, ["benchmark", "org/m"]) == 2
 
 
 def test_main_benchmark_missing_model_returns_error(monkeypatch):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["benchmark"]) == 1
+    assert _run_main(monkeypatch, ["benchmark"]) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -6793,13 +6774,13 @@ def test_main_benchmark_parses_repeat_equals_form(monkeypatch):
     assert rec["benchmark"]["repeat"] == 5
 
 
-def test_main_benchmark_noninteger_repeat_folds_to_invalid(monkeypatch):
-    # A non-integer --repeat parses to 0, which render_benchmark rejects (positive-integer gate).
-    rec = _capture_dispatch(monkeypatch)
+def test_main_benchmark_noninteger_repeat_is_click_error(monkeypatch, capsys):
+    _capture_dispatch(monkeypatch)
     monkeypatch.setattr(cli, "render_benchmark",
-                        lambda c, model, **kw: rec.update(benchmark={"model": model, **kw}) or 0)
-    _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning", "--repeat", "lots"])
-    assert rec["benchmark"]["repeat"] == 0
+                        lambda c, model, **kw: pytest.fail("renderer must not run"))
+    assert _run_main(monkeypatch, ["benchmark", "org/m", "--use-case", "reasoning",
+                                   "--repeat", "lots"]) == 2
+    assert "Invalid value for '--repeat'" in capsys.readouterr().err
 
 
 # --- serve: MLX (mlx) governed-server path ---
