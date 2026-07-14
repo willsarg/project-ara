@@ -426,10 +426,16 @@ def list_characterizations(con: sqlite3.Connection, machine_key: str,
             "SELECT * FROM characterizations WHERE machine_key=? ORDER BY model_id, engine",
             (machine_key,)).fetchall()
     else:
-        from ara.engine_identity import canonical_engine
+        from ara.engine_identity import LEGACY_ENGINE_ALIASES, canonical_engine
+        canonical = canonical_engine(engine)
+        storage_keys = [canonical, *(legacy for legacy, replacement
+                                     in LEGACY_ENGINE_ALIASES.items()
+                                     if replacement == canonical)]
+        placeholders = ",".join("?" for _ in storage_keys)
         rows = con.execute(
-            "SELECT * FROM characterizations WHERE machine_key=? AND engine=? ORDER BY model_id",
-            (machine_key, canonical_engine(engine))).fetchall()
+            f"SELECT * FROM characterizations WHERE machine_key=? "  # noqa: S608
+            f"AND engine IN ({placeholders}) ORDER BY model_id",
+            (machine_key, *storage_keys)).fetchall()
     out = []
     for r in rows:
         d = dict(r)

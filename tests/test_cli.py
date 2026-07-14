@@ -2166,17 +2166,29 @@ def test_detect_models_reads_existing_database_without_migrating(
 
     path = db._db_path()
     backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    store.execute(
+        "INSERT INTO characterizations "
+        "(machine_key, engine, model_id, safe_context, points_json) VALUES (?, ?, ?, ?, ?)",
+        ("mkey", "wmx", "org/model", 4096, "[]"),
+    )
     store.execute("PRAGMA user_version = 2")
     store.commit()
     store.close()
     backup_path.unlink(missing_ok=True)
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
-    monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/model", "modality": "text"}])
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
 
     assert cli.main(["detect", "--models", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["characterized"] is True
+    assert payload[0]["safe_context"] == 4096
+    assert payload[0]["engine"] == "mlx"
     with sqlite3.connect(path) as check:
         assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert check.execute("SELECT engine FROM characterizations").fetchone()[0] == "wmx"
     assert not backup_path.exists()
 
 
