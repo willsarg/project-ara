@@ -2566,6 +2566,40 @@ def test_recommend_json(monkeypatch, set_platform, capsys):
     assert payload[0]["fits"] is True and "est_context" in payload[0]
 
 
+def test_recommend_verbose_discloses_budget_provenance(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small")])
+    c, buf = make_console(verbose=True)
+    assert cli.render_recommend(c) == 0
+    out = " ".join(buf.getvalue().split())
+    assert "provenance wall estimated · mlx · 34.0 GB safe budget" in out
+    assert "catalog 1 cached model · ephemeral read-only scan" in out
+
+
+def test_recommend_verbose_distinguishes_measured_wall_from_analytic_fit(
+        store, make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small")])
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
+                                     wall_gb=20.0, safe_budget_gb=18.0)
+    c, buf = make_console(verbose=True)
+    assert cli.render_recommend(c) == 0
+    out = " ".join(buf.getvalue().split())
+    assert "provenance wall measured · mlx · 18.0 GB safe budget" in out
+    assert "estimated — fits this machine" in out
+
+
+def test_recommend_does_not_create_database(
+        tmp_path, make_console, monkeypatch, set_platform):
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small")])
+
+    c, _ = make_console()
+    assert cli.render_recommend(c) == 0
+    assert not path.exists()
+
+
 def test_recommend_use_case_ranks_by_capability_and_labels(make_console, monkeypatch, set_platform):
     # With --use-case, models rank by capability (not context), and provenance is labelled.
     _wire_recommend(monkeypatch, set_platform,
@@ -3119,6 +3153,15 @@ def test_render_search_lists_results(make_console, monkeypatch):
     assert "HUB SEARCH: smol" in out and "org/Smol" in out and "1000" in out
 
 
+def test_render_search_verbose_discloses_query_provenance(make_console, monkeypatch):
+    monkeypatch.setattr(cli.hub, "search",
+                        lambda q: [{"id": "org/Smol", "downloads": 1000, "likes": 5}])
+    c, buf = make_console(verbose=True)
+    assert cli.render_search(c, "smol") == 0
+    out = " ".join(buf.getvalue().split())
+    assert "source hf models list sorted by downloads · limit 20" in out
+
+
 def test_render_search_empty(make_console, monkeypatch):
     monkeypatch.setattr(cli.hub, "search", lambda q: [])
     c, buf = make_console()
@@ -3626,6 +3669,34 @@ def test_model_detail_full(make_console, monkeypatch):
     assert "8192" in out and "mlx-4bit" in out and "16000" in out
 
 
+def test_model_detail_verbose_discloses_measurement_time(make_console, monkeypatch):
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda con, mk, e, mid: ({"safe_context": 16000,
+                                                  "decode_context": None,
+                                                  "measured_at": "2026-07-02T12:00:00+00:00"}
+                                                 if e == "mlx" else None))
+    c, buf = make_console(verbose=True)
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    assert "measured 2026-07-02T12:00:00+00:00" in buf.getvalue()
+
+
+def test_models_help_is_clear_and_lists_recommend_use_cases(capsys):
+    assert cli.main(["models", "--help"]) == 0
+    group_help = " ".join(capsys.readouterr().out.split())
+    assert "Search the Hub, rank cached models, or inspect one cached model" in group_help
+
+    assert cli.main(["models", "recommend", "--help"]) == 0
+    recommend_help = " ".join(capsys.readouterr().out.split())
+    assert "estimated usable context or capability evidence" in recommend_help
+    assert "extraction, reasoning, rag, agentic, or coding" in recommend_help
+
+    assert cli.main(["models", "show", "--help"]) == 0
+    show_help = " ".join(capsys.readouterr().out.split())
+    assert "cached architecture and this machine's measured ceilings" in show_help
+
+
 def test_model_detail_sparse_no_engine(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda mid: _meta(modality=None, n_layers=None, kv_heads=None,
@@ -3644,6 +3715,16 @@ def test_model_detail_not_found(make_console, monkeypatch):
     assert "couldn't describe" in buf.getvalue()
 
 
+def test_model_detail_does_not_create_database(tmp_path, make_console, monkeypatch):
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+
+    c, _ = make_console()
+    assert cli.render_model_detail(c, "org/Smol") == 0
+    assert not path.exists()
+
+
 def test_model_detail_json(monkeypatch, capsys):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
@@ -3655,6 +3736,37 @@ def test_model_detail_json(monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["model_id"] == "org/A" and data["safe_context"] == 9000
     assert data["decode_context"] is None
+
+
+def test_model_detail_reads_legacy_characterization_without_migrating(
+        store, monkeypatch, capsys):
+    from ara import db
+
+    monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    store.execute(
+        "INSERT INTO characterizations "
+        "(machine_key, engine, model_id, safe_context, decode_context, points_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("mkey", "wmx", "org/A", 4096, 8192, "[]"),
+    )
+    store.execute("PRAGMA user_version = 2")
+    store.commit()
+    store.close()
+    path = db._db_path()
+    backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    backup_path.unlink(missing_ok=True)
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_model_detail(c, "org/A", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["safe_context"] == 4096
+    assert data["decode_context"] == 8192
+    assert data["engines"] == {"mlx": 4096}
+    with sqlite3.connect(path) as check:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert check.execute("SELECT engine FROM characterizations").fetchone()[0] == "wmx"
+    assert not backup_path.exists()
 
 
 def test_model_detail_flags_stale_ceiling_text(make_console, monkeypatch):

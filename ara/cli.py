@@ -14,7 +14,7 @@ import os
 import sqlite3
 import sys
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1010,7 +1010,13 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
     per_engine = {}                       # engine_key -> (safe_context, decode_context, measured_at)
-    with db.connected() as con:
+    with ExitStack() as stack:
+        scratch = sqlite3.connect(":memory:")
+        scratch.row_factory = sqlite3.Row
+        scratch.executescript(db.SCHEMA)
+        stack.callback(scratch.close)
+        con = (stack.enter_context(db.connected_readonly())
+               if db._db_path().is_file() else scratch)
         for key in engines.ENGINES:
             row = db.get_characterization(con, mk, key, model_id)
             if row is not None:
@@ -1046,6 +1052,8 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
                 ceiling_str += f"  · ~{dc} stream-only (est.)"
             if sc and staleness.ceiling_is_stale(model_id, at):
                 ceiling_str += "  · ⚠ stale — re-characterize"
+            if c.verbose:
+                ceiling_str += f"  · measured {at or 'unknown'}"
             c.emit(c.field(f"{key} ceiling", ceiling_str))
     else:
         c.emit(c.field("ceiling", "not characterized"))
@@ -1367,6 +1375,8 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
         return 0
     c.emit()
     c.emit(c.section(f"  HUB SEARCH: {query}"))
+    if c.verbose:
+        c.emit(c.field("source", "hf models list", "sorted by downloads · limit 20"))
     for r in results:
         c.emit("  " + c.style("metric", r["id"])
                + c.style("dim", f"  ↓{r['downloads']} · ♥{r['likes']}"))
@@ -1460,18 +1470,25 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                f"{', '.join(scoring.USE_CASES)}")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    with db.connected() as con:
-        catalog.scan(con)                 # refresh the catalog from the local cache first
+    with ExitStack() as stack:
+        cache_con = sqlite3.connect(":memory:")
+        cache_con.row_factory = sqlite3.Row
+        cache_con.executescript(db.SCHEMA)
+        stack.callback(cache_con.close)
+        catalog.scan(cache_con)            # ephemeral snapshot of the local cache
+        evidence_con = (stack.enter_context(db.connected_readonly())
+                        if db._db_path().is_file() else cache_con)
         # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
         default_engine = engines.for_backend(detect.backend_name())
-        measured = (calibration.get_calibration(con, default_engine)
+        measured = (calibration.get_calibration(evidence_con, default_engine)
                     if default_engine is not None else None)
         lim = estimate.limits(detect.machine(), measured=measured)
-        best = _best_ceilings(con)        # model_id -> (safe_context, engine_key, decode_context)
+        best = _best_ceilings(evidence_con)  # model_id -> (safe_context, engine_key, decode_context)
 
         recs = []
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
-        for row in catalog.all_models(con):
+        models = catalog.all_models(cache_con)
+        for row in models:
             fit = estimate.model_fit(lim, row, row.get("weights_gb"))
             if not fit["fits"]:
                 continue
@@ -1486,7 +1503,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                          "quant": quant, "quant_bits": scoring.quant_bits(quant),
                          "base": scoring.base_key(row["model_id"])})
         if use_case is not None:
-            rows = db.list_benchmark_results(con, profile.machine_key())
+            rows = db.list_benchmark_results(evidence_con, profile.machine_key())
             bench_measured = ({(r["model_id"], r["use_case"]):
                                {"score": r["score"], "source": r["source"],
                                 "sample_size": r.get("sample_size"),
@@ -1518,6 +1535,14 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     sub = ("  (estimated — fits this machine, most context first)" if use_case is None
            else f"  (for {use_case} — capability-ranked; measured-here or imported)")
     c.emit(c.section("  RECOMMENDED MODELS") + c.style("dim", sub))
+    if c.verbose:
+        c.emit(c.field(
+            "provenance",
+            f"wall {lim['basis']} · {default_engine or 'unknown'} · "
+            f"{_fmt_gb(lim['safe_budget_gb'], 1)} safe budget",
+        ))
+        noun = "model" if len(models) == 1 else "models"
+        c.emit(c.field("catalog", f"{len(models)} cached {noun} · ephemeral read-only scan"))
     if not recs:
         c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                               "try a smaller / more-quantized model"))
@@ -2996,7 +3021,7 @@ class _ModelsGroup(click.Group):
                   no_args_is_help=False, context_settings=_HELP_SETTINGS)
 @click.pass_context
 def _click_models(ctx: click.Context) -> int:
-    """Search, rank, or inspect model catalog entries."""
+    """Search the Hub, rank cached models, or inspect one cached model."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
     return 0
@@ -3014,12 +3039,13 @@ def _click_models_search(ctx: click.Context, query: tuple[str, ...],
 
 
 @_click_models.command("recommend", context_settings=_HELP_SETTINGS)
-@click.option("--use-case", help="Rank by a measured capability dimension.")
+@click.option("--use-case", metavar="USE_CASE",
+              help="Rank by capability evidence: extraction, reasoning, rag, agentic, or coding.")
 @_json_verbose_options
 @click.pass_context
 def _click_models_recommend(ctx: click.Context, use_case: str | None,
                             verbose: bool, as_json: bool) -> int:
-    """Rank cached models that fit this machine."""
+    """Rank cached models by estimated usable context or capability evidence."""
     return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
 
 
@@ -3029,7 +3055,7 @@ def _click_models_recommend(ctx: click.Context, use_case: str | None,
 @click.pass_context
 def _click_models_show(ctx: click.Context, model: str,
                        verbose: bool, as_json: bool) -> int:
-    """Show one model's catalog and characterization details."""
+    """Show cached architecture and this machine's measured ceilings."""
     return render_model_detail(_mark_json(ctx, as_json), model, as_json=as_json)
 
 

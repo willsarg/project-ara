@@ -415,10 +415,20 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
 
 def get_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
                          model_id: str) -> dict | None:
-    from ara.engine_identity import canonical_engine
+    from ara.engine_identity import LEGACY_ENGINE_ALIASES, canonical_engine
+    canonical = canonical_engine(engine)
     row = con.execute(
         "SELECT * FROM characterizations WHERE machine_key=? AND engine=? AND model_id=?",
-        (machine_key, canonical_engine(engine), model_id)).fetchone()
+        (machine_key, canonical, model_id)).fetchone()
+    if row is None:
+        for legacy, replacement in LEGACY_ENGINE_ALIASES.items():
+            if replacement == canonical:
+                row = con.execute(
+                    "SELECT * FROM characterizations "
+                    "WHERE machine_key=? AND engine=? AND model_id=?",
+                    (machine_key, legacy, model_id)).fetchone()
+                if row is not None:
+                    break
     if not row:
         return None
     d = dict(row)
