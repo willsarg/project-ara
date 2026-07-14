@@ -464,16 +464,18 @@ def _det_frameworks(c: Console, m) -> None:
     frameworks = [rt for rt in m.runtimes if rt.kind == "framework"]
     c.emit(c.section("  FRAMEWORKS"))
     present_fw = [rt for rt in frameworks if rt.present]
-    default_py = m.framework_python or "ARA's env (no separate user python)"
 
     if present_fw:
         libs = " · ".join(f"{rt.name} {rt.version}".strip() for rt in present_fw)
         c.emit(c.style("dim", "  Your default python has AI frameworks:"))
-        c.emit("      " + c.style("accent", default_py))
+        c.emit("      " + c.style("accent", m.framework_python))
         c.emit("      " + c.style("good", libs))
     else:
-        c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
-        c.emit("      " + c.style("accent", default_py))
+        if m.framework_python:
+            c.emit(c.style("dim", "  Your default python has no AI frameworks:"))
+            c.emit("      " + c.style("accent", m.framework_python))
+        else:
+            c.emit(c.style("dim", "  no separate user Python found"))
         # An empty section is misleading when the stack actually lives in another
         # interpreter — surface the richest one (probe paid only in this empty case).
         others = sorted((i for i in pythons.discover() if i.ai_present and not i.is_default),

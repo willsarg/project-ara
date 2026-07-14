@@ -135,6 +135,7 @@ def test_detect_runtime_explains_ready_isolated_mlx_and_absent_user_runtime(
         _machine(),
         engine="mlx", engine_ready=True,
         runtimes=[Runtime("MLX", False, kind="engine", accels=("apple",), usable=True)],
+        framework_python=None,
     )
     monkeypatch.setattr(cli.detect, "machine", lambda: machine)
     monkeypatch.setattr(cli.pythons, "discover", lambda: [])
@@ -148,6 +149,7 @@ def test_detect_runtime_explains_ready_isolated_mlx_and_absent_user_runtime(
     assert "mlx" in out and "ready" in out
     assert "USER ENVIRONMENT" in out
     assert "MLX" in out and "not found" in out
+    assert "no separate user Python found" in out
     assert "read-only user ecosystem probes" in out
 
 

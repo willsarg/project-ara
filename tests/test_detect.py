@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 import types
 
@@ -297,9 +298,7 @@ def test_runtimes_usability_and_kind_split(monkeypatch, fake_home):
         "torch": "2.1.0", "transformers": "4.40.0", "tensorflow": None,
         "vllm": "0.5.0", "mlx-lm": "0.18",
     })
-    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
-    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect, "_user_which", lambda n: None)
 
     rts = {rt.name: rt for rt in detect.runtimes(accel_kind="apple", user_py="/usr/bin/python3")}
 
@@ -324,31 +323,69 @@ def test_runtimes_usability_and_kind_split(monkeypatch, fake_home):
     assert rts["MLX"].requires is None
 
 
-def test_runtimes_detected_via_second_or_signal(monkeypatch, fake_home):
+def test_runtimes_detected_via_user_cli_signal(monkeypatch, fake_home):
     # Each engine is detectable via either of two signals; here only the SECOND is
     # present, pinning the `or` (an `and` mutation would drop them).
     monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
-    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
     present = {"llama-server", "vllm"}   # llama-cli absent / llama-server present; vllm via CLI
-    monkeypatch.setattr("shutil.which", lambda n, path=None: f"/x/{n}" if n in present else None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: object() if n == "mlx_lm" else None)
+    monkeypatch.setattr(detect, "_user_which", lambda n: f"/x/{n}" if n in present else None)
 
     rts = {rt.name: rt for rt in detect.runtimes("apple")}
     assert rts["llama.cpp"].present is True   # via llama-server (2nd operand of the or)
     assert rts["vLLM"].present is True         # via the vllm CLI (2nd operand)
-    assert rts["MLX"].present is True          # via find_spec("mlx_lm") (2nd operand)
+    assert rts["MLX"].present is False         # no explicit user Python package
 
 
-def test_runtimes_mlx_falls_back_to_ara_env(monkeypatch, fake_home):
-    # The user's python has no mlx-lm, but ARA bundles the MLX engine → still present.
-    monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
-    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: "0.18" if name == "mlx-lm" else None)
-    monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+def test_runtimes_ignore_ara_env_packages_and_venv_only_tools(
+        monkeypatch, fake_home, tmp_path):
+    venv = tmp_path / "ara-env"
+    vbin = venv / ("Scripts" if os.name == "nt" else "bin")
+    vbin.mkdir(parents=True)
+    for name in ("llama-cli", "lms", "vllm", "ollama"):
+        tool = vbin / name
+        tool.write_text("ARA-only tool", encoding="utf-8")
+        tool.chmod(0o755)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    monkeypatch.setenv("PATH", str(vbin))
+    monkeypatch.setitem(sys.modules, "mlx_lm", object())
+    monkeypatch.setattr("importlib.metadata.version", lambda name: "99.0")
+    monkeypatch.setattr(detect._versions, "find_app", lambda names: (None, None))
+    monkeypatch.setattr(detect._versions, "brew_version", lambda name: None)
+    real_exists = Path.exists
+
+    def system_app_absent(path):
+        if path == Path("/Applications/LM Studio.app"):
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", system_app_absent)
 
     rts = {rt.name: rt for rt in detect.runtimes("apple", user_py=None)}
-    assert rts["MLX"].present is True
-    assert rts["MLX"].version == "0.18"
+    assert {name: rts[name].present for name in ("MLX", "llama.cpp", "Ollama", "LM Studio", "vLLM")} == {
+        "MLX": False, "llama.cpp": False, "Ollama": False, "LM Studio": False, "vLLM": False,
+    }
+    assert all(not rts[name].present for name in ("PyTorch", "transformers", "TensorFlow"))
+    source = Path(detect.__file__).read_text(encoding="utf-8")
+    assert "_ara_pkg_version" not in source and "find_spec" not in source
+
+
+def test_machine_keeps_isolated_mlx_ready_separate_from_absent_user_mlx(
+        monkeypatch, fake_home, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(hardware, "probe", lambda: _make_hw())
+    monkeypatch.setattr(detect, "_user_python", lambda: None)
+    monkeypatch.setattr(detect, "_user_which", lambda name: None)
+    monkeypatch.setattr(detect._engines, "is_installed", lambda key: key == "mlx")
+    monkeypatch.setattr(detect._versions, "find_app", lambda names: (None, None))
+    monkeypatch.setattr(detect._versions, "brew_version", lambda name: None)
+    monkeypatch.setattr(detect._apps, "scan", lambda: [])
+    monkeypatch.setattr(detect, "_power", lambda: "unknown")
+    monkeypatch.setattr("importlib.metadata.version", lambda name: "99.0")
+
+    machine = detect.machine()
+    user_mlx = next(runtime for runtime in machine.runtimes if runtime.name == "MLX")
+    assert machine.engine == "mlx" and machine.engine_ready is True
+    assert user_mlx.present is False and user_mlx.version is None
 
 
 def test_runtime_requires_property():
@@ -389,9 +426,7 @@ def test_ollama_liveness_installed_not_serving_keeps_brew_version(monkeypatch):
 
 def test_runtimes_applies_ollama_liveness_only_to_ollama(monkeypatch, fake_home):
     monkeypatch.setattr(detect, "_python_packages", lambda py, names: {n: None for n in names})
-    monkeypatch.setattr(detect, "_ara_pkg_version", lambda name: None)
-    monkeypatch.setattr("shutil.which", lambda n, path=None: "/x/ollama" if n == "ollama" else None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
+    monkeypatch.setattr(detect, "_user_which", lambda n: "/x/ollama" if n == "ollama" else None)
     monkeypatch.setattr(ollama, "version", lambda *a, **k: "0.30.10")
 
     rts = {rt.name: rt for rt in detect.runtimes("apple")}
@@ -514,7 +549,6 @@ def test_hf_token_absent(fake_home):
 def test_profile_on_apple(set_platform, run_stub, fake_home, monkeypatch):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)            # mlx_lm absent
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)  # engine absent
     run_stub.add("machdep.cpu.brand_string", "Apple M4 Pro\n")
 
@@ -622,12 +656,6 @@ def test_python_packages_blank_on_bad_output(run_stub):
     run_stub.add("importlib", "not json at all")
     assert detect._python_packages("/usr/bin/python3", ("torch", "vllm")) == {
         "torch": None, "vllm": None}
-
-
-def test_ara_pkg_version_reads_own_env():
-    # psutil is a real dependency in ARA's own environment.
-    assert detect._ara_pkg_version("psutil") is not None
-    assert detect._ara_pkg_version("definitely-not-installed-xyz") is None
 
 
 def test_profile_cpu_fallback(set_platform, run_stub, fake_home, monkeypatch):
@@ -821,7 +849,6 @@ def test_profile_embeds_hardware_structures(set_platform, run_stub, fake_home, m
     """profile() must call hardware.probe() and embed all four sub-structures."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
 
     hw = _make_hw()
@@ -839,7 +866,6 @@ def test_profile_chip_uses_cpu_brand_when_available(set_platform, run_stub, fake
     """chip field must be cpu.brand when it is present (not the sysctl fallback)."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
 
     hw = _make_hw(cpu=CpuInfo(brand="AMD Ryzen 9 5900X", physical=12, logical=24))
@@ -853,7 +879,6 @@ def test_profile_chip_falls_back_when_brand_none(set_platform, run_stub, fake_ho
     """chip field must fall back to chip_name() when cpu.brand is None."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
 
     # run_stub returns "Apple M4 Pro" for the sysctl brand string fallback
@@ -869,7 +894,6 @@ def test_profile_flat_fields_sourced_from_hw_structures(set_platform, run_stub, 
     """Flat back-compat fields must be sourced from the hardware structures (single truth)."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
-    monkeypatch.setattr(detect, "find_spec", lambda n: None)
     monkeypatch.setattr(detect._engines, "is_installed", lambda k: False)
 
     hw = _make_hw(

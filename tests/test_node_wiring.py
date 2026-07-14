@@ -66,6 +66,30 @@ def test_run_cli_unparseable_output_returns_error_dict(monkeypatch):
     assert out == {"error": "`ara models` produced unparseable output", "stderr": "noise"}
 
 
+@pytest.mark.parametrize("payload", [None, [], ["x"], "text", 0, 1.5, True])
+def test_run_cli_zero_rejects_valid_json_non_object(monkeypatch, payload):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, stdout=json.dumps(payload), stderr="shape detail\n"),
+    )
+    assert wiring._run_cli(["status"]) == {
+        "error": "`ara status` produced non-object JSON output",
+        "stderr": "shape detail",
+    }
+
+
+@pytest.mark.parametrize("payload", [None, [], ["x"], "text", 0, 1.5, False])
+def test_run_cli_nonzero_rejects_valid_json_non_object(monkeypatch, payload):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(9, stdout=json.dumps(payload), stderr="failed detail\n"),
+    )
+    assert wiring._run_cli(["run"]) == {
+        "error": "`ara run` exited 9",
+        "stderr": "failed detail",
+    }
+
+
 def test_default_providers_map_each_key_to_its_canonical_cli_args(monkeypatch):
     calls = []
     monkeypatch.setattr(wiring, "_run_cli", lambda args: calls.append(args) or {"v": args[0]})

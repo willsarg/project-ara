@@ -40,6 +40,12 @@ def _run_cli(args: list[str]) -> dict:
                     "stderr": (proc.stderr or "").strip()}
         return {"error": f"`ara {args[0]}` produced unparseable output",
                 "stderr": (proc.stderr or "").strip()}
+    if not isinstance(payload, dict):
+        if proc.returncode != 0:
+            return {"error": f"`ara {args[0]}` exited {proc.returncode}",
+                    "stderr": (proc.stderr or "").strip()}
+        return {"error": f"`ara {args[0]}` produced non-object JSON output",
+                "stderr": (proc.stderr or "").strip()}
     return payload
 
 

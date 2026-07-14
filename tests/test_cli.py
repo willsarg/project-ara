@@ -1197,8 +1197,8 @@ def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pytho
     # no third-party launchers, non-verbose: the note must NOT read as a bare "none" that
     # contradicts the ARA section's own-engine readiness — it points there instead (bug fix).
     assert "own engine" in out and "ENGINES" in out
-    assert "has no AI frameworks" in out                  # default python is bare
-    assert "ARA's env (no separate user python)" in out   # framework_python is None
+    assert "no separate user Python found" in out
+    assert "Your default python" not in out
     assert "None found in any interpreter" in out         # discover surfaced nothing
     assert "HF cache" not in out                           # absent store hidden (non-verbose)
 
