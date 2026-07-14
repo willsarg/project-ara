@@ -2346,6 +2346,20 @@ def render_install(c: Console, *, engine: str = "auto", refresh: bool = False,
     return 0 if result.status in _INSTALL_OK else 1
 
 
+_ENGINE_BACKED_ACTIVITY_KINDS = frozenset({
+    "running", "characterizing", "benchmarking", "serving",
+})
+
+
+def _active_engine_work() -> list[activity.Activity]:
+    """Observed ARA work that may own an engine env; persistent Ollama serving owns none."""
+    return [
+        item for item in activity.snapshot()
+        if item.kind in _ENGINE_BACKED_ACTIVITY_KINDS
+        and (item.kind != "serving" or item.pid is not None)
+    ]
+
+
 def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False) -> int:
     """Remove the matched engine. Exit 0 once it's gone (removed or already absent)."""
     key = engines.resolve(engine)
@@ -2356,13 +2370,27 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
             c.emit(c.style("warn", f"  no engine matches '{engine}' on this hardware"))
         return 1
 
+    pkg = engines.ENGINES[key]["package"]
+    active = _active_engine_work()
+    if active:
+        activities = [{"kind": item.kind, "model": item.model} for item in active]
+        if as_json:
+            print(json.dumps({
+                "status": "busy", "engine": key, "activities": activities,
+            }))
+        else:
+            kinds = ", ".join(dict.fromkeys(item.kind for item in active))
+            c.emit(c.style("warn", f"  refusing to remove {pkg} while ARA work is active"))
+            c.emit(c.style("dim", f"  active: {kinds}"))
+            c.emit(c.style("dim", "  wait for ara status to be idle, then retry"))
+        return 1
+
     result = engines.uninstall(key)
     if as_json:
         print(json.dumps({"key": result.key, "status": result.status,
                           "detail": result.detail}))
         return 0 if result.status in ("removed", "absent") else 1
 
-    pkg = engines.ENGINES[key]["package"]
     if result.status == "removed":
         c.emit(c.style("good", f"  removed {pkg}"))
     elif result.status == "absent":
@@ -2373,7 +2401,10 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
     if c.verbose:
         path = engines.engine_env.env_path(engines.ENGINES[key]["backend"])
         c.emit(c.style("dim", f"  environment: {path}"))
-        c.emit(c.style("dim", "  kept: models, shared uv cache, ARA data, and other engines"))
+        c.emit(c.style(
+            "dim",
+            "  kept: models, shared uv cache, ARA database/characterizations, and other engines",
+        ))
     return 0 if result.status in ("removed", "absent") else 1
 
 
@@ -3086,7 +3117,7 @@ def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: 
 
     Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf.
 
-    Keeps models, the shared uv cache, ARA data, and other engines.
+    Keeps models, the shared uv cache, ARA's database and characterizations, and other engines.
     """
     return render_uninstall(_mark_json(ctx, as_json),
                             engine=_selected_engine(engine_arg, engine_option), as_json=as_json)

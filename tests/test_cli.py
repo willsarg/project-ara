@@ -467,7 +467,8 @@ def test_generated_uninstall_help_names_public_argument_and_removal_boundary(mon
     assert "Usage: ara uninstall [OPTIONS] [ENGINE]" in captured.out
     assert "ENGINE_ARG" not in captured.out
     assert "Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf." in captured.out
-    assert "Keeps models, the shared uv cache, ARA data, and other engines." in captured.out
+    assert "Keeps models, the shared uv cache, ARA's database and characterizations," in captured.out
+    assert "other engines." in captured.out
 
 
 def test_install_engine_help_lists_every_canonical_choice(monkeypatch, capsys):
@@ -1906,6 +1907,7 @@ def test_render_install_json_legacy_source_warning_keeps_stdout_clean(monkeypatc
 
 def _stub_uninstall(monkeypatch, key, status, detail=""):
     monkeypatch.setattr(cli.engines, "resolve", lambda v: key)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
     monkeypatch.setattr(cli.engines, "uninstall",
                         lambda k: cli.engines.InstallResult(k, status, detail))
 
@@ -1933,7 +1935,68 @@ def test_render_uninstall_verbose_shows_exact_scope(make_console, monkeypatch):
 
     out = buf.getvalue()
     assert "environment: /engines/apple" in out
-    assert "kept: models, shared uv cache, ARA data, and other engines" in out
+    assert "kept: models, shared uv cache, ARA database/characterizations, and other engines" in out
+
+
+@pytest.mark.parametrize("kind", ["running", "characterizing", "benchmarking", "serving"])
+def test_render_uninstall_refuses_during_engine_backed_activity(
+        make_console, monkeypatch, kind):
+    called = []
+    monkeypatch.setattr(cli.engines, "resolve", lambda _value: "mlx")
+    monkeypatch.setattr(
+        cli.activity, "snapshot",
+        lambda: [cli.activity.Activity(kind, "org/model", 42, 1.0)],
+    )
+    monkeypatch.setattr(cli.engines, "uninstall", lambda key: called.append(key))
+    c, buf = make_console()
+
+    assert cli.render_uninstall(c, engine="mlx") == 1
+
+    assert called == []
+    assert "refusing to remove ara-engine-mlx while ARA work is active" in buf.getvalue()
+    assert f"active: {kind}" in buf.getvalue()
+    assert "ara status" in buf.getvalue()
+
+
+def test_render_uninstall_busy_json_is_structured(monkeypatch, capsys):
+    monkeypatch.setattr(cli.engines, "resolve", lambda _value: "cuda")
+    monkeypatch.setattr(
+        cli.activity, "snapshot",
+        lambda: [cli.activity.Activity("running", "org/model", 42, 1.0)],
+    )
+    monkeypatch.setattr(
+        cli.engines, "uninstall", lambda _key: pytest.fail("busy uninstall reached removal"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_uninstall(c, engine="cuda", as_json=True) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "busy",
+        "engine": "cuda",
+        "activities": [{"kind": "running", "model": "org/model"}],
+    }
+
+
+def test_render_uninstall_ignores_search_and_persistent_ollama_serving(
+        make_console, monkeypatch):
+    monkeypatch.setattr(cli.engines, "resolve", lambda _value: "cpu")
+    monkeypatch.setattr(
+        cli.activity, "snapshot",
+        lambda: [
+            cli.activity.Activity("searching", None, 42, 1.0),
+            cli.activity.Activity(
+                "serving", "org/model", None, 2.0, runtime="ollama",
+                served_name="model-ara", context=4096, endpoint="http://localhost:11434"),
+        ],
+    )
+    monkeypatch.setattr(
+        cli.engines, "uninstall",
+        lambda key: cli.engines.InstallResult(key, "removed"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_uninstall(c, engine="cpu") == 0
+    assert "removed llama.cpp" in buf.getvalue()
 
 
 def test_render_uninstall_failed_exits_nonzero(make_console, monkeypatch):
