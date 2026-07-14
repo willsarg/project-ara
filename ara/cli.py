@@ -1875,7 +1875,7 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
         if not ollama.create(probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
             break
         ollama.load(probe)
-        entry = _find_loaded(ollama.ps() or [], probe)
+        entry = _find_loaded(ollama.ps() or [], probe, expected_context=ctx)
         loaded_ctx = entry.get("context_length") if entry is not None else None
         if (entry is None or not isinstance(loaded_ctx, int)
                 or isinstance(loaded_ctx, bool) or loaded_ctx <= 0
@@ -1955,11 +1955,20 @@ def _governed_name(model: str) -> str:
     return safe + "-ara"
 
 
-def _find_loaded(entries: list[dict], served: str) -> dict | None:
+def _find_loaded(entries: list[dict], served: str, *,
+                 expected_context: int | None = None) -> dict | None:
     """The ``/api/ps`` entry for our derived model (Ollama tags it ``:latest``), or ``None``."""
-    return next((m for m in entries if isinstance(m, dict)
-                 and isinstance(m.get("name"), str)
-                 and m["name"] in (served, served + ":latest")), None)
+    matches = [m for m in entries if isinstance(m, dict)
+               and isinstance(m.get("name"), str)
+               and m["name"] in (served, served + ":latest")]
+    if expected_context is None:
+        return matches[0] if matches else None
+    valid = next((m for m in matches
+                  if isinstance(m.get("context_length"), int)
+                  and not isinstance(m["context_length"], bool)
+                  and m["context_length"] > 0
+                  and m["context_length"] == expected_context), None)
+    return valid if valid is not None else (matches[0] if matches else None)
 
 
 def _free_port() -> int:
@@ -2158,6 +2167,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     already_owned = any(
         item.runtime == "ollama" and item.served_name == served
         and item.context == safe and item.endpoint == endpoint_base
+        and item.model == model
         for item in activity.snapshot())
     setup_activity = nullcontext() if already_owned else activity.track("serving", model)
     with setup_activity:
@@ -2166,7 +2176,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
 
         # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
         ollama.load(served)
-        entry = _find_loaded(ollama.ps() or [], served)
+        entry = _find_loaded(ollama.ps() or [], served, expected_context=safe)
         if entry is None:
             return err(f"{served} didn't load — Ollama may be out of memory.")
         served_ctx = entry.get("context_length")

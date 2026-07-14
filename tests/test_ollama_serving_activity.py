@@ -112,6 +112,19 @@ def test_snapshot_correlates_exact_latest_name_context_and_endpoint(registry, mo
         endpoint="http://127.0.0.1:11434")]
 
 
+def test_snapshot_scans_past_malformed_and_wrong_matching_rows_to_later_valid_row(
+        registry, monkeypatch):
+    _record()
+    _wire_live(monkeypatch, [
+        {"name": "org-model-ara", "context_length": True},
+        {"name": "org-model-ara:latest", "context_length": "4096"},
+        {"name": "org-model-ara", "context_length": 2048},
+        {"name": "org-model-ara:latest", "context_length": 4096},
+    ])
+    assert [(item.kind, item.model) for item in activity.snapshot()] == [
+        ("serving", "org/model")]
+
+
 @pytest.mark.parametrize("entries,endpoint", [
     (None, "http://127.0.0.1:11434"),
     ([], "http://127.0.0.1:11434"),

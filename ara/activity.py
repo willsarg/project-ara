@@ -263,12 +263,12 @@ def _live_ollama_serving(directory: Path) -> list[tuple[Activity, str]]:
         served = record["served_name"]
         entry = next((item for item in loaded if isinstance(item, dict)
                       and isinstance(item.get("name"), str)
-                      and item["name"] in (served, served + ":latest")), None)
+                      and item["name"] in (served, served + ":latest")
+                      and isinstance(item.get("context_length"), int)
+                      and not isinstance(item["context_length"], bool)
+                      and item["context_length"] > 0
+                      and item["context_length"] == record["context"]), None)
         if entry is None:
-            continue
-        live_context = entry.get("context_length")
-        if (not isinstance(live_context, int) or isinstance(live_context, bool)
-                or live_context <= 0 or live_context != record["context"]):
             continue
         live.append((Activity(
             kind="serving", model=record["model"], pid=None,

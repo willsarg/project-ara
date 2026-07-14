@@ -573,6 +573,29 @@ def test_ollama_reserve_same_live_identity_never_duplicates_status(
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
 
 
+def test_ollama_takeover_same_served_identity_for_new_base_keeps_transient_activity(
+        make_console, monkeypatch, activity_registry):
+    _wire_ollama_serve(monkeypatch)
+    activity.record_ollama_serving(
+        served_name="shared", model="org/old", context=4096,
+        endpoint="http://127.0.0.1:11434", started_at=1.0)
+    loaded = [{"name": "shared:latest", "context_length": 4096,
+               "size": 10, "size_vram": 10}]
+    monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
+
+    def create(*_a, **_k):
+        assert [(item.kind, item.model, item.runtime) for item in activity.snapshot()] == [
+            ("serving", "org/old", "ollama"),
+            ("serving", "base:model", None),
+        ]
+        return True
+
+    monkeypatch.setattr(cli.ollama, "create", create)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {"done": True})
+    c, _ = make_console()
+    assert cli.render_serve(c, "base:model", ctx=4096, name="shared") == 0
+
+
 def test_ollama_serve_declined_consent_never_claims_activity(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch, isatty=True)
@@ -654,6 +677,16 @@ def test_find_loaded_accepts_only_exact_name_or_latest_normalization():
     ]
     assert cli._find_loaded(entries, "svc") == {"name": "svc:latest"}
     assert cli._find_loaded(entries[:2], "svc") is None
+
+
+def test_find_loaded_scans_matching_rows_for_later_valid_exact_context():
+    entries = [
+        {"name": "svc", "context_length": True},
+        {"name": "svc:latest", "context_length": "4096"},
+        {"name": "svc", "context_length": 2048},
+        {"name": "svc:latest", "context_length": 4096},
+    ]
+    assert cli._find_loaded(entries, "svc", expected_context=4096) == entries[-1]
 
 
 @pytest.mark.parametrize("name", [None, [], {}, 7])
