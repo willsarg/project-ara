@@ -53,6 +53,7 @@ def _in_process_entrypoint(path: str, argv: list[str], monkeypatch) -> subproces
 @pytest.mark.parametrize("argv", [
     ["--help"],
     ["--version"],
+    ["install", "--engine", "mlx", "--help"],
     ["search"],
     ["apps", "--json"],
     ["profile", "--engine", "not-an-engine", "--json"],

@@ -451,8 +451,138 @@ def test_generated_install_help_is_stdout(monkeypatch, capsys):
     assert _run_main(monkeypatch, ["install", "--help"]) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert "Usage: ara install [OPTIONS] [ENGINE_ARG]" in captured.out
+    assert "Usage: ara install [OPTIONS] [ENGINE]" in captured.out
+    assert "ENGINE_ARG" not in captured.out
     assert "--engine ENGINE" in captured.out
+    assert "Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf." in captured.out
+    assert "ara install --engine --help" in captured.out
+    assert "Backend/env:" not in captured.out
+
+
+def test_install_engine_help_lists_every_canonical_choice(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.engines, "auto_decision",
+        lambda: cli.engines.AutoDecision(
+            "mlx", "Darwin arm64 identifies Apple Silicon, so ARA selects MLX.",
+            "Darwin", "arm64", None),
+    )
+
+    assert _run_main(monkeypatch, ["install", "--engine", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    for key in ("auto", "mlx", "cuda", "cpu", "vulkan", "cuda-gguf"):
+        assert captured.out.count(f"Engine: {key}\n") == 1
+    assert "wmx" not in captured.out and "wcx" not in captured.out
+    assert "Backend/env:" not in captured.out
+
+
+def test_install_focused_engine_help_only_describes_requested_engine(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--engine", "mlx", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Engine: mlx\n" in captured.out
+    for key in ("auto", "cuda", "cpu", "vulkan", "cuda-gguf"):
+        assert f"Engine: {key}\n" not in captured.out
+    assert "Apple Silicon" in captured.out
+    assert "MLX" in captured.out
+    assert "Backend/env:" not in captured.out
+
+
+def test_install_verbose_engine_help_includes_exact_plan(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.delenv("ARA_WMX_SOURCE", raising=False)
+    monkeypatch.setattr(cli.engines.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(cli.engines.platform, "machine", lambda: "arm64")
+
+    assert _run_main(
+        monkeypatch, ["install", "--engine", "mlx", "--help", "--verbose"]
+    ) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Engine: mlx\n" in captured.out
+    assert "Backend/env: apple" in captured.out
+    assert "Python: 3.12" in captured.out
+    assert "Platform: Darwin arm64" in captured.out
+    assert "Install arguments:" in captured.out
+    assert str(cli.engines._bundled_source("mlx")) in captured.out
+    assert "Source override: none (ARA_MLX_SOURCE)" in captured.out
+
+
+def test_install_auto_help_explains_current_selection_and_reason(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.engines, "auto_decision",
+        lambda: cli.engines.AutoDecision(
+            "cuda", "nvidia-smi is available on PATH, so ARA selects CUDA.",
+            "Windows", "AMD64", "nvidia-smi.exe"),
+    )
+
+    assert _run_main(monkeypatch, ["install", "--engine", "auto", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Engine: auto\n" in captured.out
+    assert "Selected: cuda" in captured.out
+    assert "Why: nvidia-smi is available on PATH, so ARA selects CUDA." in captured.out
+    assert "Engine: cuda\n" in captured.out
+    assert "Engine: mlx\n" not in captured.out
+
+
+def test_install_auto_help_reports_no_match_honestly(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.engines, "auto_decision",
+        lambda: cli.engines.AutoDecision(
+            None,
+            "Linux x86_64 is not Apple Silicon and nvidia-smi is not available on PATH, "
+            "so ARA has no automatic match.",
+            "Linux", "x86_64", None),
+    )
+
+    assert _run_main(monkeypatch, ["install", "--engine", "auto", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Selected: no automatic match" in captured.out
+    assert "ARA has no automatic match" in captured.out
+    assert "Choose cpu, vulkan, cuda-gguf, or another engine explicitly." in captured.out
+
+
+def test_install_contextual_help_supports_equals_short_help_and_short_verbose(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--engine=cpu", "-h", "-v"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert "Engine: cpu\n" in captured.out
+    assert "Backend/env: cpu" in captured.out
+
+
+def test_install_contextual_help_legacy_alias_warns_and_renders_canonical(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--engine", "wmx", "--help"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == "ara: --engine wmx is deprecated; use --engine mlx\n"
+    assert "Engine: mlx\n" in captured.out
+    assert "Engine: wmx\n" not in captured.out
+
+
+def test_install_contextual_help_unknown_engine_is_click_usage_error(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["install", "--engine", "bogus", "--help"]) == 2
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "Usage: ara install [OPTIONS] [ENGINE]" in captured.err
+    assert "Invalid value for --engine" in captured.err
+    assert "bogus" in captured.err
+
+
+def test_install_contextual_help_never_dispatches_install(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.engines, "install", lambda *args, **kwargs: pytest.fail("help attempted an install"))
+
+    assert _run_main(monkeypatch, ["install", "--engine", "cpu", "--help"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 # ---- install / uninstall take a positional engine (not just --engine) ---------------------

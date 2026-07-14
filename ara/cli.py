@@ -3051,7 +3051,7 @@ def _selected_engine(engine_arg: str | None, engine_option: str | None) -> str:
 
 
 @_click_cli.command("install", context_settings=_HELP_SETTINGS)
-@click.argument("engine_arg", required=False)
+@click.argument("engine_arg", required=False, metavar="[ENGINE]")
 @click.option("--engine", "engine_option", callback=_engine_callback, metavar="ENGINE",
               help="Engine to install (also accepted positionally).")
 @click.option("--refresh", is_flag=True, help="Reinstall even when already present.")
@@ -3059,7 +3059,12 @@ def _selected_engine(engine_arg: str | None, engine_option: str | None) -> str:
 @click.pass_context
 def _click_install(ctx: click.Context, engine_arg: str | None, engine_option: str | None,
                    refresh: bool, verbose: bool, as_json: bool) -> int:
-    """Install an engine on demand."""
+    """Install an engine on demand.
+
+    Engines: auto, mlx, cuda, cpu, vulkan, cuda-gguf.
+
+    Decision guide: ara install --engine --help
+    """
     return render_install(_mark_json(ctx, as_json),
                           engine=_selected_engine(engine_arg, engine_option),
                           refresh=refresh, as_json=as_json)
@@ -3187,6 +3192,84 @@ def _click_node_uninstall(ctx: click.Context, verbose: bool, as_json: bool) -> i
     return _invoke_node(ctx, "uninstall", as_json)
 
 
+def _install_help_request(args: list[str]) -> tuple[str | None, bool] | None:
+    """Recognize only the contextual ``install --engine ... --help`` dialect."""
+    if not args or args[0] != "install" or not any(a in ("-h", "--help") for a in args[1:]):
+        return None
+    verbose = any(a in ("-v", "--verbose") for a in args[1:])
+    tail = [a for a in args[1:] if a not in ("-h", "--help", "-v", "--verbose")]
+    if tail == ["--engine"]:
+        return None, verbose
+    if len(tail) == 1 and tail[0].startswith("--engine="):
+        return tail[0].partition("=")[2], verbose
+    if len(tail) == 2 and tail[0] == "--engine":
+        return tail[1], verbose
+    return None
+
+
+def _engine_help_entry(key: str, *, verbose: bool) -> None:
+    """Render one concrete catalog engine without importing or validating it."""
+    engine = engines.ENGINES[key]
+    click.echo(f"Engine: {key}")
+    click.echo(f"  Purpose: {engine['purpose']}")
+    click.echo(f"  Hardware: {engine['hardware']}")
+    click.echo(f"  Models: {engine['formats']}")
+    click.echo(f"  Installs: {engine['install_summary']}")
+    click.echo(f"  Note: {engine['caution']}")
+    if verbose:
+        plan = engines.install_plan(key)
+        source_env = engine.get("source_env")
+        click.echo(f"  Backend/env: {plan.backend}")
+        click.echo(f"  Python: {plan.python or 'default'}")
+        click.echo(f"  Platform: {plan.platform}")
+        click.echo(f"  Install arguments: {' '.join(plan.targets)}")
+        if source_env:
+            click.echo(f"  Source override: {plan.source_override or f'none ({source_env})'}")
+        click.echo(f"  Environment schema: {plan.schema or 'built-in worker'}")
+    click.echo()
+
+
+def render_install_engine_help(engine: str | None, *, verbose: bool) -> int:
+    """Render all-engine or focused install guidance from catalog and plan data."""
+    selected = _canonical_engine_arg(engine)
+    if selected is not None and selected not in ("auto", *engines.ENGINES):
+        root_ctx = click.Context(_click_cli, info_name="ara")
+        install_ctx = click.Context(_click_install, info_name="install", parent=root_ctx)
+        choices = ", ".join(("auto", *engines.ENGINES))
+        raise click.BadParameter(
+            f"{selected!r} is not an engine; choose from {choices}",
+            ctx=install_ctx, param_hint="--engine",
+        )
+
+    click.echo("ARA engine install guide")
+    click.echo()
+    if selected is None:
+        decision = engines.auto_decision()
+        click.echo("Engine: auto")
+        click.echo(f"  Selected: {decision.key or 'no automatic match'}")
+        click.echo(f"  Why: {decision.reason}")
+        click.echo()
+        for key in engines.ENGINES:
+            _engine_help_entry(key, verbose=verbose)
+        return 0
+
+    if selected == "auto":
+        decision = engines.auto_decision()
+        click.echo("Engine: auto")
+        click.echo(f"  Selected: {decision.key or 'no automatic match'}")
+        click.echo(f"  Why: {decision.reason}")
+        if decision.key is None:
+            click.echo("  Choose cpu, vulkan, cuda-gguf, or another engine explicitly.")
+            click.echo()
+            return 0
+        click.echo()
+        _engine_help_entry(decision.key, verbose=verbose)
+        return 0
+
+    _engine_help_entry(selected, verbose=verbose)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
@@ -3197,6 +3280,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     ctx: click.Context | None = None
     try:
+        if (request := _install_help_request(args)) is not None:
+            engine, verbose = request
+            return render_install_engine_help(engine, verbose=verbose)
         with _click_cli.make_context("ara", args) as ctx:
             result = _click_cli.invoke(ctx)
         return int(result or 0)

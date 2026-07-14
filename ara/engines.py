@@ -47,6 +47,11 @@ ENGINES: dict[str, dict] = {
     "mlx": {
         "backend": "apple",
         "package": "ara-engine-mlx",
+        "purpose": "Native inference and measurement for Apple Silicon.",
+        "hardware": "Apple Silicon Macs.",
+        "formats": "Hugging Face Transformers models.",
+        "install_summary": "ARA's bundled MLX engine plus MLX and Transformers, isolated from ARA.",
+        "caution": "Apple-only; the MLX runtime can be large but is installed only on demand.",
         "available": True,
         "source_dir": "_engine_packages/mlx",
         "env_schema": "ara-engine-mlx:ara_engine_mlx:v1",
@@ -65,6 +70,11 @@ ENGINES: dict[str, dict] = {
     "cuda": {
         "backend": "cuda",
         "package": "ara-engine-cuda",
+        "purpose": "Native full-GPU inference and measurement through PyTorch CUDA.",
+        "hardware": "NVIDIA GPUs on Windows; Linux uses the same path but is not yet claimed.",
+        "formats": "Hugging Face Transformers models.",
+        "install_summary": "ARA's bundled CUDA engine plus PyTorch, CUDA support, and Transformers.",
+        "caution": "PyTorch and CUDA wheels are large; uv selects the compatible CUDA wheel.",
         # Converted to the isolated-env worker model (backends/cuda.py drives the native CUDA
         # device + measure_one workers out-of-process; nothing torch-shaped loads in ARA).
         "available": True,
@@ -85,6 +95,11 @@ ENGINES: dict[str, dict] = {
     "cpu": {
         "backend": "cpu",
         "package": "llama.cpp",
+        "purpose": "Portable CPU inference for quantized local models.",
+        "hardware": "Any supported CPU; no GPU is required.",
+        "formats": "GGUF models.",
+        "install_summary": "llama-cpp-python, psutil, and Hugging Face Hub in an isolated env.",
+        "caution": "Usually slower than GPU lanes; non-Windows hosts may compile llama.cpp locally.",
         "available": True,
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
@@ -119,6 +134,11 @@ ENGINES: dict[str, dict] = {
     "vulkan": {
         "backend": "vulkan",
         "package": "llama.cpp (Vulkan)",
+        "purpose": "GPU-offloaded GGUF inference through llama.cpp's Vulkan backend.",
+        "hardware": "Vulkan-capable GPUs on x86_64 Linux or Windows, including AMD APUs.",
+        "formats": "GGUF models.",
+        "install_summary": "A Vulkan-enabled llama-cpp-python wheel plus lightweight support deps.",
+        "caution": "Requires a working Vulkan driver; prebuilt wheels target Linux and Windows.",
         "available": True,
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
@@ -142,6 +162,11 @@ ENGINES: dict[str, dict] = {
     "cuda-gguf": {
         "backend": "cuda_gguf",
         "package": "llama.cpp (CUDA)",
+        "purpose": "Partial NVIDIA GPU offload for GGUF models through llama.cpp.",
+        "hardware": "NVIDIA GPUs on Linux or Windows, with system RAM for overflow layers.",
+        "formats": "GGUF models.",
+        "install_summary": "A CUDA-enabled llama-cpp-python wheel plus lightweight support deps.",
+        "caution": "A two-wall lane: ARA governs discrete VRAM and system RAM together.",
         "available": True,
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
@@ -165,17 +190,49 @@ ENGINES: dict[str, dict] = {
 }
 
 
+@dataclass(frozen=True)
+class AutoDecision:
+    """One honest automatic-engine decision plus the read-only facts behind it."""
+    key: str | None
+    reason: str
+    system: str
+    machine: str
+    nvidia_smi: str | None
+
+
+def decide_auto(*, system: str, machine: str, nvidia_smi: str | None) -> AutoDecision:
+    """Choose an automatic engine from already-observed host facts."""
+    if system == "Darwin" and machine == "arm64":
+        return AutoDecision(
+            "mlx", "Darwin arm64 identifies Apple Silicon, so ARA selects MLX.",
+            system, machine, nvidia_smi)
+    if nvidia_smi:
+        return AutoDecision(
+            "cuda", "nvidia-smi is available on PATH, so ARA selects CUDA.",
+            system, machine, nvidia_smi)
+    return AutoDecision(
+        None,
+        f"{system} {machine} is not Apple Silicon and nvidia-smi is not available on PATH, "
+        "so ARA has no automatic match.",
+        system, machine, nvidia_smi,
+    )
+
+
+def auto_decision() -> AutoDecision:
+    """Collect the cheap, read-only facts used by automatic engine selection."""
+    return decide_auto(
+        system=platform.system(), machine=platform.machine(),
+        nvidia_smi=shutil.which("nvidia-smi"),
+    )
+
+
 def for_hardware() -> str | None:
     """The engine ARA would pick for this machine from light recon, or None.
 
     Deliberately cheap — no subprocess: Apple Silicon by ``platform``, NVIDIA by a
     bare ``nvidia-smi`` on PATH. This is the resolution behind ``--engine auto``.
     """
-    if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "mlx"
-    if shutil.which("nvidia-smi"):
-        return "cuda"
-    return None
+    return auto_decision().key
 
 
 def for_backend(backend: str) -> str | None:
@@ -246,6 +303,20 @@ class InstallResult:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class InstallPlan:
+    """Side-effect-free description consumed by both help and the mutating installer."""
+    key: str
+    backend: str
+    python: str | None
+    targets: tuple[str, ...]
+    version: str
+    schema: str | None
+    expected_import: str | None
+    source_override: str | None
+    platform: str
+
+
 def _cap_to_wheel_max(req: str, wheels: dict) -> str:
     """Append a wheel-compatible version ceiling to requirement *req* if it's a ``wheel_only``
     package with a ``max_version`` (the newest prebuilt wheel on the engine's index).
@@ -300,6 +371,30 @@ def _install_targets(key: str) -> list[str]:
     return [*pip_args, target]
 
 
+def install_plan(key: str, *, version: str | None = None) -> InstallPlan:
+    """Build the exact current-host install plan without creating or changing an env."""
+    engine = ENGINES[key]
+    source_override = None
+    if source_env := engine.get("source_env"):
+        if value := os.environ.get(source_env):
+            source_override = f"{source_env}={value}"
+        else:
+            legacy_env = engine["legacy_source_env"]
+            if value := os.environ.get(legacy_env):
+                source_override = f"{legacy_env}={value}"
+    return InstallPlan(
+        key=key,
+        backend=engine["backend"],
+        python=engine.get("python"),
+        targets=tuple(_install_targets(key)),
+        version=_ara_version() if version is None else version,
+        schema=engine.get("env_schema"),
+        expected_import=engine.get("import_package"),
+        source_override=source_override,
+        platform=f"{platform.system()} {platform.machine()}",
+    )
+
+
 def install(key: str, *, refresh: bool = False) -> InstallResult:
     """Install engine *key* into its own isolated uv env. Idempotent and honest:
     never creates an env for an unknown or not-yet-available engine.
@@ -327,15 +422,16 @@ def install(key: str, *, refresh: bool = False) -> InstallResult:
         return InstallResult(key, "already")
     if stale:                       # wipe the old env so the reinstall isn't itself a noop
         engine_env.remove(engine["backend"])
+    plan = install_plan(key, version=current)
     create_kwargs = {
-        "python": engine.get("python"),
-        "version": current,
-        "schema": engine.get("env_schema"),
+        "python": plan.python,
+        "version": plan.version,
+        "schema": plan.schema,
     }
-    if engine.get("import_package") is not None:
-        create_kwargs["expected_import"] = engine["import_package"]
+    if plan.expected_import is not None:
+        create_kwargs["expected_import"] = plan.expected_import
     try:
-        engine_env.create(engine["backend"], _install_targets(key), **create_kwargs)
+        engine_env.create(plan.backend, list(plan.targets), **create_kwargs)
     except engine_env.EngineEnvError as e:
         return InstallResult(key, "failed", str(e))
     return InstallResult(key, "refreshed" if stale else "installed")

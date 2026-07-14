@@ -15,6 +15,31 @@ def test_for_hardware_picks_mlx_on_apple_silicon(monkeypatch):
     assert engines.for_hardware() == "mlx"
 
 
+def test_decide_auto_explains_apple_silicon_selection():
+    decision = engines.decide_auto(system="Darwin", machine="arm64", nvidia_smi=None)
+
+    assert decision.key == "mlx"
+    assert decision.reason == "Darwin arm64 identifies Apple Silicon, so ARA selects MLX."
+
+
+def test_decide_auto_explains_nvidia_selection():
+    decision = engines.decide_auto(
+        system="Windows", machine="AMD64", nvidia_smi="C:/Windows/System32/nvidia-smi.exe")
+
+    assert decision.key == "cuda"
+    assert decision.reason == "nvidia-smi is available on PATH, so ARA selects CUDA."
+
+
+def test_decide_auto_explains_no_match():
+    decision = engines.decide_auto(system="Linux", machine="x86_64", nvidia_smi=None)
+
+    assert decision.key is None
+    assert decision.reason == (
+        "Linux x86_64 is not Apple Silicon and nvidia-smi is not available on PATH, "
+        "so ARA has no automatic match."
+    )
+
+
 def test_for_hardware_picks_cuda_when_nvidia_smi_present(monkeypatch):
     monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
     monkeypatch.setattr(engines.platform, "machine", lambda: "AMD64")
@@ -52,6 +77,19 @@ def test_for_hardware_none_when_no_known_accelerator(monkeypatch):
     monkeypatch.setattr(engines.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(engines.shutil, "which", lambda n: None)
     assert engines.for_hardware() is None
+
+
+def test_auto_decision_collects_read_only_host_facts(monkeypatch):
+    monkeypatch.setattr(engines.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(engines.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(engines.shutil, "which", lambda name: "nvidia-smi.exe")
+
+    decision = engines.auto_decision()
+
+    assert decision.key == "cuda"
+    assert decision.system == "Windows"
+    assert decision.machine == "AMD64"
+    assert decision.nvidia_smi == "nvidia-smi.exe"
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +232,45 @@ def test_cuda_source_for_canonical_override_wins_without_warning(monkeypatch, ca
 # --------------------------------------------------------------------------- #
 # _install_targets() — the uv-pip args per engine kind
 # --------------------------------------------------------------------------- #
+def test_install_plan_describes_the_exact_cuda_install(monkeypatch):
+    monkeypatch.delenv("ARA_CUDA_SOURCE", raising=False)
+    monkeypatch.delenv("ARA_WCX_SOURCE", raising=False)
+    monkeypatch.setattr(engines.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(engines.platform, "machine", lambda: "x86_64")
+
+    plan = engines.install_plan("cuda")
+
+    assert plan.key == "cuda"
+    assert plan.backend == "cuda"
+    assert plan.python == "3.12"
+    assert plan.targets == (
+        "--torch-backend=auto", f"{engines._bundled_source('cuda')}[cuda]")
+    assert plan.source_override is None
+    assert plan.platform == "Linux x86_64"
+
+
+def test_install_plan_reports_active_source_override(monkeypatch):
+    monkeypatch.setenv("ARA_MLX_SOURCE", "../mlx-dev")
+    monkeypatch.setattr(engines.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(engines.platform, "machine", lambda: "arm64")
+
+    plan = engines.install_plan("mlx")
+
+    assert plan.targets == ("-e", "../mlx-dev")
+    assert plan.source_override == "ARA_MLX_SOURCE=../mlx-dev"
+
+
+def test_install_plan_reports_legacy_source_override(monkeypatch, capsys):
+    monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
+    monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-mlx-dev")
+
+    plan = engines.install_plan("mlx")
+
+    assert plan.source_override == "ARA_WMX_SOURCE=../legacy-mlx-dev"
+    assert capsys.readouterr().err == (
+        "ara: ARA_WMX_SOURCE is deprecated; use ARA_MLX_SOURCE\n")
+
+
 def test_install_targets_builtin_is_the_package_list(monkeypatch):
     # Off Windows the builtin engine installs its plain package list (source build is the
     # universal path — Linux/macOS/aarch64/Pi, where no prebuilt wheel index serves them).
