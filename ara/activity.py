@@ -12,6 +12,7 @@ import json
 import math
 import os
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,15 +46,24 @@ def activity_dir() -> Path:
 
 
 def _validate_kind(kind: str) -> None:
-    if kind not in _KINDS:
+    if not isinstance(kind, str) or kind not in _KINDS:
         raise ValueError(f"kind must be one of: {', '.join(sorted(_KINDS))}")
 
 
+def _display_safe(value) -> bool:
+    return (isinstance(value, str) and bool(value) and len(value) <= 512
+            and all(unicodedata.category(char)[0] != "C"
+                    and unicodedata.category(char) not in {"Zl", "Zp"}
+                    for char in value))
+
+
 def _validate_model(model: str | None) -> None:
-    if model is not None and (not isinstance(model, str) or not model
-                              or len(model) > 512
-                              or any(ord(char) < 32 or ord(char) == 127 for char in model)):
+    if model is not None and not _display_safe(model):
         raise ValueError("model must be a non-empty, display-safe string")
+
+
+def _note_cleanup_failure(original: BaseException, action: str, cleanup: OSError) -> None:
+    original.add_note(f"ARA could not {action}: {cleanup}")
 
 
 def _atomic_write(path: Path, record: dict) -> None:
@@ -61,14 +71,25 @@ def _atomic_write(path: Path, record: dict) -> None:
     temporary = path.with_name(f".{path.stem}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        try:
+            stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        except BaseException as original:
+            try:
+                os.close(descriptor)
+            except OSError as cleanup:
+                _note_cleanup_failure(original, "close the activity descriptor", cleanup)
+            raise
+        with stream:
             json.dump(record, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-    except BaseException:
-        temporary.unlink(missing_ok=True)
+        os.replace(temporary, path)
+    except BaseException as original:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup:
+            _note_cleanup_failure(original, "remove the partial activity record", cleanup)
         raise
-    os.replace(temporary, path)
 
 
 class _Tracker:
@@ -89,8 +110,13 @@ class _Tracker:
             record["model"] = self._model
         _atomic_write(self._path, record)
 
-    def __exit__(self, _exc_type, _exc, _traceback) -> bool:
-        self._path.unlink(missing_ok=True)
+    def __exit__(self, _exc_type, exc, _traceback) -> bool:
+        try:
+            self._path.unlink(missing_ok=True)
+        except OSError as cleanup:
+            if exc is None:
+                raise
+            _note_cleanup_failure(exc, "remove the finished activity record", cleanup)
         return False
 
 
@@ -106,7 +132,7 @@ def _number(value) -> bool:
             and math.isfinite(value))
 
 
-def _read_record(path: Path) -> tuple[Activity, float] | None:
+def _read_record(path: Path) -> Activity | None:
     try:
         with path.open("r", encoding="utf-8") as stream:
             record = json.load(stream)
@@ -120,9 +146,8 @@ def _read_record(path: Path) -> tuple[Activity, float] | None:
     pid = record["pid"]
     created = record["process_created_at"]
     started = record["started_at"]
-    if kind not in _KINDS or (model is not None and (
-            not isinstance(model, str) or not model or len(model) > 512
-            or any(ord(char) < 32 or ord(char) == 127 for char in model))):
+    if not isinstance(kind, str) or kind not in _KINDS \
+            or (model is not None and not _display_safe(model)):
         return None
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
@@ -134,7 +159,7 @@ def _read_record(path: Path) -> tuple[Activity, float] | None:
             return None
     except psutil.Error:
         return None
-    return Activity(kind=kind, model=model, pid=pid, started_at=float(started)), float(created)
+    return Activity(kind=kind, model=model, pid=pid, started_at=float(started))
 
 
 def snapshot() -> list[Activity]:
@@ -142,15 +167,15 @@ def snapshot() -> list[Activity]:
     directory = activity_dir()
     try:
         paths = sorted(path for path in directory.iterdir()
-                       if path.suffix == ".json" and path.is_file())
+                       if path.suffix == ".json" and not path.is_symlink()
+                       and path.is_file())
     except OSError:
         return []
     found: list[tuple[Activity, str]] = []
     for path in paths:
         parsed = _read_record(path)
         if parsed is not None:
-            item, _created = parsed
-            found.append((item, path.name))
+            found.append((parsed, path.name))
     found.sort(key=lambda pair: (
         pair[0].started_at, pair[0].pid, pair[0].kind,
         pair[0].model or "", pair[1],

@@ -95,6 +95,82 @@ def test_failed_atomic_write_removes_partial_temp_file(activity_dir, monkeypatch
     assert list(activity_dir.iterdir()) == []
 
 
+def test_replace_failure_removes_temp_and_never_exposes_final(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    monkeypatch.setattr(activity.os, "replace",
+                        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")))
+
+    with pytest.raises(PermissionError, match="replace denied"):
+        with activity.track("running", "org/model"):
+            pass
+    assert list(activity_dir.iterdir()) == []
+
+
+def test_temp_cleanup_failure_preserves_atomic_write_error(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    monkeypatch.setattr(activity.os, "replace",
+                        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")))
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path.suffix == ".tmp":
+            raise OSError("cleanup denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(PermissionError, match="replace denied") as caught:
+        with activity.track("running", "org/model"):
+            pass
+    assert any("cleanup denied" in note for note in caught.value.__notes__)
+    assert not list(activity_dir.glob("*.json"))
+
+
+def test_fdopen_failure_closes_descriptor_and_removes_temp(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    opened = []
+    closed = []
+    real_open = os.open
+    real_close = os.close
+
+    def open_file(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def close_file(descriptor):
+        closed.append(descriptor)
+        return real_close(descriptor)
+
+    monkeypatch.setattr(activity.os, "open", open_file)
+    monkeypatch.setattr(activity.os, "close", close_file)
+    monkeypatch.setattr(activity.os, "fdopen",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fdopen failed")))
+
+    with pytest.raises(OSError, match="fdopen failed"):
+        with activity.track("running", "org/model"):
+            pass
+    assert opened == closed
+    assert list(activity_dir.iterdir()) == []
+
+
+def test_descriptor_close_failure_does_not_mask_fdopen_error(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_close = os.close
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        raise OSError("close failed")
+
+    monkeypatch.setattr(activity.os, "close", close_then_fail)
+    monkeypatch.setattr(activity.os, "fdopen",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fdopen failed")))
+    with pytest.raises(OSError, match="fdopen failed") as caught:
+        with activity.track("running", "org/model"):
+            pass
+    assert any("close failed" in note for note in caught.value.__notes__)
+    assert list(activity_dir.iterdir()) == []
+
+
 def test_nested_same_pid_records_coexist_and_snapshot_is_deterministic(
         activity_dir, monkeypatch):
     monkeypatch.setattr(activity.os, "getpid", lambda: 123)
@@ -122,6 +198,38 @@ def test_track_removes_its_record_for_every_exit_path(activity_dir, monkeypatch,
     assert list(activity_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("raised", [Exception, KeyboardInterrupt, SystemExit])
+def test_cleanup_failure_preserves_original_body_exception(
+        activity_dir, monkeypatch, raised):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path.suffix == ".json":
+            raise OSError("record cleanup failed")
+        return real_unlink(path, *args, **kwargs)
+
+    with pytest.raises(raised, match="original") as caught:
+        with activity.track("running", "org/model"):
+            monkeypatch.setattr(Path, "unlink", unlink)
+            raise raised("original")
+    assert any("record cleanup failed" in note for note in caught.value.__notes__)
+
+
+def test_cleanup_failure_without_body_exception_is_surfaced(monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path.suffix == ".json":
+            raise OSError("record cleanup failed")
+        return real_unlink(path, *args, **kwargs)
+
+    with pytest.raises(OSError, match="record cleanup failed"):
+        with activity.track("running", "org/model"):
+            monkeypatch.setattr(Path, "unlink", unlink)
+
+
 @pytest.mark.parametrize("kind", [
     "characterizing", "benchmarking", "searching", "running", "serving",
 ])
@@ -143,6 +251,22 @@ def test_public_api_rejects_sensitive_arbitrary_or_unsafe_inputs(monkeypatch):
         activity.track("running", metadata={"token": "secret"})
 
 
+@pytest.mark.parametrize("model", [
+    "org/model\u2028forged", "org/model\u2029forged", "org/model\u202eforged",
+    "org/model\u2066forged", "org/model\ud800forged",
+])
+def test_track_rejects_unicode_control_format_and_surrogate_models(monkeypatch, model):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    with pytest.raises(ValueError, match="display-safe"):
+        activity.track("running", model)
+
+
+def test_track_accepts_display_safe_unicode_and_emoji(monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    with activity.track("running", "模型/🚀"):
+        assert activity.snapshot()[0].model == "模型/🚀"
+
+
 def test_snapshot_ignores_malformed_partial_temp_and_extra_schema(
         activity_dir, monkeypatch):
     activity_dir.mkdir()
@@ -158,6 +282,38 @@ def test_snapshot_ignores_malformed_partial_temp_and_extra_schema(
     _record(activity_dir, "bad-created.json", process_created_at="12.5")
     _record(activity_dir, "bad-start.json", started_at=None)
 
+    assert activity.snapshot() == []
+
+
+@pytest.mark.parametrize("kind", [[], {}, 7, None])
+def test_snapshot_ignores_non_string_kind_without_crashing(activity_dir, monkeypatch, kind):
+    activity_dir.mkdir()
+    _live(monkeypatch)
+    _record(activity_dir, "bad-kind.json", kind=kind)
+    assert activity.snapshot() == []
+
+
+@pytest.mark.parametrize("model", [
+    "org/model\u2028forged", "org/model\u2029forged", "org/model\u202eforged",
+    "org/model\u2066forged", "org/model\ud800forged",
+])
+def test_snapshot_ignores_unicode_control_format_and_surrogate_models(
+        activity_dir, monkeypatch, model):
+    activity_dir.mkdir()
+    _live(monkeypatch)
+    _record(activity_dir, "unsafe-model.json", model=model)
+    assert activity.snapshot() == []
+
+
+def test_snapshot_ignores_json_symlink_outside_registry(activity_dir, monkeypatch, tmp_path):
+    activity_dir.mkdir()
+    _live(monkeypatch)
+    outside = _record(tmp_path, "outside.json")
+    link = activity_dir / "linked.json"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     assert activity.snapshot() == []
 
 
@@ -232,10 +388,14 @@ def test_snapshot_never_mutates_stale_records_or_touches_db_or_locks(
     monkeypatch.setattr(Path, "open", open_file)
     monkeypatch.setattr(Path, "mkdir", lambda *_a, **_k: mutations.append("mkdir"))
     monkeypatch.setattr(Path, "unlink", lambda *_a, **_k: mutations.append("unlink"))
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: mutations.append("os.open"))
     monkeypatch.setattr(activity.os, "replace", lambda *_a: mutations.append("replace"))
+    monkeypatch.setattr(activity.os, "unlink", lambda *_a: mutations.append("os.unlink"))
+    monkeypatch.setattr(activity.os, "mkdir", lambda *_a, **_k: mutations.append("os.mkdir"))
     monkeypatch.setattr("ara.db.connect", lambda *_a, **_k: mutations.append("db"))
     monkeypatch.setattr("ara.locking.measurement_lock",
                         lambda *_a, **_k: mutations.append("lock"))
+    monkeypatch.setattr("ara.ollama.ps", lambda *_a, **_k: mutations.append("ollama"))
     _live(monkeypatch, running=False)
 
     assert activity.snapshot() == []
