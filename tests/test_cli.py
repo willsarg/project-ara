@@ -214,10 +214,10 @@ def test_main_no_args_shows_landing(monkeypatch):
 
 
 def test_main_help_shows_landing(monkeypatch):
-    # bare -h (no command) routes through render_help with no command → the landing catalog.
+    # Click owns the root grammar and both conventional help spellings.
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["-h"]) == 0
-    assert rec.get("help_called") and rec["help"] is None
+    assert rec == {}
 
 
 def test_main_detect(monkeypatch):
@@ -373,10 +373,12 @@ def test_main_profile_passes_json(monkeypatch):
     assert rec["profile"]["as_json"] is True
 
 
-def test_main_unknown_command_returns_1(monkeypatch, capsys):
+def test_main_unknown_command_is_click_usage_error(monkeypatch, capsys):
     _capture_dispatch(monkeypatch)
-    assert _run_main(monkeypatch, ["frobnicate"]) == 1
-    assert "isn't a known ARA command" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["frobnicate"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'frobnicate'" in captured.err
 
 
 def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
@@ -397,20 +399,19 @@ def test_ara_version_falls_back_when_not_installed(monkeypatch):
 def test_main_subcommand_help_routes_to_help_not_action(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["install", "--help"]) == 0
-    assert rec.get("help_called") and rec["help"] == "install"
-    assert "install" not in rec                 # the install action never ran (no side effect)
+    assert "install" not in rec                 # Click exits before the action callback
 
 
 def test_main_dash_h_after_command_routes_to_help(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["characterize", "-h"]) == 0
-    assert rec["help"] == "characterize" and "characterize" not in rec
+    assert "characterize" not in rec
 
 
 def test_main_bare_help_routes_to_help_with_no_command(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["--help"]) == 0
-    assert rec.get("help_called") and rec["help"] is None
+    assert rec == {}
 
 
 def test_render_help_known_command_prints_usage(make_console):
@@ -2713,8 +2714,10 @@ def test_main_search_dispatch(monkeypatch):
 
 
 def test_main_search_no_query(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["search"]) == 1
-    assert "usage: ara search" in capsys.readouterr().out
+    assert _run_main(monkeypatch, ["search"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Usage: ara search" in captured.err
 
 
 # --------------------------------------------------------------------------- #
@@ -3097,14 +3100,20 @@ def test_main_characterize_flash_attn_optin_default_false(monkeypatch):
 # traceback that breaks a JSON consumer.
 # --------------------------------------------------------------------------- #
 def test_main_usage_errors_json(monkeypatch, capsys):
-    for argv in (["search"], ["characterize"], ["run"]):
+    assert _run_main(monkeypatch, ["search", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Missing argument" in captured.err
+    for argv in (["characterize"], ["run"]):
         assert _run_main(monkeypatch, [*argv, "--json"]) == 1
         assert "error" in json.loads(capsys.readouterr().out)
 
 
-def test_main_unknown_command_json(monkeypatch, capsys):
-    assert _run_main(monkeypatch, ["bogus", "--json"]) == 1
-    assert "isn't a known ARA command" in json.loads(capsys.readouterr().out)["error"]
+def test_main_unknown_command_json_flag_does_not_override_click(monkeypatch, capsys):
+    assert _run_main(monkeypatch, ["bogus", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'bogus'" in captured.err
 
 
 def _raise_engine_env(*a, **k):

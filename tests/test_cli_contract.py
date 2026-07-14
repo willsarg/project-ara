@@ -125,11 +125,11 @@ def test_command_emits_valid_json(mocked_world, monkeypatch, capsys, argv, kind,
         assert anchor in payload, f"{argv} JSON missing '{anchor}'"
 
 
-def test_unknown_command_is_nonzero_and_not_json(mocked_world, monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["ara", "frobnicate"])
-    assert cli.main() == 1
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(capsys.readouterr().out.strip())
+def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
+    assert cli.main(["frobnicate", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No such command 'frobnicate'" in captured.err
 
 
 def test_detect_json_includes_accelerated(mocked_world, monkeypatch, capsys):

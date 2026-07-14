@@ -12,8 +12,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+
+import click
 
 from ara import (acquire, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
@@ -2618,21 +2621,76 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
     return 0
 
 
-def main() -> int:
+_COMPAT_COMMANDS = (
+    "detect", "status", "python", "apps", "mlx", "models", "characterize", "profile",
+    "recommend", "run", "serve", "benchmark", "install", "uninstall", "hf", "node", "doctor",
+)
+
+
+def _compat_command(name: str) -> click.Command:
+    """Build a temporary Click-owned command boundary around the legacy option dispatcher.
+
+    Click owns command selection and help in this slice. Task 2 replaces these permissive
+    per-command argument collectors with typed Click parameters; until then they deliberately
+    preserve the current option surface without duplicating its parsing rules here.
+    """
+    @click.command(name=name, context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+        "help_option_names": ["-h", "--help"],
+    })
+    @click.argument("legacy_args", nargs=-1, type=click.UNPROCESSED)
+    def command(legacy_args: tuple[str, ...]) -> int:
+        return _main_impl([name, *legacy_args])
+
+    return command
+
+
+@click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--version", is_flag=True, is_eager=True, help="Show the installed version and exit.")
+@click.pass_context
+def _click_cli(ctx: click.Context, version: bool) -> int:
+    """AI Runs Anywhere: inspect this machine and run local models safely."""
+    if version:
+        click.echo(_ara_version())
+        ctx.exit(0)
+    if ctx.invoked_subcommand is None:
+        render_landing(Console.from_env())
+    return 0
+
+
+@_click_cli.command("search", context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("query", nargs=-1, required=True)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def _click_search(query: tuple[str, ...], as_json: bool) -> int:
+    """Find models on the Hugging Face Hub."""
+    return _main_impl(["search", *query, *(["--json"] if as_json else [])])
+
+
+for _command_name in _COMPAT_COMMANDS:
+    _click_cli.add_command(_compat_command(_command_name))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry. Front-door honesty guard (Rule #3): an exception that escapes a command under
     ``--json`` becomes a structured ``{"error": ...}`` instead of a raw traceback a JSON consumer
     can't parse. Without ``--json``, an :class:`~ara.engine_env.EngineEnvError` (the common
     engine-env failure — a broken/missing env, a dead worker) prints a friendly one-line diagnostic
     instead of a raw traceback; any other exception still propagates. KeyboardInterrupt / SystemExit
     are not caught."""
+    args = list(sys.argv[1:] if argv is None else argv)
     try:
-        return _main_impl()
+        result = _click_cli.main(args=args, prog_name="ara", standalone_mode=False)
+        return int(result or 0)
+    except click.ClickException as exc:
+        exc.show(file=sys.stderr)
+        return exc.exit_code
     except Exception as exc:   # noqa: BLE001 — deliberate front-door honesty guard
         if isinstance(exc, MeasurementBusy):   # a concurrent measurement holds the lock — say so
-            print(json.dumps({"error": str(exc)})) if "--json" in sys.argv[1:] \
+            print(json.dumps({"error": str(exc)})) if "--json" in args \
                 else Console.from_env().emit(Console.from_env().style("warn", f"  {exc}"))
             return 1
-        if "--json" in sys.argv[1:]:
+        if "--json" in args:
             print(json.dumps({"error": f"ara failed: {exc}"}))
             return 1
         if isinstance(exc, EngineEnvError):
@@ -2643,12 +2701,8 @@ def main() -> int:
         raise
 
 
-def _main_impl() -> int:
-    argv = sys.argv[1:]
-    if "--version" in argv:
-        print(_ara_version())
-        return 0
-    wants_help = "-h" in argv or "--help" in argv
+def _main_impl(argv: Sequence[str]) -> int:
+    argv = list(argv)
     verbose = "--verbose" in argv or "-v" in argv
     as_json = "--json" in argv
     assume_yes = "--yes" in argv or "-y" in argv
@@ -2798,12 +2852,7 @@ def _main_impl() -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("warn", f"  {msg}"))
         return 1
 
-    if wants_help:                          # `ara <cmd> --help` / `-h` → that command's usage
-        return render_help(c, rest[0] if rest else None, as_json=as_json)
-    if not rest:
-        render_landing(c)
-        return 0
-
+    # Click guarantees a registered command before this compatibility dispatcher is entered.
     cmd = rest[0]
     # Section filtering is shared across the recon commands; build the predicate once.
     want = (_resolve_want(cmd, include, exclude, c, as_json=as_json)
@@ -2845,8 +2894,6 @@ def _main_impl() -> int:
         return 0
 
     if cmd == "search":
-        if len(rest) < 2:
-            return _arg_err("usage: ara search <query>")
         return render_search(c, " ".join(rest[1:]), as_json=as_json)
 
     if cmd == "characterize":
@@ -2908,14 +2955,7 @@ def _main_impl() -> int:
     if cmd == "doctor":
         return render_doctor(c, rekey=rekey, as_json=as_json)
 
-    if as_json:
-        return _arg_err(f"'{rest[0]}' isn't a known ARA command — run `ara` for the command list.")
-    c.emit(c.style("warn", f"  '{rest[0]}' isn't a known ARA command — run `ara` for the command list."))
-    c.emit(
-        c.style("dim", "  run ") + c.style("accent", "ara")
-        + c.style("dim", " with no arguments to see the planned commands.")
-    )
-    return 1
+    raise AssertionError(f"Click dispatched an unregistered command: {cmd}")  # pragma: no cover
 
 
 if __name__ == "__main__":   # pragma: no cover — so `python -m ara.cli ...` works (node wiring shells out this way)
