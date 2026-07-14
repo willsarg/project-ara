@@ -663,7 +663,13 @@ def render_status(c: Console, *, as_json: bool = False) -> None:
             if len(activities) == 1 else "active"
         public = [{"kind": item.kind,
                    **({"model": item.model} if item.model is not None else {}),
-                   "pid": item.pid, "started_at": item.started_at}
+                   **({"pid": item.pid} if item.pid is not None else {}),
+                   "started_at": item.started_at,
+                   **({"runtime": item.runtime} if item.runtime is not None else {}),
+                   **({"served_name": item.served_name}
+                      if item.served_name is not None else {}),
+                   **({"context": item.context} if item.context is not None else {}),
+                   **({"endpoint": item.endpoint} if item.endpoint is not None else {})}
                   for item in activities]
         print(json.dumps({"state": state, "activities": public}, indent=2))
         return
@@ -1114,57 +1120,58 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
     # characterize owns calibration: measure + persist the engine baseline once (when none is
     # stored) so the ramp uses the real overhead, not the default. Spec 2026-06-23-capability-pipeline.
     calibration_error = None
-    with db.connected() as cal_con:
-        if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
-            if not as_json:
-                c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
-            cal = bk.calibrate()
-            overhead = (cal or {}).get("overhead_gb")
-            wall = (cal or {}).get("wall_gb")
-            # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
-            # never let the conservative default masquerade as a measurement. The ramp still proceeds
-            # safely on the default overhead; we just don't hide that it's a fallback.
-            cal_err = (cal or {}).get("calibration_error")
-            calibration_error = cal_err
-            if cal_err and not as_json:
-                c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
-                                       " — using conservative default overhead"))
-            # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
-            # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
-            # wall regardless of overhead is what lets profile/recommend report reality on every engine,
-            # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
-            if overhead is not None or wall is not None:
-                calibration.save_calibration(
-                    cal_con, sel.engine_key, fixed_overhead_gb=overhead,
-                    wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
-            # Surface the measured wall right where it's measured — otherwise the user sees only the
-            # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
-            # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
-            if wall is not None and not as_json:
-                budget = (cal or {}).get("safe_budget_gb")
-                line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
-                if budget is not None:
-                    line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
-                c.emit(line)
-    if not as_json:
-        c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
-    fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
-                          kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
-    _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
-    try:
-        result = bk.characterize(model, progress=progress, **fa_kw)
-    except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
-        msg = f"characterization failed: {exc}"
-        # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
-        # styled text or a traceback that would break the parse.
-        if as_json:
-            payload = {"error": msg}
-            if calibration_error:
-                payload.update(calibration_error=calibration_error, calibration_fallback=True)
-            print(json.dumps(payload))
-        else:
-            c.emit(c.style("bad", f"  {msg}"))
-        return 1
+    with activity.track("characterizing", model):
+        with db.connected() as cal_con:
+            if hasattr(bk, "calibrate") and calibration.get_calibration(cal_con, sel.engine_key) is None:
+                if not as_json:
+                    c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
+                cal = bk.calibrate()
+                overhead = (cal or {}).get("overhead_gb")
+                wall = (cal or {}).get("wall_gb")
+                # Honesty (Rule #3): if calibration couldn't run (model missing, worker error), say so —
+                # never let the conservative default masquerade as a measurement. The ramp still proceeds
+                # safely on the default overhead; we just don't hide that it's a fallback.
+                cal_err = (cal or {}).get("calibration_error")
+                calibration_error = cal_err
+                if cal_err and not as_json:
+                    c.emit(c.style("warn", f"  calibration skipped: {cal_err}"
+                                           " — using conservative default overhead"))
+                # Persist whatever the engine measured: the cold-start overhead (Apple) and/or the exact
+                # wall + safe budget (CPU/CUDA read an exact wall, so overhead is None there). Storing the
+                # wall regardless of overhead is what lets profile/recommend report reality on every engine,
+                # not just the ones with a measured overhead. Spec 2026-06-23-capability-pipeline.
+                if overhead is not None or wall is not None:
+                    calibration.save_calibration(
+                        cal_con, sel.engine_key, fixed_overhead_gb=overhead,
+                        wall_gb=wall, safe_budget_gb=(cal or {}).get("safe_budget_gb"))
+                # Surface the measured wall right where it's measured — otherwise the user sees only the
+                # ceiling and the calibrated reality stays invisible. Guard on a real wall so engines that
+                # measure only cold-start overhead don't print an empty line. Spec 2026-06-23-capability-pipeline.
+                if wall is not None and not as_json:
+                    budget = (cal or {}).get("safe_budget_gb")
+                    line = c.field("measured wall", _fmt_gb(wall, 1), label_width=15)
+                    if budget is not None:
+                        line += "  · " + c.style("dim", f"safe budget {_fmt_gb(budget, 1)}")
+                    c.emit(line)
+        if not as_json:
+            c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
+        fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
+                              kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+        _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
+        try:
+            result = bk.characterize(model, progress=progress, **fa_kw)
+        except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
+            msg = f"characterization failed: {exc}"
+            # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
+            # styled text or a traceback that would break the parse.
+            if as_json:
+                payload = {"error": msg}
+                if calibration_error:
+                    payload.update(calibration_error=calibration_error, calibration_fallback=True)
+                print(json.dumps(payload))
+            else:
+                c.emit(c.style("bad", f"  {msg}"))
+            return 1
 
     # An engine that couldn't even load the model returns an `error` (not a measurement) — don't
     # persist a misleading null row. Suggest a compatible engine when we can tell cheaply (e.g. a
@@ -1225,7 +1232,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
 def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     """Search the Hugging Face Hub for models (engine-agnostic)."""
-    results = hub.search(query)
+    with activity.track("searching"):
+        results = hub.search(query)
     if results is None:
         if as_json:
             print(json.dumps({"error": "couldn't search — is the hf CLI installed? "
@@ -1512,28 +1520,32 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
-    if (rc := _prefetch_weights(c, model, bk, key, as_json=as_json, progress=progress)) is not None:
-        return rc
-    # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
-    # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
-    # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
-    run_scores: list[float] = []
-    refused_n = 0
-    errored_n = 0
-    for _ in range(repeat):
-        result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
-        if result.get("refused"):
-            # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
-            return err(f"the engine refused: {result.get('reason', 'no reason given')}")
-        results = result.get("results", [])
-        refused_n += sum(1 for r in results if r.get("refused"))
-        errored_n += sum(1 for r in results if r.get("error"))
-        completions = [""] * len(prompts)
-        for r in results:
-            idx = r.get("prompt_index")
-            if isinstance(idx, int) and 0 <= idx < len(completions):
-                completions[idx] = r.get("completion", "")
-        run_scores.append(benchmark.score_probe_set(use_case, items, completions))
+    # One record owns the complete operational lifecycle: an on-demand fetch and every repeat
+    # backend call. All deterministic gates above run before ARA claims that work is live.
+    with activity.track("benchmarking", model):
+        if (rc := _prefetch_weights(c, model, bk, key,
+                                    as_json=as_json, progress=progress)) is not None:
+            return rc
+        # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
+        # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
+        # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
+        run_scores: list[float] = []
+        refused_n = 0
+        errored_n = 0
+        for _ in range(repeat):
+            result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+            if result.get("refused"):
+                # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
+                return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+            results = result.get("results", [])
+            refused_n += sum(1 for r in results if r.get("refused"))
+            errored_n += sum(1 for r in results if r.get("error"))
+            completions = [""] * len(prompts)
+            for r in results:
+                idx = r.get("prompt_index")
+                if isinstance(idx, int) and 0 <= idx < len(completions):
+                    completions[idx] = r.get("completion", "")
+            run_scores.append(benchmark.score_probe_set(use_case, items, completions))
 
     total = n * repeat                       # total generations attempted across every run
     if prompts and (refused_n + errored_n) == total:
@@ -1727,7 +1739,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
-        result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+        with activity.track("running", model):
+            result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if result.get("refused"):
@@ -1870,10 +1883,11 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         return err(f"couldn't read {model}'s context length from Ollama — can't bound the ramp.")
 
     probe = _governed_name(model) + "-probe"
-    try:
-        best, points = _ollama_measure_ceiling(model, max_ctx, probe)
-    finally:
-        ollama.delete(probe)                          # never leave the throwaway probe behind
+    with activity.track("characterizing", model):
+        try:
+            best, points = _ollama_measure_ceiling(model, max_ctx, probe)
+        finally:
+            ollama.delete(probe)                      # never leave the throwaway probe behind
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None)
@@ -1913,8 +1927,8 @@ def _governed_name(model: str) -> str:
 
 def _find_loaded(entries: list[dict], served: str) -> dict | None:
     """The ``/api/ps`` entry for our derived model (Ollama tags it ``:latest``), or ``None``."""
-    return next((m for m in entries if m.get("name") == served
-                 or m.get("name", "").startswith(served + ":")), None)
+    return next((m for m in entries
+                 if m.get("name") in {served, served + ":latest"}), None)
 
 
 def _free_port() -> int:
@@ -1998,7 +2012,8 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
 
     old = signal.signal(signal.SIGTERM, _stop)
     try:
-        proc.wait()                                # our child IS the server; stay alive to serve
+        with activity.track("serving", model):
+            proc.wait()                            # our child IS the server; stay alive to serve
     finally:
         signal.signal(signal.SIGTERM, old)
     return 0
@@ -2100,21 +2115,30 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", "  skipped."))
             return 0
 
-    # 4. bake the ceiling into a derived model
+    # 4. bake the ceiling into a derived model. This is temporary process-owned work until exact
+    # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
     served = name or _governed_name(model)
-    if not ollama.create(served, model, safe):
-        return err(f"couldn't create the governed model {served!r} on Ollama.")
+    with activity.track("serving", model):
+        if not ollama.create(served, model, safe):
+            return err(f"couldn't create the governed model {served!r} on Ollama.")
 
-    # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
-    ollama.load(served)
-    entry = _find_loaded(ollama.ps() or [], served)
-    if entry is None:
-        return err(f"{served} didn't load — Ollama may be out of memory.")
-    served_ctx = entry.get("context_length")
-    if served_ctx != safe:
-        return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
-    size, vram = entry.get("size"), entry.get("size_vram")
-    spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+        # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
+        ollama.load(served)
+        entry = _find_loaded(ollama.ps() or [], served)
+        if entry is None:
+            return err(f"{served} didn't load — Ollama may be out of memory.")
+        served_ctx = entry.get("context_length")
+        if served_ctx != safe:
+            return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
+        size, vram = entry.get("size"), entry.get("size_vram")
+        spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
+
+    endpoint_base = ollama.base_url()
+    try:
+        activity.record_ollama_serving(
+            served_name=served, model=model, context=safe, endpoint=endpoint_base)
+    except OSError as exc:
+        return err(f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
 
     # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
     # that is an empirical measurement, not a guess. Record it (engine "ollama") so the next serve
@@ -2131,7 +2155,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         recorded_measured = True
 
     # 6. the handoff — connection info, then ARA exits (the model stays served)
-    endpoint = ollama.base_url() + "/v1"
+    endpoint = endpoint_base + "/v1"
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,

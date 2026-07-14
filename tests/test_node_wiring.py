@@ -3,6 +3,7 @@
 """The node wiring — providers/workers translate to CLI args, and ``_run_cli`` is the only seam."""
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 
@@ -123,6 +124,14 @@ def test_benchmark_worker_minimal_no_exec_consent(monkeypatch):
 
 def test_default_workers_keys():
     assert set(wiring.default_workers()) == {"characterize", "run", "serve", "benchmark"}
+
+
+def test_node_workers_inherit_lifecycle_from_canonical_cli_without_second_registry():
+    source = inspect.getsource(wiring)
+    assert 'cli = ["run"' in source
+    assert 'cli = ["serve"' in source
+    assert "ara.activity" not in source
+    assert "activity.track" not in source
 
 
 # --- argv flag-injection guard (_safe): no job arg may be smuggled in as a CLI flag ---

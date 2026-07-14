@@ -2,12 +2,14 @@
 # Copyright 2026 Will Sarg
 """Minimal registry of ARA-owned work that is live right now.
 
-Writers use one atomic JSON file per activity. Readers only observe complete live
-records and order them by ``(started_at, pid, kind, model, record_id)``. The final
-record-id tie-breaker is private and makes simultaneous records deterministic.
+Process-bound writers use one atomic JSON file per activity. Governed Ollama serving
+uses a separate persistent ownership manifest, corroborated read-only against the exact
+live endpoint, name, and context. Readers order both forms deterministically; the final
+record-id tie-breaker remains private.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -33,8 +35,12 @@ class Activity:
 
     kind: str
     model: str | None
-    pid: int
+    pid: int | None
     started_at: float
+    runtime: str | None = None
+    served_name: str | None = None
+    context: int | None = None
+    endpoint: str | None = None
 
 
 def activity_dir() -> Path:
@@ -127,6 +133,43 @@ def track(kind: str, model: str | None = None) -> _Tracker:
     return _Tracker(kind, model)
 
 
+_SERVING_FIELDS = {
+    "runtime", "served_name", "model", "context", "endpoint", "started_at",
+}
+
+
+def _valid_serving_record(record) -> bool:
+    return (isinstance(record, dict) and set(record) == _SERVING_FIELDS
+            and record.get("runtime") == "ollama"
+            and _display_safe(record.get("served_name"))
+            and _display_safe(record.get("model"))
+            and isinstance(record.get("context"), int)
+            and not isinstance(record.get("context"), bool)
+            and record["context"] > 0
+            and _display_safe(record.get("endpoint"))
+            and _number(record.get("started_at")))
+
+
+def record_ollama_serving(*, served_name: str, model: str, context: int,
+                          endpoint: str, started_at: float | None = None) -> Path:
+    """Atomically own one exactly identified governed model on an Ollama endpoint."""
+    record = {
+        "runtime": "ollama",
+        "served_name": served_name,
+        "model": model,
+        "context": context,
+        "endpoint": endpoint,
+        "started_at": time.time() if started_at is None else started_at,
+    }
+    if not _valid_serving_record(record):
+        raise ValueError("invalid Ollama serving activity")
+    identity = hashlib.sha256(
+        f"{endpoint}\0{served_name}".encode("utf-8")).hexdigest()
+    path = activity_dir() / "serving" / f"{identity}.json"
+    _atomic_write(path, record)
+    return path
+
+
 def _number(value) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
@@ -162,6 +205,56 @@ def _read_record(path: Path) -> Activity | None:
     return Activity(kind=kind, model=model, pid=pid, started_at=float(started))
 
 
+def _read_serving_records(directory: Path) -> list[tuple[dict, str]]:
+    try:
+        paths = sorted(path for path in directory.iterdir()
+                       if path.suffix == ".json" and not path.is_symlink()
+                       and path.is_file())
+    except OSError:
+        return []
+    found = []
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                record = json.load(stream)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if _valid_serving_record(record):
+            found.append((record, path.name))
+    return found
+
+
+def _live_ollama_serving(directory: Path) -> list[tuple[Activity, str]]:
+    records = _read_serving_records(directory / "serving")
+    if not records:
+        return []
+    # Import lazily: status remains core/engine-free and contacts Ollama only when ARA has a
+    # schema-valid ownership claim worth corroborating.
+    from ara import ollama
+
+    endpoint = ollama.base_url()
+    matching = [(record, name) for record, name in records
+                if record["endpoint"] == endpoint]
+    if not matching:
+        return []
+    loaded = ollama.ps()
+    if not isinstance(loaded, list):
+        return []
+    live = []
+    for record, name in matching:
+        served = record["served_name"]
+        entry = next((item for item in loaded if isinstance(item, dict)
+                      and item.get("name") in {served, served + ":latest"}), None)
+        if entry is None or entry.get("context_length") != record["context"]:
+            continue
+        live.append((Activity(
+            kind="serving", model=record["model"], pid=None,
+            started_at=float(record["started_at"]), runtime="ollama",
+            served_name=served, context=record["context"], endpoint=endpoint,
+        ), name))
+    return live
+
+
 def snapshot() -> list[Activity]:
     """Read live records without creating, repairing, or deleting anything."""
     directory = activity_dir()
@@ -176,8 +269,9 @@ def snapshot() -> list[Activity]:
         parsed = _read_record(path)
         if parsed is not None:
             found.append((parsed, path.name))
+    found.extend(_live_ollama_serving(directory))
     found.sort(key=lambda pair: (
-        pair[0].started_at, pair[0].pid, pair[0].kind,
+        pair[0].started_at, pair[0].pid or 0, pair[0].kind,
         pair[0].model or "", pair[1],
     ))
     return [item for item, _record_id in found]
