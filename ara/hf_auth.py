@@ -47,8 +47,9 @@ def _token_path() -> Path:
 # --------------------------------------------------------------------------- #
 
 def _env_token_present() -> bool:
-    """True if HF_TOKEN or HUGGING_FACE_HUB_TOKEN is set in the environment."""
-    return "HF_TOKEN" in os.environ or "HUGGING_FACE_HUB_TOKEN" in os.environ
+    """True if Hugging Face would resolve a non-empty token from the environment."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    return bool(token and token.replace("\r", "").replace("\n", "").strip())
 
 
 def has_token() -> bool:

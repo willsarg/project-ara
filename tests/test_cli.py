@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from pathlib import Path
 import sqlite3
 import sys
 import types
@@ -141,6 +142,22 @@ def test_doctor_help_explains_its_purpose(capsys):
     assert ("Show how ARA identifies this machine, count records stored for it, and report records "
             "under other machine identities.") in " ".join(doctor_help.split())
     assert "Rewrite legacy machine identity keys in ARA's database." in doctor_help
+
+
+def test_hf_help_explains_group_and_subcommands(capsys):
+    expected = {
+        (): "Manage Hugging Face authentication for gated model access.",
+        ("login",): "Store and verify a Hugging Face token for gated models.",
+        ("logout",): "Remove the locally stored Hugging Face token.",
+        ("status",): "Check whether a Hugging Face token is active and verified.",
+    }
+    rendered = {}
+    for path, summary in expected.items():
+        assert cli.main(["hf", *path, "--help"]) == 0
+        help_text = capsys.readouterr().out
+        rendered[path] = help_text
+        assert summary in " ".join(help_text.split())
+    assert "visible in shell history and process lists" in rendered[("login",)]
 
 
 def test_render_doctor_json_reports_key_and_counts(store, monkeypatch, capsys):
@@ -5430,6 +5447,26 @@ def test_render_hf_login_json(monkeypatch, capsys):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["saved"] is True and payload["user"] == "alice"
+    assert payload["error"] is None
+    assert payload["shadowed_by_env"] is False
+
+
+def test_render_hf_login_reports_environment_override(make_console, monkeypatch, capsys):
+    state = _stub_hf_auth(monkeypatch)
+    state["set_token_result"] = {"saved": True, "user": "alice", "verified": True,
+                                 "error": None}
+    monkeypatch.setattr(cli.hf_auth, "_env_token_present", lambda: True)
+
+    c, buf = make_console()
+    assert cli.render_hf(c, "login", token="hf_tok") == 0
+    out = buf.getvalue().lower()
+    assert "stored token verified as alice" in out
+    assert "environment" in out and "active" in out
+    assert "logged in as" not in out
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_hf(c, "login", token="hf_tok", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["shadowed_by_env"] is True
 
 
 def test_render_hf_login_offline_save_warns(make_console, monkeypatch):
@@ -5565,6 +5602,53 @@ def test_render_hf_status_json(monkeypatch, capsys):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["user"] == "alice" and payload["present"] is True
+
+
+@pytest.mark.parametrize("sub", ["login", "logout", "status"])
+def test_render_hf_verbose_reports_token_store(sub, make_console, monkeypatch):
+    _stub_hf_auth(monkeypatch)
+    token_path = Path("/safe/huggingface/token")
+    monkeypatch.setattr(cli.hf_auth, "_token_path", lambda: token_path)
+    c, buf = make_console(verbose=True)
+
+    token = "hf_example" if sub == "login" else None
+    assert cli.render_hf(c, sub, token=token) == 0
+    assert str(token_path) in buf.getvalue()
+
+
+def test_render_hf_verbose_json_reports_token_store(monkeypatch, capsys):
+    _stub_hf_auth(monkeypatch)
+    token_path = Path("/safe/huggingface/token")
+    monkeypatch.setattr(cli.hf_auth, "_token_path", lambda: token_path)
+    c = cli.Console(color=False, verbose=True, stream=sys.stderr)
+
+    assert cli.render_hf(c, "status", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["token_path"] == str(token_path)
+
+
+@pytest.mark.parametrize("sub", ["login", "logout", "status"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_render_hf_store_failures_are_safe(sub, as_json, make_console, monkeypatch, capsys):
+    secret = "hf_never_print_this"
+
+    def fail(*args, **kwargs):
+        detail = f"permission denied while handling {secret}" if sub == "login" \
+            else "permission denied"
+        raise OSError(detail)
+
+    monkeypatch.setattr(cli.hf_auth,
+                        {"login": "set_token", "logout": "clear_token", "status": "status"}[sub],
+                        fail)
+    c, buf = make_console()
+
+    assert cli.render_hf(c, sub, token=secret if sub == "login" else None,
+                         as_json=as_json) == 1
+
+    rendered = capsys.readouterr().out if as_json else buf.getvalue()
+    assert f"hugging face {sub} failed" in rendered.lower()
+    assert secret not in rendered
+    if as_json:
+        assert "error" in json.loads(rendered)
 
 
 # --------------------------------------------------------------------------- #

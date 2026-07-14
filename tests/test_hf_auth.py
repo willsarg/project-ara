@@ -124,6 +124,15 @@ def test_env_token_absent(monkeypatch):
     assert hf_auth._env_token_present() is False
 
 
+def test_empty_env_tokens_do_not_shadow_file_token(monkeypatch, token_path):
+    monkeypatch.setenv("HF_TOKEN", " \r\n")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "")
+    monkeypatch.setattr(hf_auth, "_get_token", lambda: "hf_from_file")
+    monkeypatch.setattr(hf_auth, "_whoami", lambda token: {"name": "alice"})
+
+    assert hf_auth.status()["source"] == "file"
+
+
 def test_has_token_true_when_available(monkeypatch):
     monkeypatch.setattr(hf_auth, "_get_token", lambda: "hf_xyz")
     assert hf_auth.has_token() is True

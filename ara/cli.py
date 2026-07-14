@@ -2555,35 +2555,61 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
             c.emit(c.style("bad", f"  {msg}"))
         return 1
 
+    def _success(payload: dict) -> None:
+        out = dict(payload)
+        if c.verbose:
+            out["token_path"] = str(hf_auth._token_path())
+        print(json.dumps(out))
+
+    def _verbose_store() -> None:
+        if c.verbose:
+            c.emit(c.style("dim", f"  token store: {hf_auth._token_path()}"))
+
+    def _operation_error(action: str, exc: Exception) -> int:
+        return _err(f"hugging face {action} failed ({type(exc).__name__})")
+
     if sub == "login":
-        # Warn when token comes from --token flag (may persist in shell history).
+        # Warn when token comes from --token (visible in both shell history and process listings).
         if token is not None and not as_json:
             c.emit(c.style("warn",
-                           "  note: --token may be saved in your shell history; "
-                           "prefer the interactive prompt"))
-        if token is None:
-            token = _read_token(c)
-        if not token or not token.strip():
-            return _err("no token provided")
-        res = hf_auth.set_token(token)
+                           "  note: --token is visible in shell history and process lists; "
+                           "prefer the hidden prompt"))
+        try:
+            if token is None:
+                token = _read_token(c)
+            if not token or not token.strip():
+                return _err("no token provided")
+            res = hf_auth.set_token(token)
+        except Exception as exc:  # token-store and local Hub failures must not traceback
+            return _operation_error("login", exc)
         if not res["saved"]:
             msg = ("that token was rejected by the hub"
                    if res["error"] == "invalid" else "no token provided")
             return _err(msg)
+        shadowed = hf_auth._env_token_present()
         if as_json:
-            print(json.dumps({"saved": True, "user": res["user"], "verified": res["verified"]}))
+            _success({**res, "shadowed_by_env": shadowed})
             return 0
         if res["verified"]:
-            c.emit(c.style("good", f"  logged in as {res['user']}"))
+            message = (f"  stored token verified as {res['user']}" if shadowed
+                       else f"  logged in as {res['user']}")
+            c.emit(c.style("good", message))
         else:
             c.emit(c.style("warn",
                            f"  token saved — couldn't verify ({res['error']})"))
+        if shadowed:
+            c.emit(c.style("warn", "  an HF token environment variable remains active and "
+                           "overrides the stored token"))
+        _verbose_store()
         return 0
 
     if sub == "logout":
-        res = hf_auth.clear_token()
+        try:
+            res = hf_auth.clear_token()
+        except Exception as exc:  # token-store failures are an expected CLI boundary
+            return _operation_error("logout", exc)
         if as_json:
-            print(json.dumps(res))
+            _success(res)
             return 0
         if res["removed"]:
             c.emit(c.style("good", "  removed the stored hugging face token"))
@@ -2591,19 +2617,24 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
             c.emit(c.style("dim", "  no stored hugging face token to remove"))
         if res["shadowed_by_env"]:
             c.emit(c.style("warn",
-                           "  an HF_TOKEN env var is still set — "
+                           "  an HF token environment variable is still active — "
                            "ARA can't unset your environment"))
+        _verbose_store()
         return 0
 
     if sub == "status":
-        st = hf_auth.status()
+        try:
+            st = hf_auth.status()
+        except Exception as exc:  # local token lookup / OIDC failures must not traceback
+            return _operation_error("status", exc)
         if as_json:
-            print(json.dumps(st))
+            _success(st)
             return 0
         if not st["present"]:
             c.emit(c.style("dim", "  not logged in — run ")
                    + c.style("accent", "ara hf login")
                    + c.style("dim", " (needed for gated models)"))
+            _verbose_store()
             return 0
         if st["verified"]:
             c.emit(c.style("good", f"  logged in as {st['user']}"))
@@ -2611,6 +2642,7 @@ def render_hf(c: Console, sub: str | None, *, token: str | None = None,
         else:
             c.emit(c.style("warn",
                            f"  token present ({st['source']}) but couldn't verify ({st['error']})"))
+        _verbose_store()
         return 0
 
     if sub is None:
@@ -3154,15 +3186,16 @@ def _click_doctor(ctx: click.Context, rekey: bool, verbose: bool, as_json: bool)
 
 @_click_cli.group("hf", no_args_is_help=False, context_settings=_HELP_SETTINGS)
 def _click_hf() -> None:
-    """Manage the Hugging Face token used for gated models."""
+    """Manage Hugging Face authentication for gated model access."""
 
 
 @_click_hf.command("login", context_settings=_HELP_SETTINGS)
-@click.option("--token", help="Hugging Face token (interactive when omitted).")
+@click.option("--token", help="Token to store (visible in shell history and process lists).")
 @_json_verbose_options
 @click.pass_context
 def _click_hf_login(ctx: click.Context, token: str | None,
                     verbose: bool, as_json: bool) -> int:
+    """Store and verify a Hugging Face token for gated models."""
     return render_hf(_mark_json(ctx, as_json), "login", token=token, as_json=as_json)
 
 
@@ -3170,7 +3203,7 @@ def _click_hf_login(ctx: click.Context, token: str | None,
 @_json_verbose_options
 @click.pass_context
 def _click_hf_logout(ctx: click.Context, verbose: bool, as_json: bool) -> int:
-    """Remove the stored Hugging Face token."""
+    """Remove the locally stored Hugging Face token."""
     return render_hf(_mark_json(ctx, as_json), "logout", as_json=as_json)
 
 
@@ -3178,7 +3211,7 @@ def _click_hf_logout(ctx: click.Context, verbose: bool, as_json: bool) -> int:
 @_json_verbose_options
 @click.pass_context
 def _click_hf_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
-    """Show Hugging Face authentication status."""
+    """Check whether a Hugging Face token is active and verified."""
     return render_hf(_mark_json(ctx, as_json), "status", as_json=as_json)
 
 
