@@ -218,7 +218,8 @@ def _det_system(c: Console, m) -> None:
         c.emit(c.field("python", m.python_version, gloss))
     n_py = pythons.count()
     if n_py > 1:
-        c.emit(c.field("pythons", str(n_py), "interpreters on this machine — run: ara python"))
+        c.emit(c.field("pythons", str(n_py),
+                       "interpreters on this machine — run: ara detect --python"))
     c.emit()
 
 
@@ -435,7 +436,7 @@ def _det_board(c: Console, m) -> None:
     c.emit()
 
 
-def _det_engines(c: Console, m) -> None:
+def _det_engines(c: Console, m, *, show_absent: bool = False) -> None:
     engines = [rt for rt in m.runtimes if rt.kind == "engine"]
     c.emit(c.section("  ENGINES") + c.style("dim", "  (third-party launchers found on this system)"))
     for rt in engines:
@@ -450,7 +451,7 @@ def _det_engines(c: Console, m) -> None:
                 c.emit(c.field("·", val, "serving", value_role="good"))
             else:
                 c.emit(c.field("·", val, "found", value_role="good"))
-        elif c.verbose:
+        elif c.verbose or show_absent:
             c.emit(c.field("·", rt.name, "not found", value_role="dim"))
     if not any(rt.present for rt in engines) and not c.verbose:
         # NOT a bare "none" — that read as contradicting the ARA section's own-engine readiness.
@@ -489,7 +490,7 @@ def _det_frameworks(c: Console, m) -> None:
             c.emit()
             more = len(others) - 1
             tail = f" ({more} more with AI libraries)" if more else ""
-            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara python")
+            c.emit(c.style("dim", "  Run ") + c.style("accent", "ara detect --python")
                    + c.style("dim", f" to see every interpreter{tail}."))
         else:
             c.emit(c.style("dim", "  None found in any interpreter on this machine."))
@@ -510,7 +511,7 @@ def _det_models(c: Console, m) -> None:
 
 
 def _det_apps(c: Console, m) -> None:
-    # Detect shows a per-category summary; `ara apps` has the full list with versions.
+    # Detect shows a per-category summary; `ara detect --apps` has the full list with versions.
     c.emit(c.section("  AI/ML APPS"))
     if not m.apps:
         c.emit(c.style("dim", "  none detected"))
@@ -531,7 +532,8 @@ def _det_apps(c: Console, m) -> None:
         c.emit("  " + c.style("metric", f"{apps.CATEGORY_LABEL[cat]:17}")
                + c.style("good", f"{len(items):>2}") + c.style("dim", f"   {names}"))
     c.emit(c.style("dim", "  newest first per category — run ")
-           + c.style("accent", "ara apps") + c.style("dim", " for the full list with versions"))
+           + c.style("accent", "ara detect --apps")
+           + c.style("dim", " for the full list with versions"))
     c.emit()
 
 
@@ -595,6 +597,7 @@ def _mlx_runtime_detail(m) -> dict:
     """Observed Apple-only MLX ecosystem detail for the common runtime report."""
     interps = mlx.scan()
     return {
+        "source": "read-only user ecosystem probes",
         "gpu": {"name": m.accel.name, "cores": m.accel.cores},
         "mlx_community_models": mlx.mlx_community_model_count(),
         "lmstudio_mlx_runtimes": mlx.lmstudio_mlx_runtimes(),
@@ -619,27 +622,40 @@ def render_runtime(c: Console, *, as_json: bool = False, want=None) -> None:
     if as_json:
         payload = {
             "system": m.system,
-            "backend": m.backend,
-            "engine": m.engine,
-            "engine_ready": m.engine_ready,
-            "runtimes": [asdict(runtime) for runtime in m.runtimes],
+            "backend_selection": {
+                "name": m.backend,
+                "source": "observed hardware selection",
+            },
+            "ara_engine": {
+                "name": m.engine,
+                "ready": m.engine_ready,
+                "source": "ARA isolated engine environment",
+            },
+            "user_environment": {
+                "source": "user environment",
+                "runtimes": [asdict(runtime) for runtime in m.runtimes],
+            },
         }
         if detail is not None:
-            payload["mlx"] = detail
+            payload["mlx_ecosystem"] = detail
         print(json.dumps(payload, indent=2))
         return
 
     c.emit()
     c.emit(c.section("  RUNTIME"))
-    c.emit(c.field("backend", m.backend, "selected from observed hardware"))
-    c.emit(c.field("ARA engine", m.engine,
-                   "ready" if m.engine_ready else "not installed",
+    c.emit(c.field("backend selection", m.backend, "observed hardware selection", label_width=19))
+    c.emit()
+    c.emit(c.section("  ARA ISOLATED ENGINE ENVIRONMENT"))
+    c.emit(c.field("engine", m.engine, "ready" if m.engine_ready else "not installed",
                    value_role="good" if m.engine_ready else "warn"))
     c.emit()
-    _det_engines(c, m)
+    c.emit(c.section("  USER ENVIRONMENT") + c.style("dim", "  (user environment)"))
+    c.emit()
+    _det_engines(c, m, show_absent=True)
     _det_frameworks(c, m)
     if detail is not None:
-        c.emit(c.section("  MLX ECOSYSTEM") + c.style("dim", "  (Apple Silicon)"))
+        c.emit(c.section("  MLX ECOSYSTEM")
+               + c.style("dim", "  (read-only user ecosystem probes · Apple Silicon)"))
         gpu = detail["gpu"]
         cores = f"{gpu['cores']}-core Metal" if gpu["cores"] else "Metal"
         c.emit(c.field("GPU", gpu["name"], cores))
@@ -1147,7 +1163,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     Defaults to the detected engine; ``--engine`` overrides it so you can target a non-detected
     backend (e.g. the CPU fallback on a GPU box). ARA owns the result, so it shows up in
-    `ara models` regardless of which engine measured it.
+    `ara models show` regardless of which engine measured it.
 
     ``--engine ollama`` routes to a dedicated residency-ramp path (Slice 2): Ollama isn't a registry
     engine, and its model names (``qwen3:0.6b``) aren't HF refs — so it branches before both
@@ -1297,7 +1313,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 0
     if ceiling:
         c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
-               + c.style("dim", "  · stored (see ara models)"))
+               + c.style("dim", f"  · stored (see ara models show {model})"))
         dc = result.get("decode_context")
         if dc and dc > ceiling:
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
@@ -1346,7 +1362,7 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
 def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
     """Best safe-context per model across engines: ``{model_id: (safe_context, engine_key, decode_context)}``.
 
-    A model can be characterized under several engines on one machine (GPU + CPU); ``ara models``
+    A model can be characterized under several engines on one machine (GPU + CPU); ``ara models show``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
     mk = profile.machine_key()
@@ -1704,7 +1720,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             partial.append(f"{errored_n} errored")
         score_line += f" (partial: {', '.join(partial)})"
     c.emit(c.style("good", score_line))
-    c.emit(c.style("dim", f"  stored — ara recommend --use-case {use_case} now shows it"))
+    c.emit(c.style("dim", f"  stored — ara models recommend --use-case {use_case} now shows it"))
     if repeat > 1 and lo == hi:
         # Zero variance under greedy decoding is determinism, not measured robustness — say so
         # honestly rather than let an identical-across-runs band read as evidence of stability.

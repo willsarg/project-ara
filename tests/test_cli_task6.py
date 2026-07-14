@@ -58,15 +58,19 @@ def test_detect_runtime_json_reports_common_inventory_on_linux_without_mlx_detai
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "system": "Linux",
-        "backend": "cpu",
-        "engine": "cpu",
-        "engine_ready": True,
-        "runtimes": [
-            {"name": "llama.cpp", "present": True, "version": "b5200", "kind": "engine",
-             "accels": [], "usable": None, "serving": None},
-            {"name": "PyTorch", "present": True, "version": "2.7.1", "kind": "framework",
-             "accels": [], "usable": None, "serving": None},
-        ],
+        "backend_selection": {"name": "cpu", "source": "observed hardware selection"},
+        "ara_engine": {
+            "name": "cpu", "ready": True, "source": "ARA isolated engine environment",
+        },
+        "user_environment": {
+            "source": "user environment",
+            "runtimes": [
+                {"name": "llama.cpp", "present": True, "version": "b5200", "kind": "engine",
+                 "accels": [], "usable": None, "serving": None},
+                {"name": "PyTorch", "present": True, "version": "2.7.1", "kind": "framework",
+                 "accels": [], "usable": None, "serving": None},
+            ],
+        },
     }
 
 
@@ -86,10 +90,12 @@ def test_detect_runtime_text_reports_observed_common_inventory_on_windows(
     assert cli.main(["detect", "--runtime"]) == 0
     out = capsys.readouterr().out
     assert "RUNTIME" in out
-    assert "backend" in out and "cuda" in out
+    assert "backend selection  cuda" in out and "observed hardware selection" in out
+    assert "ARA ISOLATED ENGINE ENVIRONMENT" in out
+    assert "USER ENVIRONMENT" in out
     assert "Ollama 0.9.0" in out and "not serving" in out
     assert "transformers 4.53.0" in out
-    assert "vLLM" not in out
+    assert "vLLM" in out and "not found" in out
     assert "MLX ECOSYSTEM" not in out
 
 
@@ -105,8 +111,14 @@ def test_detect_runtime_adds_observed_mlx_detail_only_on_apple(
 
     assert cli.main(["detect", "--runtime", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["backend"] == "apple"
-    assert payload["mlx"] == {
+    assert payload["backend_selection"] == {
+        "name": "apple", "source": "observed hardware selection",
+    }
+    assert payload["ara_engine"] == {
+        "name": "mlx", "ready": True, "source": "ARA isolated engine environment",
+    }
+    assert payload["mlx_ecosystem"] == {
+        "source": "read-only user ecosystem probes",
         "gpu": {"name": "Apple M4 Pro GPU", "cores": 16},
         "mlx_community_models": 4,
         "lmstudio_mlx_runtimes": ["1.2.3"],
@@ -115,6 +127,28 @@ def test_detect_runtime_adds_observed_mlx_detail_only_on_apple(
             "packages": {"mlx": "0.26"},
         }],
     }
+
+
+def test_detect_runtime_explains_ready_isolated_mlx_and_absent_user_runtime(
+        monkeypatch, capsys):
+    machine = replace(
+        _machine(),
+        engine="mlx", engine_ready=True,
+        runtimes=[Runtime("MLX", False, kind="engine", accels=("apple",), usable=True)],
+    )
+    monkeypatch.setattr(cli.detect, "machine", lambda: machine)
+    monkeypatch.setattr(cli.pythons, "discover", lambda: [])
+    monkeypatch.setattr(cli.mlx, "scan", lambda: [])
+    monkeypatch.setattr(cli.mlx, "lmstudio_mlx_runtimes", lambda: [])
+    monkeypatch.setattr(cli.mlx, "mlx_community_model_count", lambda: 0)
+
+    assert cli.main(["detect", "--runtime"]) == 0
+    out = capsys.readouterr().out
+    assert "ARA ISOLATED ENGINE ENVIRONMENT" in out
+    assert "mlx" in out and "ready" in out
+    assert "USER ENVIRONMENT" in out
+    assert "MLX" in out and "not found" in out
+    assert "read-only user ecosystem probes" in out
 
 
 @pytest.mark.parametrize(("cores", "lmstudio", "packages", "anchors"), [
@@ -198,3 +232,22 @@ def test_public_docs_and_search_guidance_use_canonical_surface_and_uv_only():
     source = (ROOT / "ara" / "cli.py").read_text(encoding="utf-8")
     assert "pip install " not in source
     assert "uv run ara" in source
+
+
+def test_live_cli_guidance_never_points_to_hidden_aliases():
+    source = "\n".join(path.read_text(encoding="utf-8")
+                       for path in (ROOT / "ara").rglob("*.py"))
+    for stale in (
+        "ara python", "ara apps", "ara recommend", "see ara models)",
+    ):
+        assert stale not in source
+
+
+def test_mlx_view_guidance_never_emits_models_show_without_required_model():
+    views = ROOT / "ara" / "_engine_packages" / "mlx" / "ara_engine_mlx" / "views"
+    calibrate = (views / "calibrate.py").read_text(encoding="utf-8")
+    characterize = (views / "characterize.py").read_text(encoding="utf-8")
+    assert '("ara models show",' not in calibrate
+    assert '("ara models show MODEL",' in calibrate
+    assert '("ara models show",' not in characterize
+    assert '(f"ara models show {model}",' in characterize

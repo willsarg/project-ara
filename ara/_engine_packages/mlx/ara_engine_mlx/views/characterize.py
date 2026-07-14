@@ -83,7 +83,7 @@ def render_refusal(console, data: dict) -> None:
                f"without risking a hard lock, so we never probe it."]
         tries = [
             ("huggingface.co/mlx-community", "browse for a smaller / more-quantized build"),
-            ("ara recommend", "see what does fit right now"),
+            ("ara models recommend", "see what does fit right now"),
         ]
     else:  # borderline
         why = [f"Its estimated load footprint ({data['est_gb']:.2f} GB) is above the "
@@ -108,7 +108,7 @@ def render_failure(console, data: dict) -> None:
         f"Couldn't measure {model}.",
         [data.get("note") or "The model failed to load during probing."],
         [("huggingface.co/mlx-community", "find a different build that loads"),
-         ("ara models", "see what already fits this Mac")],
+         ("ara models recommend", "see what already fits this Mac")],
     ))
 
 
@@ -130,5 +130,5 @@ def render_summary(console, data: dict) -> None:
                    f"from {data['n_points']} measured points"))
     c.emit(c.next_block([
         (f"ara run {model} '<prompt>' --engine mlx", "launch it safely now"),
-        ("ara models", "see it alongside your other models"),
+        (f"ara models show {model}", "inspect its stored model details"),
     ]))

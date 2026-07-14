@@ -39,6 +39,26 @@ def test_run_cli_nonzero_exit_returns_error_dict(monkeypatch):
     assert out == {"error": "`ara status` exited 1", "stderr": "boom"}
 
 
+def test_run_cli_nonzero_exit_preserves_valid_operational_json(monkeypatch):
+    payload = {"error": "model has not been characterized", "model": "org/m"}
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(1, stdout=json.dumps(payload), stderr="internal detail\n"),
+    )
+    assert wiring._run_cli(["run", "--", "org/m"]) == payload
+
+
+def test_run_cli_nonzero_malformed_output_falls_back_without_raising(monkeypatch):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(7, stdout="not json", stderr="worker died\n"),
+    )
+    assert wiring._run_cli(["benchmark"]) == {
+        "error": "`ara benchmark` exited 7",
+        "stderr": "worker died",
+    }
+
+
 def test_run_cli_unparseable_output_returns_error_dict(monkeypatch):
     monkeypatch.setattr(wiring.subprocess, "run",
                         lambda *a, **k: _FakeProc(0, stdout="not json", stderr=" noise "))

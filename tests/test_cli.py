@@ -657,7 +657,8 @@ def test_render_detect_text(make_console, monkeypatch, stub_pythons):
     assert "PyTorch" in out              # framework on the default python
     assert "needs CUDA" in out          # vLLM unusable reason rendered
     assert "/usr/bin/python3" in out    # default interpreter shown under FRAMEWORKS
-    assert "interpreters on this machine" in out  # count > 1 → pointer to `ara python`
+    assert "interpreters on this machine" in out
+    assert "ara detect --python" in out
     assert "3 models" in out
 
 
@@ -1222,7 +1223,7 @@ def test_render_detect_frameworks_surfaced_from_other_interpreter(
     assert "But you've got them in" in out
     assert "Homebrew 3.12.4" in out
     assert "torch 2.1.0" in out and "transformers 4.40.0" in out
-    assert "ara python" in out
+    assert "ara detect --python" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -1555,6 +1556,7 @@ def test_det_apps_summary(make_console, monkeypatch):
     out = buf.getvalue()
     assert "AI/ML APPS" in out and "model runners" in out
     assert "(+1 more)" in out   # 4 runners, top 3 shown
+    assert "ara detect --apps" in out
 
 
 def test_det_apps_empty(make_console):
@@ -5925,6 +5927,7 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
+    assert "ara models recommend --use-case coding" in out
 
 
 def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, monkeypatch):

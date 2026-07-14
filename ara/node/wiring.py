@@ -32,14 +32,15 @@ def _run_cli(args: list[str]) -> dict:
     command_args = [*args[:json_at], "--json", *args[json_at:]]
     proc = subprocess.run([sys.executable, "-m", "ara", *command_args],
                           capture_output=True, text=True)
-    if proc.returncode != 0:
-        return {"error": f"`ara {args[0]}` exited {proc.returncode}",
-                "stderr": (proc.stderr or "").strip()}
     try:
-        return json.loads(proc.stdout)
+        payload = json.loads(proc.stdout or "")
     except json.JSONDecodeError:
+        if proc.returncode != 0:
+            return {"error": f"`ara {args[0]}` exited {proc.returncode}",
+                    "stderr": (proc.stderr or "").strip()}
         return {"error": f"`ara {args[0]}` produced unparseable output",
                 "stderr": (proc.stderr or "").strip()}
+    return payload
 
 
 def default_providers() -> dict[str, Callable[[], dict]]:
