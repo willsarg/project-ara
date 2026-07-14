@@ -323,6 +323,19 @@ def connected():
         con.close()
 
 
+@contextmanager
+def connected_readonly():
+    """Open the existing store query-only, without creating or migrating it."""
+    uri = _db_path().resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only = ON")
+    try:
+        yield con
+    finally:
+        con.close()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 

@@ -1383,11 +1383,20 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None]]:
 
 
 def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
-    """The model catalog: scan the HF cache, then list each model + its best safe ceiling here."""
-    with db.connected() as con:
-        catalog.scan(con)
-        models = catalog.all_models(con)
-        best = _best_ceilings(con)
+    """Read-only cached-model inventory, enriched with any already-stored safe ceilings."""
+    cache_con = sqlite3.connect(":memory:")
+    cache_con.row_factory = sqlite3.Row
+    try:
+        cache_con.executescript(db.SCHEMA)
+        catalog.scan(cache_con)
+        models = catalog.all_models(cache_con)
+    finally:
+        cache_con.close()
+
+    best: dict[str, tuple[int | None, str, int | None]] = {}
+    if db._db_path().is_file():
+        with db.connected_readonly() as stored:
+            best = _best_ceilings(stored)
 
     if as_json:
         print(json.dumps(

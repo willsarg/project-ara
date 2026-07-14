@@ -33,6 +33,28 @@ def test_connected_yields_working_connection_and_closes(tmp_path, monkeypatch):
         con.execute("SELECT 1")
 
 
+def test_connected_readonly_never_creates_or_writes_store(tmp_path, monkeypatch):
+    path = tmp_path / "readonly.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    assert hasattr(db, "connected_readonly")
+
+    with pytest.raises(sqlite3.OperationalError):
+        with db.connected_readonly():
+            pass
+    assert not path.exists()
+
+    writable = db.connect()
+    writable.execute("INSERT INTO models (model_id) VALUES ('org/model')")
+    writable.commit()
+    writable.close()
+    with db.connected_readonly() as con:
+        assert con.execute("SELECT model_id FROM models").fetchone()[0] == "org/model"
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("DELETE FROM models")
+    with pytest.raises(sqlite3.ProgrammingError):
+        con.execute("SELECT 1")
+
+
 def test_connected_closes_on_exception(tmp_path, monkeypatch):
     monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "cm.db"))
     import sqlite3

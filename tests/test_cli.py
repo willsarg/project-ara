@@ -2149,6 +2149,37 @@ def test_render_landing_lists_install_command(make_console, monkeypatch):
 # --------------------------------------------------------------------------- #
 # ara models — the catalog view (scan HF cache + list with characterization)
 # --------------------------------------------------------------------------- #
+def test_detect_models_does_not_create_database(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
+
+    assert cli.main(["detect", "--models", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert not path.exists()
+
+
+def test_detect_models_reads_existing_database_without_migrating(
+        store, monkeypatch, capsys):
+    from ara import db
+
+    path = db._db_path()
+    backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    store.execute("PRAGMA user_version = 2")
+    store.commit()
+    store.close()
+    backup_path.unlink(missing_ok=True)
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
+
+    assert cli.main(["detect", "--models", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    with sqlite3.connect(path) as check:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert not backup_path.exists()
+
+
 def test_render_models_lists_catalog(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models",
