@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -2698,16 +2699,26 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
     one-time migration). Rows under *other* keys are counted separately, never folded in (Rule #3).
     Spec 2026-07-04-machine-key-stabilization."""
     mk = profile.machine_key()
-    with db.connected() as con:
-        rekeyed = db._rekey_legacy(con) if rekey else None
-        counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key=?",  # noqa: S608
-                                 (mk,)).fetchone()[0] for t in _DOCTOR_TABLES}
-        other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
-                                (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
+    path = db._db_path()
+    try:
+        with db.connected() as con:
+            rekeyed = db._rekey_legacy(con) if rekey else None
+            counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key=?",  # noqa: S608
+                                     (mk,)).fetchone()[0] for t in _DOCTOR_TABLES}
+            other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
+                                    (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
+            schema_version = con.execute("PRAGMA user_version").fetchone()[0]
+    except (OSError, sqlite3.Error) as exc:
+        msg = f"database problem at {path}: {exc}"
+        print(json.dumps({"error": msg, "database": str(path)})) if as_json \
+            else c.emit(c.style("bad", f"  {msg}"))
+        return 1
     if as_json:
         out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other}
         if rekey:
             out["rekeyed_rows"] = rekeyed
+        if c.verbose:
+            out.update(database=str(path), schema_version=schema_version)
         print(json.dumps(out))
         return 0
     if rekey:
@@ -2718,6 +2729,9 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
         c.emit(f"    {name:<18} {n}")
     if other:
         c.emit(c.style("dim", f"    ({other} row(s) under other machine keys — not this box)"))
+    if c.verbose:
+        c.emit(f"    {'database':<20} {path}")
+        c.emit(f"    {'schema version':<20} {schema_version}")
     return 0
 
 
@@ -3123,12 +3137,18 @@ def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: 
                             engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
 
 
-@_click_cli.command("doctor", context_settings=_HELP_SETTINGS)
-@click.option("--rekey", is_flag=True, help="Migrate legacy machine identity keys.")
+@_click_cli.command(
+    "doctor",
+    context_settings=_HELP_SETTINGS,
+    short_help="Diagnose ARA's stored identity and records for this machine.",
+)
+@click.option("--rekey", is_flag=True,
+              help="Rewrite legacy machine identity keys in ARA's database.")
 @_json_verbose_options
 @click.pass_context
 def _click_doctor(ctx: click.Context, rekey: bool, verbose: bool, as_json: bool) -> int:
-    """Inspect ARA's stored identity and record counts."""
+    """Show how ARA identifies this machine, count records stored for it, and report records
+    under other machine identities."""
     return render_doctor(_mark_json(ctx, as_json), rekey=rekey, as_json=as_json)
 
 

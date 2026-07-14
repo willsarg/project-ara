@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sqlite3
 import sys
 import types
 
@@ -130,6 +131,18 @@ def test_main_doctor_rekey_flag(monkeypatch):
     assert rec["doctor_rekey"] is True and rec["doctor_json"] is True
 
 
+def test_doctor_help_explains_its_purpose(capsys):
+    assert cli.main(["--help"]) == 0
+    root_help = capsys.readouterr().out
+    assert "doctor        Diagnose ARA's stored identity and records for this machine." in root_help
+
+    assert cli.main(["doctor", "--help"]) == 0
+    doctor_help = capsys.readouterr().out
+    assert ("Show how ARA identifies this machine, count records stored for it, and report records "
+            "under other machine identities.") in " ".join(doctor_help.split())
+    assert "Rewrite legacy machine identity keys in ARA's database." in doctor_help
+
+
 def test_render_doctor_json_reports_key_and_counts(store, monkeypatch, capsys):
     from ara import db, profile
     monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
@@ -184,6 +197,46 @@ def test_render_doctor_text_variants(store, monkeypatch, make_console):
     assert cli.render_doctor(c, rekey=True) == 0
     out = buf.getvalue()
     assert "rekeyed 0 legacy row" in out and "other machine keys" not in out
+
+
+def test_render_doctor_verbose_reports_store_details(store, monkeypatch, make_console, capsys):
+    from ara import db, profile
+    monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_doctor(c) == 0
+
+    out = buf.getvalue()
+    assert f"database             {db._db_path()}" in out
+    assert "schema version       3" in out
+
+    c = cli.Console.from_env(verbose=True)
+    assert cli.render_doctor(c, as_json=True) == 0
+    out_json = json.loads(capsys.readouterr().out)
+    assert out_json["database"] == str(db._db_path())
+    assert out_json["schema_version"] == 3
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_render_doctor_reports_database_failure(monkeypatch, make_console, capsys, as_json):
+    from ara import db
+
+    @contextlib.contextmanager
+    def broken_store():
+        raise sqlite3.DatabaseError("file is not a database")
+        yield  # pragma: no cover - contextmanager requires an iterator
+
+    monkeypatch.setattr(db, "connected", broken_store)
+    c, buf = make_console()
+
+    assert cli.render_doctor(c, as_json=as_json) == 1
+
+    rendered = capsys.readouterr().out if as_json else buf.getvalue()
+    assert "database problem" in rendered
+    assert str(db._db_path()) in rendered
+    assert "file is not a database" in rendered
+    if as_json:
+        assert json.loads(rendered)["error"].startswith("database problem")
 
 
 def test_main_no_args_shows_landing(monkeypatch):
