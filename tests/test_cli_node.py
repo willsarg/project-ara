@@ -126,6 +126,28 @@ def test_non_linux_runtime_error_is_clean(con, monkeypatch):
     assert "Linux-only" in con[1].getvalue()
 
 
+@pytest.mark.parametrize("sub", ["start", "stop"])
+def test_service_failure_is_actionable_text(con, monkeypatch, sub):
+    monkeypatch.setattr(
+        service, sub,
+        lambda: (_ for _ in ()).throw(RuntimeError("systemctl: daemon message")),
+    )
+    assert _node(con, sub) == 1
+    assert "systemctl: daemon message" in con[1].getvalue()
+
+
+@pytest.mark.parametrize("sub", ["start", "stop"])
+def test_service_failure_is_actionable_json(con, capsys, monkeypatch, sub):
+    monkeypatch.setattr(
+        service, sub,
+        lambda: (_ for _ in ()).throw(RuntimeError("systemctl: daemon message")),
+    )
+    assert _node(con, sub, as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "systemctl: daemon message",
+    }
+
+
 # --- usage ---
 def test_no_subcommand_is_usage_error(con):
     assert _node(con) == 1

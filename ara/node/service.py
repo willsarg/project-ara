@@ -17,6 +17,7 @@ import os
 import platform
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 UNIT_NAME = "ara-node.service"
@@ -27,6 +28,16 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
     :func:`ara.engine_env._run`); tests stub it so no real ``systemctl`` ever runs."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _checked(cmd: list[str], *, allowed: tuple[int, ...] = (0,)) -> tuple[str, str]:
+    """Run one systemctl command, raising with all daemon diagnostics on failure."""
+    rc, out, err = _run(cmd)
+    if rc not in allowed:
+        details = "; ".join(part.strip() for part in (out, err) if part.strip())
+        suffix = details or "no diagnostic output"
+        raise RuntimeError(f"`{' '.join(cmd)}` exited {rc}: {suffix}")
+    return out, err
 
 
 def _require_linux() -> None:
@@ -57,6 +68,14 @@ def _unit_path() -> Path:
 WATCHDOG_SEC = 30
 
 
+def _systemd_quote(value: str) -> str:
+    """Quote one ExecStart argv item using systemd's double-quoted string rules."""
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ValueError("systemd ExecStart values must not contain control characters")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def _unit_text() -> str:
     """The systemd unit for the push-only node. ExecStart runs the phone-home agent loop
     (``ara node run``) — the loop that pets systemd's watchdog via sd_notify, hence ``Type=notify``
@@ -71,7 +90,7 @@ def _unit_text() -> str:
         "\n"
         "[Service]\n"
         "Type=notify\n"
-        f"ExecStart={sys.executable} -m ara node run\n"
+        f"ExecStart={_systemd_quote(sys.executable)} -m ara node run\n"
         f"WatchdogSec={WATCHDOG_SEC}\n"
         "Restart=on-failure\n"
         "\n"
@@ -86,32 +105,36 @@ def install() -> None:
     path = _unit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_unit_text())
-    _run(["systemctl", "--user", "daemon-reload"])
-    _run(["systemctl", "--user", "enable", "--now", UNIT_NAME])
+    _checked(["systemctl", "--user", "daemon-reload"])
+    _checked(["systemctl", "--user", "enable", "--now", UNIT_NAME])
 
 
 def start() -> None:
     """Start the installed node unit now."""
     _require_linux()
-    _run(["systemctl", "--user", "start", UNIT_NAME])
+    _checked(["systemctl", "--user", "start", UNIT_NAME])
 
 
 def stop() -> None:
     """Stop the running node unit."""
     _require_linux()
-    _run(["systemctl", "--user", "stop", UNIT_NAME])
+    _checked(["systemctl", "--user", "stop", UNIT_NAME])
 
 
 def status() -> str:
     """Return ``systemctl status`` output for the node unit (the human-readable state block)."""
     _require_linux()
-    _rc, out, _err = _run(["systemctl", "--user", "status", UNIT_NAME])
+    out, _err = _checked(
+        ["systemctl", "--user", "status", UNIT_NAME], allowed=(0, 3))
     return out
 
 
 def uninstall() -> None:
     """Disable+stop the unit, remove its file, and reload so systemd forgets it."""
     _require_linux()
-    _run(["systemctl", "--user", "disable", "--now", UNIT_NAME])
-    _unit_path().unlink(missing_ok=True)         # idempotent: fine if it was never installed
-    _run(["systemctl", "--user", "daemon-reload"])
+    path = _unit_path()
+    if not path.exists():
+        return
+    _checked(["systemctl", "--user", "disable", "--now", UNIT_NAME])
+    path.unlink()
+    _checked(["systemctl", "--user", "daemon-reload"])

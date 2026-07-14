@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import pytest
@@ -44,9 +45,9 @@ def test_manifest_is_atomic_minimal_and_same_identity_updates_in_place(
     replacements = []
     real_replace = activity.os.replace
 
-    def replace(source, target):
-        replacements.append((source, target))
-        real_replace(source, target)
+    def replace(source, target, **kwargs):
+        replacements.append((source, target, kwargs))
+        real_replace(source, target, **kwargs)
 
     monkeypatch.setattr(activity.os, "replace", replace)
     first = _record()
@@ -65,7 +66,9 @@ def test_manifest_is_atomic_minimal_and_same_identity_updates_in_place(
         "started_at": 200.0,
     }
     assert len(replacements) == 2
-    assert all(source.parent == first.parent and target == first for source, target in replacements)
+    assert all(str(source).endswith(".tmp") and target == first.name
+               and options["src_dir_fd"] == options["dst_dir_fd"]
+               for source, target, options in replacements)
 
 
 def test_multiple_served_identities_have_deterministic_distinct_manifests(registry):
@@ -234,6 +237,70 @@ def test_serving_child_symlink_is_never_read_or_written(registry, monkeypatch, t
     assert list(outside.iterdir()) == []
 
 
+def test_serving_child_open_failure_closes_held_root_descriptor(
+        registry, monkeypatch, tmp_path):
+    outside = tmp_path / "descriptor-outside"
+    outside.mkdir()
+    registry.mkdir()
+    (registry / "serving").symlink_to(outside, target_is_directory=True)
+    root_descriptors = []
+    closed = []
+    real_open = activity.os.open
+    real_close = activity.os.close
+
+    def open_file(path, *args, **kwargs):
+        descriptor = real_open(path, *args, **kwargs)
+        if path == registry:
+            root_descriptors.append(descriptor)
+        return descriptor
+
+    def close_file(descriptor):
+        closed.append(descriptor)
+        return real_close(descriptor)
+
+    monkeypatch.setattr(activity.os, "open", open_file)
+    monkeypatch.setattr(activity.os, "close", close_file)
+    with pytest.raises(OSError):
+        _record()
+    assert root_descriptors and root_descriptors == closed
+
+
+def test_root_symlink_refuses_persistent_manifest_write(registry, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        registry.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    with pytest.raises(OSError):
+        _record()
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory-fd race coverage is POSIX-specific")
+def test_manifest_serving_swap_writes_original_child(registry, monkeypatch, tmp_path):
+    serving = registry / "serving"
+    serving.mkdir(parents=True)
+    replacement = registry / "replacement"
+    replacement.mkdir()
+    displaced = registry / "displaced"
+    real_replace = activity.os.replace
+    swapped = False
+
+    def swapping_replace(source, target, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            serving.rename(displaced)
+            replacement.rename(serving)
+        real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(activity.os, "replace", swapping_replace)
+    path = _record()
+    assert path.name in {item.name for item in displaced.glob("*.json")}
+    assert list(serving.glob("*.json")) == []
+
+
 def test_stale_atomic_temp_never_wedges_future_manifest_update(registry, monkeypatch):
     path = _record()
     path.unlink()
@@ -252,12 +319,12 @@ def test_concurrent_same_identity_manifest_writers_both_complete_atomically(
     barrier = threading.Barrier(2)
     real_replace = activity.os.replace
 
-    def replace(source, target):
+    def replace(source, target, **kwargs):
         try:
             barrier.wait(timeout=0.5)
         except threading.BrokenBarrierError:
             pass
-        real_replace(source, target)
+        real_replace(source, target, **kwargs)
 
     monkeypatch.setattr(activity.os, "replace", replace)
     errors = []
@@ -279,3 +346,30 @@ def test_concurrent_same_identity_manifest_writers_both_complete_atomically(
     files = list((registry / "serving").glob("*.json"))
     assert len(files) == 1
     assert json.loads(files[0].read_text())["context"] in {4096, 8192}
+
+
+def test_fallback_manifest_write_and_snapshot(registry, monkeypatch):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    path = _record()
+    assert path.exists()
+    _wire_live(monkeypatch)
+    assert [item.model for item in activity.snapshot()] == ["org/model"]
+
+
+def test_fallback_serving_symlink_is_rejected(registry, monkeypatch, tmp_path):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    registry.mkdir()
+    outside = tmp_path / "fallback-serving-outside"
+    outside.mkdir()
+    (registry / "serving").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError, match="serving activity directory"):
+        _record()
+    assert activity.snapshot() == []
+    assert list(outside.iterdir()) == []
+
+
+def test_fallback_snapshot_without_serving_child_skips_it(registry, monkeypatch):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    registry.mkdir()
+    monkeypatch.setattr("ara.ollama.ps", lambda: pytest.fail("queried Ollama"))
+    assert activity.snapshot() == []

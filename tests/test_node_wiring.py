@@ -48,6 +48,48 @@ def test_run_cli_nonzero_exit_preserves_valid_operational_json(monkeypatch):
     assert wiring._run_cli(["run", "--", "org/m"]) == payload
 
 
+def test_run_models_inventory_wraps_successful_array(monkeypatch):
+    payload = [{"name": "HF cache", "present": True, "count": 1, "size_gb": 0.0}]
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, stdout=json.dumps(payload)),
+    )
+    assert wiring._run_models_inventory() == {"models": payload}
+
+
+def test_run_models_inventory_preserves_nonzero_error_object(monkeypatch):
+    payload = {"error": "inventory unavailable", "store": "HF cache"}
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(1, stdout=json.dumps(payload), stderr="detail\n"),
+    )
+    assert wiring._run_models_inventory() == payload
+
+
+@pytest.mark.parametrize("payload", [{"unexpected": []}, None, "text", 7, True])
+def test_run_models_inventory_rejects_wrong_success_shape(monkeypatch, payload):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(0, stdout=json.dumps(payload), stderr="shape detail\n"),
+    )
+    assert wiring._run_models_inventory() == {
+        "error": "`ara detect` produced non-array model inventory",
+        "stderr": "shape detail",
+    }
+
+
+@pytest.mark.parametrize("payload", [[], ["wrong"]])
+def test_run_models_inventory_nonzero_array_is_generic_failure(monkeypatch, payload):
+    monkeypatch.setattr(
+        wiring.subprocess, "run",
+        lambda *a, **k: _FakeProc(5, stdout=json.dumps(payload), stderr="failed detail\n"),
+    )
+    assert wiring._run_models_inventory() == {
+        "error": "`ara detect` exited 5",
+        "stderr": "failed detail",
+    }
+
+
 def test_run_cli_nonzero_malformed_output_falls_back_without_raising(monkeypatch):
     monkeypatch.setattr(
         wiring.subprocess, "run",
@@ -93,6 +135,10 @@ def test_run_cli_nonzero_rejects_valid_json_non_object(monkeypatch, payload):
 def test_default_providers_map_each_key_to_its_canonical_cli_args(monkeypatch):
     calls = []
     monkeypatch.setattr(wiring, "_run_cli", lambda args: calls.append(args) or {"v": args[0]})
+    monkeypatch.setattr(
+        wiring, "_run_models_inventory",
+        lambda: calls.append(["detect", "--models"]) or {"models": []},
+    )
     providers = wiring.default_providers()
     assert set(providers) == {"status", "detect", "profile", "models"}
     expected = {
@@ -102,8 +148,35 @@ def test_default_providers_map_each_key_to_its_canonical_cli_args(monkeypatch):
         "models": ["detect", "--models"],
     }
     for key, args in expected.items():
-        assert providers[key]() == {"v": args[0]}
+        expected_payload = {"models": []} if key == "models" else {"v": args[0]}
+        assert providers[key]() == expected_payload
     assert calls == list(expected.values())
+
+
+def test_default_models_provider_runs_real_canonical_cli_and_wraps_inventory(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    hf_home = home / "hf"
+    repo = hf_home / "hub" / "models--org--cached"
+    snapshot = repo / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps({"model_type": "llama", "num_hidden_layers": 2}),
+        encoding="utf-8",
+    )
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("a" * 40, encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / "data"))
+
+    payload = wiring.default_providers()["models"]()
+
+    assert set(payload) == {"models"}
+    assert len(payload["models"]) == 1
+    assert payload["models"][0]["model_id"] == "org/cached"
+    assert payload["models"][0]["n_layers"] == 2
+    assert payload["models"][0]["characterized"] is False
 
 
 def test_characterize_worker_builds_args(monkeypatch):

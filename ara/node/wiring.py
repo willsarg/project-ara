@@ -19,12 +19,14 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable
+from typing import cast
 
 
-def _run_cli(args: list[str]) -> dict:
-    """Run ``python -m ara <args> --json`` and return the parsed JSON object.
+def _run_cli_payload(args: list[str], expected_type: type[dict] | type[list],
+                     shape_error: str) -> dict | list:
+    """Run the canonical JSON CLI and enforce one explicit successful payload shape.
 
-    The one mockable seam to the outside world. On a non-zero exit or output that isn't valid JSON,
+    On a non-zero exit or output that isn't valid JSON,
     return a structured ``{"error", "stderr"}`` dict instead of raising — a failed verb is data the
     caller can show, not a crash. ``--json`` is inserted before any ``--`` separator so every
     call-site stays terse without weakening positional-argument safety."""
@@ -40,13 +42,34 @@ def _run_cli(args: list[str]) -> dict:
                     "stderr": (proc.stderr or "").strip()}
         return {"error": f"`ara {args[0]}` produced unparseable output",
                 "stderr": (proc.stderr or "").strip()}
-    if not isinstance(payload, dict):
-        if proc.returncode != 0:
-            return {"error": f"`ara {args[0]}` exited {proc.returncode}",
-                    "stderr": (proc.stderr or "").strip()}
-        return {"error": f"`ara {args[0]}` produced non-object JSON output",
+    if proc.returncode != 0:
+        if isinstance(payload, dict):
+            return payload
+        return {"error": f"`ara {args[0]}` exited {proc.returncode}",
+                "stderr": (proc.stderr or "").strip()}
+    if not isinstance(payload, expected_type):
+        return {"error": f"`ara {args[0]}` produced {shape_error}",
                 "stderr": (proc.stderr or "").strip()}
     return payload
+
+
+def _run_cli(args: list[str]) -> dict:
+    """Run ``python -m ara <args> --json`` and return the parsed JSON object.
+
+    Generic read/action providers require an object on success. A nonzero operational error object
+    is preserved; every other nonzero or malformed shape becomes a stable generic failure.
+    ``--json`` is inserted before any ``--`` separator so positional data stays protected.
+    """
+    return cast(dict, _run_cli_payload(args, dict, "non-object JSON output"))
+
+
+def _run_models_inventory() -> dict:
+    """Return canonical ``detect --models`` inventory under a stable node object envelope."""
+    payload = _run_cli_payload(
+        ["detect", "--models"], list, "non-array model inventory")
+    if isinstance(payload, dict):
+        return payload
+    return {"models": payload}
 
 
 def default_providers() -> dict[str, Callable[[], dict]]:
@@ -59,9 +82,10 @@ def default_providers() -> dict[str, Callable[[], dict]]:
         "status": ["status"],
         "detect": ["detect"],
         "profile": ["profile"],
-        "models": ["detect", "--models"],
     }
-    return {key: (lambda a=args: _run_cli(a)) for key, args in commands.items()}
+    providers = {key: (lambda a=args: _run_cli(a)) for key, args in commands.items()}
+    providers["models"] = _run_models_inventory
+    return providers
 
 
 def _safe(value: str, field: str) -> str:

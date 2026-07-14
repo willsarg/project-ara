@@ -59,9 +59,9 @@ def test_track_atomically_writes_exact_private_record_and_cleans_up(
     replacements = []
     real_replace = os.replace
 
-    def replace(source, destination):
-        replacements.append((Path(source), Path(destination)))
-        real_replace(source, destination)
+    def replace(source, destination, **kwargs):
+        replacements.append((Path(source), Path(destination), kwargs))
+        real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(activity.os, "replace", replace)
 
@@ -75,9 +75,10 @@ def test_track_atomically_writes_exact_private_record_and_cleans_up(
             "process_created_at": 12.5,
             "started_at": 100.0,
         }
-        assert replacements == [(replacements[0][0], files[0])]
-        assert replacements[0][0].parent == activity_dir
-        assert not replacements[0][0].exists()
+        assert len(replacements) == 1
+        assert replacements[0][0].suffix == ".tmp"
+        assert replacements[0][1].name == files[0].name
+        assert replacements[0][2]["src_dir_fd"] == replacements[0][2]["dst_dir_fd"]
         if os.name != "nt":
             assert files[0].stat().st_mode & 0o777 == 0o600
 
@@ -98,7 +99,8 @@ def test_failed_atomic_write_removes_partial_temp_file(activity_dir, monkeypatch
 def test_replace_failure_removes_temp_and_never_exposes_final(activity_dir, monkeypatch):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
     monkeypatch.setattr(activity.os, "replace",
-                        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")))
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            PermissionError("replace denied")))
 
     with pytest.raises(PermissionError, match="replace denied"):
         with activity.track("running", "org/model"):
@@ -109,15 +111,16 @@ def test_replace_failure_removes_temp_and_never_exposes_final(activity_dir, monk
 def test_temp_cleanup_failure_preserves_atomic_write_error(activity_dir, monkeypatch):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
     monkeypatch.setattr(activity.os, "replace",
-                        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")))
-    real_unlink = Path.unlink
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            PermissionError("replace denied")))
+    real_unlink = activity.os.unlink
 
     def unlink(path, *args, **kwargs):
-        if path.suffix == ".tmp":
+        if str(path).endswith(".tmp"):
             raise OSError("cleanup denied")
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(activity.os, "unlink", unlink)
     with pytest.raises(PermissionError, match="replace denied") as caught:
         with activity.track("running", "org/model"):
             pass
@@ -149,7 +152,7 @@ def test_fdopen_failure_closes_descriptor_and_removes_temp(activity_dir, monkeyp
     with pytest.raises(OSError, match="fdopen failed"):
         with activity.track("running", "org/model"):
             pass
-    assert opened == closed
+    assert sorted(opened) == sorted(closed)
     assert list(activity_dir.iterdir()) == []
 
 
@@ -202,32 +205,60 @@ def test_track_removes_its_record_for_every_exit_path(activity_dir, monkeypatch,
 def test_cleanup_failure_preserves_original_body_exception(
         activity_dir, monkeypatch, raised):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
-    real_unlink = Path.unlink
+    real_unlink = activity.os.unlink
 
     def unlink(path, *args, **kwargs):
-        if path.suffix == ".json":
+        if str(path).endswith(".json"):
             raise OSError("record cleanup failed")
         return real_unlink(path, *args, **kwargs)
 
     with pytest.raises(raised, match="original") as caught:
         with activity.track("running", "org/model"):
-            monkeypatch.setattr(Path, "unlink", unlink)
+            monkeypatch.setattr(activity.os, "unlink", unlink)
             raise raised("original")
     assert any("record cleanup failed" in note for note in caught.value.__notes__)
 
 
 def test_cleanup_failure_without_body_exception_is_surfaced(monkeypatch):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
-    real_unlink = Path.unlink
+    real_unlink = activity.os.unlink
 
     def unlink(path, *args, **kwargs):
-        if path.suffix == ".json":
+        if str(path).endswith(".json"):
             raise OSError("record cleanup failed")
         return real_unlink(path, *args, **kwargs)
 
     with pytest.raises(OSError, match="record cleanup failed"):
         with activity.track("running", "org/model"):
-            monkeypatch.setattr(Path, "unlink", unlink)
+            monkeypatch.setattr(activity.os, "unlink", unlink)
+
+
+def test_directory_close_failure_preserves_original_body_exception(monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_close = activity.os.close
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        raise OSError("directory close failed")
+
+    with pytest.raises(RuntimeError, match="original") as caught:
+        with activity.track("running"):
+            monkeypatch.setattr(activity.os, "close", close_then_fail)
+            raise RuntimeError("original")
+    assert any("directory close failed" in note for note in caught.value.__notes__)
+
+
+def test_directory_close_failure_without_body_exception_is_surfaced(monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_close = activity.os.close
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        raise OSError("directory close failed")
+
+    with pytest.raises(OSError, match="directory close failed"):
+        with activity.track("running"):
+            monkeypatch.setattr(activity.os, "close", close_then_fail)
 
 
 @pytest.mark.parametrize("kind", [
@@ -317,6 +348,83 @@ def test_snapshot_ignores_json_symlink_outside_registry(activity_dir, monkeypatc
     assert activity.snapshot() == []
 
 
+def test_root_symlink_is_never_read(activity_dir, monkeypatch, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _record(outside, "forged.json")
+    try:
+        activity_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: pytest.fail("followed root"))
+    assert activity.snapshot() == []
+
+
+def test_root_symlink_refuses_ephemeral_write(activity_dir, monkeypatch, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        activity_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    with pytest.raises(OSError):
+        with activity.track("running", "org/model"):
+            pass
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory-fd race coverage is POSIX-specific")
+def test_snapshot_root_swap_keeps_original_registry_identity(activity_dir, monkeypatch, tmp_path):
+    activity_dir.mkdir()
+    _record(activity_dir, "real.json", model="org/real")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    _record(replacement, "real.json", model="org/forged")
+    displaced = tmp_path / "displaced"
+    _live(monkeypatch)
+    real_scandir = activity.os.scandir
+    swapped = False
+
+    def swapping_scandir(path):
+        nonlocal swapped
+        iterator = real_scandir(path)
+        if not swapped and (path == activity_dir or isinstance(path, int)):
+            swapped = True
+            activity_dir.rename(displaced)
+            replacement.rename(activity_dir)
+        return iterator
+
+    monkeypatch.setattr(activity.os, "scandir", swapping_scandir)
+    assert [item.model for item in activity.snapshot()] == ["org/real"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory-fd race coverage is POSIX-specific")
+def test_tracker_cleanup_root_swap_owns_original_record(activity_dir, monkeypatch, tmp_path):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    displaced = tmp_path / "displaced"
+    real_replace = activity.os.replace
+    swapped = False
+
+    def swapping_replace(source, target, *args, **kwargs):
+        nonlocal swapped
+        real_replace(source, target, *args, **kwargs)
+        if not swapped:
+            swapped = True
+            name = Path(target).name
+            activity_dir.rename(displaced)
+            (replacement / name).write_text("forged", encoding="utf-8")
+            replacement.rename(activity_dir)
+
+    monkeypatch.setattr(activity.os, "replace", swapping_replace)
+    with activity.track("running", "org/model"):
+        pass
+    assert list(displaced.glob("*.json")) == []
+    assert [path.read_text() for path in activity_dir.glob("*.json")] == ["forged"]
+
+
 @pytest.mark.parametrize("failure", [
     psutil.NoSuchProcess(123),
     psutil.AccessDenied(123),
@@ -388,7 +496,14 @@ def test_snapshot_never_mutates_stale_records_or_touches_db_or_locks(
     monkeypatch.setattr(Path, "open", open_file)
     monkeypatch.setattr(Path, "mkdir", lambda *_a, **_k: mutations.append("mkdir"))
     monkeypatch.setattr(Path, "unlink", lambda *_a, **_k: mutations.append("unlink"))
-    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: mutations.append("os.open"))
+    real_os_open = activity.os.open
+
+    def open_readonly(path, flags, *args, **kwargs):
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            mutations.append("os.open")
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(activity.os, "open", open_readonly)
     monkeypatch.setattr(activity.os, "replace", lambda *_a: mutations.append("replace"))
     monkeypatch.setattr(activity.os, "unlink", lambda *_a: mutations.append("os.unlink"))
     monkeypatch.setattr(activity.os, "mkdir", lambda *_a, **_k: mutations.append("os.mkdir"))
@@ -407,3 +522,105 @@ def test_default_path_uses_platformdirs(monkeypatch, tmp_path):
     monkeypatch.delenv("ARA_ACTIVITY_DIR")
     monkeypatch.setattr(activity, "user_data_path", lambda appname: tmp_path / appname)
     assert activity.activity_dir() == tmp_path / "ara" / "activity"
+
+
+def test_fallback_track_snapshot_and_cleanup(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    monkeypatch.setattr(activity.os, "getpid", lambda: 123)
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    with activity.track("running", "org/fallback"):
+        assert [item.model for item in activity.snapshot()] == ["org/fallback"]
+    assert list(activity_dir.iterdir()) == []
+
+
+def test_fallback_rejects_root_symlink_for_read_and_write(activity_dir, monkeypatch, tmp_path):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    outside = tmp_path / "fallback-outside"
+    outside.mkdir()
+    activity_dir.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    assert activity.snapshot() == []
+    with pytest.raises(OSError, match="real directory"):
+        with activity.track("running"):
+            pass
+
+
+def test_fallback_tracker_detects_root_identity_swap(activity_dir, monkeypatch, tmp_path):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    displaced = tmp_path / "fallback-displaced"
+    replacement = tmp_path / "fallback-replacement"
+    replacement.mkdir()
+    with pytest.raises(OSError, match="changed during operation"):
+        with activity.track("running"):
+            activity_dir.rename(displaced)
+            replacement.rename(activity_dir)
+
+
+def test_fallback_failed_write_cleans_temp_and_closes_without_directory_fd(
+        activity_dir, monkeypatch):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    monkeypatch.setattr(
+        activity.os, "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("replace denied")),
+    )
+    with pytest.raises(PermissionError, match="replace denied"):
+        with activity.track("running"):
+            pass
+    assert list(activity_dir.iterdir()) == []
+
+
+def test_fallback_json_reader_rejects_symlink_record(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    assert activity._json_record(link) is None
+
+
+def test_fallback_snapshot_identity_swap_fails_closed(activity_dir, monkeypatch, tmp_path):
+    monkeypatch.setattr(activity, "_USE_DIR_FD", False)
+    activity_dir.mkdir()
+    replacement = tmp_path / "snapshot-fallback-replacement"
+    replacement.mkdir()
+    displaced = tmp_path / "snapshot-fallback-displaced"
+
+    def swap_after_reads(*_args, **_kwargs):
+        activity_dir.rename(displaced)
+        replacement.rename(activity_dir)
+        return []
+
+    monkeypatch.setattr(activity, "_live_ollama_serving", swap_after_reads)
+    assert activity.snapshot() == []
+
+
+def test_secure_cleanup_tolerates_temp_removed_during_failed_replace(
+        activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    real_unlink = activity.os.unlink
+
+    def remove_then_fail(source, _target, **kwargs):
+        real_unlink(source, dir_fd=kwargs["src_dir_fd"])
+        raise PermissionError("replace denied")
+
+    monkeypatch.setattr(activity.os, "replace", remove_then_fail)
+    with pytest.raises(PermissionError, match="replace denied"):
+        with activity.track("running"):
+            pass
+
+
+def test_secure_tracker_cleanup_tolerates_record_already_removed(activity_dir, monkeypatch):
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
+    with activity.track("running"):
+        next(activity_dir.glob("*.json")).unlink()
+    assert list(activity_dir.iterdir()) == []
+
+
+def test_record_name_scan_failure_is_empty(activity_dir, monkeypatch):
+    activity_dir.mkdir()
+    monkeypatch.setattr(
+        activity.os, "scandir",
+        lambda _fd: (_ for _ in ()).throw(PermissionError("scan denied")),
+    )
+    assert activity.snapshot() == []
