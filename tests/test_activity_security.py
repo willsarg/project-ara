@@ -205,6 +205,27 @@ def test_windows_tracker_holds_root_until_record_cleanup(tmp_path, monkeypatch):
     assert events[1] == ("close", 51)
 
 
+def test_windows_tracker_relative_override_stays_bound_across_chdir(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    elsewhere = tmp_path / "elsewhere"
+    origin.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(origin)
+    monkeypatch.setenv("ARA_ACTIVITY_DIR", "registry")
+    monkeypatch.setattr(activity, "_platform_mode", lambda: "windows")
+    monkeypatch.setattr(activity, "_win_open_directory", lambda _path: 52)
+    monkeypatch.setattr(activity, "_win_close_handle", lambda _handle: None)
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: type(
+        "P", (), {"create_time": lambda self: 1.0})())
+
+    assert activity.activity_dir() == origin / "registry"
+    with activity.track("running"):
+        assert list((origin / "registry").glob("*.json"))
+        monkeypatch.chdir(elsewhere)
+    assert list((origin / "registry").iterdir()) == []
+    assert not (elsewhere / "registry").exists()
+
+
 def test_windows_persistent_holds_and_closes_serving_then_root(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     monkeypatch.setenv("ARA_ACTIVITY_DIR", str(root))
@@ -218,6 +239,70 @@ def test_windows_persistent_holds_and_closes_serving_then_root(tmp_path, monkeyp
         endpoint="http://127.0.0.1:11434", started_at=1.0)
     assert path.exists()
     assert closed == [62, 61]
+
+
+def test_windows_persistent_relative_override_stays_bound_across_chdir(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    elsewhere = tmp_path / "elsewhere"
+    origin.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(origin)
+    monkeypatch.setenv("ARA_ACTIVITY_DIR", "registry")
+    monkeypatch.setattr(activity, "_platform_mode", lambda: "windows")
+    calls = []
+
+    def open_directory(path):
+        calls.append(path)
+        if len(calls) == 1:
+            monkeypatch.chdir(elsewhere)
+        return 60 + len(calls)
+
+    monkeypatch.setattr(activity, "_win_open_directory", open_directory)
+    monkeypatch.setattr(activity, "_win_close_handle", lambda _handle: None)
+    path = activity.record_ollama_serving(
+        served_name="owned", model="org/model", context=1,
+        endpoint="http://127.0.0.1:11434", started_at=1.0,
+    )
+    assert path.parent == origin / "registry" / "serving"
+    assert path.exists()
+    assert calls == [origin / "registry", origin / "registry" / "serving"]
+    assert not (elsewhere / "registry").exists()
+
+
+def test_windows_snapshot_relative_override_stays_bound_across_chdir(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    elsewhere = tmp_path / "elsewhere"
+    registry = origin / "registry"
+    registry.mkdir(parents=True)
+    elsewhere.mkdir()
+    record = registry / "live.json"
+    record.write_text(json.dumps({
+        "kind": "running", "pid": 123, "process_created_at": 1.0,
+        "started_at": 2.0,
+    }), encoding="utf-8")
+    monkeypatch.chdir(origin)
+    monkeypatch.setenv("ARA_ACTIVITY_DIR", "registry")
+    monkeypatch.setattr(activity, "_platform_mode", lambda: "windows")
+    opened = []
+
+    def open_directory(path):
+        opened.append(path)
+        if len(opened) == 1:
+            monkeypatch.chdir(elsewhere)
+        return 67 + len(opened)
+
+    monkeypatch.setattr(activity, "_win_open_directory", open_directory)
+    monkeypatch.setattr(activity, "_win_close_handle", lambda _handle: None)
+    monkeypatch.setattr(activity, "_win_open_record", lambda path: 70)
+    monkeypatch.setattr(
+        activity, "_win_handle_to_fd", lambda _handle: os.open(record, os.O_RDONLY),
+    )
+    monkeypatch.setattr(activity.psutil, "Process", lambda _pid: type(
+        "P", (), {"is_running": lambda self: True, "create_time": lambda self: 1.0})())
+
+    found = activity.snapshot()
+    assert [(item.kind, item.pid) for item in found] == [("running", 123)]
+    assert opened[0] == registry
 
 
 def test_windows_existing_serving_directory_and_failed_replace_cleanup(tmp_path, monkeypatch):
@@ -479,6 +564,122 @@ def test_reader_fdopen_close_failure_notes_original(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt, match="fdopen interrupted") as caught:
         activity.snapshot()
     assert any("record close failed" in note for note in caught.value.__notes__)
+
+
+class _ClosingStream:
+    def __init__(self, *, close_error=None):
+        self.close_error = close_error
+        self.closed = False
+        self.descriptor = None
+
+    def write(self, _value):
+        return None
+
+    def flush(self):
+        return None
+
+    def fileno(self):
+        return self.descriptor
+
+    def close(self):
+        self.closed = True
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def test_writer_body_baseexception_survives_stream_close_failure(tmp_path, monkeypatch):
+    root = tmp_path / "activity"
+    root.mkdir()
+    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    stream = _ClosingStream(close_error=OSError("writer stream close failed"))
+    original = KeyboardInterrupt("write interrupted")
+    monkeypatch.setattr(
+        activity.os, "fdopen",
+        lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
+    )
+    monkeypatch.setattr(
+        activity.json, "dump", lambda *_a, **_k: (_ for _ in ()).throw(original),
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            activity._atomic_write(root / "record.json", {}, guard=guard)
+        assert caught.value is original
+        assert stream.closed
+        assert any("writer stream close failed" in note for note in original.__notes__)
+    finally:
+        os.close(guard.value)
+
+
+def test_writer_stream_close_failure_propagates_without_body_error(tmp_path, monkeypatch):
+    root = tmp_path / "activity"
+    root.mkdir()
+    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    stream = _ClosingStream(close_error=OSError("writer stream close failed"))
+    monkeypatch.setattr(
+        activity.os, "fdopen",
+        lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
+    )
+    monkeypatch.setattr(activity.os, "fsync", lambda _fd: None)
+    try:
+        with pytest.raises(OSError, match="writer stream close failed"):
+            activity._atomic_write(root / "record.json", {}, guard=guard)
+        assert stream.closed
+    finally:
+        os.close(guard.value)
+
+
+def test_reader_body_baseexception_survives_stream_close_failure(tmp_path, monkeypatch):
+    root = tmp_path / "activity"
+    root.mkdir()
+    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    stream = _ClosingStream(close_error=OSError("reader stream close failed"))
+    original = KeyboardInterrupt("read interrupted")
+    record = root / "record.json"
+    record.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        activity, "_open_record_fd", lambda *_a, **_k: os.open(record, os.O_RDONLY),
+    )
+    monkeypatch.setattr(
+        activity.os, "fdopen",
+        lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
+    )
+    monkeypatch.setattr(
+        activity.json, "load", lambda *_a, **_k: (_ for _ in ()).throw(original),
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            activity._json_record(root / "record.json", guard=guard)
+        assert caught.value is original
+        assert stream.closed
+        assert any("reader stream close failed" in note for note in original.__notes__)
+    finally:
+        os.close(guard.value)
+
+
+def test_reader_stream_close_failure_propagates_without_body_error(tmp_path, monkeypatch):
+    root = tmp_path / "activity"
+    root.mkdir()
+    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    stream = _ClosingStream(close_error=OSError("reader stream close failed"))
+    record = root / "record.json"
+    record.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        activity, "_open_record_fd", lambda *_a, **_k: os.open(record, os.O_RDONLY),
+    )
+    monkeypatch.setattr(
+        activity.os, "fdopen",
+        lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
+    )
+    monkeypatch.setattr(activity.json, "load", lambda _stream: {})
+    try:
+        with pytest.raises(OSError, match="reader stream close failed"):
+            activity._json_record(root / "record.json", guard=guard)
+        assert stream.closed
+    finally:
+        os.close(guard.value)
 
 
 def test_reader_fstat_baseexception_closes_descriptor(monkeypatch, tmp_path):

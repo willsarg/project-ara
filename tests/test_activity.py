@@ -61,6 +61,8 @@ def test_track_atomically_writes_exact_private_record_and_cleans_up(
 
     def replace(source, destination, **kwargs):
         replacements.append((Path(source), Path(destination), kwargs))
+        if kwargs and os.name != "nt":
+            assert os.stat(source, dir_fd=kwargs["src_dir_fd"]).st_mode & 0o777 == 0o600
         real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(activity.os, "replace", replace)
@@ -80,6 +82,7 @@ def test_track_atomically_writes_exact_private_record_and_cleans_up(
         assert replacements[0][1].name == files[0].name
         assert replacements[0][2]["src_dir_fd"] == replacements[0][2]["dst_dir_fd"]
         if os.name != "nt":
+            assert activity_dir.stat().st_mode & 0o777 == 0o700
             assert files[0].stat().st_mode & 0o777 == 0o600
 
     assert list(activity_dir.iterdir()) == []
@@ -313,6 +316,15 @@ def test_snapshot_ignores_malformed_partial_temp_and_extra_schema(
     _record(activity_dir, "bad-created.json", process_created_at="12.5")
     _record(activity_dir, "bad-start.json", started_at=None)
 
+    assert activity.snapshot() == []
+
+
+def test_snapshot_suppresses_json_integer_over_interpreter_limit(
+        activity_dir, monkeypatch):
+    activity_dir.mkdir()
+    (activity_dir / "huge.json").write_text(
+        '{"pid":' + ('9' * 5000) + '}', encoding="utf-8",
+    )
     assert activity.snapshot() == []
 
 

@@ -186,6 +186,41 @@ def test_uninstall_missing_file_rejects_unclassified_disable_failure(
         service.uninstall()
 
 
+def test_uninstall_rejects_mixed_absence_and_fatal_bus_diagnostic(
+        tmp_path, monkeypatch, linux):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    unit = tmp_path / service.UNIT_NAME
+    unit.write_text("stub")
+    calls = []
+    diagnostic = (
+        "Unit ara-node.service not loaded.\n"
+        "Failed to connect to bus: Permission denied"
+    )
+    monkeypatch.setattr(
+        service, "_run", lambda cmd: calls.append(cmd) or (1, "", diagnostic),
+    )
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        service.uninstall()
+    assert unit.exists()
+    assert calls == [["systemctl", "--user", "disable", "--now", service.UNIT_NAME]]
+
+
+def test_uninstall_rejects_absence_text_with_unexpected_return_code(
+        tmp_path, monkeypatch, linux):
+    monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
+    unit = tmp_path / service.UNIT_NAME
+    unit.write_text("stub")
+    calls = []
+    monkeypatch.setattr(
+        service, "_run", lambda cmd: calls.append(cmd) or (
+            5, "", "Unit ara-node.service not loaded."),
+    )
+    with pytest.raises(RuntimeError, match="exited 5"):
+        service.uninstall()
+    assert unit.exists()
+    assert calls == [["systemctl", "--user", "disable", "--now", service.UNIT_NAME]]
+
+
 def test_uninstall_retry_after_reload_failure_converges(tmp_path, monkeypatch, linux):
     monkeypatch.setenv("ARA_NODE_SYSTEMD_DIR", str(tmp_path))
     unit = tmp_path / service.UNIT_NAME

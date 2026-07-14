@@ -41,11 +41,25 @@ def _classify_systemctl(rc: int, out: str, err: str) -> _SystemctlResult:
     """Classify only explicit systemd absence as idempotent; everything else is a failure."""
     if rc == 0:
         return _SystemctlResult.SUCCESS
-    message = f"{out}\n{err}".casefold()
-    absent = ("unit" in message and any(marker in message for marker in (
-        "does not exist", "not loaded", "not found",
-    )))
-    return _SystemctlResult.ABSENT if absent else _SystemctlResult.FAILURE
+    diagnostics = tuple(
+        part.strip().casefold() for part in (out, err) if part.strip()
+    )
+    message = "\n".join(diagnostics)
+    fatal_markers = (
+        "permission denied", "access denied", "failed to connect to bus",
+        "authentication", "transport", "i/o error", "input/output error",
+    )
+    if any(marker in message for marker in fatal_markers):
+        return _SystemctlResult.FAILURE
+    known_absent = frozenset({
+        f"unit {UNIT_NAME} does not exist.",
+        f"failed to disable unit: unit file {UNIT_NAME} does not exist.",
+        f"unit {UNIT_NAME} not loaded.",
+        f"unit file {UNIT_NAME} not found.",
+    })
+    if rc == 1 and len(diagnostics) == 1 and diagnostics[0] in known_absent:
+        return _SystemctlResult.ABSENT
+    return _SystemctlResult.FAILURE
 
 
 def _checked(cmd: list[str], *, allowed: tuple[int, ...] = (0,),

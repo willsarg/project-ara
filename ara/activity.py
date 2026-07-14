@@ -45,11 +45,13 @@ class Activity:
 
 
 def activity_dir() -> Path:
-    """Return the per-user directory used for live activity records."""
+    """Return a lexical absolute path without resolving or following filesystem links."""
     override = os.environ.get("ARA_ACTIVITY_DIR")
     if override:
-        return Path(override).expanduser()
-    return Path(user_data_path("ara")) / "activity"
+        path = Path(override).expanduser()
+    else:
+        path = Path(user_data_path("ara")) / "activity"
+    return Path(os.path.abspath(path))
 
 
 def _validate_kind(kind: str) -> None:
@@ -229,8 +231,8 @@ def _open_directory(path: Path, *, create: bool) -> _DirectoryGuard:
     return _DirectoryGuard(path, mode, value)
 
 
-def _open_root(*, create: bool) -> _DirectoryGuard:
-    return _open_directory(activity_dir(), create=create)
+def _open_root(*, create: bool, path: Path | None = None) -> _DirectoryGuard:
+    return _open_directory(activity_dir() if path is None else path, create=create)
 
 
 def _open_serving(root: _DirectoryGuard, *, create: bool) -> _DirectoryGuard:
@@ -253,7 +255,14 @@ def _open_serving(root: _DirectoryGuard, *, create: bool) -> _DirectoryGuard:
 
 
 def _atomic_write(path: Path, record: dict, *, guard: _DirectoryGuard) -> None:
-    """Write atomically while a no-follow/no-reparse directory guard is held."""
+    """Write atomically while a no-follow/no-reparse directory guard is held.
+
+    The private 0700 registry is per-user state, not an authentication boundary. A malicious
+    same-user process able to replace this unique temporary entry can already write a schema-valid
+    final record directly. The guarantees here are no symlink/reparse escape or directory swap,
+    0600 temporary files, atomic visibility for cooperating ARA writers, malformed-record
+    suppression, and accurate live corroboration—not same-user tamper resistance.
+    """
     temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
     relative = guard.mode == "posix"
     temporary_arg = temporary.name if relative else temporary
@@ -270,10 +279,17 @@ def _atomic_write(path: Path, record: dict, *, guard: _DirectoryGuard) -> None:
             except OSError as cleanup:
                 _note_cleanup_failure(original, "close the activity descriptor", cleanup)
             raise
-        with stream:
+        try:
             json.dump(record, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
+        except BaseException as original:
+            try:
+                stream.close()
+            except OSError as cleanup:
+                _note_cleanup_failure(original, "close the activity stream", cleanup)
+            raise
+        stream.close()
         if relative:
             os.replace(temporary_arg, target_arg,
                        src_dir_fd=guard.value, dst_dir_fd=guard.value)
@@ -310,7 +326,7 @@ class _Tracker:
         }
         if self._model is not None:
             record["model"] = self._model
-        self._guard = _open_root(create=True)
+        self._guard = _open_root(create=True, path=self._path.parent)
         try:
             _atomic_write(self._path, record, guard=self._guard)
         except BaseException as original:
@@ -394,7 +410,8 @@ def record_ollama_serving(*, served_name: str, model: str, context: int,
         raise ValueError("invalid Ollama serving activity")
     identity = hashlib.sha256(
         f"{endpoint}\0{served_name}".encode("utf-8")).hexdigest()
-    root = _open_root(create=True)
+    root_path = activity_dir()
+    root = _open_root(create=True, path=root_path)
     serving: _DirectoryGuard | None = None
     try:
         serving = _open_serving(root, create=True)
@@ -461,10 +478,17 @@ def _json_record(path: Path, *, guard: _DirectoryGuard):
             _note_cleanup_failure(original, "close the activity record", cleanup)
         raise
     try:
-        with stream:
-            return json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
+        record = json.load(stream)
+    except (OSError, UnicodeError, ValueError):
+        record = None
+    except BaseException as original:
+        try:
+            stream.close()
+        except OSError as cleanup:
+            _note_cleanup_failure(original, "close the activity stream", cleanup)
+        raise
+    stream.close()
+    return record
 
 
 def _read_record(path: Path, *, guard: _DirectoryGuard) -> Activity | None:
@@ -565,7 +589,7 @@ def snapshot() -> list[Activity]:
     """Read live records without creating, repairing, or deleting anything."""
     directory = activity_dir()
     try:
-        root = _open_root(create=False)
+        root = _open_root(create=False, path=directory)
     except OSError:
         return []
     found: list[tuple[Activity, str]] = []
