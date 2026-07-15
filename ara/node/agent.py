@@ -317,9 +317,21 @@ def _quarantine_spool(path: Path) -> None:
         destination = quarantine / f"{path.name}.{index}"
         index += 1
     os.replace(path, destination)
-    _fsync_parent(destination)
-    if not destination.is_symlink():
-        destination.chmod(0o700 if destination.is_dir() else 0o600)
+    try:
+        _fsync_parent(destination)
+        if not destination.is_symlink():
+            destination.chmod(0o700 if destination.is_dir() else 0o600)
+    except OSError:
+        try:
+            os.replace(destination, path)
+            _fsync_parent(path)
+        except OSError as rollback_exc:
+            if path.exists() or path.is_symlink():
+                raise
+            health.status(
+                f"quarantine completed but post-move normalization failed: {rollback_exc}")
+            return
+        raise
 
 
 def _retire_accepted(path: Path) -> bool:

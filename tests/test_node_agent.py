@@ -1107,6 +1107,69 @@ def test_flush_survives_quarantine_filesystem_failure(tmp_path, monkeypatch):
     assert agent._spool_path("later").exists()
 
 
+def test_post_rename_quarantine_failure_restores_live_blocker(tmp_path, monkeypatch):
+    results = tmp_path / "node" / "results"
+    results.mkdir(parents=True)
+    broken = results / "broken.json"
+    broken.write_text("{broken", encoding="utf-8")
+    client = FakeClient([{"id": "later", "kind": "run", "args": {}}])
+    real_sync = agent._fsync_parent
+
+    def fail_quarantine_sync(path):
+        if path.parent.name == "quarantine":
+            raise OSError("directory sync denied")
+        return real_sync(path)
+
+    monkeypatch.setattr(agent, "_fsync_parent", fail_quarantine_sync)
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _kind, _args: pytest.fail("later work must not bypass restored evidence"),
+        max_iterations=1, sleep=lambda _seconds: None,
+    )
+
+    assert broken.exists() and client.acked == []
+
+
+def test_quarantine_warns_when_post_move_failure_cannot_roll_back(tmp_path, monkeypatch):
+    source = tmp_path / "results" / "broken.json"
+    source.parent.mkdir()
+    source.write_text("evidence", encoding="utf-8")
+    real_replace = agent.os.replace
+    replaces = 0
+
+    def fail_rollback(src, destination):
+        nonlocal replaces
+        replaces += 1
+        if replaces == 2:
+            raise OSError("rollback denied")
+        return real_replace(src, destination)
+
+    monkeypatch.setattr(agent.os, "replace", fail_rollback)
+    monkeypatch.setattr(agent, "_fsync_parent",
+                        lambda _path: (_ for _ in ()).throw(OSError("sync denied")))
+    statuses = []
+    monkeypatch.setattr(agent.health, "status", statuses.append)
+
+    agent._quarantine_spool(source)
+
+    assert not source.exists()
+    assert len(list((source.parent / "quarantine").iterdir())) == 1
+    assert statuses and "quarantine completed" in statuses[0]
+
+
+def test_quarantine_raises_when_rollback_restores_source_but_sync_fails(tmp_path, monkeypatch):
+    source = tmp_path / "results" / "broken.json"
+    source.parent.mkdir()
+    source.write_text("evidence", encoding="utf-8")
+    monkeypatch.setattr(agent, "_fsync_parent",
+                        lambda _path: (_ for _ in ()).throw(OSError("sync denied")))
+
+    with pytest.raises(OSError, match="sync denied"):
+        agent._quarantine_spool(source)
+
+    assert source.exists()
+
+
 def test_flush_401_invalidates_session_and_stops_with_spool_intact(tmp_path):
     d = tmp_path / "node" / "results"
     d.mkdir(parents=True)
