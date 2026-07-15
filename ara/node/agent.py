@@ -198,10 +198,25 @@ def _write_json_atomic(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_last_spool_order = 0
+
+
+def _next_spool_order() -> int:
+    """Return a process-monotonic completion order suitable for durable spool replay."""
+    global _last_spool_order  # noqa: PLW0603 — the single leased agent owns this sequence
+    _last_spool_order = max(time.time_ns(), _last_spool_order + 1)
+    return _last_spool_order
+
+
 def _spool_result(job_id: str, payload: dict) -> None:
     """Persist a finished result to disk BEFORE any network attempt, so a report failure or a crash
     can never lose completed work (Rule #1). Same job → same outcome, so overwrite is fine."""
-    envelope = {"version": 1, "job_id": job_id, "payload": payload}
+    envelope = {
+        "version": 2,
+        "order": _next_spool_order(),
+        "job_id": job_id,
+        "payload": payload,
+    }
     _write_json_atomic(_spool_path(job_id), envelope)
 
 
@@ -214,22 +229,27 @@ def _journal_job(job: dict) -> None:
 _SAFE_LEGACY_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def _read_spooled_result(path: Path) -> tuple[str, dict]:
+def _read_spooled_result(path: Path) -> tuple[str, dict, int | None]:
     """Read a current envelope or a legacy payload whose filename contains a safe job ID."""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("spooled result must be a JSON object")
-    if set(value) == {"version", "job_id", "payload"} and value["version"] == 1:
+    current = set(value) == {"version", "order", "job_id", "payload"} and value["version"] == 2
+    previous = set(value) == {"version", "job_id", "payload"} and value["version"] == 1
+    if current or previous:
         job_id = value["job_id"]
         payload = value["payload"]
         if not isinstance(job_id, str) or not isinstance(payload, dict):
             raise ValueError("invalid spooled result envelope")
+        order = value.get("order")
+        if current and (not isinstance(order, int) or isinstance(order, bool) or order < 1):
+            raise ValueError("invalid spooled result order")
         if path != _spool_path(job_id):
             raise ValueError("spooled result filename does not match its job ID")
-        return job_id, payload
+        return job_id, payload, order
     if not _SAFE_LEGACY_JOB_ID.fullmatch(path.stem):
         raise ValueError("unsafe legacy spool filename")
-    return path.stem, value
+    return path.stem, value, None
 
 
 def _quarantine_spool(path: Path) -> None:
@@ -334,20 +354,29 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
     d = _results_dir()
     if not d.exists():
         return client
-    # Filenames are privacy-preserving hashes, not sequence keys. The durable file write time is
-    # the only ordering evidence retained by both current and legacy spool formats.
-    files = sorted(d.glob("*.json"), key=lambda path: (path.stat().st_mtime_ns, path.name))
-    for f in files:
+    entries = []
+    order_counts: dict[tuple[int, int], int] = {}
+    for f in d.glob("*.json"):
         try:
+            modified_ns = f.lstat().st_mtime_ns
             if f.is_symlink():
                 raise ValueError("spool path is a symlink")
-            job_id, payload = _read_spooled_result(f)
+            job_id, payload, order = _read_spooled_result(f)
         except (OSError, ValueError):
             try:
                 _quarantine_spool(f)
             except OSError:
                 pass
             continue
+        # Versioned order is authoritative. Legacy entries predate ordered envelopes, so their
+        # persisted write time is only usable when unique; a tie is honestly unknowable.
+        order_key = (1, order) if order is not None else (0, modified_ns)
+        order_counts[order_key] = order_counts.get(order_key, 0) + 1
+        entries.append((order_key, f.name, f, job_id, payload))
+    for order_key, _name, f, job_id, payload in sorted(entries):
+        if order_counts[order_key] > 1:
+            health.status("result spool order is ambiguous; preserving evidence and blocking work")
+            break
         # The completion spool is durable proof that execution already finished. Its older
         # accepted-job journal is now redundant even if result delivery remains unavailable.
         _accepted_path(job_id).unlink(missing_ok=True)

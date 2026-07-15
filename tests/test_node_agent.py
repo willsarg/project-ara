@@ -587,19 +587,62 @@ def test_undelivered_result_blocks_polling_and_execution_of_later_work(tmp_path)
 
 
 def test_flush_replays_results_in_persisted_write_order(tmp_path):
-    """Opaque hash filenames must not decide FIFO replay order after a restart."""
+    """Opaque hash filenames and tied mtimes must not decide current-envelope replay order."""
     job_ids = ["first candidate", "second candidate"]
     by_filename = sorted(job_ids, key=lambda job_id: agent._spool_path(job_id).name)
     older, newer = reversed(by_filename)  # make filename order intentionally contradict age
     agent._spool_result(older, {"status": "done", "result": {"order": 1}})
     agent._spool_result(newer, {"status": "done", "result": {"order": 2}})
     os.utime(agent._spool_path(older), ns=(1_000_000_000, 1_000_000_000))
-    os.utime(agent._spool_path(newer), ns=(2_000_000_000, 2_000_000_000))
+    os.utime(agent._spool_path(newer), ns=(1_000_000_000, 1_000_000_000))
     client = FakeClient([])
 
     agent._flush_spool(client, _cfg())
 
     assert [job_id for job_id, _payload in client.posted] == [older, newer]
+
+
+def test_flush_preserves_tied_legacy_results_when_fifo_order_is_unknown(tmp_path, monkeypatch):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    for job_id in ("legacy-a", "legacy-b"):
+        path = d / f"{job_id}.json"
+        path.write_text(json.dumps({"status": "done", "result": {"job": job_id}}))
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+    statuses = []
+    monkeypatch.setattr(agent.health, "status", statuses.append)
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert client.posted == []
+    assert len(_spool_files(tmp_path)) == 2
+    assert statuses == ["result spool order is ambiguous; preserving evidence and blocking work"]
+
+
+def test_previous_envelope_version_remains_deliverable(tmp_path):
+    payload = {"status": "done", "result": {"ok": True}}
+    path = agent._spool_path("v1-job")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"version": 1, "job_id": "v1-job", "payload": payload}))
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert client.posted == [("v1-job", payload)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_flush_quarantines_dangling_symlink_before_ordering(tmp_path):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "dangling.json").symlink_to(tmp_path / "missing.json")
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert client.posted == []
+    assert (d / "quarantine" / "dangling.json").is_symlink()
 
 
 def test_flush_quarantines_permanently_rejected_result_and_continues(tmp_path):
@@ -653,6 +696,7 @@ def test_flush_quarantines_and_preserves_corrupt_spool_file(tmp_path):
     {"status": "done"},
     {"version": 1, "job_id": 7, "payload": {}},
     {"version": 1, "job_id": "j1", "payload": []},
+    {"version": 2, "order": 0, "job_id": "j1", "payload": {}},
 ])
 def test_flush_quarantines_invalid_spool_shapes(tmp_path, value):
     d = tmp_path / "node" / "results"
@@ -735,9 +779,9 @@ def test_spool_filename_is_deterministic_and_not_derived_from_job_id(tmp_path):
     assert files == [agent._spool_path(job_id)]
     assert files[0].parent == tmp_path / "node" / "results"
     assert "escape" not in files[0].name and "SECRET" not in files[0].name
-    assert json.loads(files[0].read_text(encoding="utf-8")) == {
-        "version": 1, "job_id": job_id, "payload": payload,
-    }
+    envelope = json.loads(files[0].read_text(encoding="utf-8"))
+    assert isinstance(envelope.pop("order"), int)
+    assert envelope == {"version": 2, "job_id": job_id, "payload": payload}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode is advisory on Windows")
