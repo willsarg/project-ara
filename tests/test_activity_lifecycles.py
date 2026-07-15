@@ -507,8 +507,28 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None})
+        "safe_context": 4096, "measured_at": None,
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64})
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "base:model" else "b" * 64)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+
+
+_OLLAMA_BASE_ARTIFACT = "ollama-manifest-sha256:" + "a" * 64
+_OLLAMA_SERVED_ARTIFACT = "ollama-manifest-sha256:" + "b" * 64
+
+
+def _ollama_served_name():
+    return cli._governed_name(
+        "base:model", artifact_id=_OLLAMA_BASE_ARTIFACT, context=4096,
+    )
+
+
+def _ollama_artifact_fields():
+    return {
+        "base_artifact_id": _OLLAMA_BASE_ARTIFACT,
+        "served_artifact_id": _OLLAMA_SERVED_ARTIFACT,
+    }
 
 
 def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap(
@@ -529,8 +549,8 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     def verify(*_a, **_k):
         _assert_activity("serving", "base:model")
         calls.append("verify")
-        return [{"name": "base-model-ara:latest", "context_length": 4096,
-                 "size": 10, "size_vram": 10}]
+        return [{"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
+                 "size": 10, "size_vram": 10, "digest": "b" * 64}]
 
     real_record = activity.record_ollama_serving
 
@@ -548,7 +568,8 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     assert calls == ["create", "load", "verify", "record"]
 
     monkeypatch.setattr(cli.ollama, "ps", lambda: [
-        {"name": "base-model-ara:latest", "context_length": 4096}])
+        {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
+         "digest": "b" * 64}])
     found = activity.snapshot()
     assert len(found) == 1 and found[0].runtime == "ollama"
     assert not list(activity_registry.glob("*.json"))
@@ -558,10 +579,11 @@ def test_ollama_reserve_same_live_identity_never_duplicates_status(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
     activity.record_ollama_serving(
-        served_name="base-model-ara", model="base:model", context=4096,
-        endpoint="http://127.0.0.1:11434", started_at=1.0)
-    loaded = [{"name": "base-model-ara:latest", "context_length": 4096,
-               "size": 10, "size_vram": 10}]
+        served_name=_ollama_served_name(), model="base:model", context=4096,
+        endpoint="http://127.0.0.1:11434", started_at=1.0,
+        **_ollama_artifact_fields())
+    loaded = [{"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
+               "size": 10, "size_vram": 10, "digest": "b" * 64}]
     monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
 
     def create(*_a, **_k):
@@ -577,27 +599,72 @@ def test_ollama_reserve_same_live_identity_never_duplicates_status(
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
 
 
-def test_ollama_takeover_same_served_identity_for_new_base_keeps_transient_activity(
+def test_ollama_status_requires_exact_base_and_served_manifest_digests(
+        monkeypatch, activity_registry):
+    base_artifact = "ollama-manifest-sha256:" + "a" * 64
+    served_artifact = "ollama-manifest-sha256:" + "b" * 64
+    activity.record_ollama_serving(
+        served_name="base-model-ara", model="base:model", context=4096,
+        endpoint="http://127.0.0.1:11434", base_artifact_id=base_artifact,
+        served_artifact_id=served_artifact, started_at=1.0,
+    )
+    monkeypatch.setattr(activity.ollama if hasattr(activity, "ollama") else cli.ollama,
+                        "base_url", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "base:model" else None)
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "base-model-ara:latest", "context_length": 4096,
+        "digest": "b" * 64,
+    }])
+    found = activity.snapshot()
+    assert len(found) == 1
+    assert found[0].base_artifact_id == base_artifact
+    assert found[0].served_artifact_id == served_artifact
+
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "base-model-ara:latest", "context_length": 4096,
+        "digest": "c" * 64,
+    }])
+    assert activity.snapshot() == []
+
+
+def test_ollama_status_suppresses_retargeted_base_manifest(monkeypatch):
+    activity.record_ollama_serving(
+        served_name="base-model-ara", model="base:model", context=4096,
+        endpoint="http://127.0.0.1:11434",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "b" * 64,
+        started_at=1.0,
+    )
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "d" * 64)
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "base-model-ara:latest", "context_length": 4096,
+        "digest": "b" * 64,
+    }])
+    assert activity.snapshot() == []
+
+
+def test_ollama_refuses_takeover_of_served_identity_owned_by_another_base(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name in ("base:model", "org/old") else "b" * 64)
     activity.record_ollama_serving(
         served_name="shared", model="org/old", context=4096,
-        endpoint="http://127.0.0.1:11434", started_at=1.0)
+        endpoint="http://127.0.0.1:11434", started_at=1.0,
+        **_ollama_artifact_fields())
     loaded = [{"name": "shared:latest", "context_length": 4096,
-               "size": 10, "size_vram": 10}]
+               "size": 10, "size_vram": 10, "digest": "b" * 64}]
     monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
 
-    def create(*_a, **_k):
-        assert [(item.kind, item.model, item.runtime) for item in activity.snapshot()] == [
-            ("serving", "org/old", "ollama"),
-            ("serving", "base:model", None),
-        ]
-        return True
-
-    monkeypatch.setattr(cli.ollama, "create", create)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {"done": True})
-    c, _ = make_console()
-    assert cli.render_serve(c, "base:model", ctx=4096, name="shared") == 0
+    monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model", "shared:latest"])
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("existing identity overwritten"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "base:model", ctx=4096, name="shared") == 1
+    assert "already exists" in buf.getvalue() and "refusing" in buf.getvalue()
+    assert [(item.kind, item.model, item.runtime) for item in activity.snapshot()] == [
+        ("serving", "org/old", "ollama")]
 
 
 def test_ollama_serve_declined_consent_never_claims_activity(
@@ -621,8 +688,8 @@ def test_ollama_manifest_failure_unloads_untrackable_service(
                         lambda name, keep_alive=-1:
                         unloading.append(name) or {} if keep_alive == 0 else {"done": True})
     monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
-        {"name": "base-model-ara:latest", "context_length": 4096,
-         "size": 10, "size_vram": 10}])
+        {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
+         "size": 10, "size_vram": 10, "digest": "b" * 64}])
     monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(OSError("disk full")))
@@ -630,7 +697,7 @@ def test_ollama_manifest_failure_unloads_untrackable_service(
     assert cli.render_serve(c, "base:model", ctx=4096) == 1
     assert "ownership could not be recorded" in buf.getvalue()
     assert "unloaded" in buf.getvalue()
-    assert unloading == ["base-model-ara"] and deleted == ["base-model-ara"]
+    assert unloading == [_ollama_served_name()] and deleted == [_ollama_served_name()]
     assert activity.snapshot() == []
 
 
@@ -643,16 +710,16 @@ def test_ollama_manifest_validation_failure_is_honest_json_not_raw_exception(
                         lambda name, keep_alive=-1:
                         unloading.append(name) or {} if keep_alive == 0 else {"done": True})
     monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
-        {"name": "base-model-ara:latest", "context_length": 4096,
-         "size": 10, "size_vram": 10}])
+        {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
+         "size": 10, "size_vram": 10, "digest": "b" * 64}])
     monkeypatch.setattr(cli.ollama, "delete", lambda _name: True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(ValueError("invalid identity")))
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096, as_json=True) == 1
     assert json.loads(capsys.readouterr().out) == {
-        "error": "base-model-ara loaded at 4096 ctx, but ARA ownership could not be recorded: "
-                 "invalid identity; unloaded the untracked service"}
+        "error": f"{_ollama_served_name()} loaded at 4096 ctx, but ARA ownership could not "
+                 "be recorded: invalid identity; unloaded the untracked service"}
     assert activity.snapshot() == []
 
 

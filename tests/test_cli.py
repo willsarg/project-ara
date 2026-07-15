@@ -3474,6 +3474,118 @@ def test_ollama_measure_ceiling_rejects_unverified_residency(monkeypatch, size, 
     assert best is None and points[0]["fit"] is False
 
 
+def test_ollama_measure_ceiling_binds_probe_and_base_manifest_before_load(monkeypatch):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "base" else "b" * 64)
+    loads = []
+    monkeypatch.setattr(cli.ollama, "load", lambda name: loads.append(name) or {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "probe:latest", "context_length": 2048,
+        "size": 10, "size_vram": 10, "digest": "b" * 64,
+    }])
+    provenance = {}
+    best, points = cli._ollama_measure_ceiling(
+        "base", 2048, "probe", base_artifact_id=artifact, provenance=provenance)
+    assert best == 2048 and points[0]["fit"] is True and loads == ["probe"]
+    assert provenance == {"created": True,
+                          "artifact_id": "ollama-manifest-sha256:" + "b" * 64}
+
+
+def test_ollama_measure_ceiling_can_track_probe_without_base_gate(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "probe:latest", "context_length": 2048,
+        "size": 10, "size_vram": 10, "digest": "b" * 64,
+    }])
+    provenance = {}
+    best, _points = cli._ollama_measure_ceiling(
+        "base", 2048, "probe", provenance=provenance)
+    assert best == 2048 and provenance["artifact_id"].endswith("b" * 64)
+
+
+def test_ollama_measure_ceiling_refuses_retargeted_base_before_probe_load(monkeypatch):
+    base_digests = iter(["a" * 64, "c" * 64])
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: next(base_digests) if name == "base" else "b" * 64,
+    )
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a: pytest.fail("loaded probe from retargeted base"))
+    with pytest.raises(RuntimeError, match="changed during probe creation"):
+        cli._ollama_measure_ceiling(
+            "base", 2048, "probe",
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+            provenance={},
+        )
+
+
+def test_ollama_measure_ceiling_refuses_retargeted_base_before_create(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a: pytest.fail("created from retargeted base"))
+    with pytest.raises(RuntimeError, match="changed before probe creation"):
+        cli._ollama_measure_ceiling(
+            "base", 2048, "probe",
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+            provenance={},
+        )
+
+
+def test_ollama_measure_ceiling_requires_probe_identity_without_provenance_dict(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "base" else None)
+    with pytest.raises(RuntimeError, match="could not be identified"):
+        cli._ollama_measure_ceiling(
+            "base", 2048, "probe",
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        )
+
+
+def test_ollama_measure_ceiling_accepts_verified_probe_without_provenance_dict(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "base" else "b" * 64)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "probe:latest", "context_length": 2048,
+        "size": 10, "size_vram": 10, "digest": "b" * 64,
+    }])
+    best, points = cli._ollama_measure_ceiling(
+        "base", 2048, "probe",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+    )
+    assert best == 2048 and points[0]["fit"] is True
+
+
+def test_cleanup_ollama_probe_refuses_retargeted_manifest(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("unloaded retargeted probe"))
+    monkeypatch.setattr(cli.ollama, "delete",
+                        lambda *_a, **_k: pytest.fail("deleted retargeted probe"))
+    error = cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+    assert "identity changed" in error and "refused" in error
+
+
+def test_cleanup_ollama_probe_refuses_retarget_before_delete(monkeypatch):
+    digests = iter(["b" * 64, "c" * 64])
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: next(digests))
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
+    monkeypatch.setattr(cli.ollama, "delete",
+                        lambda *_a, **_k: pytest.fail("deleted retargeted probe"))
+    error = cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+    assert "identity changed" in error and "refused delete" in error
+
+
 def test_cleanup_ollama_probe_unloads_verifies_then_deletes(monkeypatch):
     calls = []
     monkeypatch.setattr(cli.ollama, "load",
@@ -3528,14 +3640,27 @@ def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
     monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda model: "a" * 64)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
-    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: None)
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda probe, expected_artifact_id=None: None)
+
+
+def _fake_ollama_measure(result=None, error=None):
+    def measure(*_args, provenance=None, **_kwargs):
+        if provenance is not None:
+            provenance.update(created=True,
+                              artifact_id="ollama-manifest-sha256:" + "a" * 64)
+        if error is not None:
+            raise error
+        return result
+    return measure
 
 
 def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure(
+        (4096, [{"context": 4096, "fit": True}])))
     c = cli.Console.from_env()
     # a bare Ollama name (colon) must NOT be rejected as an invalid HF ref — the ollama path
     # branches before valid_model_ref.
@@ -3543,14 +3668,119 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["safe_context"] == 4096 and out["source"] == "measured" and out["engine"] == "ollama"
     with cli.db.connected() as con:
-        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")["safe_context"] == 4096
+        row = cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")
+        assert row["safe_context"] == 4096
+        assert row["artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
+
+
+def test_characterize_ollama_refuses_if_manifest_changes_during_measurement(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    base_digests = iter(["a" * 64, "b" * 64])
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: next(base_digests) if name == "qwen3:0.6b" else "a" * 64)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        _fake_ollama_measure((4096, [])))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "manifest changed" in buf.getvalue()
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b") is None
+
+
+def test_characterize_ollama_refuses_unidentified_manifest(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _model: None)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda *_a: pytest.fail("measured unidentified manifest"))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "artifact provenance" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_preexisting_content_addressed_probe(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    probe = cli._governed_name(
+        "qwen3:0.6b", artifact_id=artifact, context=8192) + "-probe"
+    monkeypatch.setattr(cli.ollama, "tags", lambda _t=2.0: ["qwen3:0.6b", probe])
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda *_a, **_k: pytest.fail("overwrote preexisting probe"))
+    monkeypatch.setattr(cli.ollama, "delete",
+                        lambda *_a, **_k: pytest.fail("deleted preexisting probe"))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "probe" in buf.getvalue() and "already exists" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_when_final_probe_inventory_is_unavailable(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    calls = 0
+
+    def tags(_timeout=2.0):
+        nonlocal calls
+        calls += 1
+        return ["qwen3:0.6b"] if calls == 1 else None
+
+    monkeypatch.setattr(cli.ollama, "tags", tags)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "recheck" in buf.getvalue() and "probe collision" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_when_probe_setup_is_locked(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+
+    @contextlib.contextmanager
+    def busy(_endpoint, _probe):
+        raise cli.locking.OllamaSetupBusy("probe setup busy")
+        yield
+
+    monkeypatch.setattr(cli.locking, "ollama_setup_lock", busy)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "probe setup busy" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_cleanup_without_probe_provenance(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+
+    def unidentified(*_args, provenance=None, **_kwargs):
+        provenance["created"] = True
+        raise RuntimeError("probe identity unavailable")
+
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", unidentified)
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda *_a, **_k: pytest.fail("cleaned unproven probe"))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    out = buf.getvalue()
+    assert "identity unavailable" in out and "ownership could not be proven" in out
+
+
+def test_characterize_ollama_handles_create_failure_without_cleanup(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
+                        lambda *_a, **_k: (None, []))
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda *_a, **_k: pytest.fail("cleaned nonexistent probe"))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
+    assert "no no-spill ceiling" in buf.getvalue()
 
 
 def test_characterize_ollama_refuses_to_store_when_cleanup_is_unverified(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_measure_ceiling", lambda *a: (4096, []))
-    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: "probe is still resident")
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure((4096, [])))
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda probe, expected_artifact_id=None: "probe is still resident")
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "still resident" in buf.getvalue()
@@ -3562,9 +3792,10 @@ def test_characterize_ollama_measurement_exception_still_cleans_up(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda *args: (_ for _ in ()).throw(RuntimeError("probe failed")))
+                        _fake_ollama_measure(error=RuntimeError("probe failed")))
     cleaned = []
-    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: cleaned.append(probe) or None)
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda probe, expected_artifact_id=None: cleaned.append(probe) or None)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "probe failed" in buf.getvalue()
@@ -3575,8 +3806,9 @@ def test_characterize_ollama_reports_measurement_and_cleanup_failures(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda *args: (_ for _ in ()).throw(RuntimeError("probe failed")))
-    monkeypatch.setattr(cli, "_cleanup_ollama_probe", lambda probe: "probe still resident")
+                        _fake_ollama_measure(error=RuntimeError("probe failed")))
+    monkeypatch.setattr(cli, "_cleanup_ollama_probe",
+                        lambda probe, expected_artifact_id=None: "probe still resident")
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "probe failed" in buf.getvalue() and "still resident" in buf.getvalue()
@@ -3584,8 +3816,8 @@ def test_characterize_ollama_reports_measurement_and_cleanup_failures(
 
 def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure(
+        (4096, [{"context": 4096, "fit": True}])))
     monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
@@ -3596,8 +3828,8 @@ def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, m
 def test_characterize_ollama_verbose_discloses_runtime_and_model_limit(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda model, mc, probe: (4096, [{"context": 4096, "fit": True}]))
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure(
+        (4096, [{"context": 4096, "fit": True}])))
     monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
     c, buf = make_console(verbose=True)
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
@@ -3633,8 +3865,8 @@ def test_characterize_ollama_rejects_unsupported_context_lever_json(
 
 def test_characterize_ollama_records_none_when_it_spills(store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_measure_ceiling",
-                        lambda model, mc, probe: (None, [{"context": 2048, "fit": False}]))
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure(
+        (None, [{"context": 2048, "fit": False}])))
     monkeypatch.setattr(cli.ollama, "delete", lambda name: True)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
@@ -6434,12 +6666,20 @@ def test_main_hf_no_sub_dispatches_none(monkeypatch):
 # --------------------------------------------------------------------------- #
 # A loaded /api/ps entry for the default derived name at the requested 8192 ctx (no spill).
 _SERVE_LOADED = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
-                  "size": 100, "size_vram": 100}]
+                  "size": 100, "size_vram": 100, "digest": "b" * 64}]
+_SERVE_BASE_ARTIFACT = "ollama-manifest-sha256:" + "a" * 64
+_SERVE_DERIVED_ARTIFACT = "ollama-manifest-sha256:" + "b" * 64
+
+
+def _serve_name(context=8192):
+    return cli._governed_name(
+        "qwen3:0.6b", artifact_id=_SERVE_BASE_ARTIFACT, context=context,
+    )
 
 
 def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create_ok=True,
                 ps_rows=None, characterization=None, isatty=False, pull_ok=True,
-                show=None, size=None):
+                show=None, size=None, estimated=8192):
     """Wire render_serve's Ollama + db seams. ``names=None`` ⇒ tags() unreachable;
     ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches).
     ``pull_ok`` is ollama.pull's result; ``show``/``size`` feed the estimated-ceiling fallback."""
@@ -6449,15 +6689,44 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     monkeypatch.setattr(cli.ollama, "version", lambda timeout=0.5: version)
     monkeypatch.setattr(cli.ollama, "tags",
                         lambda timeout=2.0: (None if names is None else list(names)))
-    monkeypatch.setattr(cli.ollama, "create", lambda n, f, ctx, timeout=300.0: create_ok)
+    state = {"served": None}
+
+    def create(n, f, ctx, timeout=300.0):
+        state["served"] = n
+        return create_ok
+
+    monkeypatch.setattr(cli.ollama, "create", create)
     monkeypatch.setattr(cli.ollama, "load", lambda n, keep_alive=-1, timeout=300.0: {"done": True})
-    monkeypatch.setattr(cli.ollama, "ps", lambda timeout=2.0: (ps_rows or []))
+    normalized_rows = [({**row, "digest": row.get("digest", "b" * 64)})
+                       for row in (ps_rows or [])]
+    def ps(timeout=2.0):
+        rows = []
+        for row in normalized_rows:
+            copy = dict(row)
+            if (state["served"] and isinstance(copy.get("name"), str)
+                    and copy["name"] in ("qwen3-0.6b-ara", "qwen3-0.6b-ara:latest")):
+                copy["name"] = state["served"] + (":latest" if copy["name"].endswith(":latest")
+                                                   else "")
+            rows.append(copy)
+        return rows
+
+    monkeypatch.setattr(cli.ollama, "ps", ps)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name, timeout=2.0: "a" * 64 if name == "qwen3:0.6b" else "b" * 64)
     monkeypatch.setattr(cli.ollama, "delete", lambda n, timeout=30.0: True)
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.db, "connect", lambda: types.SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    if characterization is not None and "artifact_id" not in characterization:
+        characterization = {**characterization,
+                            "artifact_id": "ollama-manifest-sha256:" + "a" * 64}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
     monkeypatch.setattr(cli.db, "save_characterization", lambda *a, **k: None)
+    if show is None and size is None:
+        monkeypatch.setattr(
+            cli, "_ollama_estimated_ceiling",
+            lambda _m: ((estimated, "estimated", None) if estimated is not None else None),
+        )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
 
 
@@ -6515,6 +6784,26 @@ def test_serve_refuses_when_pull_fails(make_console, monkeypatch):
     assert "couldn't pull" in buf.getvalue()
 
 
+def test_serve_refuses_new_custom_name_before_pulling_missing_model(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    monkeypatch.setattr(cli.ollama, "pull",
+                        lambda *_a, **_k: pytest.fail("pulled for unsupported custom name"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "missing:model", ctx=8192, name="mysrv") == 1
+    assert "custom --name" in buf.getvalue() and "atomic" in buf.getvalue()
+
+
+def test_serve_refuses_unidentified_base_manifest(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: None)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("created unidentified base"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "artifact provenance" in buf.getvalue()
+
+
 def test_serve_rejects_nonpositive_ctx(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     c, buf = make_console()
@@ -6530,6 +6819,27 @@ def test_serve_rejects_nonpositive_ctx_before_ollama_side_effects(make_console, 
     assert cli.render_serve(c, "missing:model", ctx=0) == 1
     assert "positive integer" in buf.getvalue()
     assert calls == []
+
+
+def test_serve_explicit_ctx_cannot_exceed_estimated_bound(make_console, monkeypatch):
+    _wire_serve(monkeypatch, characterization=None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a, **_k: pytest.fail("unsafe create"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=16384) == 1
+    assert "estimated safe bound 8192" in buf.getvalue()
+
+
+def test_serve_explicit_ctx_refuses_without_measured_or_estimated_bound(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch, characterization=None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: None)
+    monkeypatch.setattr(cli.ollama, "create", lambda *_a, **_k: pytest.fail("unbounded create"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    out = buf.getvalue()
+    assert "no measured or estimated safe bound" in out
+    assert "ara characterize" in out
 
 
 def test_serve_rejects_invalid_custom_name_before_ollama_side_effects(make_console, monkeypatch):
@@ -6569,7 +6879,7 @@ def test_serve_accepts_ollama_and_nonapple_auto(
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, engine=engine) == 0
-    assert "qwen3-0.6b-ara" in buf.getvalue()
+    assert _serve_name() in buf.getvalue()
 
 
 def test_serve_uses_estimated_ceiling_when_unmeasured(make_console, monkeypatch, capsys):
@@ -6597,7 +6907,7 @@ def test_serve_estimated_ceiling_nudges_to_characterize(make_console, monkeypatc
 
 
 def test_serve_refuses_when_neither_measured_nor_estimable(make_console, monkeypatch):
-    _wire_serve(monkeypatch, characterization=None, show=None)   # unmeasured + arch unreadable
+    _wire_serve(monkeypatch, characterization=None, show=None, estimated=None)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 1               # no --ctx, no guess
     assert "couldn't determine a safe ceiling" in buf.getvalue()
@@ -6613,6 +6923,75 @@ def test_serve_uses_measured_ceiling(make_console, monkeypatch, capsys):
     assert payload["served_context"] == 4096 and payload["ceiling_source"] == "measured"
 
 
+def test_serve_uses_measured_ceiling_only_for_current_ollama_manifest(
+        make_console, monkeypatch, capsys):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 4096,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096,
+                                               "artifact_id": artifact}, ps_rows=rows)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["ceiling_source"] == "measured"
+
+
+def test_serve_ignores_measurement_for_retargeted_ollama_manifest(
+        make_console, monkeypatch, capsys):
+    old_artifact = "ollama-manifest-sha256:" + "c" * 64
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 2048,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096,
+                                               "artifact_id": old_artifact}, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (2048, "estimated", None))
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ceiling_source"] == "estimated"
+    assert payload["served_context"] == 2048
+
+
+def test_serve_refuses_when_loaded_manifest_digest_differs_from_created_manifest(
+        make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": 100, "size_vram": 100, "digest": "c" * 64}]
+    _wire_serve(monkeypatch, ps_rows=rows, characterization={
+        "safe_context": 8192, "artifact_id": "ollama-manifest-sha256:" + "a" * 64})
+    cleaned = []
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda name, **_k: cleaned.append(name) or None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "manifest" in buf.getvalue() and "governance" in buf.getvalue()
+    assert len(cleaned) == 1
+
+
+def test_serve_passes_verified_digest_into_failure_cleanup(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
+    cleanup = {}
+
+    def capture(name, *, label, delete, expected_artifact_id=None):
+        cleanup.update(name=name, expected=expected_artifact_id)
+        return None
+
+    monkeypatch.setattr(cli, "_cleanup_ollama_model", capture)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert cleanup == {"name": _serve_name(), "expected": _SERVE_DERIVED_ARTIFACT}
+
+
+def test_serve_records_base_and_served_manifest_identity(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, characterization={
+        "safe_context": 8192, "artifact_id": "ollama-manifest-sha256:" + "a" * 64})
+    recorded = {}
+    monkeypatch.setattr(cli.activity, "record_ollama_serving",
+                        lambda **fields: recorded.update(fields))
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert recorded["base_artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
+    assert recorded["served_artifact_id"] == "ollama-manifest-sha256:" + "b" * 64
+
+
 def test_serve_refuses_when_create_fails(make_console, monkeypatch):
     _wire_serve(monkeypatch, create_ok=False)
     cleaned = []
@@ -6626,6 +7005,78 @@ def test_serve_refuses_when_create_fails(make_console, monkeypatch):
     assert cleaned == []
 
 
+def test_serve_refuses_created_manifest_without_identity(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "manifest_digest",
+                        lambda name: "a" * 64 if name == "qwen3:0.6b" else None)
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("loaded unidentified manifest"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't identify its Ollama manifest" in buf.getvalue()
+
+
+def test_serve_does_not_cleanup_when_derived_manifest_retargets_before_failure(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    served_reads = iter(["b" * 64, "c" * 64])
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: "a" * 64 if name == "qwen3:0.6b" else next(served_reads),
+    )
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda *_a, **_k: pytest.fail("retargeted manifest deleted"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "changed before load" in buf.getvalue() and "did not unload or delete" in buf.getvalue()
+
+
+def test_serve_does_not_cleanup_when_manifest_becomes_unverifiable_after_load_failure(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    served_reads = iter(["b" * 64, "b" * 64, None])
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: "a" * 64 if name == "qwen3:0.6b" else next(served_reads),
+    )
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda *_a, **_k: pytest.fail("cleaned unverifiable manifest"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "ownership of the derived manifest is unverified" in buf.getvalue()
+
+
+def test_serve_refuses_if_base_manifest_retargets_during_setup(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    base_reads = iter(["a" * 64, "c" * 64])
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: next(base_reads) if name == "qwen3:0.6b" else "b" * 64,
+    )
+    monkeypatch.setattr(
+        cli.ollama, "load",
+        lambda *_a, keep_alive=-1, **_k: (
+            {} if keep_alive == 0 else pytest.fail("loaded retargeted base")),
+    )
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "manifest changed during setup" in buf.getvalue()
+
+
+def test_serve_refuses_if_base_manifest_retargets_during_load(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    base_reads = iter(["a" * 64, "a" * 64, "c" * 64])
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: next(base_reads) if name == "qwen3:0.6b" else "b" * 64,
+    )
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "manifest changed during setup" in buf.getvalue()
+
+
 def test_serve_interrupt_after_create_cleans_up_then_propagates(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     cleaned = []
@@ -6635,11 +7086,12 @@ def test_serve_interrupt_after_create_cleans_up_then_propagates(make_console, mo
 
     monkeypatch.setattr(cli.ollama, "load", load)
     monkeypatch.setattr(cli, "_cleanup_ollama_model",
-                        lambda name, *, label, delete: cleaned.append(name) or None)
+                        lambda name, *, label, delete, expected_artifact_id=None:
+                        cleaned.append((name, expected_artifact_id)) or None)
     c, _ = make_console()
     with pytest.raises(KeyboardInterrupt):
         cli.render_serve(c, "qwen3:0.6b", ctx=8192)
-    assert cleaned == ["qwen3-0.6b-ara"]
+    assert cleaned == [(_serve_name(), _SERVE_DERIVED_ARTIFACT)]
 
 
 def test_serve_interrupt_reports_cleanup_failure(make_console, monkeypatch):
@@ -6656,11 +7108,12 @@ def test_serve_interrupt_reports_cleanup_failure(make_console, monkeypatch):
 def test_serve_refuses_name_appearing_at_final_collision_check(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     calls = 0
+    served = _serve_name()
 
     def tags(*_a, **_k):
         nonlocal calls
         calls += 1
-        return ["qwen3:0.6b"] if calls == 1 else ["qwen3:0.6b", "qwen3-0.6b-ara:latest"]
+        return ["qwen3:0.6b"] if calls == 1 else ["qwen3:0.6b", f"{served}:latest"]
 
     monkeypatch.setattr(cli.ollama, "tags", tags)
     monkeypatch.setattr(cli.ollama, "create",
@@ -6685,6 +7138,22 @@ def test_serve_refuses_when_final_collision_check_is_unavailable(make_console, m
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "recheck" in buf.getvalue() and "collision" in buf.getvalue()
+
+
+def test_serve_refuses_when_same_identity_setup_is_locked(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+
+    @contextlib.contextmanager
+    def busy(_endpoint, served):
+        raise cli.locking.OllamaSetupBusy(f"busy setting up {served}")
+        yield
+
+    monkeypatch.setattr(cli.locking, "ollama_setup_lock", busy)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("created despite setup lock"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "busy setting up" in buf.getvalue()
 
 
 def test_serve_refuses_when_model_does_not_load(make_console, monkeypatch):
@@ -6712,12 +7181,12 @@ def test_serve_load_failure_cannot_reuse_stale_ps_row(make_console, monkeypatch)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "couldn't load" in buf.getvalue()
-    assert cleanup_started == ["qwen3-0.6b-ara"]
-    assert deleted == ["qwen3-0.6b-ara"]
+    assert cleanup_started == [_serve_name()]
+    assert deleted == [_serve_name()]
 
 
 def test_serve_refuses_unowned_preexisting_governed_manifest(make_console, monkeypatch):
-    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"))
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", f"{_serve_name()}:latest"))
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("pre-existing manifest overwritten"))
     monkeypatch.setattr(cli.ollama, "load",
@@ -6727,38 +7196,60 @@ def test_serve_refuses_unowned_preexisting_governed_manifest(make_console, monke
     assert "already exists" in buf.getvalue() and "refusing" in buf.getvalue()
 
 
-def test_serve_refuses_name_that_collides_with_just_pulled_base(make_console, monkeypatch):
+def test_serve_refuses_custom_name_before_pulling_a_colliding_base(make_console, monkeypatch):
     _wire_serve(monkeypatch, names=("other:1",))
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("pulled base manifest overwritten"))
     c, buf = make_console()
     assert cli.render_serve(c, "new:model", ctx=8192, name="new:model") == 1
-    assert "already exists" in buf.getvalue() and "refusing" in buf.getvalue()
+    assert "custom --name" in buf.getvalue() and "atomic" in buf.getvalue()
 
 
 def test_serve_reuses_exact_owned_manifest_without_recreating(make_console, monkeypatch):
-    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"),
-                ps_rows=_SERVE_LOADED)
+    served = _serve_name()
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", f"{served}:latest"),
+                ps_rows=[{"name": f"{served}:latest", "context_length": 8192,
+                          "size": 100, "size_vram": 100,
+                          "digest": "b" * 64}])
     monkeypatch.setattr(
         cli.activity, "snapshot",
-        lambda: [types.SimpleNamespace(runtime="ollama", served_name="qwen3-0.6b-ara",
+        lambda: [types.SimpleNamespace(runtime="ollama", served_name=served,
                                        context=8192, endpoint="http://127.0.0.1:11434",
-                                       model="qwen3:0.6b")],
+                                       model="qwen3:0.6b",
+                                       base_artifact_id=_SERVE_BASE_ARTIFACT,
+                                       served_artifact_id=_SERVE_DERIVED_ARTIFACT)],
     )
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("owned manifest recreated"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
-    assert "qwen3-0.6b-ara" in buf.getvalue()
+    assert served in buf.getvalue()
+
+
+def test_serve_refuses_duplicate_while_legacy_ara_service_is_live(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [types.SimpleNamespace(
+        runtime="ollama", served_name="qwen3-0.6b-ara", context=8192,
+        endpoint="http://127.0.0.1:11434", model="qwen3:0.6b",
+        base_artifact_id=None, served_artifact_id=None,
+    )])
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("duplicated legacy service"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "legacy ARA service" in buf.getvalue()
 
 
 def test_serve_owned_manifest_failure_does_not_cleanup_user_state(make_console, monkeypatch):
-    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"))
+    served = _serve_name()
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", f"{served}:latest"))
     monkeypatch.setattr(
         cli.activity, "snapshot",
-        lambda: [types.SimpleNamespace(runtime="ollama", served_name="qwen3-0.6b-ara",
+        lambda: [types.SimpleNamespace(runtime="ollama", served_name=served,
                                        context=8192, endpoint="http://127.0.0.1:11434",
-                                       model="qwen3:0.6b")],
+                                       model="qwen3:0.6b",
+                                       base_artifact_id=_SERVE_BASE_ARTIFACT,
+                                       served_artifact_id=_SERVE_DERIVED_ARTIFACT)],
     )
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "_cleanup_ollama_model",
@@ -6790,7 +7281,7 @@ def test_serve_unverifiable_ps_cleans_up_derived_model(make_console, monkeypatch
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "verify" in buf.getvalue().lower()
-    assert deleted == ["qwen3-0.6b-ara"]
+    assert deleted == [_serve_name()]
 
 
 def test_serve_refuses_on_governance_mismatch(make_console, monkeypatch):
@@ -6815,7 +7306,7 @@ def test_serve_governance_mismatch_cleans_up_derived_model(make_console, monkeyp
     monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
-    assert deleted == ["qwen3-0.6b-ara"]
+    assert deleted == [_serve_name()]
 
 
 def test_serve_confirm_declined_skips(make_console, monkeypatch):
@@ -6831,7 +7322,7 @@ def test_serve_confirm_accepted_proceeds(make_console, monkeypatch):
     monkeypatch.setattr(cli, "_confirm", lambda q: True)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
-    assert "qwen3-0.6b-ara" in buf.getvalue()
+    assert _serve_name() in buf.getvalue()
 
 
 def test_serve_happy_text(make_console, monkeypatch):
@@ -6839,7 +7330,7 @@ def test_serve_happy_text(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
     out = buf.getvalue()
-    assert "qwen3-0.6b-ara" in out
+    assert _serve_name() in out
     assert "OPENAI_BASE_URL=http://127.0.0.1:11434/v1" in out
 
 
@@ -6848,7 +7339,7 @@ def test_serve_happy_json(make_console, monkeypatch, capsys):
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["model"] == "qwen3-0.6b-ara"
+    assert payload["model"] == _serve_name()
     assert payload["base_model"] == "qwen3:0.6b"
     assert payload["served_context"] == 8192
     assert payload["endpoint"] == "http://127.0.0.1:11434/v1"
@@ -6856,12 +7347,23 @@ def test_serve_happy_json(make_console, monkeypatch, capsys):
     assert payload["spilled"] is False
 
 
-def test_serve_custom_name_and_assume_yes(make_console, monkeypatch):
+def test_serve_custom_name_and_assume_yes_still_refuses_unsafe_creation(
+        make_console, monkeypatch):
     rows = [{"name": "mysrv:latest", "context_length": 8192, "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, ps_rows=rows, isatty=True)    # tty, but --yes bypasses consent
     c, buf = make_console()
-    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, name="mysrv", assume_yes=True) == 0
-    assert "mysrv" in buf.getvalue()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, name="mysrv", assume_yes=True) == 1
+    assert "custom --name" in buf.getvalue()
+
+
+def test_serve_refuses_new_custom_name_without_atomic_create(make_console, monkeypatch):
+    _wire_serve(monkeypatch, isatty=False)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("created racy custom name"))
+    c, buf = make_console()
+    assert cli.render_serve(
+        c, "qwen3:0.6b", ctx=8192, name="mysrv", assume_yes=True) == 1
+    assert "custom --name" in buf.getvalue() and "atomic" in buf.getvalue()
 
 
 def test_serve_warns_on_spill(make_console, monkeypatch):
@@ -6874,9 +7376,27 @@ def test_serve_warns_on_spill(make_console, monkeypatch):
 
 
 # serve helpers
-def test_governed_name_sanitizes():
+def test_governed_name_legacy_compatibility_sanitizes():
     assert cli._governed_name("qwen3:0.6b") == "qwen3-0.6b-ara"
     assert cli._governed_name("Org/Repo-Name") == "org-repo-name-ara"
+
+
+def test_governed_name_is_content_addressed_by_manifest_and_context():
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    name = cli._governed_name("Org/Model:latest", artifact_id=artifact, context=8192)
+    assert name.startswith("ara-org-model-latest-ctx8192-")
+    assert len(name.rsplit("-", 1)[-1]) == 24
+    assert name.isascii() and len(name) <= 96
+    assert cli._governed_name("Org/Model:latest", artifact_id=artifact, context=4096) != name
+    assert cli._governed_name(
+        "Org/Model:latest", artifact_id="ollama-manifest-sha256:" + "b" * 64,
+        context=8192) != name
+
+
+def test_governed_name_hash_prevents_slug_collisions():
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    assert cli._governed_name("a/b:c", artifact_id=artifact, context=8192) != cli._governed_name(
+        "a-b-c", artifact_id=artifact, context=8192)
 
 
 def test_find_loaded_matches_exact_tagged_and_none():
@@ -6885,51 +7405,69 @@ def test_find_loaded_matches_exact_tagged_and_none():
     assert cli._find_loaded([{"name": "other"}], "srv") is None
 
 
-def test_ollama_safe_ceiling_first_engine_largest(monkeypatch):
-    # measured_at is carried through so the caller can flag a stale ceiling.
-    chars = {"cpu": {"safe_context": 8000, "measured_at": "2026-06-01T00:00:00+00:00"},
-             "vulkan": {"safe_context": 5000}}
+def test_ollama_safe_ceiling_requires_matching_manifest_artifact(monkeypatch):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    chars = {"ollama": {"safe_context": 8000,
+                         "measured_at": "2026-06-01T00:00:00+00:00",
+                         "artifact_id": artifact}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (
+    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) == (
         8000, "measured", "2026-06-01T00:00:00+00:00")
+    assert cli._ollama_safe_ceiling(
+        object(), "mk", "m", "ollama-manifest-sha256:" + "b" * 64) is None
 
 
-def test_ollama_safe_ceiling_does_not_transfer_vulkan_measurements(monkeypatch):
-    chars = {"cpu": {"safe_context": 5000}, "vulkan": {"safe_context": 8000}}
+def test_ollama_safe_ceiling_rejects_nondefault_measurement_config(monkeypatch):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
+        "safe_context": 8000, "artifact_id": artifact, "config": {"kv_quant": "q4_0"},
+    })
+    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) is None
+
+
+def test_ollama_safe_ceiling_does_not_transfer_other_runtime_or_legacy_rows(monkeypatch):
+    chars = {
+        "ollama": {"safe_context": 7000, "artifact_id": None},
+        "cpu": {"safe_context": 8000},
+        "cuda-gguf": {"safe_context": 9000},
+    }
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (5000, "measured", None)
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) is None
 
 
 def test_ollama_safe_ceiling_vulkan_only_is_none(monkeypatch):
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: (
         {"safe_context": 8000, "config": {}} if e == "vulkan" else None
     ))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") is None
+    assert cli._ollama_safe_ceiling(
+        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
 
 
 def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
     chars = {"cpu": None, "vulkan": {"safe_context": None}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") is None
+    assert cli._ollama_safe_ceiling(
+        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
 
 
-def test_ollama_safe_ceiling_cuda_gguf_wins(monkeypatch):
-    # cuda-gguf characterization is also a llama.cpp ceiling → transfers to Ollama.
-    # (2026-06-29-cuda-gguf-hybrid-two-wall-engine)
+def test_ollama_safe_ceiling_does_not_transfer_cuda_gguf_without_artifact_proof(monkeypatch):
     chars = {"cpu": {"safe_context": 4000}, "vulkan": {"safe_context": 5000},
              "cuda-gguf": {"safe_context": 12000}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (12000, "measured", None)
+    assert cli._ollama_safe_ceiling(
+        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
 
 
-def test_ollama_safe_ceiling_skips_nondefault_vulkan_measurement(monkeypatch):
+def test_ollama_safe_ceiling_skips_other_runtime_configs(monkeypatch):
     rows = {
         "vulkan": {"safe_context": 16000, "config": {"kv_quant": "q4_0"}},
         "cpu": {"safe_context": 4000, "config": {}},
     }
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, key, model: rows.get(key))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (4000, "measured", None)
+    assert cli._ollama_safe_ceiling(
+        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
 
 
 # _ollama_estimated_ceiling — engine-free fallback via Ollama's own /api/show
@@ -7076,7 +7614,8 @@ def test_serve_estimated_heals_to_measured(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
     assert saved == [{"engine": "ollama", "model": "qwen3:0.6b", "safe_context": 8192,
-                      "points": [{"context": 8192, "fit": True}], "measured_at": None}]
+                      "points": [{"context": 8192, "fit": True}], "measured_at": None,
+                      "artifact_id": "ollama-manifest-sha256:" + "a" * 64}]
     assert "recorded a measured ceiling" in buf.getvalue()
 
 
@@ -7138,9 +7677,11 @@ def test_serve_unknown_residency_is_clear_in_text(make_console, monkeypatch):
 
 def test_ollama_safe_ceiling_includes_ollama_engine(monkeypatch):
     # a ceiling measured through Ollama (engine "ollama") is picked up as measured on later serves.
-    chars = {"ollama": {"safe_context": 7777}}
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    chars = {"ollama": {"safe_context": 7777, "artifact_id": artifact}}
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m") == (7777, "measured", None)
+    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) == (
+        7777, "measured", None)
 
 
 # --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #
@@ -8200,7 +8741,7 @@ def test_serve_help_explains_runtimes_governance_and_lifecycle(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "Ollama" in out and "MLX" in out
     assert "ollama, mlx, or auto" in out
-    assert "measured safe ceiling" in out
+    assert "measured or estimated safe bound" in out
     assert "foreground" in out
     assert "--name NAME" in out and "Ollama" in out
 

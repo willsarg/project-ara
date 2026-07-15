@@ -9,6 +9,7 @@ dispatched below; an unrecognized command falls through to a clear error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -2078,24 +2079,29 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # serve — stand a model up as a governed OpenAI-compatible endpoint on Ollama
 # (Decision 2026-06-26; spec 2026-06-26-ara-serve-governed-endpoint)
 # --------------------------------------------------------------------------- #
-# Ollama runs llama.cpp under the hood, so a safe ceiling measured on the GGUF/llama.cpp-class
-# engines transfers; the MLX ceiling does NOT (different allocation model — the seam mismatch).
-_OLLAMA_CEILING_ENGINES = ("ollama", "cpu", "cuda-gguf")
+# Ollama measurements are valid only for the exact Ollama manifest that was measured. Even another
+# llama.cpp-class runtime can allocate differently, so cross-runtime ceilings never transfer.
+_OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 
 
-def _ollama_safe_ceiling(con, mk: str, model: str):
-    """The largest *measured* llama.cpp-class safe ceiling for *model* on this machine, as
+def _ollama_artifact_id(model: str) -> str | None:
+    digest = ollama.manifest_digest(model)
+    return _OLLAMA_ARTIFACT_PREFIX + digest if digest else None
+
+
+def _ollama_safe_ceiling(con, mk: str, model: str, artifact_id: str):
+    """The measured Ollama safe ceiling for this exact manifest on this machine, as
     ``(safe_context, "measured", measured_at)``, or ``None`` if none is recorded. ``measured_at``
-    lets the caller flag a stale ceiling (cache changed since it was measured)."""
-    best = None
-    for key in _OLLAMA_CEILING_ENGINES:
-        row = db.get_characterization(con, mk, key, model)
-        config = row.get("config", {}) if row else None
-        config_matches = config in ({}, None)
-        if (row and config_matches and row.get("safe_context") is not None
-                and (best is None or row["safe_context"] > best[0])):
-            best = (row["safe_context"], "measured", row.get("measured_at"))
-    return best
+    is retained for output metadata. Legacy and other-runtime measurements lack artifact proof and
+    cannot authorize an Ollama load (Rule #1/#3)."""
+    row = db.get_characterization(con, mk, "ollama", model)
+    if (not row or row.get("artifact_id") != artifact_id
+            or row.get("safe_context") is None):
+        return None
+    config = row.get("config", {})
+    if config not in ({}, None):
+        return None
+    return row["safe_context"], "measured", row.get("measured_at")
 
 
 def _ollama_estimated_ceiling(model: str):
@@ -2155,7 +2161,9 @@ def _ollama_ramp_contexts(max_ctx: int) -> list[int]:
     return sorted(rungs)
 
 
-def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
+def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
+                            base_artifact_id: str | None = None,
+                            provenance: dict | None = None):
     """Ramp Ollama residency to the largest context *model* loads with NO spill. For each rung
     (ascending), bake a *probe* derived model at that ctx, load it, and read ``/api/ps``: it counts
     only when governance took (``context_length`` == ctx) AND it's fully resident
@@ -2163,14 +2171,32 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
     Returns ``(best_ctx | None, points)``. Spec 2026-07-04-characterize-through-ollama-ramp."""
     best, points = None, []
     for ctx in _ollama_ramp_contexts(max_ctx):
+        if (base_artifact_id is not None
+                and _ollama_artifact_id(model) != base_artifact_id):
+            raise RuntimeError("base manifest changed before probe creation")
         if not ollama.create(probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
             break
+        probe_artifact_id = None
+        if base_artifact_id is not None or provenance is not None:
+            if provenance is not None:
+                provenance["created"] = True
+            probe_artifact_id = _ollama_artifact_id(probe)
+            if probe_artifact_id is None:
+                raise RuntimeError("created probe manifest could not be identified")
+            if provenance is not None:
+                provenance["artifact_id"] = probe_artifact_id
+            if (base_artifact_id is not None
+                    and _ollama_artifact_id(model) != base_artifact_id):
+                raise RuntimeError("base manifest changed during probe creation")
         ollama.load(probe)
         entry = _find_loaded(ollama.ps() or [], probe, expected_context=ctx)
         loaded_ctx = entry.get("context_length") if entry is not None else None
         if (entry is None or not isinstance(loaded_ctx, int)
                 or isinstance(loaded_ctx, bool) or loaded_ctx <= 0
-                or loaded_ctx != ctx):   # didn't load / governance slipped
+                or loaded_ctx != ctx
+                or (probe_artifact_id is not None
+                    and entry.get("digest") != probe_artifact_id.removeprefix(
+                        _OLLAMA_ARTIFACT_PREFIX))):  # governance or identity slipped
             points.append({"context": ctx, "fit": False})
             break
         size, vram = entry.get("size"), entry.get("size_vram")
@@ -2186,13 +2212,18 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
     return best, points
 
 
-def _cleanup_ollama_probe(probe: str) -> str | None:
+def _cleanup_ollama_probe(probe: str, expected_artifact_id: str | None = None) -> str | None:
     """Unload, verify absence, then delete a characterization probe; return any cleanup error."""
-    return _cleanup_ollama_model(probe, label="probe", delete=True)
+    return _cleanup_ollama_model(
+        probe, label="probe", delete=True, expected_artifact_id=expected_artifact_id)
 
 
-def _cleanup_ollama_model(name: str, *, label: str, delete: bool) -> str | None:
+def _cleanup_ollama_model(name: str, *, label: str, delete: bool,
+                          expected_artifact_id: str | None = None) -> str | None:
     """Unload an ARA-created Ollama model, verify absence, and optionally delete its manifest."""
+    if (expected_artifact_id is not None
+            and _ollama_artifact_id(name) != expected_artifact_id):
+        return f"{label} manifest identity changed; refused unload and delete"
     errors = []
     if ollama.load(name, keep_alive=0) is None:
         errors.append(f"couldn't request {label} unload")
@@ -2209,8 +2240,12 @@ def _cleanup_ollama_model(name: str, *, label: str, delete: bool) -> str | None:
             time.sleep(0.1)
     if not absent and not any("verify" in error for error in errors):
         errors.append(f"{label} is still resident after unload")
-    if absent and delete and not ollama.delete(name):
-        errors.append(f"couldn't delete {label} model")
+    if absent and delete:
+        if (expected_artifact_id is not None
+                and _ollama_artifact_id(name) != expected_artifact_id):
+            errors.append(f"{label} manifest identity changed; refused delete")
+        elif not ollama.delete(name):
+            errors.append(f"couldn't delete {label} model")
     return "; ".join(errors) if errors else None
 
 
@@ -2231,6 +2266,10 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         return err("couldn't list Ollama models — is the server reachable?")
     if model not in names:
         return err(f"{model} isn't in Ollama — pull it first: ollama pull {model}")
+    artifact_id = _ollama_artifact_id(model)
+    if artifact_id is None:
+        return err(f"couldn't identify {model}'s Ollama manifest — refusing to measure mutable "
+                   "weights without artifact provenance.")
     max_ctx = _ollama_max_context(model)
     if not max_ctx:
         return err(f"couldn't read {model}'s context length from Ollama — can't bound the ramp.")
@@ -2238,16 +2277,36 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         c.emit(c.field("engine", "ollama", "external runtime"))
         c.emit(c.field("model limit", f"{max_ctx} tokens", "architecture maximum"))
 
-    probe = _governed_name(model) + "-probe"
+    probe = _governed_name(
+        model, artifact_id=artifact_id, context=max_ctx) + "-probe"
     cleanup_error = None
     measurement_error = None
-    with activity.track("characterizing", model):
-        try:
-            best, points = _ollama_measure_ceiling(model, max_ctx, probe)
-        except (SystemExit, Exception) as exc:
-            measurement_error = exc
-        finally:
-            cleanup_error = _cleanup_ollama_probe(probe)
+    provenance: dict = {}
+    try:
+        with locking.ollama_setup_lock(ollama.base_url(), probe):
+            latest_names = ollama.tags()
+            if latest_names is None:
+                return err("couldn't recheck Ollama model names before characterization — "
+                           "refusing to risk a probe collision.")
+            if probe in latest_names or probe + ":latest" in latest_names:
+                return err(f"Ollama characterization probe {probe!r} already exists — refusing "
+                           "to overwrite or delete it.")
+            with activity.track("characterizing", model):
+                try:
+                    best, points = _ollama_measure_ceiling(
+                        model, max_ctx, probe, base_artifact_id=artifact_id,
+                        provenance=provenance)
+                except (SystemExit, Exception) as exc:
+                    measurement_error = exc
+                finally:
+                    probe_artifact_id = provenance.get("artifact_id")
+                    if probe_artifact_id is None and provenance.get("created"):
+                        cleanup_error = ("probe ownership could not be proven; ARA refused "
+                                         "destructive cleanup")
+                    elif probe_artifact_id is not None:
+                        cleanup_error = _cleanup_ollama_probe(probe, probe_artifact_id)
+    except locking.OllamaSetupBusy as exc:
+        return err(str(exc))
     if measurement_error is not None:
         msg = f"Ollama characterization failed: {measurement_error}"
         if cleanup_error:
@@ -2255,9 +2314,13 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         return err(msg)
     if cleanup_error:
         return err(f"Ollama probe cleanup failed: {cleanup_error}")
+    if _ollama_artifact_id(model) != artifact_id:
+        return err(f"{model}'s Ollama manifest changed during measurement — refusing to store a "
+                   "ceiling for ambiguous weights.")
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
-                                 safe_context=best, points=points, measured_at=None)
+                                 safe_context=best, points=points, measured_at=None,
+                                 artifact_id=artifact_id)
     if as_json:
         print(json.dumps({"model": model, "engine": "ollama", "safe_context": best,
                           "source": "measured", "max_context": max_ctx}))
@@ -2279,16 +2342,27 @@ def _ollama_pick_best(names: list[str]) -> str | None:
     best_name, best_ceiling = None, -1
     with db.connected() as con:
         for n in names:
-            found = _ollama_safe_ceiling(con, mk, n) or _ollama_estimated_ceiling(n)
+            artifact_id = _ollama_artifact_id(n)
+            found = (_ollama_safe_ceiling(con, mk, n, artifact_id) if artifact_id else None)
+            found = found or _ollama_estimated_ceiling(n)
             if found and found[0] is not None and found[0] > best_ceiling:
                 best_name, best_ceiling = n, found[0]
     return best_name
 
 
-def _governed_name(model: str) -> str:
-    """A valid derived Ollama model name carrying the governed ceiling — e.g.
-    ``qwen3:0.6b`` → ``qwen3-0.6b-ara``. Anything outside ``[a-z0-9._-]`` becomes ``-``."""
+def _governed_name(model: str, *, artifact_id: str | None = None,
+                   context: int | None = None) -> str:
+    """Return a deterministic Ollama name bound to model manifest and governed context.
+
+    The two-argument form is retained for internal probe-name compatibility only.
+    """
     safe = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in model.lower())
+    if artifact_id is not None and context is not None:
+        ascii_safe = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "-"
+                             for ch in model.lower()).strip("-._") or "model"
+        digest = hashlib.sha256(
+            f"{model}\0{artifact_id}\0{context}".encode("utf-8")).hexdigest()[:24]
+        return f"ara-{ascii_safe[:40]}-ctx{context}-{digest}"
     return safe + "-ara"
 
 
@@ -2434,7 +2508,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     """Stand *model* up as a **governed** OpenAI-compatible endpoint on a local Ollama, capped at a
     safe context ceiling, and hand back the connection — then get out of the way (BYO consumer).
 
-    The ceiling is **baked into a derived model** (``<model>-ara``): a plain ``/v1`` request reloads
+    The ceiling is **baked into a content-addressed derived model**: a plain ``/v1`` request reloads
     the base model at its *default* context, blowing past the safe wall (measured 2026-06-26), so
     governing per-request isn't enough. The ceiling is *measured* (a llama.cpp-class
     characterization), *explicit* (``--ctx``), or — when nothing is measured — a conservative
@@ -2471,7 +2545,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     # validated before setup; this pass keeps malformed user input side-effect free.
     def validate_identity(candidate: str) -> int | None:
         try:
-            activity.validate_ollama_serving(
+            activity.validate_ollama_serving_fields(
                 served_name=name or _governed_name(candidate), model=candidate,
                 context=ctx or 1, endpoint=ollama.base_url())
         except ValueError as exc:
@@ -2506,6 +2580,10 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
 
     # 2b. named model: ensure it's in the store — pull it if missing (get out of the way)
     if model not in names:
+        if name is not None:
+            return err("a new custom --name cannot be created safely because Ollama has no atomic "
+                       "create-if-absent operation; omit --name to use ARA's content-addressed "
+                       "name.")
         if not as_json:
             c.emit(c.style("dim", f"  pulling {model} …"))
         if not ollama.pull(model):
@@ -2514,25 +2592,39 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         if not as_json:
             c.emit(c.style("dim", "  pulled."))
 
-    # 3. resolve the safe ceiling — measured, or explicit; never guessed
+    base_artifact_id = _ollama_artifact_id(model)
+    if base_artifact_id is None:
+        return err(f"couldn't identify {model}'s Ollama manifest — refusing to serve mutable "
+                   "weights without artifact provenance.")
+
+    # 3. resolve the safe ceiling — measured or conservatively estimated; an explicit value is
+    # accepted only within that bound.
     if ctx is not None:
-        # Rule #1 gate: an explicit --ctx must not exceed what was MEASURED for this model on
-        # this machine (previously this path never consulted the measurement at all).
+        # Rule #1 gate: explicit --ctx must not exceed the measured or conservatively estimated
+        # bound for this exact manifest on this machine.
         with db.connected() as con:
-            found = _ollama_safe_ceiling(con, profile.machine_key(), model)
-        if (msg := _ctx_gate_msg(ctx, found[0] if found else None, model)):
-            return err(msg)
+            found = _ollama_safe_ceiling(
+                con, profile.machine_key(), model, base_artifact_id)
+        bound = found or _ollama_estimated_ceiling(model)
+        if bound is None:
+            return err(f"no measured or estimated safe bound for {model} — refusing --ctx {ctx}; "
+                       f"run `ara characterize {model}` first.")
+        if ctx > bound[0]:
+            label = "measured safe ceiling" if bound[1] == "measured" else "estimated safe bound"
+            return err(f"--ctx {ctx} exceeds the {label} {bound[0]} for {model} — refusing "
+                       "(Rule #1: never exceed the memory wall).")
         safe, source = ctx, "requested"
         ceiling_measured_at = None           # explicit --ctx, not a stored ceiling
     else:
         with db.connected() as con:
-            found = _ollama_safe_ceiling(con, profile.machine_key(), model)
+            found = _ollama_safe_ceiling(
+                con, profile.machine_key(), model, base_artifact_id)
         # No measurement yet → fall back to a conservative engine-free ESTIMATE (labelled as such,
         # never as measured — Rule #3), so a fresh model still serves safely in one command.
         if found is None:
             found = _ollama_estimated_ceiling(model)
         if found is None:
-            return err(f"couldn't determine a safe ceiling for {model} — pass --ctx N, or run "
+            return err(f"couldn't determine a safe ceiling for {model} — run "
                        f"`ara characterize {model}` to measure one.")
         safe, source, ceiling_measured_at = found
         if source == "estimated" and not as_json:
@@ -2549,22 +2641,45 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
 
     # 4. bake the ceiling into a derived model. This is temporary process-owned work until exact
     # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
-    served = name or _governed_name(model)
+    served = name or _governed_name(
+        model, artifact_id=base_artifact_id, context=safe)
     served_preexisting = served in names or served + ":latest" in names
     endpoint_base = ollama.base_url()
-    already_owned = any(
-        item.runtime == "ollama" and item.served_name == served
+    live_activity = activity.snapshot()
+    legacy_item = next((item for item in live_activity
+                        if item.runtime == "ollama" and item.model == model
+                        and item.endpoint == endpoint_base and item.base_artifact_id is None), None)
+    if legacy_item is not None:
+        return err(f"legacy ARA service {legacy_item.served_name!r} is still live for {model} — "
+                   "refusing to load a duplicate; stop and remove that legacy service first.")
+    owned_item = next((
+        item
+        for item in live_activity
+        if item.runtime == "ollama" and item.served_name == served
         and item.context == safe and item.endpoint == endpoint_base
-        and item.model == model
-        for item in activity.snapshot())
+        and item.model == model and item.base_artifact_id == base_artifact_id
+        and item.served_artifact_id is not None
+    ), None)
+    already_owned = owned_item is not None
     if served_preexisting and not already_owned:
         return err(f"Ollama model {served!r} already exists but is not owned by ARA with this "
                    "exact model, context, and endpoint — refusing to overwrite or unload it.")
+    if name is not None and not already_owned:
+        return err("a new custom --name cannot be created safely because Ollama has no atomic "
+                   "create-if-absent operation; omit --name to use ARA's content-addressed name.")
+
+    served_artifact_id = owned_item.served_artifact_id if owned_item else None
 
     def setup_err(msg: str) -> int:
         if already_owned:
             return err(msg)
-        cleanup = _cleanup_ollama_model(served, label="governed model", delete=True)
+        if (served_artifact_id is None
+                or _ollama_artifact_id(served) != served_artifact_id):
+            return err(msg + "; ownership of the derived manifest is unverified, so ARA did not "
+                       "unload or delete it")
+        cleanup = _cleanup_ollama_model(
+            served, label="governed model", delete=True,
+            expected_artifact_id=served_artifact_id)
         if cleanup:
             msg += f"; cleanup also failed: {cleanup}"
         else:
@@ -2574,7 +2689,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     setup_activity = nullcontext() if already_owned else activity.track("serving", model)
     create_confirmed = False
     try:
-        with setup_activity:
+        with locking.ollama_setup_lock(endpoint_base, served), setup_activity:
             if not already_owned:
                 latest_names = ollama.tags()
                 if latest_names is None:
@@ -2587,8 +2702,18 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                     return err(f"couldn't confirm creation of governed model {served!r}; no load "
                                "or destructive cleanup was attempted because ownership is unknown.")
                 create_confirmed = True
+                served_artifact_id = _ollama_artifact_id(served)
+                if served_artifact_id is None:
+                    return err(f"created {served!r}, but couldn't identify its Ollama manifest; "
+                               "refusing to load or destructively clean up unknown ownership.")
+                if _ollama_artifact_id(model) != base_artifact_id:
+                    return setup_err(
+                        f"{model}'s Ollama manifest changed during setup — refusing to load it")
 
             # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
+            if _ollama_artifact_id(served) != served_artifact_id:
+                return err(f"governed model {served!r} changed before load — refusing mutable "
+                           "identity; ARA did not unload or delete it")
             if ollama.load(served) is None:
                 return setup_err(f"couldn't load the governed model {served!r} on Ollama")
             entries = ollama.ps()
@@ -2602,6 +2727,10 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                     or served_ctx <= 0 or served_ctx != safe):
                 return setup_err(
                     f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing")
+            expected_served_digest = served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+            if entry.get("digest") != expected_served_digest:
+                return setup_err(
+                    f"governance failed: Ollama loaded a different manifest for {served!r}")
             size, vram = entry.get("size"), entry.get("size_vram")
             residency_verified = (
                 isinstance(size, int) and not isinstance(size, bool) and size > 0
@@ -2610,15 +2739,25 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             spilled = vram < size if residency_verified else None
 
         if not already_owned:
+            if _ollama_artifact_id(model) != base_artifact_id:
+                return setup_err(
+                    f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
             try:
                 activity.record_ollama_serving(
-                    served_name=served, model=model, context=safe, endpoint=endpoint_base)
+                    served_name=served, model=model, context=safe, endpoint=endpoint_base,
+                    base_artifact_id=base_artifact_id,
+                    served_artifact_id=served_artifact_id)
             except (OSError, ValueError) as exc:
                 return setup_err(
                     f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
+    except locking.OllamaSetupBusy as exc:
+        return err(str(exc))
     except BaseException:
-        if create_confirmed:
-            cleanup = _cleanup_ollama_model(served, label="governed model", delete=True)
+        if (create_confirmed and served_artifact_id is not None
+                and _ollama_artifact_id(served) == served_artifact_id):
+            cleanup = _cleanup_ollama_model(
+                served, label="governed model", delete=True,
+                expected_artifact_id=served_artifact_id)
             if cleanup:
                 c.emit(c.style("warn", f"  interrupted setup cleanup failed: {cleanup}"))
         raise
@@ -2634,7 +2773,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         with db.connected() as con:
             db.save_characterization(con, profile.machine_key(), "ollama", model,
                                      safe_context=safe, points=[{"context": safe, "fit": True}],
-                                     measured_at=None)
+                                     measured_at=None, artifact_id=base_artifact_id)
         recorded_measured = True
 
     # 6. the handoff — connection info, then ARA exits (the model stays served)
@@ -2643,6 +2782,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
                           "residency_verified": residency_verified,
+                          "base_artifact_id": base_artifact_id,
+                          "served_artifact_id": served_artifact_id,
                           "auto_selected": auto_selected, "recorded_measured": recorded_measured,
                           "stale_ceiling": stale_ceiling, "openai_base_url": endpoint}, indent=2))
         return 0
@@ -3514,9 +3655,9 @@ def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: 
 @_click_cli.command("serve", context_settings=_HELP_SETTINGS)
 @click.argument("model", required=False)
 @click.option("--ctx", "serve_ctx", type=click.IntRange(min=1), metavar="N",
-              help="Context cap; never above this model's measured safe ceiling.")
+              help="Context cap; never above this model's measured or estimated safe bound.")
 @click.option("--name", "serve_name", metavar="NAME",
-              help="Ollama-only name exposed by the endpoint.")
+              help="Existing exactly ARA-owned Ollama name to reuse; omit for a new service.")
 @_serve_engine_option
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_json_verbose_options

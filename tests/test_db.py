@@ -315,6 +315,40 @@ def test_save_characterization_default_decode_context_is_none(store):
     assert row["decode_context"] is None
 
 
+def test_characterization_artifact_id_round_trips(store):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    db.save_characterization(
+        store, "m", "ollama", "org/model", safe_context=16000, points=[],
+        artifact_id=artifact,
+    )
+    row = db.get_characterization(store, "m", "ollama", "org/model")
+    assert row["artifact_id"] == artifact
+
+
+def test_legacy_characterization_migrates_with_unknown_artifact_id(tmp_path, monkeypatch):
+    path = tmp_path / "legacy-artifact.db"
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    INSERT INTO characterizations VALUES
+        ('m', 'ollama', 'org/model', 4096, NULL, '{}', '[]', '2026-01-01');
+    PRAGMA user_version = 3;
+    """)
+    con.close()
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    migrated = db.connect()
+    try:
+        assert db.get_characterization(
+            migrated, "m", "ollama", "org/model")["artifact_id"] is None
+    finally:
+        migrated.close()
+
+
 def test_list_characterizations_includes_decode_context(store):
     db.save_characterization(store, "m", "wcx", "a", safe_context=8000, points=[], decode_context=50000)
     db.save_characterization(store, "m", "wcx", "b", safe_context=4000, points=[])

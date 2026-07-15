@@ -236,7 +236,9 @@ def test_windows_persistent_holds_and_closes_serving_then_root(tmp_path, monkeyp
     monkeypatch.setattr(activity, "_win_close_handle", lambda handle: closed.append(handle))
     path = activity.record_ollama_serving(
         served_name="owned", model="org/model", context=1,
-        endpoint="http://127.0.0.1:11434", started_at=1.0)
+        endpoint="http://127.0.0.1:11434", started_at=1.0,
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "b" * 64)
     assert path.exists()
     assert closed == [62, 61]
 
@@ -262,6 +264,8 @@ def test_windows_persistent_relative_override_stays_bound_across_chdir(tmp_path,
     path = activity.record_ollama_serving(
         served_name="owned", model="org/model", context=1,
         endpoint="http://127.0.0.1:11434", started_at=1.0,
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "b" * 64,
     )
     assert path.parent == origin / "registry" / "serving"
     assert path.exists()
@@ -479,7 +483,9 @@ def test_unsupported_platform_fails_closed_before_any_path_mutation(
         with pytest.raises(OSError, match="safe activity registry"):
             activity.record_ollama_serving(
                 served_name="owned", model="org/model", context=1,
-                endpoint="http://127.0.0.1:11434", started_at=1.0)
+                endpoint="http://127.0.0.1:11434", started_at=1.0,
+                base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+                served_artifact_id="ollama-manifest-sha256:" + "b" * 64)
     assert mutations == []
 
 
@@ -731,7 +737,9 @@ def test_persistent_body_exception_closes_serving_then_root_and_preserves_origin
     with pytest.raises(KeyboardInterrupt, match="write interrupted") as caught:
         activity.record_ollama_serving(
             served_name="owned", model="org/model", context=1,
-            endpoint="http://127.0.0.1:11434", started_at=1.0)
+            endpoint="http://127.0.0.1:11434", started_at=1.0,
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+            served_artifact_id="ollama-manifest-sha256:" + "b" * 64)
     assert events == ["serving", "root"]
     assert len(caught.value.__notes__) == 2
 

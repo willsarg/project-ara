@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
 DEFAULT_HOST = "127.0.0.1:11434"
+_MANIFEST_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def base_url() -> str:
@@ -77,6 +79,26 @@ def tags(timeout: float = 2.0) -> list[str] | None:
         return None
     return [m["name"] for m in models
             if isinstance(m, dict) and isinstance(m.get("name"), str)]
+
+
+def manifest_digest(name: str, timeout: float = 2.0) -> str | None:
+    """Return Ollama's manifest SHA-256 for *name*, or ``None`` when it cannot be proven.
+
+    The structured ``digest`` from ``/api/tags`` identifies the complete Ollama manifest (weights
+    references, template, and parameters). It is intentionally not described as a weights digest.
+    """
+    data = _get_json("/api/tags", timeout)
+    models = data.get("models") if data else None
+    if not isinstance(models, list):
+        return None
+    leaf = name.rsplit("/", 1)[-1]
+    accepted = {name, name + ":latest"} if ":" not in leaf else {name}
+    for model in models:
+        if not isinstance(model, dict) or model.get("name") not in accepted:
+            continue
+        digest = model.get("digest")
+        return digest if isinstance(digest, str) and _MANIFEST_DIGEST.fullmatch(digest) else None
+    return None
 
 
 def ps(timeout: float = 2.0) -> list[dict] | None:

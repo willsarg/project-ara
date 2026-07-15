@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Cross-process measurement lock.
+"""Cross-process locks for safety-sensitive ARA operations.
 
 Two ARA measurements running at once on one machine each read the *other's* memory footprint into
 their own reading — a Rule #1 hazard (a corrupted-high reading can store a ceiling that exceeds the
@@ -13,6 +13,7 @@ Spec 2026-07-04-measurement-flock-lock.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,9 +28,19 @@ class MeasurementBusy(RuntimeError):
     """Raised when another measurement already holds the lock."""
 
 
+class OllamaSetupBusy(RuntimeError):
+    """Raised when another ARA process is setting up the same Ollama identity."""
+
+
 def _lock_path() -> Path:
     """The lock file, alongside ``ara.db`` — so the test ``ARA_DB_PATH`` override isolates it too."""
     return db._db_path().parent / "measurement.lock"
+
+
+def _ollama_lock_path(endpoint: str, served_name: str) -> Path:
+    identity = f"{endpoint}\0{served_name}".encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:24]
+    return db._db_path().parent / f"ollama-setup-{suffix}.lock"
 
 
 def _is_windows() -> bool:
@@ -76,6 +87,30 @@ def measurement_lock():
     try:
         if not _acquire(fd):
             raise MeasurementBusy(_BUSY_MSG)
+        try:
+            yield
+        finally:
+            _release(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def ollama_setup_lock(endpoint: str, served_name: str):
+    """Serialize setup of one Ollama model identity across local ARA processes.
+
+    The lock is non-blocking and process-scoped. It closes ARA's same-host collision-check/create
+    race; Ollama clients that do not use ARA remain outside this advisory lock.
+    """
+    path = _ollama_lock_path(endpoint, served_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if not _acquire(fd):
+            raise OllamaSetupBusy(
+                f"another ARA process is setting up Ollama model {served_name!r} — retry after "
+                "that setup finishes."
+            )
         try:
             yield
         finally:

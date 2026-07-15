@@ -150,6 +150,49 @@ def test_tags_skips_malformed_entries(monkeypatch):
     assert ollama.tags() == ["a"]
 
 
+def test_manifest_digest_matches_exact_and_implicit_latest(monkeypatch):
+    digest = "a" * 64
+    monkeypatch.setattr(
+        ollama, "_get_json",
+        lambda p, t: {"models": [{"name": "base:latest", "digest": digest}]},
+    )
+    assert ollama.manifest_digest("base") == digest
+    assert ollama.manifest_digest("base:latest") == digest
+
+
+def test_manifest_digest_treats_registry_port_as_part_of_name(monkeypatch):
+    digest = "b" * 64
+    monkeypatch.setattr(
+        ollama, "_get_json",
+        lambda p, t: {"models": [
+            {"name": "registry.local:5000/org/base:latest", "digest": digest},
+        ]},
+    )
+    assert ollama.manifest_digest("registry.local:5000/org/base") == digest
+
+
+def test_manifest_digest_fails_closed_on_malformed_inventory(monkeypatch):
+    monkeypatch.setattr(
+        ollama, "_get_json",
+        lambda p, t: {"models": [
+            {"name": "missing"},
+            {"name": "short", "digest": "abc"},
+            {"name": "upper", "digest": "A" * 64},
+            {"name": 7, "digest": "b" * 64},
+            "bad",
+        ]},
+    )
+    assert ollama.manifest_digest("missing") is None
+    assert ollama.manifest_digest("short") is None
+    assert ollama.manifest_digest("upper") is None
+    assert ollama.manifest_digest("absent") is None
+
+
+def test_manifest_digest_none_when_inventory_unreachable(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: None)
+    assert ollama.manifest_digest("base") is None
+
+
 # --------------------------------------------------------------------------- #
 # ps — loaded models
 # --------------------------------------------------------------------------- #

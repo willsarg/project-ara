@@ -42,6 +42,8 @@ class Activity:
     served_name: str | None = None
     context: int | None = None
     endpoint: str | None = None
+    base_artifact_id: str | None = None
+    served_artifact_id: str | None = None
 
 
 def activity_dir() -> Path:
@@ -367,11 +369,42 @@ def track(kind: str, model: str | None = None) -> _Tracker:
 
 _SERVING_FIELDS = {
     "runtime", "served_name", "model", "context", "endpoint", "started_at",
+    "base_artifact_id", "served_artifact_id",
 }
+_LEGACY_SERVING_FIELDS = {
+    "runtime", "served_name", "model", "context", "endpoint", "started_at",
+}
+_OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
+
+
+def _valid_ollama_artifact_id(value) -> bool:
+    if not isinstance(value, str) or not value.startswith(_OLLAMA_ARTIFACT_PREFIX):
+        return False
+    digest = value.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+    return len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
 
 
 def _valid_serving_record(record) -> bool:
     return (isinstance(record, dict) and set(record) == _SERVING_FIELDS
+            and record.get("runtime") == "ollama"
+            and _display_safe(record.get("served_name"))
+            and _display_safe(record.get("model"))
+            and _valid_ollama_artifact_id(record.get("base_artifact_id"))
+            and _valid_ollama_artifact_id(record.get("served_artifact_id"))
+            and isinstance(record.get("context"), int)
+            and not isinstance(record.get("context"), bool)
+            and record["context"] > 0
+            and _display_safe(record.get("endpoint"))
+            and _number(record.get("started_at")))
+
+
+def _valid_legacy_serving_record(record) -> bool:
+    """One-release read compatibility for records written before manifest provenance.
+
+    Legacy records remain visible only when their exact name/context/endpoint is live. They never
+    authorize reuse, cleanup, or a new serving setup.
+    """
+    return (isinstance(record, dict) and set(record) == _LEGACY_SERVING_FIELDS
             and record.get("runtime") == "ollama"
             and _display_safe(record.get("served_name"))
             and _display_safe(record.get("model"))
@@ -383,27 +416,42 @@ def _valid_serving_record(record) -> bool:
 
 
 def validate_ollama_serving(*, served_name: str, model: str, context: int,
-                            endpoint: str) -> None:
+                            endpoint: str, base_artifact_id: str,
+                            served_artifact_id: str) -> None:
     """Validate public persistent-ownership fields without touching the filesystem."""
     record = {
         "runtime": "ollama", "served_name": served_name, "model": model,
         "context": context, "endpoint": endpoint, "started_at": 0.0,
+        "base_artifact_id": base_artifact_id, "served_artifact_id": served_artifact_id,
     }
     if not _valid_serving_record(record):
         raise ValueError("invalid Ollama serving activity")
 
 
+def validate_ollama_serving_fields(*, served_name: str, model: str, context: int,
+                                   endpoint: str) -> None:
+    """Validate side-effect-facing identity fields before artifact IDs are observable."""
+    if (not _display_safe(served_name) or not _display_safe(model)
+            or not isinstance(context, int) or isinstance(context, bool) or context <= 0
+            or not _display_safe(endpoint)):
+        raise ValueError("invalid Ollama serving activity")
+
+
 def record_ollama_serving(*, served_name: str, model: str, context: int,
-                          endpoint: str, started_at: float | None = None) -> Path:
+                          endpoint: str, base_artifact_id: str, served_artifact_id: str,
+                          started_at: float | None = None) -> Path:
     """Atomically own one exactly identified governed model on an Ollama endpoint."""
     validate_ollama_serving(
-        served_name=served_name, model=model, context=context, endpoint=endpoint)
+        served_name=served_name, model=model, context=context, endpoint=endpoint,
+        base_artifact_id=base_artifact_id, served_artifact_id=served_artifact_id)
     record = {
         "runtime": "ollama",
         "served_name": served_name,
         "model": model,
         "context": context,
         "endpoint": endpoint,
+        "base_artifact_id": base_artifact_id,
+        "served_artifact_id": served_artifact_id,
         "started_at": time.time() if started_at is None else started_at,
     }
     if not _number(record["started_at"]):
@@ -540,7 +588,7 @@ def _read_serving_records(root: _DirectoryGuard) -> list[tuple[dict, str]]:
     try:
         for name in _record_names(serving.path, guard=serving):
             record = _json_record(serving.path / name, guard=serving)
-            if _valid_serving_record(record):
+            if _valid_serving_record(record) or _valid_legacy_serving_record(record):
                 found.append((record, name))
     except BaseException as original:
         _close_guards([serving], original=original)
@@ -568,19 +616,30 @@ def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
     live = []
     for record, name in matching:
         served = record["served_name"]
+        legacy = set(record) == _LEGACY_SERVING_FIELDS
+        expected_served = None
+        if not legacy:
+            base_digest = ollama.manifest_digest(record["model"])
+            expected_base = _OLLAMA_ARTIFACT_PREFIX + base_digest if base_digest else None
+            if expected_base != record["base_artifact_id"]:
+                continue
+            expected_served = record["served_artifact_id"].removeprefix(_OLLAMA_ARTIFACT_PREFIX)
         entry = next((item for item in loaded if isinstance(item, dict)
                       and isinstance(item.get("name"), str)
                       and item["name"] in (served, served + ":latest")
                       and isinstance(item.get("context_length"), int)
                       and not isinstance(item["context_length"], bool)
                       and item["context_length"] > 0
-                      and item["context_length"] == record["context"]), None)
+                      and item["context_length"] == record["context"]
+                      and (legacy or item.get("digest") == expected_served)), None)
         if entry is None:
             continue
         live.append((Activity(
             kind="serving", model=record["model"], pid=None,
             started_at=float(record["started_at"]), runtime="ollama",
             served_name=served, context=record["context"], endpoint=endpoint,
+            base_artifact_id=record.get("base_artifact_id"),
+            served_artifact_id=record.get("served_artifact_id"),
         ), name))
     return live
 

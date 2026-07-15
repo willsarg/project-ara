@@ -12,6 +12,10 @@ import pytest
 from ara import activity, cli
 
 
+_BASE_ARTIFACT = "ollama-manifest-sha256:" + "a" * 64
+_SERVED_ARTIFACT = "ollama-manifest-sha256:" + "b" * 64
+
+
 @pytest.fixture
 def registry(tmp_path, monkeypatch):
     path = tmp_path / "activity"
@@ -26,17 +30,21 @@ def _record(**over):
         "context": 4096,
         "endpoint": "http://127.0.0.1:11434",
         "started_at": 100.0,
+        "base_artifact_id": _BASE_ARTIFACT,
+        "served_artifact_id": _SERVED_ARTIFACT,
     }
     fields.update(over)
     return activity.record_ollama_serving(**fields)
 
 
 def _live(name="org-model-ara:latest", context=4096):
-    return [{"name": name, "context_length": context, "size": 10, "size_vram": 10}]
+    return [{"name": name, "context_length": context, "size": 10, "size_vram": 10,
+             "digest": "b" * 64}]
 
 
 def _wire_live(monkeypatch, entries=None, endpoint="http://127.0.0.1:11434"):
     monkeypatch.setattr("ara.ollama.base_url", lambda: endpoint)
+    monkeypatch.setattr("ara.ollama.manifest_digest", lambda _name: "a" * 64)
     monkeypatch.setattr("ara.ollama.ps", lambda: _live() if entries is None else entries)
 
 
@@ -58,11 +66,13 @@ def test_manifest_is_atomic_minimal_and_same_identity_updates_in_place(
     assert list(first.parent.glob("*.json")) == [first]
     assert not list(first.parent.glob("*.tmp"))
     assert json.loads(first.read_text()) == {
+        "base_artifact_id": _BASE_ARTIFACT,
         "context": 8192,
         "endpoint": "http://127.0.0.1:11434",
         "model": "org/model",
         "runtime": "ollama",
         "served_name": "org-model-ara",
+        "served_artifact_id": _SERVED_ARTIFACT,
         "started_at": 200.0,
     }
     assert len(replacements) == 2
@@ -88,6 +98,8 @@ def test_multiple_served_identities_have_deterministic_distinct_manifests(regist
     ("context", True),
     ("endpoint", ""),
     ("started_at", float("nan")),
+    ("base_artifact_id", None),
+    ("served_artifact_id", "sha256:" + "b" * 64),
 ])
 def test_manifest_writer_rejects_invalid_schema_without_writing(registry, field, value):
     with pytest.raises(ValueError):
@@ -106,13 +118,28 @@ def test_snapshot_skips_ollama_when_no_valid_manifests(registry, monkeypatch):
     assert activity.snapshot() == []
 
 
+def test_snapshot_preserves_live_legacy_ara_service_visibility(registry, monkeypatch):
+    serving = registry / "serving"
+    serving.mkdir(parents=True)
+    (serving / "legacy.json").write_text(json.dumps({
+        "runtime": "ollama", "served_name": "org-model-ara", "model": "org/model",
+        "context": 4096, "endpoint": "http://127.0.0.1:11434", "started_at": 100.0,
+    }))
+    _wire_live(monkeypatch)
+    found = activity.snapshot()
+    assert len(found) == 1
+    assert found[0].model == "org/model" and found[0].runtime == "ollama"
+    assert found[0].base_artifact_id is None and found[0].served_artifact_id is None
+
+
 def test_snapshot_correlates_exact_latest_name_context_and_endpoint(registry, monkeypatch):
     _record()
     _wire_live(monkeypatch)
     assert activity.snapshot() == [activity.Activity(
         kind="serving", model="org/model", pid=None, started_at=100.0,
         runtime="ollama", served_name="org-model-ara", context=4096,
-        endpoint="http://127.0.0.1:11434")]
+        endpoint="http://127.0.0.1:11434", base_artifact_id=_BASE_ARTIFACT,
+        served_artifact_id=_SERVED_ARTIFACT)]
 
 
 def test_snapshot_scans_past_malformed_and_wrong_matching_rows_to_later_valid_row(
@@ -122,7 +149,7 @@ def test_snapshot_scans_past_malformed_and_wrong_matching_rows_to_later_valid_ro
         {"name": "org-model-ara", "context_length": True},
         {"name": "org-model-ara:latest", "context_length": "4096"},
         {"name": "org-model-ara", "context_length": 2048},
-        {"name": "org-model-ara:latest", "context_length": 4096},
+        {"name": "org-model-ara:latest", "context_length": 4096, "digest": "b" * 64},
     ])
     assert [(item.kind, item.model) for item in activity.snapshot()] == [
         ("serving", "org/model")]
@@ -140,6 +167,7 @@ def test_snapshot_suppresses_every_uncorroborated_manifest(
         registry, monkeypatch, entries, endpoint):
     _record()
     monkeypatch.setattr("ara.ollama.base_url", lambda: endpoint)
+    monkeypatch.setattr("ara.ollama.manifest_digest", lambda _name: "a" * 64)
     monkeypatch.setattr("ara.ollama.ps", lambda: entries)
     assert activity.snapshot() == []
 
@@ -187,8 +215,8 @@ def test_snapshot_merges_and_sorts_ephemeral_with_multiple_persistent_states(
     _record(served_name="b-ara", model="org/b", started_at=20.0)
     _record(served_name="a-ara", model="org/a", started_at=10.0)
     _wire_live(monkeypatch, [
-        {"name": "a-ara:latest", "context_length": 4096},
-        {"name": "b-ara", "context_length": 4096},
+        {"name": "a-ara:latest", "context_length": 4096, "digest": "b" * 64},
+        {"name": "b-ara", "context_length": 4096, "digest": "b" * 64},
     ])
     monkeypatch.setattr(activity.time, "time", lambda: 15.0)
     with activity.track("running", "org/run"):

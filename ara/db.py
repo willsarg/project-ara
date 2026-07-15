@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS characterizations (
     model_id      TEXT NOT NULL,
     safe_context  INTEGER,
     decode_context INTEGER,
+    artifact_id   TEXT,
     config_json   TEXT,
     points_json   TEXT,
     measured_at   TEXT,
@@ -108,6 +109,8 @@ def connect() -> sqlite3.Connection:
         con.execute("ALTER TABLE characterizations ADD COLUMN decode_context INTEGER")
     if "config_json" not in cols:
         con.execute("ALTER TABLE characterizations ADD COLUMN config_json TEXT")
+    if "artifact_id" not in cols:
+        con.execute("ALTER TABLE characterizations ADD COLUMN artifact_id TEXT")
     # Measured wall + safe budget joined the calibration store later — add to old DBs.
     cal_cols = {r["name"] for r in con.execute("PRAGMA table_info(calibrations)")}
     if "wall_gb" not in cal_cols:
@@ -404,17 +407,19 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
                           model_id: str, *, safe_context: int | None,
                           points: list, measured_at: str | None = None,
                           decode_context: int | None = None,
-                          config: dict | None = None) -> None:
+                          config: dict | None = None,
+                          artifact_id: str | None = None) -> None:
     from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO characterizations "
-        "(machine_key, engine, model_id, safe_context, decode_context, config_json, "
-        "points_json, measured_at) VALUES (?,?,?,?,?,?,?,?) "
+        "(machine_key, engine, model_id, safe_context, decode_context, artifact_id, config_json, "
+        "points_json, measured_at) VALUES (?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(machine_key, engine, model_id) DO UPDATE SET "
         "safe_context=excluded.safe_context, decode_context=excluded.decode_context, "
-        "config_json=excluded.config_json, points_json=excluded.points_json, "
+        "artifact_id=excluded.artifact_id, config_json=excluded.config_json, "
+        "points_json=excluded.points_json, "
         "measured_at=excluded.measured_at",
-        (machine_key, canonical_engine(engine), model_id, safe_context, decode_context,
+        (machine_key, canonical_engine(engine), model_id, safe_context, decode_context, artifact_id,
          json.dumps({} if config is None else config, sort_keys=True),
          json.dumps(points), measured_at or _now()))
     con.commit()
