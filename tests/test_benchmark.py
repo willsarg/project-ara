@@ -372,15 +372,16 @@ def test_coding_wrong_scores_0():
     assert score("coding", _TINY_CODING_ITEM, "    return a - b\n") == 0.0
 
 
-def test_coding_timeout_scores_0():
-    from ara.benchmark import score
+def test_coding_timeout_scores_0(monkeypatch):
+    from ara import benchmark
+    monkeypatch.setattr(benchmark, "_CODING_TIMEOUT_SECONDS", 0.05)
     item = {
         "task_id": "test/hang",
         "prompt": "def hang():\n",
         "entry_point": "hang",
         "test": "hang()\n",
     }
-    assert score("coding", item, "    while True: pass\n") == 0.0
+    assert benchmark.score("coding", item, "    while True: pass\n") == 0.0
 
 
 # ── additional edge-case tests for full branch coverage ──────────────────────

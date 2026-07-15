@@ -12,6 +12,7 @@ import io
 
 import pytest
 
+from ara.detect import Accelerator, Machine, ModelStore, Runtime
 from ara.ui import Console
 
 
@@ -35,15 +36,28 @@ def _clear_version_caches():
 # console capture
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def _isolate_db(tmp_path_factory, monkeypatch):
-    """Point ARA's store at a throwaway db for EVERY test — never the real ~/.ara."""
-    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path_factory.mktemp("aradb") / "ara.db"))
+def _isolate_runtime_state(tmp_path_factory, monkeypatch):
+    """Keep every ARA-owned state file under one fresh per-test directory."""
+    root = tmp_path_factory.mktemp("ara-state")
+    monkeypatch.setenv("ARA_DB_PATH", str(root / "ara.db"))
+    monkeypatch.setenv("ARA_ACTIVITY_DIR", str(root / "activity"))
 
 
-@pytest.fixture(autouse=True)
-def _isolate_activity(tmp_path_factory, monkeypatch):
-    """Keep lifecycle and persistent serving records out of the user's real data directory."""
-    monkeypatch.setenv("ARA_ACTIVITY_DIR", str(tmp_path_factory.mktemp("activity")))
+@pytest.fixture
+def sample_machine():
+    """Deterministic domain snapshot for projection tests that do not exercise recon."""
+    return Machine(
+        system="Darwin", os_version="macOS 15.0", chip="Apple M4 Pro", arch="arm64",
+        cpu_physical=12, cpu_logical=12, cpu_features=["NEON"], python_version="3.12.8",
+        ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
+        disk_free_gb=500.0,
+        runtimes=[Runtime("Ollama", True, "0.6", serving=True)],
+        framework_python="/usr/bin/python3",
+        model_stores=[ModelStore("HF cache", True, 3, 12.0)],
+        hf_token=True, power="AC power", backend="apple", engine="mlx",
+        engine_ready=True,
+    )
 
 
 @pytest.fixture

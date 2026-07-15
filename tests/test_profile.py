@@ -47,10 +47,10 @@ def test_rekey_legacy_key_transforms_and_guards():
     assert profile.rekey_legacy_key("TestCPU|TestGPU|notanint|Linux") is None
 
 
-def test_capture_persists_machine_and_projection(store, monkeypatch):
+def test_capture_persists_machine_and_projection(store, monkeypatch, sample_machine):
     """capture() persists BOTH the lossless machine blob and the curated projection, and
     returns that record."""
-    m = dataclasses.replace(detect.machine(), engine="wmx", backend="apple")
+    m = dataclasses.replace(sample_machine, engine="wmx", backend="apple")
     monkeypatch.setattr(profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(profile.detect, "machine", lambda: m)   # fixed snapshot, no live churn
     d = profile.capture(store)
@@ -68,9 +68,10 @@ def test_capture_persists_machine_and_projection(store, monkeypatch):
     assert json.loads(saved["profile_json"]) == json.loads(json.dumps(d, default=str))
 
 
-def test_capture_projection_is_stable_no_false_drift(store, monkeypatch):
+def test_capture_projection_is_stable_no_false_drift(store, monkeypatch, sample_machine):
     """Two immediate captures on an unchanged machine produce a byte-identical PROJECTION."""
     monkeypatch.setattr(profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(profile.detect, "machine", lambda: sample_machine)
     first = profile.capture(store)
     second = profile.capture(store)
     assert first["projection"] == second["projection"]   # no false drift in the durable view

@@ -9,12 +9,12 @@ import dataclasses
 
 import pytest
 
-from ara import detect, serialize
+from ara import serialize
 
 
-def test_machine_matches_detect_json_shape():
+def test_machine_matches_detect_json_shape(sample_machine):
     """serialize.machine(m) == asdict(m) + the `accelerated` @property — the detect --json shape."""
-    m = detect.machine()
+    m = sample_machine
     d = serialize.machine(m)
     expected = {**dataclasses.asdict(m), "accelerated": m.accelerated}
     expected["engine"] = {"wmx": "mlx", "wmx-suite": "mlx", "wcx": "cuda",
@@ -24,14 +24,14 @@ def test_machine_matches_detect_json_shape():
 
 
 @pytest.mark.parametrize(("legacy", "canonical"), [("wmx", "mlx"), ("wcx", "cuda")])
-def test_machine_canonicalizes_legacy_engine_identity(legacy, canonical):
-    m = dataclasses.replace(detect.machine(), engine=legacy)
+def test_machine_canonicalizes_legacy_engine_identity(sample_machine, legacy, canonical):
+    m = dataclasses.replace(sample_machine, engine=legacy)
     assert serialize.machine(m)["engine"] == canonical
 
 
-def test_profile_record_includes_durable_capability():
+def test_profile_record_includes_durable_capability(sample_machine):
     """The durable capability fields are present (chip, accel, ram_total, backend, runtimes...)."""
-    m = detect.machine()
+    m = sample_machine
     rec = serialize.profile_record(m)
     for key in ("system", "os_version", "arch", "chip", "cpu_physical", "cpu_logical",
                 "cpu_features", "ram_total_gb", "swap_gb", "accel", "gpus", "board",
@@ -45,16 +45,18 @@ def test_profile_record_includes_durable_capability():
 
 
 @pytest.mark.parametrize(("legacy", "canonical"), [("wmx", "mlx"), ("wcx", "cuda")])
-def test_profile_record_canonicalizes_engine_without_changing_backend(legacy, canonical):
-    m = dataclasses.replace(detect.machine(), engine=legacy, backend="apple" if legacy == "wmx" else "cuda")
+def test_profile_record_canonicalizes_engine_without_changing_backend(
+        sample_machine, legacy, canonical):
+    m = dataclasses.replace(
+        sample_machine, engine=legacy, backend="apple" if legacy == "wmx" else "cuda")
     rec = serialize.profile_record(m)
     assert rec["engine"] == canonical
     assert rec["backend"] == ("apple" if legacy == "wmx" else "cuda")
 
 
-def test_profile_record_excludes_live_transient_fields():
+def test_profile_record_excludes_live_transient_fields(sample_machine):
     """The live/transient fields are absent — including them would cause false drift."""
-    m = detect.machine()
+    m = sample_machine
     rec = serialize.profile_record(m)
     for key in ("ram_available_gb", "disk_free_gb", "power", "model_stores", "apps",
                 "hf_token", "hf_cli", "hf_cli_version", "python_version",
@@ -62,10 +64,10 @@ def test_profile_record_excludes_live_transient_fields():
         assert key not in rec, f"live/transient field leaked into projection: {key}"
 
 
-def test_profile_record_drops_volatile_serving_from_runtimes():
+def test_profile_record_drops_volatile_serving_from_runtimes(sample_machine):
     """A runtime's `serving` state (e.g. ollama up/down) is LIVE — it must not enter the durable
     projection, or starting/stopping ollama would trip false drift. Spec 2026-06-26-detect-ollama-liveness."""
-    m = detect.machine()
+    m = sample_machine
     rec = serialize.profile_record(m)
     for r in rec["runtimes"]:
         assert "serving" not in r, "live `serving` leaked into the durable runtime projection"

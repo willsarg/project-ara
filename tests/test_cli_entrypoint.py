@@ -55,7 +55,6 @@ def _in_process_entrypoint(path: str, argv: list[str], monkeypatch) -> subproces
     ["--version"],
     ["install", "--engine", "mlx", "--help"],
     ["search"],
-    ["apps", "--json"],
     ["profile", "--engine", "not-an-engine", "--json"],
 ])
 def test_blessed_entrypoints_are_equivalent(argv):
@@ -63,6 +62,19 @@ def test_blessed_entrypoints_are_equivalent(argv):
         _direct(argv),
         _subprocess([str(ARA), *argv]),
         _subprocess([sys.executable, "-m", "ara", *argv]),
+    ]
+    expected = (results[0].returncode, results[0].stdout, results[0].stderr)
+    assert [(r.returncode, r.stdout, r.stderr) for r in results] == [expected] * 3
+
+
+def test_operational_entrypoints_are_equivalent_with_inventory_mocked(monkeypatch):
+    monkeypatch.setattr(cli.apps, "scan", lambda: [])
+    monkeypatch.setattr(cli.versions, "cask_auto_updates", lambda _tokens: {})
+    argv = ["apps", "--json"]
+    results = [
+        _direct(argv),
+        _in_process_entrypoint("console", argv, monkeypatch),
+        _in_process_entrypoint("module", argv, monkeypatch),
     ]
     expected = (results[0].returncode, results[0].stdout, results[0].stderr)
     assert [(r.returncode, r.stdout, r.stderr) for r in results] == [expected] * 3

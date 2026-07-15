@@ -2505,6 +2505,7 @@ def _wire_recommend(monkeypatch, set_platform, models, machine=None):
                         else _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models", lambda con: models)
     monkeypatch.setattr(cli.db, "list_characterizations", lambda con, mk, e: [])
@@ -7094,6 +7095,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches).
     ``pull_ok`` is ollama.pull's result; ``show``/``size`` feed the estimated-ceiling fallback."""
     monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pull_ok)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: show)
     monkeypatch.setattr(cli.ollama, "size_bytes", lambda n, timeout=2.0: size)
     monkeypatch.setattr(cli.ollama, "version", lambda timeout=0.5: version)

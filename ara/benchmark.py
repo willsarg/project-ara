@@ -38,6 +38,7 @@ _DATA_DIR = Path(__file__).parent / "data" / "benchmarks"
 # stays broad (dyld needs version-specific paths) — safe because no-write + no-network block
 # exfiltration. None on Linux/Windows → caller falls back to process-isolation + a loud warning.
 _SANDBOX_EXEC: str | None = shutil.which("sandbox-exec")
+_CODING_TIMEOUT_SECONDS = 10.0
 
 _SB_PROFILE_TMPL = """\
 (version 1)
@@ -198,7 +199,7 @@ def _score_coding(item: dict, completion: str) -> float:
             start_new_session=True, env=env,
         )
         try:
-            return 1.0 if proc.wait(timeout=10) == 0 else 0.0
+            return 1.0 if proc.wait(timeout=_CODING_TIMEOUT_SECONDS) == 0 else 0.0
         except subprocess.TimeoutExpired:
             return 0.0
     finally:
