@@ -325,6 +325,47 @@ def test_artifact_identity_refuses_symlinked_snapshot_root(tmp_path, monkeypatch
     assert staleness.artifact_identity("org/model") is None
 
 
+def test_artifact_identity_refuses_symlinked_repository_root(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    hub = tmp_path / ".cache" / "huggingface" / "hub"
+    external = tmp_path / "external-repo"
+    revision = "a" * 40
+    snapshot = external / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (external / "refs").mkdir()
+    (external / "refs" / "main").write_text(revision)
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    hub.mkdir(parents=True)
+    (hub / "models--org--model").symlink_to(external, target_is_directory=True)
+
+    assert staleness.artifact_identity("org/model") is None
+
+
+def test_artifact_identity_can_authorize_prepared_revision_without_main_ref(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    root = tmp_path / ".cache" / "huggingface" / "hub" / "models--org--model"
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    identity = staleness.artifact_identity("org/model", revision=revision)
+    assert identity is not None
+    assert staleness.pinned_model_ref(
+        "org/model", identity, revision=revision) == str(snapshot)
+    assert staleness.artifact_matches("org/model", identity, revision=revision)
+    assert staleness.artifact_matches("org/model", identity)
+    assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
+
+    other = "c" * 40
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text(other)
+    (root / "snapshots" / other).mkdir()
+    (root / "snapshots" / other / "model.safetensors").write_bytes(b"other")
+    assert staleness.artifact_matches("org/model", identity) is False
+
+
 def test_validated_snapshot_refuses_resolution_race(tmp_path, monkeypatch):
     root = tmp_path / "models--org--model"
     snapshot = root / "snapshots" / ("a" * 40)
@@ -398,6 +439,17 @@ def test_bare_hf_identity_rejects_mixed_formats_and_noncanonical_blobs(
     direct = snapshot / "model.safetensors"
     direct.write_bytes(b"not a standard HF blob link")
     assert ":direct:" in staleness.artifact_identity("org/model")
+
+
+def test_bare_hf_identity_never_selects_mmproj_without_hyphen(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="mmproj.gguf")
+    (snapshot / "model-q4.gguf").write_bytes(b"real model weights")
+
+    identity = staleness.artifact_identity("org/model")
+    assert identity is not None
+    assert "model-q4.gguf" in identity and "mmproj.gguf" not in identity
 
 
 def test_bare_hf_identity_tolerates_snapshot_walk_race(tmp_path, monkeypatch):
@@ -487,6 +539,11 @@ def test_artifact_matches_requires_exact_nonempty_authority(tmp_path):
     assert staleness.artifact_matches(str(model), "") is False
     model.write_bytes(b"different weights")
     assert staleness.artifact_matches(str(model), artifact_id) is False
+
+
+@pytest.mark.parametrize("malformed", ["hf:no-revision", "hf:org/model@main:descriptor"])
+def test_artifact_matches_rejects_malformed_encoded_revision(malformed):
+    assert staleness.artifact_matches("org/missing", malformed) is False
 
 
 def test_artifact_identity_rejects_unknown_or_malformed_cache(tmp_path, monkeypatch):

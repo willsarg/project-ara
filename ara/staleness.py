@@ -57,9 +57,10 @@ def _validated_snapshot(root: Path, revision: str) -> Path | None:
     snapshots = root / "snapshots"
     snapshot = snapshots / revision
     try:
-        if snapshots.is_symlink() or snapshot.is_symlink() or not snapshot.is_dir():
+        if root.is_symlink() or snapshots.is_symlink() or snapshot.is_symlink() or not snapshot.is_dir():
             return None
-        if (snapshots.resolve(strict=True).parent != root.resolve(strict=True)
+        if (root.resolve(strict=True).parent != root.parent.resolve(strict=True)
+                or snapshots.resolve(strict=True).parent != root.resolve(strict=True)
                 or snapshot.resolve(strict=True).parent != snapshots.resolve(strict=True)):
             return None
     except OSError:
@@ -119,7 +120,7 @@ def _selected_weights(snapshot: Path) -> list[Path] | None:
         path for path in snapshot.rglob("*")
         if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
         and not (path.suffix.lower() == ".gguf"
-                 and path.name.lower().startswith("mmproj-"))
+                 and path.name.lower().startswith("mmproj"))
     ]
     ggufs = [path for path in weights if path.suffix.lower() == ".gguf"]
     transformer = [path for path in weights if path.suffix.lower() != ".gguf"]
@@ -212,7 +213,7 @@ def fit_is_stale(model_id: str, measured_at: str | None) -> bool:
     return cache_mtime > measured.timestamp() + 1.0
 
 
-def artifact_identity(model: str) -> str | None:
+def artifact_identity(model: str, *, revision: str | None = None) -> str | None:
     """Identity of the exact local weights selected by *model*, without loading an engine."""
     if not isinstance(model, str):
         return None
@@ -230,7 +231,12 @@ def artifact_identity(model: str) -> str | None:
 
     repo, separator, filename = model.partition(":")
     repo_id = repo if separator and filename.lower().endswith(".gguf") else model
-    current = _current_snapshot(repo_id)
+    if revision is not None:
+        snapshot = (_validated_snapshot(_cache_dir(repo_id), revision)
+                    if _REVISION_RE.fullmatch(revision) else None)
+        current = (revision, snapshot) if snapshot is not None else None
+    else:
+        current = _current_snapshot(repo_id)
     if current is None:
         return None
     revision, snapshot = current
@@ -259,13 +265,16 @@ def artifact_identity(model: str) -> str | None:
     return f"hf:{repo_id}@{revision}:" + "|".join(descriptors)
 
 
-def pinned_model_ref(model: str, expected_artifact_id: str | None) -> str | None:
+def pinned_model_ref(model: str, expected_artifact_id: str | None, *,
+                     revision: str | None = None) -> str | None:
     """Resolve authorized evidence to an immutable local load reference.
 
     HF repository names are mutable. Governed commands must load the exact cached snapshot/file
     that characterization authorized, not ask the Hub for whatever ``main`` means later.
     """
-    if not artifact_matches(model, expected_artifact_id):
+    matches = (artifact_matches(model, expected_artifact_id, revision=revision)
+               if revision is not None else artifact_matches(model, expected_artifact_id))
+    if not matches:
         return None
     local = Path(model).expanduser()
     if model.lower().endswith(".gguf") and local.is_file():
@@ -290,10 +299,20 @@ def pinned_model_ref(model: str, expected_artifact_id: str | None) -> str | None
     return str(snapshot)
 
 
-def artifact_matches(model: str, expected_artifact_id: str | None) -> bool:
+def artifact_matches(model: str, expected_artifact_id: str | None, *,
+                     revision: str | None = None) -> bool:
     """Whether *model* still resolves to the exact artifact that authorized stored evidence."""
+    current = (artifact_identity(model, revision=revision)
+               if revision is not None else artifact_identity(model))
+    if current is None and revision is None and isinstance(expected_artifact_id, str):
+        prefix = ("hf:", "hf-gguf:")
+        if expected_artifact_id.startswith(prefix):
+            authority = expected_artifact_id.split(":", 2)[1]
+            _, separator, encoded_revision = authority.rpartition("@")
+            if separator and _REVISION_RE.fullmatch(encoded_revision):
+                current = artifact_identity(model, revision=encoded_revision)
     return (isinstance(expected_artifact_id, str) and bool(expected_artifact_id)
-            and artifact_identity(model) == expected_artifact_id)
+            and current == expected_artifact_id)
 
 
 def artifact_size_gb(model: str) -> float | None:

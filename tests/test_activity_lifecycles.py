@@ -146,6 +146,61 @@ def test_prefetch_carries_one_immutable_plan_through_download(make_console, monk
     assert seen == [("prepare", "org/model"), ("download", plan)]
 
 
+def test_prepared_plan_revision_is_carried_into_identity_and_pinning(monkeypatch):
+    plan = cli.acquire.AcquisitionPlan(
+        "org/model", "org/model", "a" * 40, None, 4.0)
+    seen = []
+    monkeypatch.setattr(cli.staleness, "artifact_identity",
+                        lambda model, *, revision: seen.append(
+                            ("identity", model, revision)) or "artifact")
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
+                        lambda model, artifact, *, revision: seen.append(
+                            ("pin", model, artifact, revision)) or "/cache/snapshot")
+
+    assert cli._artifact_identity_for_plan("org/model", plan) == "artifact"
+    assert cli._pinned_model_for_plan("org/model", "artifact", plan) == "/cache/snapshot"
+    assert seen == [
+        ("identity", "org/model", "a" * 40),
+        ("pin", "org/model", "artifact", "a" * 40),
+    ]
+
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: None)
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda _model, _expected: True)
+    assert cli._artifact_identity_for_plan(
+        "org/model", None, expected="artifact") == "artifact"
+
+
+def test_prefetch_refuses_prepared_download_when_free_space_is_unknown(
+        make_console, monkeypatch):
+    plan = cli.acquire.AcquisitionPlan(
+        "org/model", "org/model", "a" * 40, "model-q4.gguf", 4.0)
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: False,
+        prepare_download=lambda _model: plan,
+        download_prepared_model=lambda *_args, **_kwargs: pytest.fail("download called"),
+    )
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    c, buf = make_console()
+
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=False, progress=False) == 1
+    assert "free disk space" in buf.getvalue()
+
+
+def test_prefetch_enforces_buffer_for_zero_rounded_payload(make_console, monkeypatch):
+    plan = cli.acquire.AcquisitionPlan(
+        "org/model", "org/model", "a" * 40, "tiny.gguf", 0.0)
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: False,
+        prepare_download=lambda _model: plan,
+    )
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 0.1)
+    c, buf = make_console()
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=False, progress=False) == 1
+    assert "not enough disk" in buf.getvalue()
+
+
 @pytest.mark.parametrize("as_json", [False, True])
 def test_prefetch_preparation_failure_is_a_clean_error(
         make_console, monkeypatch, capsys, as_json):

@@ -351,6 +351,26 @@ def test_prepare_download_covers_local_invalid_revision_and_missing_selection(
             "local", None, None, None, None))
 
 
+def test_prepare_download_refuses_unknown_payload_sizes(monkeypatch):
+    class UnknownTransformerApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 40,
+                siblings=[types.SimpleNamespace(rfilename="model.safetensors", size=None)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: UnknownTransformerApi())
+    with pytest.raises(RuntimeError, match="size"):
+        acquire.prepare_download("org/repo", gguf=False)
+
+    class UnknownGgufApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 40,
+                siblings=[types.SimpleNamespace(rfilename="model.gguf", size=None)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: UnknownGgufApi())
+    with pytest.raises(RuntimeError, match="size"):
+        acquire.prepare_download("org/repo", gguf=True)
+
+
 def test_valid_model_id_accepts_well_formed_repo_ids():
     # org/name and bare name, with the chars HF allows in a segment.
     for ok in ("mlx-community/Qwen3-0.6B-4bit", "meta-llama/Llama-3.2-1B",

@@ -1224,12 +1224,32 @@ def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
         return False, None, 1
     size_gb = payload.size_gb if isinstance(payload, acquire.AcquisitionPlan) else payload
     free_gb = acquire.free_disk_gb()
-    if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
+    if isinstance(payload, acquire.AcquisitionPlan) and free_gb is None:
+        msg = f"cannot verify free disk space for downloading {model} — download refused"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return False, payload, 1
+    if size_gb is not None and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
         msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
                f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return False, payload, 1
     return True, payload, None
+
+
+def _artifact_identity_for_plan(model: str, payload: object | None, *,
+                                expected: str | None = None) -> str | None:
+    if isinstance(payload, acquire.AcquisitionPlan):
+        return staleness.artifact_identity(model, revision=payload.revision)
+    current = staleness.artifact_identity(model)
+    if current is None and expected and staleness.artifact_matches(model, expected):
+        return expected
+    return current
+
+
+def _pinned_model_for_plan(model: str, artifact_id: str, payload: object | None) -> str | None:
+    if isinstance(payload, acquire.AcquisitionPlan):
+        return staleness.pinned_model_ref(model, artifact_id, revision=payload.revision)
+    return staleness.pinned_model_ref(model, artifact_id)
 
 
 def _download_prefetched_weights(c: Console, model: str, bk, payload: object | None,
@@ -1393,12 +1413,12 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                               kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
         _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
-        artifact_id_before = staleness.artifact_identity(evidence_model)
+        artifact_id_before = _artifact_identity_for_plan(evidence_model, prefetch_size)
         if artifact_id_before is None:
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
-        pinned_model = staleness.pinned_model_ref(evidence_model, artifact_id_before)
+        pinned_model = _pinned_model_for_plan(evidence_model, artifact_id_before, prefetch_size)
         if pinned_model is None:
             msg = f"cannot pin the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
@@ -1435,7 +1455,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 1
 
     ceiling = result["safe_context"]
-    artifact_id = staleness.artifact_identity(evidence_model)
+    artifact_id = _artifact_identity_for_plan(evidence_model, prefetch_size)
     if artifact_id != artifact_id_before:
         msg = f"the artifact for {model} changed during characterization — result not stored"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
@@ -1853,8 +1873,6 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 
     mk = profile.machine_key()
     evidence_model = scoring.durable_model_id(model)
-    current_artifact_id = (staleness.artifact_identity(evidence_model)
-                           if auto_engine else None)
     with db.connected() as con:
         if auto_engine:
             # Auto is evidence-led: prefer the detected engine on a tie, but fall back to any
@@ -1887,8 +1905,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 if not candidate_row.get("artifact_id"):
                     missing_artifact_authority = True
                     continue
-                if (not current_artifact_id
-                        or candidate_row["artifact_id"] != current_artifact_id):
+                if not staleness.artifact_matches(
+                        evidence_model, candidate_row["artifact_id"]):
                     artifact_mismatch = True
                     continue
                 candidates.append((candidate_row["safe_context"], candidate_key,
@@ -1971,11 +1989,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 c, model, bk, prefetch_size,
                 as_json=as_json, progress=progress)) is not None:
             return rc
-        artifact_id = staleness.artifact_identity(evidence_model)
+        artifact_id = _artifact_identity_for_plan(
+            evidence_model, prefetch_size, expected=characterized_artifact_id)
         if artifact_id != characterized_artifact_id:
             return err(f"the cached artifact for {model} differs from its measured ceiling — "
                        f"re-run: ara characterize {model}")
-        pinned_model = staleness.pinned_model_ref(evidence_model, artifact_id)
+        pinned_model = _pinned_model_for_plan(evidence_model, artifact_id, prefetch_size)
         if pinned_model is None:
             return err(f"cannot pin the exact characterized artifact for {model} — "
                        f"re-run: ara characterize {model}")
@@ -2032,7 +2051,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                         return err("invalid benchmark result: error must be text")
                     errored_n += 1
             run_scores.append(benchmark.score_probe_set(use_case, items, completions))
-            current_artifact_id = staleness.artifact_identity(evidence_model)
+            current_artifact_id = _artifact_identity_for_plan(
+                evidence_model, prefetch_size, expected=artifact_id)
             if current_artifact_id != artifact_id:
                 return err(f"the cached artifact for {model} changed during the benchmark — "
                            "no measurement taken")
