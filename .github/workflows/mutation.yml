@@ -9,7 +9,7 @@
 # This is a PERIODIC HEALTH CHECK, not a blocking gate on every push:
 #   - It never runs on pull_request — a survivor is a finding to triage, not a regression to
 #     block on (mutation testing has known false positives — equivalent mutants, etc.).
-#   - A full sweep of ara/ (~4900 statements) reruns the suite once per mutant and takes HOURS —
+#   - A full sweep of thousands of ARA statements reruns the suite once per mutant and takes HOURS —
 #     far past any CI budget (hence the 60-minute timeout below, generous but still bounded).
 #     scripts/mutation_probe.sh scopes each run to ara/*.py files that changed in the last 7 days
 #     (i.e. since the previous weekly run), which keeps a normal week's run well inside the

@@ -164,7 +164,12 @@ def test_coverage_and_mutation_only_exclude_native_engine_packages():
         "ara/_engine_packages/*",
     ]
     assert project["tool"]["mutmut"]["do_not_mutate"] == ["ara/_engine_packages/*"]
+    mutation_inputs = set(project["tool"]["mutmut"]["also_copy"])
+    assert {"scripts", ".github", "coordinator", "README.md", "AGENTS.md",
+            "CONTRIBUTING.md"} <= mutation_inputs
 
     mutation_probe = (_ROOT / "scripts" / "mutation_probe.sh").read_text(encoding="utf-8")
     assert "ara/_engine_packages/" in mutation_probe
     assert "ara/_vendor/" not in mutation_probe
+    assert 'uv run mutmut run --max-children "${MUTMUT_MAX_CHILDREN:-1}" || true' \
+        not in mutation_probe

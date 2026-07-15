@@ -125,9 +125,13 @@ pytest_add_cli_args = [
     "-p",
     "no:cacheprovider",
 ]
-# "contracts" carries the wire-schema fixtures (tests/test_wire_contract.py,
-# tests/test_node_capabilities.py read them via a repo-root-relative path, not from "ara").
-also_copy = ["tests", "pyproject.toml", "uv.lock", "contracts"]
+# Repo-root-relative fixtures inspected by the test suite must exist in mutmut's isolated tree
+# before baseline stats collection can pass. mutmut copies directories recursively but does not
+# create a missing parent for one nested file, hence whole-directory entries where applicable.
+also_copy = [
+    "tests", "pyproject.toml", "uv.lock", "contracts", "scripts", ".github", "coordinator",
+    "README.md", "AGENTS.md", "CONTRIBUTING.md",
+]
 # scripts/mutation_probe.sh appends a temporary `only_mutate` filter here for scoped (weekly
-# CI / on-demand) runs, then restores this file — a full unscoped sweep over ara/ (~4900
-# statements) reruns the suite per mutant and takes hours, so it's a manual/local long-run only.
+# CI / on-demand) runs, then restores this file — a full unscoped sweep over thousands of ARA
+# statements reruns the suite per mutant and takes hours, so it's a manual/local long-run only.

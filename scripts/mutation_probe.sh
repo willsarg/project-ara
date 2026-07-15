@@ -7,7 +7,7 @@
 #
 # Why scoped, not a full sweep: mutmut (see [tool.mutmut] in pyproject.toml) reads its scope
 # ONLY from pyproject.toml's [tool.mutmut] table — there is no CLI flag or env var to narrow
-# it per-run. A full sweep of ara/ (~4900 statements) reruns the fast unit suite once per
+# it per-run. A full sweep of thousands of ARA statements reruns the fast unit suite once per
 # mutant and takes HOURS, far past any CI budget. So this script computes a bounded file list
 # (by default: ara/*.py touched in the last 7 days, i.e. since the previous weekly run),
 # temporarily appends an `only_mutate` filter to pyproject.toml for the duration of the run,
@@ -70,11 +70,12 @@ printf '  %s\n' "${FILES[@]}"
 } >>"$PYPROJECT"
 
 # mutmut's own exit code reflects infra failures (e.g. the clean test run itself failing), not
-# survivor counts — survivors are a finding, not a probe failure, so don't fail the job on them.
+# survivor counts — survivors are a finding, not a probe failure, but infra failures must fail the
+# probe instead of leaving every mutant "not checked" behind a green workflow.
 # Default to --max-children 1: mutmut's parallel workers share pytest tmp dirs and hit a cleanup
 # race that leaves mutants "not checked" (verified). Serial is reliable; override for a faster
 # local sweep with MUTMUT_MAX_CHILDREN=N if your box tolerates it.
-uv run mutmut run --max-children "${MUTMUT_MAX_CHILDREN:-1}" || true
+uv run mutmut run --max-children "${MUTMUT_MAX_CHILDREN:-1}"
 
 echo ""
 echo "=== mutation_probe results ==="
