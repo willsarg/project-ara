@@ -73,7 +73,7 @@ def test_run_tracks_only_generate_and_cleans_after_refusal(
         make_console, monkeypatch, activity_registry):
     def generate(*_a, **_k):
         _assert_activity("running", "org/model")
-        return {"refused": True, "reason": "safe refusal"}
+        return {"context": 4096, "refused": True, "reason": "safe refusal"}
 
     _wire_run(monkeypatch, generate)
     c, _ = make_console()
@@ -206,6 +206,23 @@ def test_prefetch_enforces_buffer_for_zero_rounded_payload(make_console, monkeyp
     assert cli._prefetch_weights(
         c, "org/model", backend, "cpu", as_json=False, progress=False) == 1
     assert "not enough disk" in buf.getvalue()
+
+
+def test_prefetch_reserves_download_and_private_stage_before_network(
+        make_console, monkeypatch):
+    plan = cli.acquire.AcquisitionPlan(
+        "org/model", "org/model", "a" * 40, None, 4.0)
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: False,
+        prepare_download=lambda _model: plan,
+        download_prepared_model=lambda *_a, **_k: pytest.fail("download called"),
+    )
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 7.0)
+    c, buf = make_console()
+
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=False, progress=False) == 1
+    assert "download + private stage" in buf.getvalue()
 
 
 def test_prefetch_skips_network_for_existing_authorized_snapshot(make_console, monkeypatch):

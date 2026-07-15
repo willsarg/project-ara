@@ -3006,7 +3006,7 @@ _CHAR = {"model_id": "org/m", "safe_context": 8192, "decode_context": None,
 
 
 def _ok_generate(*a, **k):
-    return {"completion": "ok"}
+    return {"context": k["max_context"], "completion": "ok"}
 
 
 def _wire_run(monkeypatch, *, engine_ok=True, generate=_ok_generate, characterization=None,
@@ -3022,7 +3022,13 @@ def _wire_run(monkeypatch, *, engine_ok=True, generate=_ok_generate, characteriz
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
     bk = types.SimpleNamespace()
     if generate is not None:
-        bk.generate = generate
+        def governed_generate(*args, **kwargs):
+            result = generate(*args, **kwargs)
+            if isinstance(result, dict):
+                result = dict(result)
+                result.setdefault("context", kwargs["max_context"])
+            return result
+        bk.generate = governed_generate
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
 
 
@@ -3226,6 +3232,18 @@ def test_run_rejects_malformed_completion_payload(make_console, monkeypatch, res
     assert "invalid completion" in buf.getvalue()
 
 
+@pytest.mark.parametrize("reported", [None, True, 4096])
+def test_run_rejects_missing_boolean_or_mismatched_reported_context(
+        make_console, monkeypatch, reported):
+    _wire_run(
+        monkeypatch, characterization=_CHAR,
+        generate=lambda *_a, **_k: {"context": reported, "completion": "unsafe"})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "reported context" in buf.getvalue()
+    assert "unsafe" not in buf.getvalue()
+
+
 def test_run_json(monkeypatch, capsys):
     _wire_run(monkeypatch, characterization=_CHAR,
               generate=lambda *a, **k: {"completion": "hello"})
@@ -3281,7 +3299,8 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
         bk = types.SimpleNamespace()
         if supports.get(b):
             bk.generate = lambda model, prompt, *, max_context, max_tokens, kv_quant="f16", flash_attn=False, weight_quant="none", prefill_chunk=None: {
-                "engine_backend": b, "max_context": max_context, "completion": f"ran on {b}"}
+                "engine_backend": b, "max_context": max_context, "context": max_context,
+                "completion": f"ran on {b}"}
         return bk
     monkeypatch.setattr(cli, "get_backend", backend)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))

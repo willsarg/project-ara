@@ -155,8 +155,18 @@ def test_artifact_identity_accepts_valid_cache_through_symlinked_ancestor(
     alias.symlink_to(real_parent, target_is_directory=True)
     monkeypatch.setenv("HF_HUB_CACHE", str(alias / "hub"))
 
-    assert staleness.artifact_identity("org/model").startswith(
-        f"hf:org/model@{revision}:")
+    identity = staleness.artifact_identity("org/model")
+    assert identity.startswith(f"hf:org/model@{revision}:")
+    staged = staleness.stage_model_ref("org/model", identity)
+    staged_path = Path(staged.path)
+    assert str(staged_path).startswith(str(real_parent.resolve()))
+    with staged as load_path:
+        alias.unlink()
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        alias.symlink_to(evil, target_is_directory=True)
+        assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
+    assert not staged_path.exists()
 
 
 def test_bare_hf_identity_rejects_empty_snapshot_and_binds_weight_blob(tmp_path, monkeypatch):
@@ -355,6 +365,17 @@ def test_stage_model_ref_requires_disk_headroom_on_staging_volume(tmp_path, monk
         staleness.shutil, "disk_usage",
         lambda path: (_ for _ in ()).throw(OSError("unknown")))
     with pytest.raises(RuntimeError, match="cannot verify free disk"):
+        staleness.stage_model_ref(str(model), identity)
+
+    real_resolve = Path.resolve
+
+    def fail_stage_parent(path, *args, **kwargs):
+        if path == tmp_path:
+            raise OSError("volume disappeared")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_stage_parent)
+    with pytest.raises(RuntimeError, match="cannot resolve the staging volume"):
         staleness.stage_model_ref(str(model), identity)
 
 
@@ -593,7 +614,8 @@ def test_artifact_identity_can_authorize_prepared_revision_without_main_ref(
     (root / "refs" / "main").write_text(other)
     (root / "snapshots" / other).mkdir()
     (root / "snapshots" / other / "model.safetensors").write_bytes(b"other")
-    assert staleness.artifact_matches("org/model", identity) is False
+    assert staleness.artifact_matches("org/model", identity) is True
+    assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
 
 
 def test_artifact_fallback_refuses_changed_main_without_cached_snapshot(
@@ -605,6 +627,8 @@ def test_artifact_fallback_refuses_changed_main_without_cached_snapshot(
     snapshot.mkdir(parents=True)
     (snapshot / "model.safetensors").write_bytes(b"weights")
     identity = staleness.artifact_identity("org/model", revision=revision)
+    (snapshot / "model.safetensors").unlink()
+    snapshot.rmdir()
     (root / "refs").mkdir()
     (root / "refs" / "main").write_text("c" * 40)
 

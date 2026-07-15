@@ -398,6 +398,10 @@ def stage_model_ref(model: str, expected_artifact_id: str, *,
     if not source.exists():
         raise RuntimeError(f"authorized artifact disappeared before staging: {source}")
     stage_parent = source.parent if source.is_file() else source.parent.parent
+    try:
+        stage_parent = stage_parent.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve the staging volume for {model}") from exc
     required = sum(size for size, _digest in manifest.values()) + _STAGE_DISK_BUFFER_BYTES
     try:
         free = shutil.disk_usage(stage_parent).free
@@ -437,16 +441,15 @@ def artifact_matches(model: str, expected_artifact_id: str | None, *,
     """Whether *model* still resolves to the exact artifact that authorized stored evidence."""
     current = (artifact_identity(model, revision=revision)
                if revision is not None else artifact_identity(model))
-    if current is None and revision is None and isinstance(expected_artifact_id, str):
+    if (current != expected_artifact_id and revision is None
+            and isinstance(expected_artifact_id, str)):
         prefix = ("hf:", "hf-gguf:")
         if expected_artifact_id.startswith(prefix):
             repo, separator, filename = model.partition(":")
             repo_id = repo if separator and filename.lower().endswith(".gguf") else model
             authority = expected_artifact_id.split(":", 2)[1]
             _, separator, encoded_revision = authority.rpartition("@")
-            main_ref = _cache_dir(repo_id) / "refs" / "main"
-            if (not main_ref.exists() and not main_ref.is_symlink() and separator
-                    and _REVISION_RE.fullmatch(encoded_revision)):
+            if separator and _REVISION_RE.fullmatch(encoded_revision):
                 current = artifact_identity(model, revision=encoded_revision)
     return (isinstance(expected_artifact_id, str) and bool(expected_artifact_id)
             and current == expected_artifact_id)

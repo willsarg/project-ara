@@ -1232,8 +1232,13 @@ def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
         msg = f"cannot verify free disk space for downloading {model} — download refused"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return False, payload, 1
-    if size_gb is not None and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
-        msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
+    # Governed execution retains the downloaded cache and loads from an exact private copy.
+    # Admit both allocations before network/device work so a cold start cannot fail after download.
+    staged_size_gb = size_gb * 2 if size_gb is not None else None
+    if (staged_size_gb is not None and free_gb is not None
+            and free_gb < staged_size_gb + acquire.DISK_BUFFER_GB):
+        msg = (f"not enough disk for {model}: needs ~{staged_size_gb:.1f} GB "
+               f"(download + private stage) + "
                f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return False, payload, 1
@@ -2380,6 +2385,11 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"run failed: {exc}")
     if not isinstance(result, dict):
         return err("run failed: engine returned an invalid completion")
+    reported_context = result.get("context")
+    if (not isinstance(reported_context, int) or isinstance(reported_context, bool)
+            or reported_context != safe):
+        return err(f"run failed: the engine reported context {reported_context!r}, "
+                   f"expected {safe}")
     if result.get("refused"):
         return err(f"the {engine_label} refused: {result.get('reason', 'no reason given')}")
     if result.get("error"):
