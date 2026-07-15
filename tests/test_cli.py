@@ -2490,6 +2490,22 @@ def _wire_recommend(monkeypatch, set_platform, models, machine=None):
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
     monkeypatch.setattr(cli.catalog, "all_models", lambda con: models)
     monkeypatch.setattr(cli.db, "list_characterizations", lambda con, mk, e: [])
+    monkeypatch.setattr(cli.staleness, "artifact_identity",
+                        lambda model: f"artifact:{model}")
+
+
+def _measured_row(model_id, use_case="coding", score=0.6, source="mlx probe", **over):
+    canonical = cli.scoring.canonical_model_id(model_id)
+    row = {
+        "model_id": model_id, "use_case": use_case, "score": score, "source": source,
+        "tier": "measured", "engine_key": "mlx", "backend": "apple",
+        "base_model": cli.scoring.base_key(canonical),
+        "quant": cli.scoring.quant_key(model_id), "benchmark_id": use_case,
+        "max_score": None, "artifact_id": f"artifact:{model_id}",
+        "canonical_model_id": canonical, "measured_at": "2026-07-15T12:00:00+00:00",
+    }
+    row.update(over)
+    return row
 
 
 def test_recommend_ranks_fits_by_context(make_console, monkeypatch, set_platform):
@@ -2678,10 +2694,10 @@ def _wire_inversion_bench(monkeypatch, four_bit=0.098, eight_bit=0.061, n=50):
     # Same base model, two quants, both measured here — a lower-precision upset.
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda con, mk: [
-        {"model_id": "org/Model-4bit", "use_case": "coding", "score": four_bit,
-         "source": "mlx probe", "sample_size": n, "refused_n": 0, "errored_n": 0},
-        {"model_id": "org/Model-8bit", "use_case": "coding", "score": eight_bit,
-         "source": "mlx probe", "sample_size": n, "refused_n": 0, "errored_n": 0}])
+        _measured_row("org/Model-4bit", score=four_bit, sample_size=n,
+                      refused_n=0, errored_n=0),
+        _measured_row("org/Model-8bit", score=eight_bit, sample_size=n,
+                      refused_n=0, errored_n=0)])
 
 
 def test_recommend_text_discloses_quant_inversion(make_console, monkeypatch, set_platform):
@@ -7792,6 +7808,8 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
         items = [{"id": 0}, {"id": 1}]
     monkeypatch.setattr(cli.engines, "for_hardware", lambda: engine_key)
     monkeypatch.setattr(cli.engines, "resolve", lambda e: engine_key)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     # Patch ENGINES so key → backend mapping works without touching real hardware detection.
     orig = dict(cli.engines.ENGINES)
     orig[engine_key] = {**orig.get(engine_key, {}), "backend": "apple"}
@@ -8385,8 +8403,8 @@ def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_
                     [_model_row("org/Strong", weights_gb=4.0, max_context=131072),
                      _model_row("org/Weak", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
-                        lambda con, mk: [{"model_id": "org/Strong", "use_case": "coding",
-                                          "score": 0.9, "source": "mlx probe=5 (org/Strong)"}])
+                        lambda con, mk: [_measured_row(
+                            "org/Strong", score=0.9, source="mlx probe=5 (org/Strong)")])
     monkeypatch.setattr(cli.scoring, "load_imported",
                         lambda: {"org/Strong": {"coding": {"score": 0.5, "source": "HumanEval"}},
                                  "org/Weak": {"coding": {"score": 0.7, "source": "HumanEval"}}})
@@ -8427,9 +8445,9 @@ def test_recommend_measured_partial_refusal_and_low_confidence_annotated(make_co
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
-                        lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
-                                          "score": 0.4, "source": "mlx probe",
-                                          "sample_size": 30, "refused_n": 2, "errored_n": 0}])
+                        lambda con, mk: [_measured_row(
+                            "org/Partial", score=0.4, sample_size=30,
+                            refused_n=2, errored_n=0)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8443,9 +8461,9 @@ def test_recommend_measured_errored_partial_no_low_confidence_at_threshold(make_
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Err", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
-                        lambda con, mk: [{"model_id": "org/Err", "use_case": "coding",
-                                          "score": 0.6, "source": "cuda probe",
-                                          "sample_size": 100, "refused_n": 0, "errored_n": 3}])
+                        lambda con, mk: [_measured_row(
+                            "org/Err", score=0.6, source="cuda probe", sample_size=100,
+                            refused_n=0, errored_n=3)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8459,9 +8477,9 @@ def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platfor
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Partial", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.db, "list_benchmark_results",
-                        lambda con, mk: [{"model_id": "org/Partial", "use_case": "coding",
-                                          "score": 0.4, "source": "mlx probe",
-                                          "sample_size": 30, "refused_n": 2, "errored_n": 1}])
+                        lambda con, mk: [_measured_row(
+                            "org/Partial", score=0.4, sample_size=30,
+                            refused_n=2, errored_n=1)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_recommend(c, as_json=True, use_case="coding") == 0
@@ -8475,13 +8493,12 @@ def test_recommend_carries_repeat_wide_benchmark_provenance(
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Repeated", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
-    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
-        "model_id": "org/Repeated", "use_case": "coding", "score": 0.6,
-        "source": "mlx probe=100", "sample_size": 100,
-        "refused_n": 5, "errored_n": 2,
-        "probe_context": 4096, "generation_cap": 512, "repeat_count": 3,
-        "total_generations": 300, "run_scores_json": "[0.55, 0.6, 0.65]",
-    }])
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
+        "org/Repeated", score=0.6, source="mlx probe=100", sample_size=100,
+        refused_n=5, errored_n=2,
+        probe_context=4096, generation_cap=512, repeat_count=3,
+        total_generations=300, run_scores_json="[0.55, 0.6, 0.65]",
+    )])
 
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8499,18 +8516,32 @@ def test_recommend_carries_repeat_wide_benchmark_provenance(
     assert score["run_scores"] == [0.55, 0.6, 0.65]
 
 
+def test_recommend_joins_exact_gguf_variant_evidence(
+        make_console, monkeypatch, set_platform):
+    selector = "org/repo:Model-Q4_K_M.gguf"
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row(selector, weights_gb=4.0, quant="q4_k_m")])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [
+        _measured_row(selector, score=0.7, sample_size=100, refused_n=0, errored_n=0)
+    ])
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, use_case="coding") == 0
+    assert selector in buf.getvalue() and "coding 70% (measured)" in buf.getvalue()
+
+
 def test_recommend_verbose_handles_legacy_benchmark_provenance(
         make_console, monkeypatch, set_platform):
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Legacy", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
-    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
-        "model_id": "org/Legacy", "use_case": "coding", "score": 0.6,
-        "source": "mlx probe=100", "sample_size": 100,
-        "refused_n": 0, "errored_n": 0,
-        "probe_context": None, "generation_cap": None, "repeat_count": None,
-        "total_generations": None, "run_scores_json": None,
-    }])
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
+        "org/Legacy", score=0.6, source="mlx probe=100", sample_size=100,
+        refused_n=0, errored_n=0,
+        probe_context=None, generation_cap=None, repeat_count=None,
+        total_generations=None, run_scores_json=None,
+    )])
 
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8524,13 +8555,10 @@ def test_recommend_discloses_invalid_stored_run_scores(
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
-    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
-        "model_id": "org/Corrupt", "use_case": "coding", "score": 0.6,
-        "source": "mlx probe=100", "sample_size": 100,
-        "refused_n": 0, "errored_n": 0,
-        "probe_context": 4096, "generation_cap": 512, "repeat_count": 2,
-        "total_generations": 200, "run_scores_json": stored,
-    }])
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
+        "org/Corrupt", score=0.6, source="mlx probe=100", sample_size=100,
+        refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
+        repeat_count=2, total_generations=200, run_scores_json=stored)])
 
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8551,21 +8579,21 @@ def test_recommend_discloses_invalid_stored_run_scores(
     ("probe_context", 0), ("probe_context", None),
     ("generation_cap", -1), ("repeat_count", 0),
     ("total_generations", 199), ("source", ""), ("measured_at", "not-a-date"),
-    ("measured_at", 123),
+    ("measured_at", 123), ("tier", "imported"), ("benchmark_id", "rag"),
+    ("engine_key", "bogus"), ("engine_key", None),
+    ("backend", "bogus"), ("backend", None), ("base_model", "bogus"),
+    ("canonical_model_id", "other/model"), ("artifact_id", ""), ("max_score", 0.5),
+    ("quant", "q8_0"),
 ])
 def test_recommend_downgrades_other_invalid_stored_evidence(
         make_console, monkeypatch, set_platform, field, value):
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
-    row = {
-        "model_id": "org/Corrupt", "use_case": "coding", "score": 0.6,
-        "source": "mlx probe=100", "sample_size": 100,
-        "refused_n": 0, "errored_n": 0,
-        "probe_context": 4096, "generation_cap": 512, "repeat_count": 2,
-        "total_generations": 200, "run_scores_json": "[0.6, 0.6]",
-        "measured_at": "2026-07-15T12:00:00+00:00",
-    }
+    row = _measured_row(
+        "org/Corrupt", score=0.6, source="mlx probe=100", sample_size=100,
+        refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
+        repeat_count=2, total_generations=200, run_scores_json="[0.6, 0.6]")
     row[field] = value
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [row])
     monkeypatch.setattr(cli.staleness, "fit_is_stale", lambda *_a: False)
@@ -8581,14 +8609,11 @@ def test_recommend_downgrades_stale_benchmark_for_changed_cached_artifact(
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Changed", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
-    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
-        "model_id": "org/Changed", "use_case": "coding", "score": 0.9,
-        "source": "mlx probe=100", "sample_size": 100,
-        "refused_n": 0, "errored_n": 0, "probe_context": 4096,
-        "generation_cap": 512, "repeat_count": 1, "total_generations": 100,
-        "run_scores_json": "[0.9]", "measured_at": "2026-01-01T00:00:00+00:00",
-    }])
-    monkeypatch.setattr(cli.staleness, "fit_is_stale", lambda model, when: True)
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
+        "org/Changed", score=0.9, source="mlx probe=100", sample_size=100,
+        refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
+        repeat_count=1, total_generations=100, run_scores_json="[0.9]")])
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:changed")
 
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8783,6 +8808,42 @@ def test_render_benchmark_persists_structured_execution_provenance(
     assert saved["repeat_count"] == 2
     assert saved["total_generations"] == 4
     assert saved["run_scores"] == [0.4, 0.8]
+    assert saved["artifact_id"] == "artifact:test"
+    assert saved["canonical_model_id"] == "org/m"
+
+
+def test_render_benchmark_refuses_unknown_or_changing_artifact(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: None)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "cannot identify the exact cached artifact" in buf.getvalue()
+    assert "model" not in saved
+
+    identities = iter(["artifact:a", "artifact:b"])
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "changed during the benchmark" in buf.getvalue()
+    assert "model" not in saved
+
+
+def test_render_benchmark_catalogs_exact_gguf_variant(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    captured = {}
+    monkeypatch.setattr(cli.catalog, "remember_variant",
+                        lambda con, model, canonical, **kw:
+                        captured.update(model=model, canonical=canonical, **kw))
+    c, _ = make_console()
+    selector = "org/repo:Model-Q4_K_M.gguf"
+
+    assert cli.render_benchmark(c, selector, use_case="reasoning", engine="cpu",
+                                assume_yes=True) == 0
+    assert captured == {"model": selector, "canonical": "org/repo",
+                        "quant": "q4_k_m", "weights_gb": 1.0}
+    assert saved["canonical_model_id"] == "org/repo"
+    assert saved["quant"] == "q4_k_m"
 
 
 def test_render_benchmark_persists_effective_default_generation_cap(

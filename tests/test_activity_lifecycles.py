@@ -282,6 +282,7 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda *_a: 1.0)
     monkeypatch.setattr(cli.db, "get_model", lambda *_a: None)
     monkeypatch.setattr(cli.db, "save_benchmark_result", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 

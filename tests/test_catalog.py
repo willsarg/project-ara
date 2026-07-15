@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from ara import catalog
+from ara import catalog, db
 
 
 def test_describe_parses_config(monkeypatch):
@@ -328,6 +328,25 @@ def test_remember_records_cache_weight(store, monkeypatch):
 def test_remember_none_when_undescribable(store, monkeypatch):
     monkeypatch.setattr(catalog, "describe", lambda m: None)
     assert catalog.remember(store, "x") is None
+
+
+def test_remember_variant_preserves_repo_metadata_and_exact_quant(store, monkeypatch):
+    monkeypatch.setattr(catalog, "remember", lambda con, model: (
+        db.upsert_model(con, model, modality="text", n_layers=32, hidden_size=4096,
+                        kv_heads=8, head_dim=128, max_context=8192, weights_gb=10.0)
+        or db.get_model(con, model)))
+    row = catalog.remember_variant(
+        store, "org/repo:Model-Q4_K_M.gguf", "org/repo",
+        quant="q4_k_m", weights_gb=4.2)
+    assert row["model_id"] == "org/repo:Model-Q4_K_M.gguf"
+    assert row["quant"] == "q4_k_m" and row["weights_gb"] == 4.2
+    assert row["n_layers"] == 32
+
+
+def test_remember_variant_returns_none_when_repo_is_undescribable(store, monkeypatch):
+    monkeypatch.setattr(catalog, "remember", lambda *_a: None)
+    assert catalog.remember_variant(store, "org/x:m.gguf", "org/x",
+                                    quant="q4", weights_gb=1.0) is None
     assert catalog.get(store, "x") is None
 
 

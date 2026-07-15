@@ -14,10 +14,12 @@ code never imports a nested engine package in-process.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
+_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 def _cache_dir(model_id: str) -> Path:
@@ -47,7 +49,7 @@ def fit_is_stale(model_id: str, measured_at: str | None) -> bool:
         return False
     try:
         measured = datetime.fromisoformat(measured_at)
-    except ValueError:
+    except (TypeError, ValueError):
         return False
     if measured.tzinfo is None:
         measured = measured.replace(tzinfo=timezone.utc)
@@ -56,6 +58,64 @@ def fit_is_stale(model_id: str, measured_at: str | None) -> bool:
         return False
     # DB timestamps use second precision; avoid false positives within that second.
     return cache_mtime > measured.timestamp() + 1.0
+
+
+def artifact_identity(model: str) -> str | None:
+    """Identity of the exact local weights selected by *model*, without loading an engine."""
+    if not isinstance(model, str):
+        return None
+    local = Path(model).expanduser()
+    if model.lower().endswith(".gguf") and local.is_file():
+        try:
+            stat = local.stat()
+            return (f"local-gguf:{local.resolve()}:{stat.st_dev}:{stat.st_ino}:"
+                    f"{stat.st_size}:{stat.st_mtime_ns}")
+        except OSError:
+            return None
+
+    repo, separator, filename = model.partition(":")
+    repo_id = repo if separator and filename.lower().endswith(".gguf") else model
+    root = _cache_dir(repo_id)
+    try:
+        revision = (root / "refs" / "main").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not _REVISION_RE.fullmatch(revision):
+        return None
+    if separator:
+        selected = root / "snapshots" / revision / filename
+        try:
+            if not selected.is_file():
+                return None
+            blob = selected.resolve(strict=True)
+            stat = blob.stat()
+        except OSError:
+            return None
+        return f"hf-gguf:{repo_id}@{revision}:{filename}:{blob.name}:{stat.st_size}"
+    if not (root / "snapshots" / revision).is_dir():
+        return None
+    return f"hf:{repo_id}@{revision}"
+
+
+def artifact_size_gb(model: str) -> float | None:
+    """Exact selected GGUF size for cataloging a quant variant; otherwise unknown."""
+    if not isinstance(model, str):
+        return None
+    local = Path(model).expanduser()
+    if model.lower().endswith(".gguf") and local.is_file():
+        try:
+            return round(local.stat().st_size / 1e9, 3)
+        except OSError:
+            return None
+    repo, separator, filename = model.partition(":")
+    if not separator or not filename.lower().endswith(".gguf"):
+        return None
+    root = _cache_dir(repo)
+    try:
+        revision = (root / "refs" / "main").read_text(encoding="utf-8").strip()
+        return round((root / "snapshots" / revision / filename).stat().st_size / 1e9, 3)
+    except (OSError, UnicodeError):
+        return None
 
 
 def ceiling_is_stale(model_id: str, measured_at: str | None) -> bool:

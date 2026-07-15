@@ -67,6 +67,98 @@ def test_ceiling_is_not_stale_for_malformed_timestamp(tmp_path, monkeypatch):
     _cached_artifact(tmp_path)
 
     assert staleness.ceiling_is_stale("org/model", "not-a-timestamp") is False
+    assert staleness.ceiling_is_stale("org/model", b"2026-01-01") is False
+
+
+def _revision_cache(home: Path, revision: str, *, filename: str | None = None) -> Path:
+    root = home / ".cache" / "huggingface" / "hub" / "models--org--model"
+    (root / "refs").mkdir(parents=True, exist_ok=True)
+    (root / "refs" / "main").write_text(revision)
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True, exist_ok=True)
+    if filename is not None:
+        blob = root / "blobs" / ("b" * 40)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"weights")
+        (snapshot / filename).symlink_to(blob)
+    return snapshot
+
+
+def test_artifact_identity_tracks_hf_revision_and_exact_gguf(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    rev_a, rev_b = "a" * 40, "c" * 40
+    _revision_cache(tmp_path, rev_a, filename="Model-Q4_K_M.gguf")
+
+    assert staleness.artifact_identity("org/model") == f"hf:org/model@{rev_a}"
+    selected = staleness.artifact_identity("org/model:Model-Q4_K_M.gguf")
+    assert selected.startswith(f"hf-gguf:org/model@{rev_a}:Model-Q4_K_M.gguf:")
+    assert staleness.artifact_size_gb("org/model:Model-Q4_K_M.gguf") == 0.0
+
+    _revision_cache(tmp_path, rev_b)
+    assert staleness.artifact_identity("org/model") == f"hf:org/model@{rev_b}"
+    assert staleness.artifact_identity("org/model:Model-Q4_K_M.gguf") is None
+
+
+def test_artifact_identity_tracks_local_gguf_stat(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"one")
+    first = staleness.artifact_identity(str(model))
+    assert first and first.startswith("local-gguf:")
+    assert staleness.artifact_size_gb(str(model)) == 0.0
+    model.write_bytes(b"changed")
+    assert staleness.artifact_identity(str(model)) != first
+
+
+def test_artifact_identity_rejects_unknown_or_malformed_cache(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    assert staleness.artifact_identity(123) is None
+    assert staleness.artifact_size_gb(123) is None
+    assert staleness.artifact_identity("org/model") is None
+    root = tmp_path / ".cache" / "huggingface" / "hub" / "models--org--model"
+    (root / "refs").mkdir(parents=True)
+    (root / "refs" / "main").write_text("not-a-revision")
+    assert staleness.artifact_identity("org/model") is None
+    assert staleness.artifact_size_gb("org/model:missing.gguf") is None
+    (root / "refs" / "main").write_text("a" * 40)
+    assert staleness.artifact_identity("org/model") is None
+    assert staleness.artifact_size_gb("org/model") is None
+
+
+def test_artifact_helpers_tolerate_filesystem_races(tmp_path, monkeypatch):
+    model = tmp_path / "race.gguf"
+    model.write_bytes(b"weights")
+    original_stat = Path.stat
+    calls = 0
+
+    def fail_second_stat(path, *args, **kwargs):
+        nonlocal calls
+        if path == model:
+            calls += 1
+            if calls == 2:
+                raise OSError("disappeared")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_second_stat)
+    assert staleness.artifact_identity(str(model)) is None
+
+    calls = 0
+    assert staleness.artifact_size_gb(str(model)) is None
+
+
+def test_hf_gguf_identity_tolerates_resolve_race(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="m.gguf")
+    selected = snapshot / "m.gguf"
+    original_resolve = Path.resolve
+
+    def fail_selected(path, *args, **kwargs):
+        if path == selected:
+            raise OSError("disappeared")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_selected)
+    assert staleness.artifact_identity("org/model:m.gguf") is None
 
 
 def test_ceiling_ignores_artifact_filesystem_errors(tmp_path, monkeypatch):

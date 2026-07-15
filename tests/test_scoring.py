@@ -31,6 +31,27 @@ def test_score_for_unknown_model_returns_none():
     assert scoring.score_for("who/knows", "coding", imported={}) is None
 
 
+def test_gguf_selector_has_canonical_repo_and_exact_quant():
+    selector = "org/repo:Model-Q4_K_M.gguf"
+    assert scoring.canonical_model_id(selector) == "org/repo"
+    assert scoring.quant_key(selector) == "q4_k_m"
+    assert scoring.canonical_model_id("org/plain") == "org/plain"
+
+
+def test_measured_evidence_rejects_selector_quant_mismatch():
+    selector = "org/repo:Model-Q4_K_M.gguf"
+    row = {
+        "model_id": selector, "use_case": "coding", "tier": "measured",
+        "benchmark_id": "coding", "canonical_model_id": "org/repo",
+        "base_model": scoring.base_key("org/repo"), "artifact_id": "artifact",
+        "engine_key": "cpu", "backend": "cpu", "quant": "q8_0",
+        "score": 0.5, "source": "probe", "max_score": None, "measured_at": None,
+    }
+    assert scoring.validate_measured_evidence(row)[0] is None
+    row["quant"] = "q4_k_m"
+    assert scoring.validate_measured_evidence(row)[0]["score"] == 0.5
+
+
 def test_measured_score_beats_imported():
     # A locally-measured score (on the actual quant) wins over an imported leaderboard number.
     imported = {"m": {"coding": {"score": 0.50, "source": "leaderboard"}}}

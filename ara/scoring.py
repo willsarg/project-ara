@@ -44,6 +44,12 @@ def base_key(model_id: str) -> str:
     return name
 
 
+def canonical_model_id(model_id: str) -> str:
+    """Catalog identity for an exact model selector; preserves local paths and bare repo ids."""
+    repo, separator, filename = model_id.partition(":")
+    return repo if separator and filename.lower().endswith(".gguf") else model_id
+
+
 # Genuine quantization tokens only — bit-widths, llama.cpp quant classes (Q/IQ/TQ), and the
 # awq/gptq/float classes. The container FORMATS `gguf`/`mlx` (present in _QUANT_RE for base_key
 # stripping) are deliberately excluded: they describe packaging, not precision, so they're never
@@ -60,7 +66,8 @@ def quant_key(model_id: str) -> str | None:
     ``4bit``, ``q4_k_m``, ``int8``, ``awq``, ``fp16``. Container formats (``gguf``/``mlx``) are
     never returned. Used when the catalog doesn't record the quant, so a measured score can still
     carry the precision it was taken at."""
-    name = model_id.rsplit("/", 1)[-1].lower()
+    name = model_id.partition(":")[2] or model_id.rsplit("/", 1)[-1]
+    name = name.lower().removesuffix(".gguf")
     for tok in name.split("-"):
         if _QUANT_ONLY_RE.fullmatch(tok):
             return tok
@@ -181,11 +188,31 @@ def decode_run_scores(raw: str | None, repeat_count: int | None
 def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
     """Validate a local benchmark row before it can influence recommendation ranking."""
     warning = "invalid stored benchmark evidence"
+    model_id = row.get("model_id")
+    use_case = row.get("use_case")
+    canonical = canonical_model_id(model_id) if isinstance(model_id, str) else None
+    if (row.get("tier") != "measured" or not isinstance(use_case, str)
+            or row.get("benchmark_id") != use_case
+            or row.get("canonical_model_id") != canonical
+            or row.get("base_model") != (base_key(canonical) if canonical else None)
+            or not isinstance(row.get("artifact_id"), str) or not row["artifact_id"]):
+        return None, warning
+    if (not isinstance(row.get("engine_key"), str) or not row["engine_key"]
+            or not isinstance(row.get("backend"), str) or not row["backend"]):
+        return None, warning
+    expected_quant = quant_key(model_id)
+    if expected_quant is not None and row.get("quant") != expected_quant:
+        return None, warning
     score = row.get("score")
     if (isinstance(score, bool) or not isinstance(score, (int, float))
             or not math.isfinite(score) or not 0 <= score <= 1):
         return None, warning
     if not isinstance(row.get("source"), str) or not row["source"]:
+        return None, warning
+    max_score = row.get("max_score")
+    if (max_score is not None and (isinstance(max_score, bool)
+            or not isinstance(max_score, (int, float)) or not math.isfinite(max_score)
+            or max_score <= 0 or score > max_score)):
         return None, warning
     measured_at = row.get("measured_at")
     if measured_at is not None:

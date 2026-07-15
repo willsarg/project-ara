@@ -307,6 +307,19 @@ def get(con, model_id: str) -> dict | None:
     return db.get_model(con, model_id)
 
 
+def remember_variant(con, model_id: str, canonical_model_id: str, *,
+                     quant: str | None, weights_gb: float | None) -> dict | None:
+    """Catalog an exact artifact selector using its repo's architecture metadata."""
+    base = db.get_model(con, canonical_model_id) or remember(con, canonical_model_id)
+    if base is None:
+        return None
+    fields = {name: base.get(name) for name in db._MODEL_COLS}
+    fields["quant"] = quant
+    fields["weights_gb"] = weights_gb
+    db.upsert_model(con, model_id, **fields)
+    return db.get_model(con, model_id)
+
+
 def all_models(con) -> list[dict]:
     return db.list_models(con)
 

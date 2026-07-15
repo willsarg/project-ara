@@ -1610,14 +1610,23 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             rows = db.list_benchmark_results(evidence_con, profile.machine_key())
             bench_measured = {}
             evidence_warnings = {}
+            catalog_quants = {rec["model_id"]: rec["quant"] for rec in recs}
             for row in rows:
                 evidence_key = (row["model_id"], row["use_case"])
-                if staleness.fit_is_stale(row["model_id"], row.get("measured_at")):
-                    evidence_warnings[evidence_key] = "cached model changed since benchmark"
-                    continue
                 evidence, evidence_warning = scoring.validate_measured_evidence(row)
                 if evidence is None:
                     evidence_warnings[evidence_key] = evidence_warning
+                    continue
+                engine_spec = engines.ENGINES.get(row["engine_key"])
+                if engine_spec is None or engine_spec.get("backend") != row["backend"]:
+                    evidence_warnings[evidence_key] = "invalid stored benchmark evidence"
+                    continue
+                if (row["model_id"] in catalog_quants
+                        and row.get("quant") != catalog_quants[row["model_id"]]):
+                    evidence_warnings[evidence_key] = "invalid stored benchmark evidence"
+                    continue
+                if staleness.artifact_identity(row["model_id"]) != row["artifact_id"]:
+                    evidence_warnings[evidence_key] = "cached model changed since benchmark"
                     continue
                 bench_measured[evidence_key] = evidence
             bench_measured = bench_measured or None
@@ -1830,6 +1839,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 c, model, bk, prefetch_size,
                 as_json=as_json, progress=progress)) is not None:
             return rc
+        artifact_id = staleness.artifact_identity(model)
         # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
         # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
         # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
@@ -1880,6 +1890,15 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                         return err("invalid benchmark result: error must be text")
                     errored_n += 1
             run_scores.append(benchmark.score_probe_set(use_case, items, completions))
+            current_artifact_id = staleness.artifact_identity(model)
+            if artifact_id is None:
+                artifact_id = current_artifact_id
+            if artifact_id is None:
+                return err(f"cannot identify the exact cached artifact for {model} — "
+                           "no measurement taken")
+            if current_artifact_id != artifact_id:
+                return err(f"the cached artifact for {model} changed during the benchmark — "
+                           "no measurement taken")
 
     total = n * repeat                       # total generations attempted across every run
     if prompts and (refused_n + errored_n) == total:
@@ -1905,17 +1924,23 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
     with db.connected() as con:
-        mrow = db.get_model(con, model)
+        canonical_model_id = scoring.canonical_model_id(model)
+        mrow = db.get_model(con, model) or db.get_model(con, canonical_model_id)
         quant = mrow.get("quant") if mrow else None
         quant = quant or scoring.quant_key(model)
+        if model != canonical_model_id:
+            catalog.remember_variant(
+                con, model, canonical_model_id, quant=quant,
+                weights_gb=staleness.artifact_size_gb(model))
         db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
                                  engine_key=key, backend=backend,
-                                 base_model=scoring.base_key(model), quant=quant,
+                                 base_model=scoring.base_key(canonical_model_id), quant=quant,
                                  benchmark_id=use_case, sample_size=n,
                                  refused_n=refused_n, errored_n=errored_n,
                                  probe_context=safe, generation_cap=effective_generation_cap,
                                  repeat_count=repeat, total_generations=total,
-                                 run_scores=run_scores)
+                                 run_scores=run_scores, artifact_id=artifact_id,
+                                 canonical_model_id=canonical_model_id)
         con.commit()
 
     if as_json:
