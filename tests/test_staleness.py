@@ -106,6 +106,26 @@ def test_artifact_identity_tracks_hf_revision_and_exact_gguf(tmp_path, monkeypat
     assert staleness.artifact_identity("org/model:Model-Q4_K_M.gguf") is None
 
 
+def test_artifact_identity_does_not_read_weight_contents(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
+    blob = (snapshot / "model.safetensors").resolve()
+    local = tmp_path / "local.gguf"
+    local.write_bytes(b"weights")
+    real_open = Path.open
+
+    def refuse_weight_reads(path, *args, **kwargs):
+        if path in {blob, local}:
+            pytest.fail("artifact identity read model contents")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", refuse_weight_reads)
+
+    assert staleness.artifact_identity("org/model") is not None
+    assert staleness.artifact_identity(str(local)) is not None
+
+
 def test_artifact_identity_honors_hugging_face_cache_environment(tmp_path, monkeypatch):
     revision = "a" * 40
     custom = tmp_path / "custom-hub"
@@ -157,16 +177,13 @@ def test_artifact_identity_accepts_valid_cache_through_symlinked_ancestor(
 
     identity = staleness.artifact_identity("org/model")
     assert identity.startswith(f"hf:org/model@{revision}:")
-    staged = staleness.stage_model_ref("org/model", identity)
-    staged_path = Path(staged.path)
-    assert str(staged_path).startswith(str(real_parent.resolve()))
-    with staged as load_path:
-        alias.unlink()
-        evil = tmp_path / "evil"
-        evil.mkdir()
-        alias.symlink_to(evil, target_is_directory=True)
-        assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
-    assert not staged_path.exists()
+    load_path = staleness.pinned_model_ref("org/model", identity)
+    assert load_path is not None and str(load_path).startswith(str(real_parent.resolve()))
+    alias.unlink()
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    alias.symlink_to(evil, target_is_directory=True)
+    assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
 
 
 def test_authorized_download_ref_recovers_exact_transformer_and_gguf_revision(
@@ -189,14 +206,14 @@ def test_authorized_download_ref_recovers_exact_transformer_and_gguf_revision(
 
 @pytest.mark.parametrize(("model", "authority"), [
     (1, "hf:org/model@" + "a" * 40 + ":x"),
-    ("org/model", "local-gguf:/m:1:sha256:" + "a" * 64),
+    ("org/model", "local-gguf:/m:stat:1:2:3:4:5"),
     ("org/model", "hf:other/model@" + "a" * 40
-     + ":model.safetensors:direct:1:sha256:" + "a" * 64),
+     + ":model.safetensors:direct:stat:1:2:3:4:5"),
     ("org/model", "hf:org/model@" + "a" * 40 + ":bad"),
     ("org/model", "hf-gguf:org/model@" + "a" * 40
-     + ":config.json:direct:1:sha256:" + "a" * 64),
+     + ":config.json:direct:stat:1:2:3:4:5"),
     ("org/model:file", "hf:org/model@" + "a" * 40
-     + ":model.safetensors:direct:1:sha256:" + "a" * 64),
+     + ":model.safetensors:direct:stat:1:2:3:4:5"),
 ])
 def test_authorized_download_ref_rejects_malformed_or_mismatched_authority(
         model, authority):
@@ -205,8 +222,8 @@ def test_authorized_download_ref_rejects_malformed_or_mismatched_authority(
 
 def test_authorized_download_ref_rejects_ambiguous_gguf_manifest():
     revision = "a" * 40
-    first = "one.gguf:direct:1:sha256:" + "a" * 64
-    second = "two.gguf:direct:1:sha256:" + "b" * 64
+    first = "one.gguf:direct:stat:1:2:3:4:5"
+    second = "two.gguf:direct:stat:6:7:8:9:10"
     authority = f"hf:org/model@{revision}:{first}|{second}"
     assert staleness.authorized_download_ref("org/model", authority) is None
 
@@ -294,229 +311,24 @@ def test_pinned_model_ref_handles_multishard_transformer_and_filesystem_races(
     assert staleness.pinned_model_ref("org/model", identity) is None
 
 
-def test_stage_model_ref_copies_local_gguf_and_cleans_up(tmp_path):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"authorized")
-    identity = staleness.artifact_identity(str(model))
-
-    staged = staleness.stage_model_ref(str(model), identity)
-    staged_path = Path(staged.path)
-    with staged as load_path:
-        assert Path(load_path).read_bytes() == b"authorized"
-        model.write_bytes(b"replacement")
-        assert Path(load_path).read_bytes() == b"authorized"
-    assert not staged_path.exists()
-
-
-def test_stage_model_ref_copies_direct_snapshot_and_preserves_manifest(
-        tmp_path, monkeypatch):
-    _point_hub_at(tmp_path, monkeypatch)
-    revision = "a" * 40
-    snapshot = _revision_cache(tmp_path, revision)
-    weight = snapshot / "model.safetensors"
-    config = snapshot / "config.json"
-    weight.write_bytes(b"authorized")
-    config.write_text('{"model_type":"test"}')
-    identity = staleness.artifact_identity("org/model")
-
-    with staleness.stage_model_ref("org/model", identity) as load_path:
-        staged = Path(load_path)
-        weight.write_bytes(b"replacement")
-        assert (staged / "model.safetensors").read_bytes() == b"authorized"
-        assert (staged / "config.json").read_text() == '{"model_type":"test"}'
-
-
-def test_stage_model_ref_privately_copies_content_addressed_blob(tmp_path, monkeypatch):
-    _point_hub_at(tmp_path, monkeypatch)
-    revision = "a" * 40
-    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
-    logical = snapshot / "model.safetensors"
-    identity = staleness.artifact_identity("org/model")
-
-    with staleness.stage_model_ref("org/model", identity) as load_path:
-        staged_weight = Path(load_path) / "model.safetensors"
-        replacement = snapshot.parents[1] / "blobs" / ("d" * 40)
-        replacement.write_bytes(b"replacement")
-        logical.unlink()
-        logical.symlink_to(replacement)
-        assert staged_weight.read_bytes() == b"weights"
-        replacement.write_bytes(b"mutated in place")
-        assert staged_weight.read_bytes() == b"weights"
-
-
-def test_stage_model_ref_copies_blob_and_fails_closed(tmp_path, monkeypatch):
-    _point_hub_at(tmp_path, monkeypatch)
-    revision = "a" * 40
-    _revision_cache(tmp_path, revision, filename="model.safetensors")
-    identity = staleness.artifact_identity("org/model")
-    with staleness.stage_model_ref("org/model", identity) as load_path:
-        assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
-
-    monkeypatch.setattr(staleness, "artifact_matches", lambda *_a, **_k: False)
-    with pytest.raises(RuntimeError, match="cannot pin"):
-        staleness.stage_model_ref("org/model", identity)
-
-
-def test_stage_model_ref_reclaims_only_marked_crash_remnants(tmp_path):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"weights")
-    identity = staleness.artifact_identity(str(model))
-    stale = tmp_path / ".ara-stage-stale"
-    stale.mkdir()
-    (stale / staleness._STAGE_OWNER).write_text("ara-stage-v1\n")
-    (stale / "stranded-model").write_bytes(b"large")
-    unowned = tmp_path / ".ara-stage-unowned"
-    unowned.mkdir()
-    foreign_marker = tmp_path / ".ara-stage-foreign-marker"
-    foreign_marker.mkdir()
-    (foreign_marker / staleness._STAGE_OWNER).write_text("not-ara\n")
-
-    with staleness.stage_model_ref(str(model), identity) as staged:
-        assert Path(staged).read_bytes() == b"weights"
-        assert not stale.exists()
-        assert unowned.exists()
-        assert foreign_marker.exists()
-        with pytest.raises(staleness.locking.StagingBusy):
-            staleness.stage_model_ref(str(model), identity)
-    with staleness.stage_model_ref(str(model), identity) as staged:
-        assert Path(staged).read_bytes() == b"weights"
-
-
-def test_stale_stage_reclamation_fails_closed_on_scan_error(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        Path, "glob", lambda *_a, **_k: (_ for _ in ()).throw(OSError("scan failed")))
-    with pytest.raises(RuntimeError, match="cannot safely reclaim"):
-        staleness._reclaim_stale_stages(tmp_path)
-
-
-def test_stage_model_ref_cleans_up_when_authority_changes_during_staging(
-        tmp_path, monkeypatch):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"authorized")
-    identity = staleness.artifact_identity(str(model))
-    real_matches = staleness.artifact_matches
-    calls = 0
-
-    def changes_after_pin(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return real_matches(*args, **kwargs) if calls == 1 else False
-
-    monkeypatch.setattr(staleness, "artifact_matches", changes_after_pin)
-    with pytest.raises(RuntimeError, match="changed while staging"):
-        staleness.stage_model_ref(str(model), identity)
-    assert not list(tmp_path.glob(".ara-stage-*"))
-
-
-def test_stage_model_ref_rejects_aba_bytes_even_if_source_authority_is_restored(
-        tmp_path, monkeypatch):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"authorized")
-    identity = staleness.artifact_identity(str(model))
-
-    def stage_unauthorized(_source, destination):
-        Path(destination).write_bytes(b"unauthorized")
-
-    monkeypatch.setattr(staleness.shutil, "copy2", stage_unauthorized)
-    monkeypatch.setattr(staleness, "artifact_matches", lambda *_a, **_k: True)
-    with pytest.raises(RuntimeError, match="authorized digest"):
-        staleness.stage_model_ref(str(model), identity)
-    assert not list(tmp_path.glob(".ara-stage-*"))
-
-
-def test_stage_model_ref_requires_disk_headroom_on_staging_volume(tmp_path, monkeypatch):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"authorized")
-    identity = staleness.artifact_identity(str(model))
-    monkeypatch.setattr(
-        staleness.shutil, "disk_usage",
-        lambda path: type("Usage", (), {"free": staleness._STAGE_DISK_BUFFER_BYTES})())
-
-    with pytest.raises(RuntimeError, match="not enough disk"):
-        staleness.stage_model_ref(str(model), identity)
-
-    monkeypatch.setattr(
-        staleness.shutil, "disk_usage",
-        lambda path: (_ for _ in ()).throw(OSError("unknown")))
-    with pytest.raises(RuntimeError, match="cannot verify free disk"):
-        staleness.stage_model_ref(str(model), identity)
-
-    real_resolve = Path.resolve
-
-    def fail_stage_parent(path, *args, **kwargs):
-        if path == tmp_path:
-            raise OSError("volume disappeared")
-        return real_resolve(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", fail_stage_parent)
-    with pytest.raises(RuntimeError, match="cannot resolve the staging volume"):
-        staleness.stage_model_ref(str(model), identity)
-
-
-def test_stage_model_ref_rejects_invalid_and_multifile_authority_for_one_file(
-        tmp_path, monkeypatch):
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"weights")
-    monkeypatch.setattr(staleness, "pinned_model_ref", lambda *_a, **_k: str(model))
-    with pytest.raises(RuntimeError, match="cannot decode"):
-        staleness.stage_model_ref("org/model", "unknown:authority")
-
-    descriptor = "model.safetensors:direct:7:sha256:" + "a" * 64
-    authority = f"hf:org/model@{'a' * 40}:{descriptor}|config.json:direct:1:sha256:" + "b" * 64
-    with pytest.raises(RuntimeError, match="does not describe one file"):
-        staleness.stage_model_ref("org/model", authority)
-
-
-def test_staging_refuses_wrong_digest_and_disappeared_sources(
-        tmp_path, monkeypatch):
-    source = tmp_path / "model.gguf"
-    destination = tmp_path / "stage" / "model.gguf"
-    source.write_bytes(b"weights")
-    with pytest.raises(RuntimeError, match="authorized digest"):
-        staleness._stage_file(source, destination, (7, "0" * 64))
-
-    missing = tmp_path / "missing.gguf"
-    monkeypatch.setattr(staleness, "pinned_model_ref", lambda *_a, **_k: str(missing))
-    with pytest.raises(RuntimeError, match="disappeared"):
-        staleness.stage_model_ref("org/model", staleness.artifact_identity(str(source)))
-
-
-def test_staging_refuses_empty_transformer_manifest_and_carries_revision(
-        tmp_path, monkeypatch):
-    snapshot = tmp_path / "cache" / "snapshots" / ("a" * 40)
-    snapshot.mkdir(parents=True)
-    seen = []
-    monkeypatch.setattr(
-        staleness, "pinned_model_ref",
-        lambda model, artifact, *, revision: seen.append(
-            (model, artifact, revision)) or str(snapshot))
-    local_authority = "local-gguf:/model.gguf:7:sha256:" + "a" * 64
-
-    with pytest.raises(RuntimeError, match="cannot verify transformer snapshot"):
-        staleness.stage_model_ref(
-            "org/model", local_authority, revision="a" * 40)
-    assert seen == [("org/model", local_authority, "a" * 40)]
-    assert not list((tmp_path / "cache").glob(".ara-stage-*"))
-
-
 @pytest.mark.parametrize("authority", [
     None,
     "unknown:artifact",
-    "local-gguf:path:not-an-int:sha256:" + "a" * 64,
-    "local-gguf:path:1:md5:" + "a" * 64,
+    "local-gguf:path:stat:1:2:3:4:5",
     "hf:org/model@rev:bad",
     "hf:x",
-    "hf:org/model@rev:model:direct:1:md5:" + "a" * 64,
-    "hf:org/model@rev:model:blob:not-a-blob:1:sha256:" + "a" * 64,
-    "hf:org/model@rev:../model:direct:1:sha256:" + "a" * 64,
+    "hf:org/model@rev:model:direct:stat:1:2:3:4",
+    "hf:org/model@rev:model:blob:not-a-blob:stat:1:2:3:4:5",
+    "hf:org/model@rev:../model:direct:stat:1:2:3:4:5",
+    "hf:org/model@rev:model:direct:stat:1:2:-3:4:5",
 ])
-def test_authority_manifest_rejects_malformed_authority(authority):
-    assert staleness._authority_manifest(authority) is None
+def test_authority_files_rejects_malformed_authority(authority):
+    assert staleness._authority_files(authority) is None
 
 
-def test_authority_manifest_rejects_duplicate_paths():
-    descriptor = "model.safetensors:direct:1:sha256:" + "a" * 64
-    assert staleness._authority_manifest(
+def test_authority_files_rejects_duplicate_paths():
+    descriptor = "model.safetensors:direct:stat:1:2:3:4:5"
+    assert staleness._authority_files(
         f"hf:org/model@{'a' * 40}:{descriptor}|{descriptor}") is None
 
 
@@ -842,25 +654,19 @@ def test_artifact_identity_tracks_same_size_local_gguf_with_restored_mtime(tmp_p
     assert staleness.artifact_identity(str(model)) != identity
 
 
-def test_content_authority_refuses_read_races_and_digest_failures(tmp_path, monkeypatch):
+def test_stat_authority_refuses_metadata_failures(tmp_path, monkeypatch):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"weights")
-    real_stat = model.stat()
-    changed = type("Changed", (), {
-        field: getattr(real_stat, field)
-        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-    })()
-    changed.st_size = real_stat.st_size + 1
-    calls = iter((real_stat, changed))
-    monkeypatch.setattr(Path, "stat", lambda _path: next(calls))
-    assert staleness._content_digest(model) is None
+    monkeypatch.setattr(
+        Path, "stat", lambda _path: (_ for _ in ()).throw(OSError("metadata unavailable")))
+    assert staleness._stat_fingerprint(model) is None
 
     monkeypatch.undo()
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     selected = snapshot / "model.safetensors"
     selected.write_bytes(b"weights")
-    monkeypatch.setattr(staleness, "_content_digest", lambda _path: None)
+    monkeypatch.setattr(staleness, "_stat_fingerprint", lambda _path: None)
     assert staleness._file_descriptor(snapshot, selected) is None
 
 

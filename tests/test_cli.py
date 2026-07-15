@@ -22,17 +22,7 @@ def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     monkeypatch.setattr(
-        cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    @contextlib.contextmanager
-    def stage(model, artifact, *, revision=None):
-        pinned = (cli.staleness.pinned_model_ref(model, artifact, revision=revision)
-                  if revision is not None else
-                  cli.staleness.pinned_model_ref(model, artifact))
-        if pinned is None:
-            raise RuntimeError(f"cannot pin the authorized artifact for {model}")
-        yield pinned
-
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", stage)
+        cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
 
 
 def _raise_input(exc):
@@ -5282,6 +5272,25 @@ def test_render_characterize_cold_remote_gguf_downloads_then_pins(
     assert cli.render_characterize(c, "org/model", engine="cpu") == 0
     assert bk.downloaded == ["org/model"]
     assert state["loaded"] == "/cache/model-q4.gguf"
+
+
+def test_render_characterize_loads_pinned_artifact_without_private_stage(
+        make_console, store, monkeypatch):
+    loaded = []
+    bk = FakeBackend(_limits(), cached=True)
+    bk.calibrate_result = None
+    bk.characterize = lambda model, **_kwargs: (
+        loaded.append(model) or {"safe_context": 4096, "decode_context": None, "points": []})
+    _wire_characterize_bk(monkeypatch, bk, backend="cpu")
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(
+        cli.staleness, "pinned_model_ref",
+        lambda _model, _artifact: "/cache/snapshots/exact/model.gguf")
+    assert not hasattr(cli.staleness, "stage_model_ref")
+
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/model", engine="cpu") == 0
+    assert loaded == ["/cache/snapshots/exact/model.gguf"]
 
 
 def test_render_characterize_prefetch_json_stdout_is_pure(store, monkeypatch, capsys):

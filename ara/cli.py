@@ -1250,13 +1250,10 @@ def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
         msg = f"cannot verify free disk space for downloading {model} — download refused"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return False, payload, 1
-    # Governed execution retains the downloaded cache and loads from an exact private copy.
-    # Admit both allocations before network/device work so a cold start cannot fail after download.
-    staged_size_gb = size_gb * 2 if size_gb is not None else None
-    if (staged_size_gb is not None and free_gb is not None
-            and free_gb < staged_size_gb + acquire.DISK_BUFFER_GB):
-        msg = (f"not enough disk for {model}: needs ~{staged_size_gb:.1f} GB "
-               f"(download + private stage) + "
+    if (size_gb is not None and free_gb is not None
+            and free_gb < size_gb + acquire.DISK_BUFFER_GB):
+        msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB "
+               f"for the download + "
                f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return False, payload, 1
@@ -1273,11 +1270,14 @@ def _artifact_identity_for_plan(model: str, payload: object | None, *,
     return current
 
 
-def _staged_model_for_plan(model: str, artifact_id: str, payload: object | None):
-    """Bind the verified plan authority to the private path an engine will actually load."""
-    if isinstance(payload, acquire.AcquisitionPlan):
-        return staleness.stage_model_ref(model, artifact_id, revision=payload.revision)
-    return staleness.stage_model_ref(model, artifact_id)
+def _pinned_model_for_plan(model: str, artifact_id: str, payload: object | None):
+    """Bind the verified plan authority to the exact cache path an engine will load."""
+    pinned = (staleness.pinned_model_ref(model, artifact_id, revision=payload.revision)
+              if isinstance(payload, acquire.AcquisitionPlan)
+              else staleness.pinned_model_ref(model, artifact_id))
+    if pinned is None:
+        raise RuntimeError(f"cannot pin the authorized artifact for {model}")
+    return nullcontext(pinned)
 
 
 def _download_prefetched_weights(c: Console, model: str, bk, payload: object | None,
@@ -1450,9 +1450,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
         try:
-            with _staged_model_for_plan(
-                    evidence_model, artifact_id_before, prefetch_size) as staged_model:
-                result = bk.characterize(staged_model, progress=progress, **fa_kw)
+            with _pinned_model_for_plan(
+                    evidence_model, artifact_id_before, prefetch_size) as pinned_model:
+                result = bk.characterize(pinned_model, progress=progress, **fa_kw)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
             msg = f"characterization failed: {exc}"
             # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
@@ -2038,12 +2038,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         errored_n = 0
         loaded_model_ref = evidence_model
         try:
-            with _staged_model_for_plan(
-                    evidence_model, artifact_id, prefetch_size) as staged_model:
-                loaded_model_ref = staged_model
+            with _pinned_model_for_plan(
+                    evidence_model, artifact_id, prefetch_size) as pinned_model:
+                loaded_model_ref = pinned_model
                 for _ in range(repeat):
                     try:
-                        result = bk.benchmark(staged_model, prompts, max_context=safe, **bench_kw)
+                        result = bk.benchmark(pinned_model, prompts, max_context=safe, **bench_kw)
                     except (SystemExit, Exception) as exc:
                         return err(f"benchmark failed: {exc}")
                     if not isinstance(result, dict):
@@ -2399,10 +2399,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} differs from its measured ceiling — "
                            f"re-run: ara characterize {model}")
-            with staleness.stage_model_ref(
-                    evidence_model, characterized_artifact_id) as staged_model:
+            with _pinned_model_for_plan(
+                    evidence_model, characterized_artifact_id, None) as pinned_model:
                 result = bk.generate(
-                    staged_model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+                    pinned_model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} changed during the run — no result shown")
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard

@@ -63,9 +63,8 @@ def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
-    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact:
-                        contextlib.nullcontext(cli.staleness.pinned_model_ref(model, artifact)))
+    monkeypatch.setattr(
+        cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 
@@ -113,9 +112,8 @@ def _wire_characterize(monkeypatch, backend):
     monkeypatch.setattr(cli.catalog, "remember", lambda *_a: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity",
                         lambda _model, **_kwargs: "artifact:test")
-    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact, **_kwargs:
-                        contextlib.nullcontext(cli.staleness.pinned_model_ref(model, artifact)))
+    monkeypatch.setattr(
+        cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
 
 
 @pytest.mark.parametrize("cached,expected_downloads", [(True, []), (False, ["org/model"])])
@@ -151,7 +149,7 @@ def test_prefetch_carries_one_immutable_plan_through_download(make_console, monk
     assert seen == [("prepare", "org/model"), ("download", plan)]
 
 
-def test_prepared_plan_revision_is_carried_into_identity_and_staging(monkeypatch):
+def test_prepared_plan_revision_is_carried_into_identity_and_pinning(monkeypatch):
     plan = cli.acquire.AcquisitionPlan(
         "org/model", "org/model", "a" * 40, None, 4.0)
     seen = []
@@ -164,13 +162,13 @@ def test_prepared_plan_revision_is_carried_into_identity_and_staging(monkeypatch
         ("identity", "org/model", "a" * 40),
     ]
 
-    monkeypatch.setattr(cli.staleness, "stage_model_ref",
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
                         lambda model, artifact, *, revision: seen.append(
-                            ("stage", model, artifact, revision)) or
-                        contextlib.nullcontext("/cache/staged"))
-    with cli._staged_model_for_plan("org/model", "artifact", plan) as staged:
-        assert staged == "/cache/staged"
-    assert seen[-1] == ("stage", "org/model", "artifact", "a" * 40)
+                            ("pin", model, artifact, revision)) or
+                        "/cache/snapshots/exact")
+    with cli._pinned_model_for_plan("org/model", "artifact", plan) as pinned:
+        assert pinned == "/cache/snapshots/exact"
+    assert seen[-1] == ("pin", "org/model", "artifact", "a" * 40)
 
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: None)
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda _model, _expected: True)
@@ -209,21 +207,22 @@ def test_prefetch_enforces_buffer_for_zero_rounded_payload(make_console, monkeyp
     assert "not enough disk" in buf.getvalue()
 
 
-def test_prefetch_reserves_download_and_private_stage_before_network(
+def test_prefetch_reserves_only_download_and_normal_headroom(
         make_console, monkeypatch):
     plan = cli.acquire.AcquisitionPlan(
         "org/model", "org/model", "a" * 40, None, 4.0)
+    downloaded = []
     backend = types.SimpleNamespace(
         calibration_model_cached=lambda _model: False,
         prepare_download=lambda _model: plan,
-        download_prepared_model=lambda *_a, **_k: pytest.fail("download called"),
+        download_prepared_model=lambda received, **_k: downloaded.append(received),
     )
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 7.0)
-    c, buf = make_console()
+    c, _ = make_console()
 
     assert cli._prefetch_weights(
-        c, "org/model", backend, "cpu", as_json=False, progress=False) == 1
-    assert "download + private stage" in buf.getvalue()
+        c, "org/model", backend, "cpu", as_json=False, progress=False) is None
+    assert downloaded == [plan]
 
 
 def test_prefetch_skips_network_for_existing_authorized_snapshot(make_console, monkeypatch):
@@ -434,9 +433,8 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli.db, "save_benchmark_result", lambda *_a, **_k: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity",
                         lambda _model, **_kwargs: "artifact:test")
-    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact, **_kwargs:
-                        contextlib.nullcontext(cli.staleness.pinned_model_ref(model, artifact)))
+    monkeypatch.setattr(
+        cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 

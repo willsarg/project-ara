@@ -14,40 +14,15 @@ code never imports a nested engine package in-process.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import re
-import shutil
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-
-from ara import locking
 
 _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _BLOB_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
-_STAGE_DISK_BUFFER_BYTES = 2_000_000_000
-_STAGE_OWNER = ".ara-stage-owner"
-
-
-class StagedModel:
-    """A verified operation-private model path with deterministic cleanup."""
-
-    def __init__(self, path: Path, temporary: tempfile.TemporaryDirectory, lease):
-        self.path = str(path)
-        self._temporary = temporary
-        self._lease = lease
-
-    def __enter__(self) -> str:
-        return self.path
-
-    def __exit__(self, *_exc) -> None:
-        try:
-            self._temporary.cleanup()
-        finally:
-            self._lease.__exit__(*_exc)
 
 
 def _cache_dir(model_id: str) -> Path:
@@ -86,35 +61,35 @@ def _validated_snapshot(root: Path, revision: str) -> Path | None:
                 or not snapshot.is_dir()):
             return None
         resolved_root = root.resolve(strict=True)
+        resolved_snapshot = snapshot.resolve(strict=True)
         if (resolved_root.name != root.name
                 or resolved_root.parent != root.parent.resolve(strict=True)
                 or snapshots.resolve(strict=True).parent != root.resolve(strict=True)
-                or snapshot.resolve(strict=True).parent != snapshots.resolve(strict=True)):
+                or resolved_snapshot.parent != snapshots.resolve(strict=True)):
             return None
     except OSError:
         return None
-    return snapshot
+    return resolved_snapshot
 
 
-def _content_digest(path: Path) -> tuple[int, str] | None:
-    """Return a stable content digest, refusing a file that changes while it is read."""
+def _stat_fingerprint(path: Path) -> str | None:
+    """Cheap identity for ordinary local drift without reading model contents.
+
+    ARA pins Hugging Face revisions and content-addressed blob names. The stat fields extend that
+    authority to direct snapshot files and local GGUFs, and let before/after checks notice normal
+    replacement or mutation. A malicious same-user process that rewrites cache bytes while
+    preserving metadata is outside ARA's functional trust boundary.
+    """
     try:
-        before = path.stat()
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        after = path.stat()
+        info = path.stat()
     except OSError:
         return None
-    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
-        return None
-    return after.st_size, digest.hexdigest()
+    fields = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return ":".join(str(value) for value in fields)
 
 
 def _file_descriptor(snapshot: Path, path: Path) -> str | None:
-    """Content-derived HF-cache identity, including Windows' direct-file fallback."""
+    """Pinned HF-cache identity, including Windows' direct-file fallback."""
     try:
         resolved = path.resolve(strict=True)
         relative = path.relative_to(snapshot).as_posix()
@@ -139,12 +114,11 @@ def _file_descriptor(snapshot: Path, path: Path) -> str | None:
         except (OSError, ValueError):
             return None
         kind = "direct"
-    content = _content_digest(resolved)
-    if content is None:
+    fingerprint = _stat_fingerprint(resolved)
+    if fingerprint is None:
         return None
-    size, digest = content
     # huggingface_hub uses direct snapshot files when Windows cannot create symlinks.
-    authority = f"{kind}:{size}:sha256:{digest}"
+    authority = f"{kind}:stat:{fingerprint}"
     return f"{relative}:{authority}"
 
 
@@ -257,11 +231,10 @@ def artifact_identity(model: str, *, revision: str | None = None) -> str | None:
             resolved = local.resolve(strict=True)
         except OSError:
             return None
-        content = _content_digest(resolved)
-        if content is None:
+        fingerprint = _stat_fingerprint(resolved)
+        if fingerprint is None:
             return None
-        size, digest = content
-        return f"local-gguf:{resolved}:{size}:sha256:{digest}"
+        return f"local-gguf:{resolved}:stat:{fingerprint}"
 
     repo, separator, filename = model.partition(":")
     repo_id = repo if separator and filename.lower().endswith(".gguf") else model
@@ -333,14 +306,11 @@ def pinned_model_ref(model: str, expected_artifact_id: str | None, *,
     return str(snapshot)
 
 
-def _authority_entry(descriptor: str) -> tuple[str, tuple[int, str]] | None:
-    """Decode one content descriptor from ARA's opaque stored artifact authority."""
-    try:
-        prefix, encoded_size, algorithm, digest = descriptor.rsplit(":", 3)
-        size = int(encoded_size)
-    except ValueError:
-        return None
-    if size < 0 or algorithm != "sha256" or not re.fullmatch(r"[0-9a-f]{64}", digest):
+def _authority_entry(descriptor: str) -> str | None:
+    """Decode one selected relative file from ARA's opaque artifact authority."""
+    prefix, marker, fingerprint = descriptor.rpartition(":stat:")
+    fields = fingerprint.split(":")
+    if not marker or len(fields) != 5 or any(not field.isdigit() for field in fields):
         return None
     if prefix.endswith(":direct"):
         relative = prefix[:-len(":direct")]
@@ -352,23 +322,13 @@ def _authority_entry(descriptor: str) -> tuple[str, tuple[int, str]] | None:
     if (not relative or logical.is_absolute() or "\\" in relative or "|" in relative
             or any(part in ("", ".", "..") for part in relative.split("/"))):
         return None
-    return relative, (size, digest)
+    return relative
 
 
-def _authority_manifest(expected_artifact_id: str) -> dict[str | None, tuple[int, str]] | None:
-    """Extract the exact size/digest manifest that an artifact authority authorized."""
+def _authority_files(expected_artifact_id: str) -> list[str] | None:
+    """Extract selected relative files from a Hugging Face artifact authority."""
     if not isinstance(expected_artifact_id, str):
         return None
-    if expected_artifact_id.startswith("local-gguf:"):
-        try:
-            _prefix, encoded_size, algorithm, digest = expected_artifact_id.rsplit(":", 3)
-            size = int(encoded_size)
-        except ValueError:
-            return None
-        if (size < 0 or algorithm != "sha256"
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
-            return None
-        return {None: (size, digest)}
     if not expected_artifact_id.startswith(("hf:", "hf-gguf:")):
         return None
     try:
@@ -378,8 +338,7 @@ def _authority_manifest(expected_artifact_id: str) -> dict[str | None, tuple[int
     entries = [_authority_entry(descriptor) for descriptor in descriptors]
     if not entries or any(entry is None for entry in entries):
         return None
-    manifest = dict(entries)
-    return manifest if len(manifest) == len(entries) else None
+    return entries if len(set(entries)) == len(entries) else None
 
 
 def authorized_download_ref(model: str, expected_artifact_id: str) -> tuple[str, str] | None:
@@ -393,10 +352,10 @@ def authorized_download_ref(model: str, expected_artifact_id: str) -> tuple[str,
     repo, model_separator, requested = model.partition(":")
     if (not separator or encoded_repo != repo or not _REVISION_RE.fullmatch(revision)):
         return None
-    manifest = _authority_manifest(expected_artifact_id)
-    if manifest is None or None in manifest:
+    files = _authority_files(expected_artifact_id)
+    if files is None:
         return None
-    ggufs = [relative for relative in manifest if relative.lower().endswith(".gguf")]
+    ggufs = [relative for relative in files if relative.lower().endswith(".gguf")]
     if expected_artifact_id.startswith("hf-gguf:") or ggufs:
         if len(ggufs) != 1 or (model_separator and requested != ggufs[0]):
             return None
@@ -404,89 +363,6 @@ def authorized_download_ref(model: str, expected_artifact_id: str) -> tuple[str,
     if model_separator:
         return None
     return repo, revision
-
-
-def _stage_file(source: Path, destination: Path, expected: tuple[int, str]) -> None:
-    """Copy one source privately, then prove it is the exact authorized content."""
-    resolved = source.resolve(strict=True)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(resolved, destination)
-    if _content_digest(destination) != expected:
-        raise RuntimeError(f"{source} did not match its authorized digest while staging")
-
-
-def _reclaim_stale_stages(parent: Path) -> None:
-    """Remove only ARA-marked crash remnants while the volume-wide lease is held."""
-    try:
-        candidates = list(parent.glob(".ara-stage-*"))
-        for candidate in candidates:
-            marker = candidate / _STAGE_OWNER
-            if (candidate.is_symlink() or not candidate.is_dir()
-                    or marker.is_symlink() or not marker.is_file()):
-                continue
-            if marker.read_text(encoding="utf-8") == "ara-stage-v1\n":
-                shutil.rmtree(candidate)
-    except (OSError, UnicodeError) as exc:
-        raise RuntimeError(f"cannot safely reclaim stale model stages under {parent}") from exc
-
-
-def stage_model_ref(model: str, expected_artifact_id: str, *,
-                    revision: str | None = None) -> StagedModel:
-    """Create a private load path whose files cannot be replaced through the source cache paths."""
-    pinned = (pinned_model_ref(model, expected_artifact_id, revision=revision)
-              if revision is not None else pinned_model_ref(model, expected_artifact_id))
-    if pinned is None:
-        raise RuntimeError(f"cannot pin the authorized artifact for {model}")
-    manifest = _authority_manifest(expected_artifact_id)
-    if manifest is None:
-        raise RuntimeError(f"cannot decode the authorized artifact manifest for {model}")
-    source = Path(pinned)
-    if not source.exists():
-        raise RuntimeError(f"authorized artifact disappeared before staging: {source}")
-    stage_parent = source.parent if source.is_file() else source.parent.parent
-    try:
-        stage_parent = stage_parent.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"cannot resolve the staging volume for {model}") from exc
-    lease = locking.staging_lock(stage_parent)
-    lease.__enter__()
-    temporary = None
-    try:
-        _reclaim_stale_stages(stage_parent)
-        required = sum(size for size, _digest in manifest.values()) + _STAGE_DISK_BUFFER_BYTES
-        try:
-            free = shutil.disk_usage(stage_parent).free
-        except OSError as exc:
-            raise RuntimeError(f"cannot verify free disk space for staging {model}") from exc
-        if free < required:
-            raise RuntimeError(
-                f"not enough disk to stage {model}: needs the artifact size plus 2 GB headroom")
-        temporary = tempfile.TemporaryDirectory(prefix=".ara-stage-", dir=stage_parent)
-        root = Path(temporary.name)
-        (root / _STAGE_OWNER).write_text("ara-stage-v1\n", encoding="utf-8")
-        if source.is_file():
-            if len(manifest) != 1:
-                raise RuntimeError(f"authorized manifest does not describe one file for {model}")
-            destination = root / source.name
-            _stage_file(source, destination, next(iter(manifest.values())))
-            staged_path = destination
-        else:
-            if None in manifest:
-                raise RuntimeError(f"cannot verify transformer snapshot {source}")
-            staged_path = root / "snapshot"
-            for relative, expected in manifest.items():
-                item = source.joinpath(*PurePosixPath(relative).parts)
-                _stage_file(item, staged_path / relative, expected)
-        matches = (artifact_matches(model, expected_artifact_id, revision=revision)
-                   if revision is not None else artifact_matches(model, expected_artifact_id))
-        if not matches:
-            raise RuntimeError(f"artifact changed while staging: {model}")
-        return StagedModel(staged_path, temporary, lease)
-    except BaseException:
-        if temporary is not None:
-            temporary.cleanup()
-        lease.__exit__(None, None, None)
-        raise
 
 
 def artifact_matches(model: str, expected_artifact_id: str | None, *,
