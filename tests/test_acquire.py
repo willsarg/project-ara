@@ -277,6 +277,80 @@ def test_gguf_remote_selection_refuses_missing_weight(monkeypatch):
     assert acquire.gguf_size_gb("org/repo") is None
 
 
+def test_prepared_gguf_download_pins_one_revision_and_selection(monkeypatch):
+    siblings = [
+        types.SimpleNamespace(rfilename="model-q8.gguf", size=8_000_000_000),
+        types.SimpleNamespace(rfilename="model-q4.gguf", size=4_000_000_000),
+    ]
+    class Api:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(sha="a" * 40, siblings=siblings)
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: Api())
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, filename, **kwargs: calls.append(
+                            (repo, filename, kwargs)) or "/cache/model.gguf")
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: None)
+
+    plan = acquire.prepare_download("org/repo", gguf=True)
+    assert plan.revision == "a" * 40 and plan.filename == "model-q4.gguf"
+    assert plan.size_gb == 4.0
+    assert acquire.download_prepared(plan) == "/cache/model.gguf"
+    assert calls == [("org/repo", "model-q4.gguf", {"revision": "a" * 40})]
+
+
+def test_prepared_transformer_download_pins_probed_revision(monkeypatch):
+    class Api:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="b" * 40,
+                siblings=[types.SimpleNamespace(rfilename="model.safetensors", size=2_000_000_000)])
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: Api())
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo, **kwargs: calls.append((repo, kwargs)) or "/cache/snapshot")
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: None)
+
+    plan = acquire.prepare_download("org/repo", gguf=False)
+    assert plan.revision == "b" * 40 and plan.size_gb == 2.0
+    assert acquire.download_prepared(plan) == "/cache/snapshot"
+    assert calls == [("org/repo", {"revision": "b" * 40})]
+
+
+def test_prepare_download_covers_local_invalid_revision_and_missing_selection(
+        tmp_path, monkeypatch):
+    local = tmp_path / "model.gguf"
+    local.write_bytes(b"weights")
+    local_plan = acquire.prepare_download(str(local), gguf=True)
+    assert local_plan.repo_id is None
+    assert acquire.download_prepared(local_plan) == str(local.resolve())
+
+    with pytest.raises(ValueError, match="invalid model"):
+        acquire.prepare_download("../bad", gguf=False)
+
+    class BadRevisionApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(sha="main", siblings=[])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: BadRevisionApi())
+    with pytest.raises(RuntimeError, match="immutable revision"):
+        acquire.prepare_download("org/repo", gguf=False)
+
+    class NoGgufApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(sha="c" * 40, siblings=[])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: NoGgufApi())
+    with pytest.raises(FileNotFoundError, match="no loadable"):
+        acquire.prepare_download("org/repo", gguf=True)
+
+    with pytest.raises(ValueError, match="no file"):
+        acquire.download_prepared(acquire.AcquisitionPlan(
+            "local", None, None, None, None))
+
+
 def test_valid_model_id_accepts_well_formed_repo_ids():
     # org/name and bare name, with the chars HF allows in a segment.
     for ok in ("mlx-community/Qwen3-0.6B-4bit", "meta-llama/Llama-3.2-1B",

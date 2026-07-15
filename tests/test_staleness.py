@@ -310,6 +310,57 @@ def test_transformer_identity_refuses_external_direct_symlink(tmp_path, monkeypa
     assert staleness.artifact_identity("org/model") is None
 
 
+def test_artifact_identity_refuses_symlinked_snapshot_root(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    root = tmp_path / ".cache" / "huggingface" / "hub" / "models--org--model"
+    (root / "refs").mkdir(parents=True)
+    (root / "refs" / "main").write_text(revision)
+    (root / "snapshots").mkdir()
+    external = tmp_path / "external-snapshot"
+    external.mkdir()
+    (external / "model.safetensors").write_bytes(b"weights")
+    (root / "snapshots" / revision).symlink_to(external, target_is_directory=True)
+
+    assert staleness.artifact_identity("org/model") is None
+
+
+def test_validated_snapshot_refuses_resolution_race(tmp_path, monkeypatch):
+    root = tmp_path / "models--org--model"
+    snapshot = root / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    original = Path.resolve
+
+    def fail_snapshot(path, *args, **kwargs):
+        if path == snapshot:
+            raise OSError("snapshot moved")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_snapshot)
+    assert staleness._validated_snapshot(root, "a" * 40) is None
+
+
+def test_validated_snapshot_refuses_resolved_parent_mismatch(tmp_path, monkeypatch):
+    root = tmp_path / "models--org--model"
+    snapshot = root / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    original = Path.resolve
+
+    def escape_snapshot(path, *args, **kwargs):
+        if path == snapshot:
+            return tmp_path / "external" / snapshot.name
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", escape_snapshot)
+    assert staleness._validated_snapshot(root, "a" * 40) is None
+
+
+def test_authorized_snapshot_refuses_missing_revision(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    assert staleness._authorized_snapshot(
+        "org/model", "hf:org/model@" + "a" * 40 + ":descriptor") is None
+
+
 def test_transformer_identity_validates_duplicate_corrupt_and_complete_indexes(
         tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)

@@ -1206,32 +1206,45 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
 
 
 def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
-                   *, as_json: bool) -> tuple[bool, float | None, int | None]:
+                   *, as_json: bool) -> tuple[bool, object | None, int | None]:
     """Run deterministic cache/compatibility/disk gates before live work is claimed."""
     incompatible = engines.engine_for_model(model) not in (None, engine_key)
     cached = getattr(bk, "calibration_model_cached", None)
     if incompatible or cached is None or cached(model):
         return False, None, None
-    size_gb = (acquire.gguf_size_gb(model)
-               if engine_key in {"cpu", "vulkan", "cuda-gguf"}
-               else acquire.repo_size_gb(model))
+    prepare = getattr(bk, "prepare_download", None)
+    try:
+        payload = (prepare(model) if prepare is not None else
+                   acquire.gguf_size_gb(model)
+                   if engine_key in {"cpu", "vulkan", "cuda-gguf"}
+                   else acquire.repo_size_gb(model))
+    except Exception as exc:
+        msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return False, None, 1
+    size_gb = payload.size_gb if isinstance(payload, acquire.AcquisitionPlan) else payload
     free_gb = acquire.free_disk_gb()
     if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
         msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
                f"{acquire.DISK_BUFFER_GB:.0f} GB headroom, only {free_gb:.1f} GB free.")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return False, size_gb, 1
-    return True, size_gb, None
+        return False, payload, 1
+    return True, payload, None
 
 
-def _download_prefetched_weights(c: Console, model: str, bk, size_gb: float | None,
+def _download_prefetched_weights(c: Console, model: str, bk, payload: object | None,
                                  *, as_json: bool, progress: bool) -> int | None:
     """Perform the actual HF download after the caller has started live tracking."""
+    size_gb = payload.size_gb if isinstance(payload, acquire.AcquisitionPlan) else payload
     _hf_hint(c, as_json)        # nudge to `ara hf login` before the (visible) HF rate-limit warning
     if not as_json:
         c.emit(c.style("dim", f"  downloading {model} … ({_fmt_size(size_gb)})"))
     try:
-        bk.download_calibration_model(model, progress=progress)
+        prepared = getattr(bk, "download_prepared_model", None)
+        if isinstance(payload, acquire.AcquisitionPlan) and prepared is not None:
+            prepared(payload, progress=progress)
+        else:
+            bk.download_calibration_model(model, progress=progress)
     except Exception as exc:
         msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))

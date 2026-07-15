@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from ara import catalog
-from ara.backends import apple, cpu, cuda
+from ara import acquire, catalog
+from ara.backends import apple, cpu, cuda, cuda_gguf, vulkan
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +22,8 @@ def _no_catalog_network(monkeypatch):
 
 # The interface every ramp-class backend must expose.
 REQUIRED = ["characterize", "safe_limits", "calibrate", "calibration_model_cached",
-            "download_calibration_model", "CALIBRATION_MODEL"]
+            "download_calibration_model", "prepare_download", "download_prepared_model",
+            "CALIBRATION_MODEL"]
 
 # The canonical key set safe_limits() must return (engine facts + ARA's calibration overlay).
 SAFE_LIMITS_KEYS = {"device", "total_gb", "wall_gb", "safe_budget_gb", "margin_gb",
@@ -80,6 +81,22 @@ _IDS = [b[0] for b in BACKENDS]
 # Every backend is now a worker-model adapter held to the STRICT result-shape contract.
 SHIPPING = BACKENDS
 _SHIP_IDS = _IDS
+
+
+@pytest.mark.parametrize("mod", [apple, cpu, cuda, cuda_gguf, vulkan])
+def test_backend_prepared_download_delegates_to_immutable_acquisition(mod, monkeypatch):
+    plan = acquire.AcquisitionPlan("org/model", "org/model", "a" * 40, None, 1.0)
+    seen = []
+    monkeypatch.setattr(acquire, "prepare_download",
+                        lambda model, *, gguf: seen.append(("prepare", model, gguf)) or plan)
+    monkeypatch.setattr(acquire, "download_prepared",
+                        lambda received, *, progress=False: seen.append(
+                            ("download", received, progress)))
+
+    assert mod.prepare_download("org/model") is plan
+    assert mod.download_prepared_model(plan, progress=True) is None
+    assert seen[0][0:2] == ("prepare", "org/model")
+    assert seen[1] == ("download", plan, True)
 
 
 @pytest.mark.parametrize("label, mod, _seam", BACKENDS, ids=_IDS)

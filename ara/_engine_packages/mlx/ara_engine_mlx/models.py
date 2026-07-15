@@ -93,10 +93,12 @@ def _cache_dir(hf_id: str) -> str:
 
 def _local_snapshot(hf_id: str) -> str | None:
     path = os.path.abspath(os.path.expanduser(hf_id))
-    return path if os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")) else None
+    parent = os.path.dirname(path)
+    return (path if not os.path.islink(path) and not os.path.islink(parent)
+            and os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")) else None)
 
 
-def _snapshot_weight_bytes(snapshot: str) -> int:
+def _snapshot_weight_bytes(snapshot: str) -> int | None:
     """Weight bytes in a local snapshot, deduplicating resolved HF blob links."""
     indexes = []
     for dirpath, _, filenames in os.walk(snapshot):
@@ -106,7 +108,7 @@ def _snapshot_weight_bytes(snapshot: str) -> int:
     selected: list[str] | None = None
     if indexes:
         if len(indexes) != 1:
-            return 0
+            return None
         try:
             with open(indexes[0], encoding="utf-8") as stream:
                 weight_map = json.load(stream).get("weight_map")
@@ -117,13 +119,13 @@ def _snapshot_weight_bytes(snapshot: str) -> int:
                 if (not isinstance(name, str) or not name or "\\" in name
                         or os.path.isabs(name)
                         or any(part in ("", ".", "..") for part in name.split("/"))):
-                    return 0
+                    return None
                 candidate = os.path.abspath(os.path.join(root, *name.split("/")))
                 if os.path.commonpath((root, candidate)) != root or not os.path.isfile(candidate):
-                    return 0
+                    return None
                 selected.append(candidate)
         except (OSError, UnicodeError, ValueError, AttributeError):
-            return 0
+            return None
     seen: set[str] = set()
     total = 0
     paths = selected
@@ -145,12 +147,17 @@ def _snapshot_weight_bytes(snapshot: str) -> int:
             except ValueError:
                 authorized = False
         if not authorized:
-            return 0
-        if resolved in seen or not os.path.isfile(resolved):
+            return None
+        if not os.path.isfile(resolved):
+            return None
+        if resolved in seen:
             continue
         seen.add(resolved)
-        total += os.path.getsize(resolved)
-    return total
+        try:
+            total += os.path.getsize(resolved)
+        except OSError:
+            return None
+    return total if paths and total > 0 else None
 
 
 def cache_updated_at(hf_id: str) -> float | None:
@@ -187,11 +194,12 @@ def fit_is_stale(hf_id: str, characterized_at: str | None) -> bool:
     return cache_mtime > characterized.timestamp() + 1.0
 
 
-def weights_gb(hf_id: str) -> float:
+def weights_gb(hf_id: str) -> float | None:
     """Real on-disk weight size from the cache `blobs/` dir (not the symlinked snapshot)."""
     local = _local_snapshot(hf_id)
     if local is not None:
-        return _snapshot_weight_bytes(local) / 1e9
+        weight_bytes = _snapshot_weight_bytes(local)
+        return weight_bytes / 1e9 if weight_bytes is not None else None
     blobs = os.path.join(_cache_dir(hf_id), "blobs")
     total = 0
     for f in glob.glob(os.path.join(blobs, "*")):
@@ -224,6 +232,9 @@ def describe(hf_id: str) -> ModelInfo | None:
     raw = _read_raw_config(hf_id)
     if raw is None:
         return None
+    weight_size = weights_gb(hf_id)
+    if weight_size is None:
+        return None
     t = raw.get("text_config", raw) if isinstance(raw.get("text_config"), dict) else raw
     layer_types = t.get("layer_types", []) or []
     lt = Counter(layer_types)
@@ -247,7 +258,7 @@ def describe(hf_id: str) -> ModelInfo | None:
 
     return ModelInfo(
         hf_id=hf_id,
-        weights_gb=round(weights_gb(hf_id), 2),
+        weights_gb=round(weight_size, 2),
         n_layers=n_layers,
         growing_layers=growing,
         kv_heads=t.get("num_key_value_heads"),

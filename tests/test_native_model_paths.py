@@ -69,8 +69,8 @@ def test_native_weight_sizing_uses_only_confined_index_shards(tmp_path):
     (snapshot / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {"layer.0": "../outside.safetensors"},
     }))
-    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 0
-    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 0
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) is None
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) is None
 
 
 def test_native_weight_sizing_refuses_external_direct_symlink(tmp_path):
@@ -80,8 +80,59 @@ def test_native_weight_sizing_refuses_external_direct_symlink(tmp_path):
     external.write_bytes(b"outside")
     (snapshot / "model.safetensors").symlink_to(external)
 
-    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 0
-    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 0
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) is None
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) is None
+
+
+def test_native_describe_refuses_unverifiable_weight_size(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"layer.0": "missing.safetensors"},
+    }))
+    monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
+    utils = types.ModuleType("mlx_lm.utils")
+    utils._get_classes = lambda _config: (object, object)
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
+
+    assert mlx_models.describe(str(snapshot)) is None
+    assert cuda_models.describe(str(snapshot)) is None
+
+
+def test_native_weight_sizing_refuses_shard_disappearing_mid_validation(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    shard = snapshot / "model.safetensors"
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"layer.0": "model.safetensors"},
+    }))
+    real_isfile = __import__("os").path.isfile
+
+    for module in (mlx_models, cuda_models):
+        calls = 0
+
+        def racing_isfile(path):
+            nonlocal calls
+            if str(path) == str(shard):
+                calls += 1
+                return calls == 1
+            return real_isfile(path)
+
+        with monkeypatch.context() as context:
+            context.setattr(module.os.path, "isfile", racing_isfile)
+            assert module._snapshot_weight_bytes(str(snapshot)) is None
+
+
+def test_native_describe_refuses_symlinked_snapshot_root(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    external = tmp_path / "external"
+    snapshot.rename(external)
+    snapshot.symlink_to(external, target_is_directory=True)
+    monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
+    utils = types.ModuleType("mlx_lm.utils")
+    utils._get_classes = lambda _config: (object, object)
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
+
+    assert mlx_models.describe(str(snapshot)) is None
+    assert cuda_models.describe(str(snapshot)) is None
 
 
 def test_native_weight_sizing_accepts_repository_blob_symlink(tmp_path):

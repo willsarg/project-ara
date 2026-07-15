@@ -129,6 +129,38 @@ def test_prefetch_wrapper_preserves_cached_and_download_contract(
     assert downloads == expected_downloads
 
 
+def test_prefetch_carries_one_immutable_plan_through_download(make_console, monkeypatch):
+    plan = cli.acquire.AcquisitionPlan(
+        "org/model", "org/model", "a" * 40, "model-q4.gguf", 4.0)
+    seen = []
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: False,
+        prepare_download=lambda model: seen.append(("prepare", model)) or plan,
+        download_prepared_model=lambda received, **_kwargs: seen.append(("download", received)),
+    )
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 50.0)
+    c, _ = make_console()
+
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=False, progress=False) is None
+    assert seen == [("prepare", "org/model"), ("download", plan)]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_prefetch_preparation_failure_is_a_clean_error(
+        make_console, monkeypatch, capsys, as_json):
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _model: False,
+        prepare_download=lambda _model: (_ for _ in ()).throw(RuntimeError("revision race")),
+    )
+    c, buf = make_console()
+
+    assert cli._prefetch_weights(
+        c, "org/model", backend, "cpu", as_json=as_json, progress=False) == 1
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert "couldn't fetch" in output
+
+
 def test_characterize_tracks_calibration_and_backend_measurement(
         make_console, monkeypatch, activity_registry):
     calls = []

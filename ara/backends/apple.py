@@ -88,6 +88,17 @@ def download_calibration_model(model: str = CALIBRATION_MODEL, *,
     acquire.download(model, progress=progress)
 
 
+def prepare_download(model: str):
+    """Bind transformer sizing and download to one immutable Hub revision."""
+    from ara import acquire
+    return acquire.prepare_download(model, gguf=False)
+
+
+def download_prepared_model(plan, *, progress: bool = False) -> None:
+    from ara import acquire
+    acquire.download_prepared(plan, progress=progress)
+
+
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     """Run the native MLX engine's crash-safe calibration; return fresh limits + what it
     measured.

@@ -75,6 +75,15 @@ def download_calibration_model(model: str = CALIBRATION_MODEL, *,
     acquire.download_gguf(model, progress=progress)
 
 
+def prepare_download(model: str):
+    """Bind GGUF sizing, selection, and download to one immutable Hub revision."""
+    return acquire.prepare_download(model, gguf=True)
+
+
+def download_prepared_model(plan, *, progress: bool = False) -> None:
+    acquire.download_prepared(plan, progress=progress)
+
+
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     """Characterize *model* on the hybrid GPU+CPU path and attach it to the limits.
 

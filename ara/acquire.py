@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 # Headroom we insist on beyond the raw download, so a fetch never fills the disk
@@ -25,6 +26,18 @@ DISK_BUFFER_GB = 2.0
 # *sink arg* (it becomes argv for the engine worker), so ARA validates its shape before it ever
 # leaves the process. Defensive: the value is a local CLI arg, but cheap to get right.
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+@dataclass(frozen=True)
+class AcquisitionPlan:
+    """One immutable Hub revision and exact payload authorized by the disk gate."""
+
+    model: str
+    repo_id: str | None
+    revision: str | None
+    filename: str | None
+    size_gb: float | None
 
 
 def valid_model_id(model: str) -> bool:
@@ -190,6 +203,55 @@ def download_gguf(model: str, *, progress: bool = False) -> str:
     enable_progress_bars() if progress else disable_progress_bars()
     try:
         return hf_hub_download(repo, filename)
+    finally:
+        disable_progress_bars() if was_disabled else enable_progress_bars()
+
+
+def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
+    """Resolve one immutable Hub revision for both sizing and the later download."""
+    if gguf and is_local_gguf(model):
+        return AcquisitionPlan(model, None, None, os.path.realpath(model), gguf_size_gb(model))
+    if not (valid_model_id(model) or (gguf and valid_repo_gguf_ref(model))):
+        raise ValueError(f"invalid model reference: {model!r}")
+    from huggingface_hub import HfApi
+
+    repo, separator, requested = model.partition(":")
+    info = HfApi().model_info(repo, files_metadata=True)
+    revision = getattr(info, "sha", None)
+    if not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision):
+        raise RuntimeError(f"the Hub did not return an immutable revision for {repo}")
+    siblings = info.siblings or []
+    if gguf:
+        candidates = [item for item in siblings
+                      if item.rfilename.lower().endswith(".gguf")
+                      and not os.path.basename(item.rfilename).lower().startswith("mmproj")]
+        selected = (next((item for item in candidates if item.rfilename == requested), None)
+                    if separator else
+                    min(candidates, key=lambda item: item.size or 1 << 62) if candidates else None)
+        if selected is None:
+            raise FileNotFoundError(f"no loadable .gguf in {repo}")
+        size = selected.size
+        return AcquisitionPlan(model, repo, revision, selected.rfilename,
+                               round(size / 1e9, 3) if size is not None else None)
+    total = sum(item.size for item in siblings if item.size)
+    return AcquisitionPlan(model, repo, revision, None, round(total / 1e9, 3) if total else None)
+
+
+def download_prepared(plan: AcquisitionPlan, *, progress: bool = False) -> str:
+    """Download exactly the revision and payload already admitted by the disk gate."""
+    if plan.repo_id is None:
+        if plan.filename is None:
+            raise ValueError("local acquisition plan has no file")
+        return plan.filename
+    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
+
+    was_disabled = are_progress_bars_disabled()
+    enable_progress_bars() if progress else disable_progress_bars()
+    try:
+        if plan.filename is not None:
+            return hf_hub_download(plan.repo_id, plan.filename, revision=plan.revision)
+        return snapshot_download(plan.repo_id, revision=plan.revision)
     finally:
         disable_progress_bars() if was_disabled else enable_progress_bars()
 

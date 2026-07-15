@@ -44,10 +44,27 @@ def _current_snapshot(repo_id: str) -> tuple[str, Path] | None:
         revision = (root / "refs" / "main").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         return None
-    snapshot = root / "snapshots" / revision
-    if not _REVISION_RE.fullmatch(revision) or not snapshot.is_dir():
+    if not _REVISION_RE.fullmatch(revision):
+        return None
+    snapshot = _validated_snapshot(root, revision)
+    if snapshot is None:
         return None
     return revision, snapshot
+
+
+def _validated_snapshot(root: Path, revision: str) -> Path | None:
+    """Return a real snapshot directory confined to this repository cache root."""
+    snapshots = root / "snapshots"
+    snapshot = snapshots / revision
+    try:
+        if snapshots.is_symlink() or snapshot.is_symlink() or not snapshot.is_dir():
+            return None
+        if (snapshots.resolve(strict=True).parent != root.resolve(strict=True)
+                or snapshot.resolve(strict=True).parent != snapshots.resolve(strict=True)):
+            return None
+    except OSError:
+        return None
+    return snapshot
 
 
 def _content_digest(path: Path) -> tuple[int, str] | None:
@@ -152,9 +169,11 @@ def _authorized_snapshot(repo_id: str, artifact_id: str) -> Path | None:
         return None
     authority = artifact_id.split(":", 2)[1]
     artifact_repo, separator, revision = authority.rpartition("@")
-    snapshot = _cache_dir(repo_id) / "snapshots" / revision
-    if (not separator or artifact_repo != repo_id or not _REVISION_RE.fullmatch(revision)
-            or not snapshot.is_dir()):
+    if not separator or artifact_repo != repo_id or not _REVISION_RE.fullmatch(revision):
+        return None
+    root = _cache_dir(repo_id)
+    snapshot = _validated_snapshot(root, revision)
+    if snapshot is None:
         return None
     return snapshot
 
