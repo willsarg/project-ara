@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Node liveness via systemd's ``sd_notify`` protocol — a no-op off systemd.
+"""Optional node liveness signals via systemd's ``sd_notify`` protocol.
 
-The push-only node has no inbound endpoint to probe, so liveness is a heartbeat the node *emits*.
-On a ``Type=notify`` systemd unit that heartbeat is ``sd_notify(WATCHDOG=1)`` on the
-``$NOTIFY_SOCKET`` datagram socket; ``READY=1`` announces startup and ``STATUS=…`` publishes a
-human-readable state line. Off systemd (``NOTIFY_SOCKET`` unset) every notify is a deliberate no-op
-returning False, so the agent loop can call these unconditionally without a platform branch —
-:func:`status` still prints a structured line so journald/syslog pick it up either way.
+ARA's installed user unit is deliberately ``Type=simple`` with no watchdog: legitimate model jobs
+can block the polling loop for hours. If a supervising environment independently supplies
+``NOTIFY_SOCKET``, these helpers can still emit readiness, heartbeat, and status datagrams. Without
+that socket every notify is a deliberate no-op; :func:`status` still prints a structured line so
+journald or another log collector can capture it.
 """
 from __future__ import annotations
 
@@ -40,13 +39,12 @@ def sd_notify(state: str) -> bool:
 
 
 def ready() -> bool:
-    """Announce startup completion to systemd (``READY=1``) — required by ``Type=notify``. No-op
-    off systemd."""
+    """Optionally announce startup completion (``READY=1``); no-op without ``NOTIFY_SOCKET``."""
     return sd_notify("READY=1")
 
 
 def heartbeat() -> bool:
-    """Pet systemd's watchdog (``WATCHDOG=1``). No-op (returns False) off systemd."""
+    """Optionally emit ``WATCHDOG=1``; ARA's installed unit does not configure a watchdog."""
     return sd_notify("WATCHDOG=1")
 
 

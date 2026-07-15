@@ -52,7 +52,9 @@ def test_active_immediately_stores_and_saves_session_token():
     fake = FakeClient([{"status": "active", "session_token": "SES"}])
     cfg = enroll.enroll_flow(_cfg(), client=fake, sleep=lambda s: slept.append(s))
     assert cfg.session_token == "SES"
+    assert cfg.enrollment_token is None                    # consumed one-shot secret is discarded
     assert config.load().session_token == "SES"            # persisted to disk
+    assert config.load().enrollment_token is None
     assert fake.enrolled_with == {"machine_key": "m"}
     assert slept == []                                     # approved on the first poll → never slept
 
@@ -93,3 +95,21 @@ def test_builds_a_default_client_when_none_injected(monkeypatch):
     enroll.enroll_flow(_cfg())                             # no client kwarg → default NodeClient path
     assert seen == {"server_url": "https://c.example", "token": "ENR"}
     assert config.load().session_token == "SES"
+
+
+def test_rejects_malformed_enrollment_handle():
+    fake = FakeClient([])
+    fake.enroll = lambda _desc: {"status": "pending", "enrollment_id": ""}
+    with pytest.raises(ValueError, match="invalid enrollment response"):
+        enroll.enroll_flow(_cfg(), client=fake)
+
+
+@pytest.mark.parametrize("poll", [
+    {"status": "active"}, {"status": "active", "session_token": ""},
+    {"status": "active", "session_token": 7},
+])
+def test_rejects_active_approval_without_real_session_token(poll):
+    fake = FakeClient([poll])
+    with pytest.raises(ValueError, match="invalid approval response"):
+        enroll.enroll_flow(_cfg(), client=fake)
+    assert config.load() is None

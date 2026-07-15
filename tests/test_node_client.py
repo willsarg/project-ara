@@ -59,6 +59,17 @@ def test_default_client_is_httpx_and_base_is_trimmed(monkeypatch):
     assert nc._base == "https://c.example"                 # trailing slash trimmed
 
 
+def test_client_refuses_remote_cleartext_even_for_loaded_config():
+    with pytest.raises(ValueError, match="insecure coordinator URL"):
+        NodeClient("http://coordinator.example", "SECRET", client=FakeHTTPClient())
+
+
+@pytest.mark.parametrize("token", [None, "", 7])
+def test_client_requires_a_nonempty_string_token(token):
+    with pytest.raises(ValueError, match="token is missing"):
+        NodeClient("https://c.example", token, client=FakeHTTPClient())
+
+
 def test_enroll_posts_self_description_with_bearer():
     nc, fake = _client(FakeResponse(payload={"enrollment_id": "e1", "status": "pending"}))
     out = nc.enroll({"machine_key": "m"})
@@ -76,12 +87,30 @@ def test_poll_approval_gets_enrollment_state():
     assert fake.calls[0][:2] == ("GET", "https://c.example/api/enroll/e1")
 
 
+def test_poll_approval_percent_encodes_wire_identifier():
+    nc, fake = _client(FakeResponse(payload={"status": "pending"}))
+    nc.poll_approval("../other enrollment")
+    assert fake.calls[0][1] == "https://c.example/api/enroll/..%2Fother%20enrollment"
+
+
 def test_get_work_returns_job_on_200():
     job = {"id": "j1", "kind": "run", "args": {}}
     nc, fake = _client(FakeResponse(status_code=200, payload={"job": job}))
     assert nc.get_work(20) == job
     method, url, params, _ = fake.calls[0]
     assert method == "GET" and url == "https://c.example/api/work" and params == {"wait": 20}
+
+
+@pytest.mark.parametrize("payload", [
+    None, {}, {"job": None}, {"job": []},
+    {"job": {"id": "", "kind": "run", "args": {}}},
+    {"job": {"id": "j", "kind": "", "args": {}}},
+    {"job": {"id": "j", "kind": "run", "args": []}},
+])
+def test_get_work_rejects_malformed_wire_jobs(payload):
+    nc, _fake = _client(FakeResponse(status_code=200, payload=payload))
+    with pytest.raises(ValueError, match="invalid work response"):
+        nc.get_work(20)
 
 
 def test_get_work_returns_none_on_204():
@@ -96,6 +125,13 @@ def test_post_result_posts_payload():
     method, url, body, headers = fake.calls[0]
     assert method == "POST" and url == "https://c.example/api/work/j1/result"
     assert body["status"] == "done" and headers == {"Authorization": "Bearer TOK"}
+
+
+def test_post_result_percent_encodes_wire_job_id():
+    nc, fake = _client()
+    nc.post_result("../../outside job", {"status": "done"})
+    assert fake.calls[0][1] == (
+        "https://c.example/api/work/..%2F..%2Foutside%20job/result")
 
 
 def test_close_releases_the_pool():

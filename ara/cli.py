@@ -3542,7 +3542,6 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
         if not server_url or not token:
             return _node_err(c, as_json, "usage: ara node enroll <server_url> --token <token>")
         cfg = config.NodeConfig(server_url=server_url, enrollment_token=token)
-        config.save(cfg)
         try:
             enroll.enroll_flow(cfg)
         except Exception as exc:                    # surface, don't swallow: enrollment can fail
@@ -3550,8 +3549,11 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
         return _node_say(c, as_json, f"enrolled with {server_url}", endpoint=server_url)
 
     if sub == "run":
-        cfg = config.load()
-        if cfg is None:
+        try:
+            cfg = config.load()
+        except (OSError, ValueError) as exc:
+            return _node_err(c, as_json, f"cannot load node configuration: {exc}")
+        if cfg is None or not cfg.session_token:
             return _node_err(c, as_json,
                              "not enrolled — run: ara node enroll <server_url> --token <token>")
         agent.run_loop(cfg)                         # blocks: phone-home work loop until stopped
@@ -3559,12 +3561,24 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
 
     if sub in ("install", "start", "stop", "status", "uninstall"):
         try:
+            if sub in {"install", "start"}:
+                cfg = config.load()
+                if cfg is None or not cfg.session_token:
+                    return _node_err(
+                        c, as_json,
+                        "not enrolled — run: ara node enroll <server_url> --token <token>",
+                    )
             if sub == "install":
                 service.install()
-                return _node_say(c, as_json, "installed + started (systemd --user)")
+                return _node_say(
+                    c, as_json,
+                    "installed + started (systemd --user; starts with the user manager)",
+                )
             if sub == "status":
-                out = service.status()
-                print(json.dumps({"status": out})) if as_json else c.emit(out.rstrip())
+                if as_json:
+                    print(json.dumps({"status": service.status_info()}))
+                else:
+                    c.emit(service.status().rstrip())
                 return 0
             getattr(service, sub)()            # start | stop | uninstall
             return _node_say(c, as_json, f"{sub} ok")
@@ -4198,7 +4212,11 @@ def _click_node_run(ctx: click.Context, verbose: bool, as_json: bool) -> int:
 @_json_verbose_options
 @click.pass_context
 def _click_node_install(ctx: click.Context, verbose: bool, as_json: bool) -> int:
-    """Install and start the user service."""
+    """Install and start the Linux user service.
+
+    The service starts with this user's systemd manager. Headless boot before login requires
+    administrator-configured user lingering; ARA does not enable that policy automatically.
+    """
     return _invoke_node(ctx, "install", as_json)
 
 

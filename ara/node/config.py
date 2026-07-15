@@ -5,14 +5,15 @@
 A node holds three facts: the coordinator ``server_url``, the one-shot ``enrollment_token`` an
 admin handed it, and (once approved) the durable ``session_token`` it auths work with. They live in
 the node data dir as ``config.json`` (``ARA_NODE_DIR`` override for tests, else the OS data dir),
-written mode 0600 with an atomic owner-only create+truncate: a session token is a credential and
-must never be world/group-readable, even for the instant between create and chmod.
+written mode 0600 with an owner-only same-directory atomic replacement: a session token is a
+credential and must never be world/group-readable, even for the instant between create and chmod.
 """
 from __future__ import annotations
 
 import dataclasses
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -54,6 +55,17 @@ def _config_path():
     return node_dir() / "config.json"
 
 
+def _fsync_parent(path: Path) -> None:
+    """Make a completed rename durable on POSIX; directory handles are not portable to Windows."""
+    if os.name == "nt":
+        return
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def load() -> NodeConfig | None:
     """The stored config, or None if this node has never been pointed at a coordinator."""
     path = _config_path()
@@ -68,13 +80,26 @@ def load() -> NodeConfig | None:
 
 
 def save(config: NodeConfig) -> None:
-    """Persist *config* to the node data dir, owner-only (0600) via an atomic create+truncate.
+    """Persist *config* to the node data dir via an owner-only atomic replacement.
 
-    The session token is a credential, so the file is created 0600 up front (``os.open`` with the
-    mode, not create-then-chmod) — never world/group-readable, even transiently. On Windows the mode
-    is advisory (ACLs govern)."""
+    The session token is a credential, so a same-directory temporary file is created 0600 up front
+    and replaces the destination only after its contents are durable. This leaves an existing valid
+    config intact if writing or replacement fails. On Windows the mode is advisory (ACLs govern)."""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(dataclasses.asdict(config), handle)
+    if path.is_symlink():
+        raise OSError(f"refusing to replace config-path symlink: {path}")
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(dataclasses.asdict(config), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_parent(path)
+    finally:
+        temporary.unlink(missing_ok=True)

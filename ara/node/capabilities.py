@@ -98,7 +98,7 @@ def environment() -> dict:
     _wall, cgroup_binds = _effective_wall()
     accel = detect.accelerator(detect.chip_name())
     return {
-        "platform": _PLATFORMS.get(platform.system(), "linux"),
+        "platform": _PLATFORMS.get(platform.system(), "unknown"),
         "accel": _ACCELS.get(accel.kind, "unknown"),
         "containerized": _containerized(cgroup_binds),
         "virtualization_layer": _virtualization_layer(),

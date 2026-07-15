@@ -275,6 +275,15 @@ def test_benchmark_worker_minimal_no_exec_consent(monkeypatch):
     assert seen["a"] == ["benchmark", "--use-case", "rag", "--yes", "--", "org/m"]
 
 
+@pytest.mark.parametrize("not_consent", [False, "false", "true", 1, [], {}])
+def test_benchmark_worker_requires_literal_true_exec_consent(monkeypatch, not_consent):
+    seen = {}
+    monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
+    wiring._benchmark({"model": "org/m", "use_case": "coding",
+                       "exec_consent": not_consent})
+    assert "--exec-consent" not in seen["a"]
+
+
 def test_run_cli_inserts_json_before_end_of_options_separator(monkeypatch):
     captured = {}
 

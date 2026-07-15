@@ -26,11 +26,17 @@ def enroll_flow(config: config_mod.NodeConfig, *, client: NodeClient | None = No
     config_mod.require_secure_url(config.server_url)
     client = client or NodeClient(config.server_url, config.enrollment_token)
     response = client.enroll(capabilities.self_description())
-    enrollment_id = response["enrollment_id"]
+    enrollment_id = response.get("enrollment_id") if isinstance(response, dict) else None
+    if not isinstance(enrollment_id, str) or not enrollment_id:
+        raise ValueError("invalid enrollment response from coordinator")
     for _ in range(max_polls):
         poll = client.poll_approval(enrollment_id)
-        if poll.get("status") == "active":
-            config.session_token = poll["session_token"]
+        if isinstance(poll, dict) and poll.get("status") == "active":
+            session_token = poll.get("session_token")
+            if not isinstance(session_token, str) or not session_token:
+                raise ValueError("invalid approval response from coordinator")
+            config.session_token = session_token
+            config.enrollment_token = None
             config_mod.save(config)
             return config
         sleep(poll_interval)

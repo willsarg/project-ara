@@ -67,3 +67,58 @@ def test_saved_file_is_owner_only():
     config.save(config.NodeConfig(server_url="https://c.example", session_token="SECRET"))
     mode = os.stat(config._config_path()).st_mode & 0o777
     assert mode == 0o600                       # a session token must never be group/world-readable
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode is advisory on Windows")
+def test_save_replaces_existing_permissive_file_owner_only():
+    path = config._config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text('{"server_url": "https://old.example"}', encoding="utf-8")
+    path.chmod(0o666)
+
+    config.save(config.NodeConfig(server_url="https://new.example", session_token="SECRET"))
+
+    assert config.load().server_url == "https://new.example"
+    assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_save_refuses_config_path_symlink_without_touching_target(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text('{"server_url": "https://old.example"}', encoding="utf-8")
+    path = config._config_path()
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    with pytest.raises(OSError, match="symlink"):
+        config.save(config.NodeConfig(server_url="https://new.example", session_token="SECRET"))
+
+    assert path.is_symlink()
+    assert target.read_text(encoding="utf-8") == '{"server_url": "https://old.example"}'
+
+
+def test_save_replace_failure_preserves_prior_valid_config(monkeypatch):
+    old = config.NodeConfig(server_url="https://old.example", session_token="OLD")
+    config.save(old)
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(config.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        config.save(config.NodeConfig(server_url="https://new.example", session_token="NEW"))
+
+    assert config.load() == old
+    assert list(config._config_path().parent.glob(".config.json.*")) == []
+
+
+def test_save_degrades_when_fchmod_is_unavailable(monkeypatch):
+    monkeypatch.delattr(config.os, "fchmod")
+    config.save(config.NodeConfig(server_url="https://c.example"))
+    assert config.load().server_url == "https://c.example"
+
+
+def test_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(config.os, "name", "nt")
+    monkeypatch.setattr(config.os, "open", lambda *_a: pytest.fail("must not open a directory"))
+    assert config._fsync_parent(tmp_path / "config.json") is None

@@ -11,14 +11,18 @@ subprocess, or a wall-clock wait.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
-from ara.node import capabilities, config as config_mod, enroll, health, wiring
+from ara.node import capabilities, config as config_mod, health, wiring
 from ara.node.client import NodeClient
 
 
@@ -52,22 +56,19 @@ def _result_payload(result: dict) -> dict:
 
 
 def _is_unauthorized(exc: httpx.HTTPStatusError) -> bool:
-    """A 401 means our session token was revoked or expired — time to re-enroll."""
+    """Return whether the coordinator rejected the node's current session."""
     return exc.response.status_code == 401
 
 
-def _reauth(config) -> NodeClient | None:
-    """Session token rejected (401): drop it, re-run the enroll handshake for a fresh one, and
-    rebuild the client around it. Returns ``None`` when re-enrollment itself fails — most importantly
-    when the enrollment token was already consumed/revoked (it's single-use, so the coordinator 4xxs
-    the reuse). Absorbing that here is the contract: callers keep the work spooled and back off,
-    rather than the enroll error crashing the agent into a systemd restart loop."""
+class _ReenrollmentRequired(RuntimeError):
+    """The current session was rejected and a fresh explicit enrollment is required."""
+
+
+def _invalidate_session(config) -> None:
+    """Persist the rejected session as unusable; one-shot enrollment tokens are never retried."""
     config.session_token = None
-    try:
-        enroll.enroll_flow(config)
-    except httpx.HTTPError:
-        return None
-    return NodeClient(config.server_url, config.session_token)
+    config.enrollment_token = None
+    config_mod.save(config)
 
 
 def _results_dir() -> Path:
@@ -76,53 +77,121 @@ def _results_dir() -> Path:
 
 
 def _spool_path(job_id: str) -> Path:
-    return _results_dir() / f"{job_id}.json"
+    digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+    return _results_dir() / f"{digest}.json"
+
+
+def _fsync_parent(path: Path) -> None:
+    """Make a completed rename durable on POSIX; directory handles are not portable to Windows."""
+    if os.name == "nt":
+        return
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    """Write JSON through a same-directory owner-only temporary, then atomically replace *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_parent(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _spool_result(job_id: str, payload: dict) -> None:
     """Persist a finished result to disk BEFORE any network attempt, so a report failure or a crash
     can never lose completed work (Rule #1). Same job → same outcome, so overwrite is fine."""
-    _results_dir().mkdir(parents=True, exist_ok=True)
-    _spool_path(job_id).write_text(json.dumps(payload), encoding="utf-8")
+    envelope = {"version": 1, "job_id": job_id, "payload": payload}
+    _write_json_atomic(_spool_path(job_id), envelope)
+
+
+_SAFE_LEGACY_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _read_spooled_result(path: Path) -> tuple[str, dict]:
+    """Read a current envelope or a legacy payload whose filename contains a safe job ID."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("spooled result must be a JSON object")
+    if set(value) == {"version", "job_id", "payload"} and value["version"] == 1:
+        job_id = value["job_id"]
+        payload = value["payload"]
+        if not isinstance(job_id, str) or not isinstance(payload, dict):
+            raise ValueError("invalid spooled result envelope")
+        if path != _spool_path(job_id):
+            raise ValueError("spooled result filename does not match its job ID")
+        return job_id, payload
+    if not _SAFE_LEGACY_JOB_ID.fullmatch(path.stem):
+        raise ValueError("unsafe legacy spool filename")
+    return path.stem, value
+
+
+def _quarantine_spool(path: Path) -> None:
+    """Move an unreadable spool entry out of the retry lane without destroying evidence."""
+    quarantine = path.parent / "quarantine"
+    quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = quarantine / path.name
+    index = 1
+    while destination.exists() or destination.is_symlink():
+        destination = quarantine / f"{path.name}.{index}"
+        index += 1
+    os.replace(path, destination)
+    _fsync_parent(destination)
+    if not destination.is_symlink():
+        destination.chmod(0o600)
 
 
 def _try_post(client: NodeClient, config, job_id: str, payload: dict):
-    """POST one result. On a 401 (revoked token) re-enroll once and retry with the fresh client.
-    Returns ``(delivered, client)`` and NEVER raises on a report failure — the caller keeps the
-    result spooled for a later retry instead of crashing or discarding it."""
+    """POST one result without losing it on failure.
+
+    Transient failures return ``False`` so the caller keeps the spool. A 401 invalidates the
+    rejected session and raises ``_ReenrollmentRequired``: enrollment tokens are one-shot, so only
+    a new explicit ``ara node enroll`` can establish the next session.
+    """
     try:
         client.post_result(job_id, payload)
         return True, client
     except httpx.HTTPStatusError as exc:
-        if not _is_unauthorized(exc):
-            return False, client
-        refreshed = _reauth(config)                 # token revoked → refresh, then retry once
-        if refreshed is None:                       # re-enroll failed → keep spooled, retry later
-            return False, client
-        client = refreshed
-    except httpx.HTTPError:
+        if _is_unauthorized(exc):
+            _invalidate_session(config)
+            raise _ReenrollmentRequired from exc
         return False, client
-    try:
-        client.post_result(job_id, payload)
-        return True, client
     except httpx.HTTPError:
         return False, client
 
 
 def _flush_spool(client: NodeClient, config) -> NodeClient:
     """Re-deliver any durably-spooled results (left by an earlier failure or a crash), removing each
-    on success — so finished work survives a restart. A corrupt spool file is dropped, not retried
-    forever or crashed on."""
+    on success — so finished work survives a restart. Corrupt spool files are quarantined for
+    inspection rather than retried forever or destroyed."""
     d = _results_dir()
     if not d.exists():
         return client
     for f in sorted(d.glob("*.json")):
         try:
-            payload = json.loads(f.read_text(encoding="utf-8"))
+            if f.is_symlink():
+                raise ValueError("spool path is a symlink")
+            job_id, payload = _read_spooled_result(f)
         except (OSError, ValueError):
-            f.unlink(missing_ok=True)
+            try:
+                _quarantine_spool(f)
+            except OSError:
+                pass
             continue
-        delivered, client = _try_post(client, config, f.stem, payload)
+        delivered, client = _try_post(client, config, job_id, payload)
         if delivered:
             f.unlink(missing_ok=True)
     return client
@@ -134,16 +203,13 @@ def run_loop(config, *, client: NodeClient | None = None,
              reauth_backoff: float = 5.0) -> int:
     """Run the phone-home work loop, returning the number of poll iterations performed.
 
-    Ensures the node is enrolled (a session token present), then for each iteration long-polls for a
-    job, runs it, and reports the outcome. Emits an sd_notify heartbeat + status each iteration so
-    systemd's watchdog is fed (and journald sees liveness off systemd). A 401 on either call means
-    the session token was revoked/expired: the node re-enrolls for a fresh token, rebuilds the
-    client, and carries on rather than crashing — then sleeps ``reauth_backoff`` so a server that
-    persistently 401s can't busy-loop (a 401 returns immediately, with none of the long-poll's
-    natural pacing). ``max_iterations`` bounds the loop (None = forever, the production default);
-    ``client``/``runner``/``sleep`` are injectable for tests."""
+    Requires an active session, then for each iteration long-polls for a job, runs it, and reports
+    the outcome. A 401 invalidates the rejected session and stops cleanly for an explicit fresh
+    enrollment; a one-shot enrollment token is never reused. Coordinator transport, 5xx, and
+    malformed-response failures back off and retry. ``max_iterations`` bounds the loop (None =
+    forever, the production default); ``client``/``runner``/``sleep`` are injectable for tests."""
     if not config.session_token:
-        enroll.enroll_flow(config)
+        raise ValueError("re-enrollment required — run: ara node enroll <server_url> --token <token>")
     client = client or NodeClient(config.server_url, config.session_token)
     runner = runner or default_runner()
     health.ready()
@@ -152,17 +218,25 @@ def run_loop(config, *, client: NodeClient | None = None,
         count += 1
         health.heartbeat()
         health.status(f"polling for work (iteration {count})")
-        client = _flush_spool(client, config)   # first, deliver anything left by a prior failure/crash
+        try:
+            client = _flush_spool(client, config)  # deliver work left by a prior failure/crash
+        except _ReenrollmentRequired:
+            health.status("re-enrollment required — session rejected while reporting a result")
+            return count
         try:
             job = client.get_work(wait)
         except httpx.HTTPStatusError as exc:
             if _is_unauthorized(exc):
-                refreshed = _reauth(config)    # None → re-enroll failed (e.g. consumed token)
-                if refreshed is not None:      # keep the old (dead) client otherwise; it 401s again
-                    client = refreshed         # → we simply back off again, bounded, never crash
-                sleep(reauth_backoff)          # backoff: a persistent 401 mustn't busy-loop
-                continue
-            raise
+                _invalidate_session(config)
+                health.status("re-enrollment required — coordinator rejected the session")
+                return count
+            health.status(f"coordinator unavailable: {exc}")
+            sleep(reauth_backoff)
+            continue
+        except (httpx.HTTPError, ValueError) as exc:
+            health.status(f"coordinator unavailable: {exc}")
+            sleep(reauth_backoff)
+            continue
         if job is None:
             sleep(poll_gap)
             continue
@@ -174,7 +248,11 @@ def run_loop(config, *, client: NodeClient | None = None,
         # Durable BEFORE the network: spool the finished result, then post. Only remove it once the
         # server has acknowledged it — so a 401/5xx/crash retries later instead of losing the work.
         _spool_result(job["id"], payload)
-        delivered, client = _try_post(client, config, job["id"], payload)
+        try:
+            delivered, client = _try_post(client, config, job["id"], payload)
+        except _ReenrollmentRequired:
+            health.status("re-enrollment required — coordinator rejected the session")
+            return count
         if delivered:
             _spool_path(job["id"]).unlink(missing_ok=True)
         else:

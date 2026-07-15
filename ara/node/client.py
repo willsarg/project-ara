@@ -14,7 +14,11 @@ touch a real socket. Endpoints (pinned by ``contracts/wire``):
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
+
+from ara.node import config as config_mod
 
 
 class NodeClient:
@@ -22,6 +26,9 @@ class NodeClient:
 
     def __init__(self, server_url: str, token: str, *, client: httpx.Client | None = None,
                  timeout: float = 30.0) -> None:
+        config_mod.require_secure_url(server_url)
+        if not isinstance(token, str) or not token:
+            raise ValueError("node authentication token is missing")
         self._base = server_url.rstrip("/")
         self._token = token
         self._client = client or httpx.Client(timeout=timeout)
@@ -37,7 +44,8 @@ class NodeClient:
 
     def poll_approval(self, enrollment_id: str) -> dict:
         """GET the enrollment's state: ``pending``, or ``active`` carrying the ``session_token``."""
-        resp = self._client.get(f"{self._base}/api/enroll/{enrollment_id}", headers=self._headers())
+        encoded = quote(enrollment_id, safe="")
+        resp = self._client.get(f"{self._base}/api/enroll/{encoded}", headers=self._headers())
         resp.raise_for_status()
         return resp.json()
 
@@ -48,11 +56,19 @@ class NodeClient:
         if resp.status_code == 204:
             return None
         resp.raise_for_status()
-        return resp.json()["job"]
+        payload = resp.json()
+        job = payload.get("job") if isinstance(payload, dict) else None
+        if (not isinstance(job, dict)
+                or not isinstance(job.get("id"), str) or not job["id"]
+                or not isinstance(job.get("kind"), str) or not job["kind"]
+                or not isinstance(job.get("args"), dict)):
+            raise ValueError("invalid work response from coordinator")
+        return job
 
     def post_result(self, job_id: str, payload: dict) -> None:
         """POST the run's outcome (``result.request`` shape) for a dispatched job."""
-        resp = self._client.post(f"{self._base}/api/work/{job_id}/result", json=payload,
+        encoded = quote(job_id, safe="")
+        resp = self._client.post(f"{self._base}/api/work/{encoded}/result", json=payload,
                                  headers=self._headers())
         resp.raise_for_status()
 

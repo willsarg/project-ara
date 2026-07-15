@@ -162,7 +162,7 @@ def test_virtualization_layer_none_bare_metal(env_io):
 # environment() — mapping + container-honesty, schema-valid
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("system,expected", [
-    ("Linux", "linux"), ("Darwin", "darwin"), ("Windows", "windows"), ("Plan9", "linux"),
+    ("Linux", "linux"), ("Darwin", "darwin"), ("Windows", "windows"), ("Plan9", "unknown"),
 ])
 def test_environment_platform_mapping(stub_host, env_io, system, expected):
     stub_host()

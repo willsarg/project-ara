@@ -59,8 +59,9 @@ def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     unit = tmp_path / "sd" / "ara-node.service"
     text = unit.read_text()
     assert f'ExecStart="{service.sys.executable}" -m ara node run' in text
-    assert "Type=notify" in text                             # watchdog needs sd_notify handshake
-    assert f"WatchdogSec={service.WATCHDOG_SEC}" in text
+    assert "Type=simple" in text                            # long jobs must not trip a loop watchdog
+    assert "WatchdogSec=" not in text
+    assert f"RestartSec={service.RESTART_SEC}" in text      # daemon failures never rapid-loop
     assert "WantedBy=default.target" in text
     assert calls == [["systemctl", "--user", "daemon-reload"],
                      ["systemctl", "--user", "enable", "--now", "ara-node.service"]]
@@ -114,6 +115,30 @@ def test_start_stop_status(linux, calls):
     assert calls == [["systemctl", "--user", "start", "ara-node.service"],
                      ["systemctl", "--user", "stop", "ara-node.service"],
                      ["systemctl", "--user", "status", "ara-node.service"]]
+
+
+def test_status_info_returns_stable_machine_state(monkeypatch, linux):
+    output = "LoadState=loaded\nActiveState=inactive\nSubState=dead\nStatusText=needs enrollment\n"
+    monkeypatch.setattr(service, "_run", lambda _cmd: (0, output, ""))
+    assert service.status_info() == {
+        "installed": True, "active": False, "load_state": "loaded",
+        "active_state": "inactive", "sub_state": "dead",
+        "status_text": "needs enrollment",
+    }
+
+
+def test_status_info_reports_absent_unit(monkeypatch, linux):
+    output = "LoadState=not-found\nActiveState=inactive\nSubState=dead\nStatusText=\n"
+    monkeypatch.setattr(service, "_run", lambda _cmd: (0, output, ""))
+    assert service.status_info()["installed"] is False
+
+
+def test_status_info_ignores_unstructured_lines_and_defaults_unknown(monkeypatch, linux):
+    monkeypatch.setattr(service, "_run", lambda _cmd: (0, "localized noise\n", ""))
+    assert service.status_info() == {
+        "installed": False, "active": False, "load_state": "unknown",
+        "active_state": "unknown", "sub_state": "unknown", "status_text": None,
+    }
 
 
 @pytest.mark.parametrize("fn,verb", [(service.start, "start"), (service.stop, "stop")])

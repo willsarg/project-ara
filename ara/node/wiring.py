@@ -152,7 +152,7 @@ def _benchmark(args: dict) -> dict:
         cli += ["--ctx", str(args["ctx"])]
     if args.get("max_tokens") is not None:
         cli += ["--max-tokens", str(args["max_tokens"])]
-    if args.get("exec_consent"):
+    if args.get("exec_consent") is True:
         cli.append("--exec-consent")
     cli.append("--yes")
     cli += ["--", _safe(args["model"], "model")]

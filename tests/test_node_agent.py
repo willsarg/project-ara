@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 
 import httpx
 import pytest
@@ -152,14 +154,11 @@ def test_no_work_sleeps_and_continues_without_posting():
     assert n == 1 and fake.posted == [] and slept == [0.25]
 
 
-def test_enrolls_first_when_no_session_token(monkeypatch):
-    called = {}
-    monkeypatch.setattr(agent.enroll, "enroll_flow",
-                        lambda cfg: called.setdefault("cfg", cfg))
+def test_run_loop_requires_a_fresh_explicit_enrollment_when_session_is_missing():
     fake = FakeClient([None])
-    agent.run_loop(_cfg(session_token=None), client=fake, runner=lambda k, a: {},
-                   max_iterations=1, sleep=lambda s: None)
-    assert "cfg" in called                                  # missing session → enroll_flow ran first
+    with pytest.raises(ValueError, match="re-enrollment required"):
+        agent.run_loop(_cfg(session_token=None), client=fake, runner=lambda k, a: {},
+                       max_iterations=1, sleep=lambda s: None)
 
 
 def test_builds_default_client_and_runner_when_none_injected(monkeypatch):
@@ -182,10 +181,10 @@ def test_heartbeat_and_status_fire_each_iteration_after_ready(monkeypatch):
     fake = FakeClient([None, None])
     agent.run_loop(_cfg(), client=fake, runner=lambda k, a: {}, max_iterations=2, sleep=lambda s: None)
     assert beats["ready"] == 1                              # READY=1 announced once, before the loop
-    assert beats["heartbeat"] == 2 and len(beats["status"]) == 2   # watchdog + status every iteration
+    assert beats["heartbeat"] == 2 and len(beats["status"]) == 2  # optional signal + status
 
 
-# --- 401 re-enrollment (session token revoked/expired) ---
+# --- revoked session / coordinator outage handling ---
 class RaisingClient:
     """get_work / post_result raise a scripted error (or behave) so the 401 path is exercisable."""
 
@@ -206,43 +205,40 @@ class RaisingClient:
         self.posted.append((job_id, payload))
 
 
-def test_get_work_401_reenrolls_and_rebuilds_client(monkeypatch):
-    reenrolled = []
-    monkeypatch.setattr(agent.enroll, "enroll_flow", lambda cfg: reenrolled.append(cfg))
-    fresh = FakeClient([None])
-    built = {}
-    monkeypatch.setattr(agent, "NodeClient",
-                        lambda url, token: built.setdefault("args", (url, token)) or fresh)
+def test_get_work_401_invalidates_session_and_stops_for_explicit_reenrollment(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(agent.health, "status", statuses.append)
     cfg = _cfg()
     client = RaisingClient(get_work_error=_status_error(401))
     n = agent.run_loop(cfg, client=client, runner=lambda k, a: {}, max_iterations=1,
                        sleep=lambda s: None)
-    assert n == 1 and reenrolled == [cfg]                  # 401 → re-ran enroll_flow
-    assert cfg.session_token is None                       # dropped the revoked token before re-enroll
-    assert built["args"] == (cfg.server_url, cfg.session_token)   # rebuilt the client fresh
+    assert n == 1 and cfg.session_token is None
+    assert config.load().session_token is None
+    assert any("re-enrollment required" in status for status in statuses)
 
 
-def test_get_work_non_401_error_propagates():
-    client = RaisingClient(get_work_error=_status_error(500))
-    with pytest.raises(httpx.HTTPStatusError):
-        agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
-                       sleep=lambda s: None)
+@pytest.mark.parametrize("error", [
+    _status_error(500), httpx.ConnectError("connection refused"),
+    ValueError("invalid work response from coordinator"),
+])
+def test_get_work_transient_or_invalid_response_backs_off_without_crashing(error):
+    client = RaisingClient(get_work_error=error)
+    slept = []
+    assert agent.run_loop(
+        _cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+        sleep=slept.append, reauth_backoff=7.0,
+    ) == 1
+    assert slept == [7.0]
 
 
-def test_post_result_401_reenrolls_and_delivers(monkeypatch, tmp_path):
-    """A 401 on report means the token was revoked — re-enroll and DELIVER the result to the fresh
-    client. It must never be silently dropped (the old bug: `continue` discarded finished work)."""
-    reenrolled = []
-    monkeypatch.setattr(agent.enroll, "enroll_flow", lambda cfg: reenrolled.append(cfg))
-    fresh = FakeClient([None])
-    monkeypatch.setattr(agent, "NodeClient", lambda url, token: fresh)
+def test_post_result_401_invalidates_session_and_keeps_spool(monkeypatch, tmp_path):
     client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
                            post_error=_status_error(401))
-    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
+    cfg = _cfg()
+    n = agent.run_loop(cfg, client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
                        sleep=lambda s: None)
-    assert n == 1 and reenrolled                            # re-enrolled after the 401
-    assert fresh.posted and fresh.posted[0][0] == "j1"      # result delivered, NOT discarded
-    assert _spool_files(tmp_path) == []                     # spool cleaned up on success
+    assert n == 1 and cfg.session_token is None
+    assert len(_spool_files(tmp_path)) == 1                 # result retained for new enrollment
 
 
 def test_post_result_non_401_error_spools_and_does_not_crash(tmp_path):
@@ -255,48 +251,10 @@ def test_post_result_non_401_error_spools_and_does_not_crash(tmp_path):
                        sleep=lambda s: slept.append(s), reauth_backoff=5.0)
     assert n == 1                                           # loop survived, no exception
     spooled = _spool_files(tmp_path)
-    assert len(spooled) == 1 and spooled[0].stem == "j1"   # finished work kept on disk
+    assert len(spooled) == 1                                # finished work kept on disk
+    envelope = json.loads(spooled[0].read_text(encoding="utf-8"))
+    assert envelope["job_id"] == "j1" and envelope["payload"]["status"] == "done"
     assert 5.0 in slept                                     # bounded backoff after the failure
-
-
-def test_reauth_returns_none_when_enrollment_token_already_consumed(monkeypatch):
-    """The enrollment token is single-use — re-running enroll_flow after the coordinator burned it
-    (the exact situation on a session revoke) raises. `_reauth` must ABSORB that and return None so
-    callers keep work spooled + back off, instead of letting it crash the agent — Fix #1."""
-    def _raise(cfg):
-        raise _status_error(401)
-    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
-    assert agent._reauth(_cfg()) is None
-
-
-def test_get_work_401_survives_failed_reauth(monkeypatch):
-    """Revoked session + already-consumed enrollment token → enroll_flow raises. The loop must back
-    off and keep running, never crash — otherwise systemd `Restart=on-failure` crash-loops it (the
-    bug: `_reauth` propagated the enroll HTTPStatusError straight out of run_loop) — Fix #1."""
-    def _raise(cfg):
-        raise _status_error(401)
-    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
-    slept = []
-    client = RaisingClient(get_work_error=_status_error(401))
-    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
-                       sleep=lambda s: slept.append(s), reauth_backoff=5.0)
-    assert n == 1                                          # survived, no exception
-    assert 5.0 in slept                                    # bounded backoff, no busy-loop
-
-
-def test_post_401_failed_reauth_keeps_spool_and_survives(tmp_path, monkeypatch):
-    """Report 401 → reauth, but enroll_flow raises (consumed token). `_try_post` must report
-    not-delivered so the finished result stays spooled for a later retry — never raise/lose it — Fix #1."""
-    def _raise(cfg):
-        raise _status_error(401)
-    monkeypatch.setattr(agent.enroll, "enroll_flow", _raise)
-    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
-                           post_error=_status_error(401))
-    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
-                       sleep=lambda s: None)
-    assert n == 1                                          # loop survived
-    spooled = _spool_files(tmp_path)
-    assert len(spooled) == 1 and spooled[0].stem == "j1"   # finished work kept, not lost
 
 
 def test_finished_result_spool_is_cleaned_up_on_successful_post(tmp_path):
@@ -320,17 +278,14 @@ def test_spooled_result_from_prior_crash_is_flushed(tmp_path):
     assert _spool_files(tmp_path) == []                     # removed after delivery
 
 
-def test_post_401_then_reauth_client_also_fails_keeps_spool(tmp_path, monkeypatch):
-    """Token refreshed on 401 but the server is still erroring — the retry fails too; the result
-    must stay spooled (not lost, not crashed on)."""
-    monkeypatch.setattr(agent.enroll, "enroll_flow", lambda cfg: None)
-    monkeypatch.setattr(agent, "NodeClient",
-                        lambda url, token: RaisingClient(post_error=_status_error(503)))
-    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
-                           post_error=_status_error(401))
-    n = agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=1,
-                       sleep=lambda s: None)
-    assert n == 1 and len(_spool_files(tmp_path)) == 1      # kept for a later retry
+def test_current_spool_envelope_from_prior_crash_is_flushed(tmp_path):
+    payload = {"status": "done", "result": {"x": 1}}
+    agent._spool_result("current-job", payload)
+    client = FakeClient([None])
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                   sleep=lambda s: None)
+    assert client.posted == [("current-job", payload)]
+    assert _spool_files(tmp_path) == []
 
 
 def test_post_network_error_spools_and_does_not_crash(tmp_path):
@@ -353,8 +308,8 @@ def test_flush_keeps_result_when_post_still_fails(tmp_path):
     assert len(_spool_files(tmp_path)) == 1                 # still spooled
 
 
-def test_flush_skips_and_drops_corrupt_spool_file(tmp_path):
-    """A corrupt spool file can't be delivered — it's dropped, not retried forever or crashed on."""
+def test_flush_quarantines_and_preserves_corrupt_spool_file(tmp_path):
+    """A corrupt spool file can't be delivered, but evidence must be preserved for inspection."""
     d = tmp_path / "node" / "results"
     d.mkdir(parents=True)
     (d / "bad.json").write_text("{not json")
@@ -362,3 +317,129 @@ def test_flush_skips_and_drops_corrupt_spool_file(tmp_path):
     agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
                    sleep=lambda s: None)
     assert client.posted == [] and _spool_files(tmp_path) == []
+    quarantined = list((d / "quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not json"
+
+
+@pytest.mark.parametrize("value", [
+    [],
+    {"status": "done"},
+    {"version": 1, "job_id": 7, "payload": {}},
+    {"version": 1, "job_id": "j1", "payload": []},
+])
+def test_flush_quarantines_invalid_spool_shapes(tmp_path, value):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "bad name.json").write_text(json.dumps(value), encoding="utf-8")
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda s: None)
+    assert not list(d.glob("*.json"))
+    assert len(list((d / "quarantine").iterdir())) == 1
+
+
+def test_flush_quarantines_envelope_with_mismatched_filename(tmp_path):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "wrong.json").write_text(json.dumps({
+        "version": 1, "job_id": "j1", "payload": {"status": "done"},
+    }), encoding="utf-8")
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda s: None)
+    assert len(list((d / "quarantine").iterdir())) == 1
+
+
+def test_flush_quarantine_collision_preserves_both_files(tmp_path):
+    d = tmp_path / "node" / "results"
+    quarantine = d / "quarantine"
+    quarantine.mkdir(parents=True)
+    (quarantine / "bad.json").write_text("older", encoding="utf-8")
+    (d / "bad.json").write_text("{broken", encoding="utf-8")
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda s: None)
+    assert sorted(p.name for p in quarantine.iterdir()) == ["bad.json", "bad.json.1"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_flush_quarantines_symlink_without_chmodding_its_target(tmp_path):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    target = tmp_path / "target.json"
+    target.write_text("evidence", encoding="utf-8")
+    mode = os.stat(target).st_mode & 0o777
+    (d / "link.json").symlink_to(target)
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda s: None)
+    quarantined = d / "quarantine" / "link.json"
+    assert quarantined.is_symlink() and target.read_text(encoding="utf-8") == "evidence"
+    assert os.stat(target).st_mode & 0o777 == mode
+
+
+def test_flush_survives_quarantine_filesystem_failure(tmp_path, monkeypatch):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    bad = d / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+    assert agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                          max_iterations=1, sleep=lambda s: None) == 1
+    assert bad.exists()
+
+
+def test_flush_401_invalidates_session_and_stops_with_spool_intact(tmp_path):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    old = d / "old.json"
+    old.write_text(json.dumps({"status": "done"}), encoding="utf-8")
+    cfg = _cfg()
+    assert agent.run_loop(cfg, client=RaisingClient(post_error=_status_error(401)),
+                          runner=lambda k, a: {}, max_iterations=1,
+                          sleep=lambda s: None) == 1
+    assert cfg.session_token is None and old.exists()
+
+
+def test_spool_filename_is_deterministic_and_not_derived_from_job_id(tmp_path):
+    job_id = "../../escape/SECRET job"
+    payload = {"status": "done", "result": {"x": 1}}
+
+    agent._spool_result(job_id, payload)
+
+    files = _spool_files(tmp_path)
+    assert files == [agent._spool_path(job_id)]
+    assert files[0].parent == tmp_path / "node" / "results"
+    assert "escape" not in files[0].name and "SECRET" not in files[0].name
+    assert json.loads(files[0].read_text(encoding="utf-8")) == {
+        "version": 1, "job_id": job_id, "payload": payload,
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode is advisory on Windows")
+def test_spool_file_is_owner_only(tmp_path):
+    agent._spool_result("j1", {"status": "done"})
+    assert os.stat(agent._spool_path("j1")).st_mode & 0o777 == 0o600
+
+
+def test_spool_replace_failure_preserves_prior_result(tmp_path, monkeypatch):
+    old = {"status": "done", "result": {"attempt": 1}}
+    agent._spool_result("j1", old)
+
+    monkeypatch.setattr(os, "replace",
+                        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
+    with pytest.raises(OSError, match="replace failed"):
+        agent._spool_result("j1", {"status": "done", "result": {"attempt": 2}})
+
+    envelope = json.loads(agent._spool_path("j1").read_text(encoding="utf-8"))
+    assert envelope["payload"] == old
+
+
+def test_spool_write_degrades_when_fchmod_is_unavailable(monkeypatch):
+    monkeypatch.delattr(agent.os, "fchmod")
+    agent._spool_result("j1", {"status": "done"})
+    assert agent._spool_path("j1").exists()
+
+
+def test_spool_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.os, "name", "nt")
+    monkeypatch.setattr(agent.os, "open", lambda *_a: pytest.fail("must not open a directory"))
+    assert agent._fsync_parent(tmp_path / "result.json") is None

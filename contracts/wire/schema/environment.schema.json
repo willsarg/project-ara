@@ -5,7 +5,7 @@
   "description": "Where a node/measurement lives. Carried on every measurement so a container/WSL2 wall is never mistaken for a bare-metal wall. wall_source records HOW the memory ceiling was read.",
   "type": "object",
   "properties": {
-    "platform": { "type": "string", "enum": ["linux", "darwin", "windows"] },
+    "platform": { "type": "string", "enum": ["linux", "darwin", "windows", "unknown"] },
     "accel": { "type": "string", "enum": ["nvidia", "amd", "metal", "vulkan", "intel", "cpu", "unknown"] },
     "containerized": { "type": "boolean" },
     "virtualization_layer": {

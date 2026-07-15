@@ -3,9 +3,10 @@
 """Run the push-only node on boot (systemd --user).
 
 The ``install``/``start``/``stop``/``status``/``uninstall`` functions manage a **user** systemd unit
-(``systemctl --user``, no root): the node comes back after a reboot or a crash without touching
-system-wide config, matching ARA's install-into-your-own-space philosophy. ExecStart runs the
-phone-home work loop (``ara node run``) — the node is a pure client with no inbound socket.
+(``systemctl --user``, no root): the node starts with the user's systemd manager and restarts after
+an unexpected failure without touching system-wide config. Starting a user manager at headless boot
+requires administrator-configured lingering; ARA does not claim or mutate that policy. ExecStart
+runs the phone-home work loop (``ara node run``) — the node is a pure client with no inbound socket.
 
 Linux first — systemd is the only init covered today; the other platforms raise a clear error via
 :func:`_require_linux` rather than silently no-op'ing (Rule #3). The one external boundary is
@@ -97,9 +98,9 @@ def _unit_path() -> Path:
     return _unit_dir() / UNIT_NAME
 
 
-# Watchdog ceiling: systemd kills+restarts the node if it misses a WATCHDOG=1 beat this long. The
-# agent loop pets it every poll iteration (health.heartbeat), so 30s comfortably clears the cadence.
-WATCHDOG_SEC = 30
+# A coordinator outage should not create a rapid restart loop even if an unexpected error escapes
+# the daemon's own bounded backoff.
+RESTART_SEC = 30
 
 
 def _systemd_quote(value: str) -> str:
@@ -112,10 +113,11 @@ def _systemd_quote(value: str) -> str:
 
 def _unit_text() -> str:
     """The systemd unit for the push-only node. ExecStart runs the phone-home agent loop
-    (``ara node run``) — the loop that pets systemd's watchdog via sd_notify, hence ``Type=notify``
-    and ``WatchdogSec``. ExecStart uses the *current* interpreter (``sys.executable -m ara``) so
-    it points at whichever uv-managed environment ARA is installed in rather than assuming a fixed
-    ``~/.local/bin/ara`` that may not exist there."""
+    (``ara node run``). Jobs such as characterization and benchmark can legitimately run for hours,
+    so the unit is ``Type=simple`` and deliberately has no loop-level watchdog that would kill a
+    healthy blocking worker. ExecStart uses the *current* interpreter (``sys.executable -m ara``)
+    so it points at whichever uv-managed environment ARA is installed in rather than assuming a
+    fixed ``~/.local/bin/ara`` that may not exist there."""
     return (
         "[Unit]\n"
         "Description=ARA node daemon\n"
@@ -123,10 +125,10 @@ def _unit_text() -> str:
         "Wants=network-online.target\n"
         "\n"
         "[Service]\n"
-        "Type=notify\n"
+        "Type=simple\n"
         f"ExecStart={_systemd_quote(sys.executable)} -m ara node run\n"
-        f"WatchdogSec={WATCHDOG_SEC}\n"
         "Restart=on-failure\n"
+        f"RestartSec={RESTART_SEC}\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
@@ -134,7 +136,11 @@ def _unit_text() -> str:
 
 
 def install() -> None:
-    """Write the unit, reload systemd, and enable+start it so the node survives reboots."""
+    """Write the unit, reload systemd, and enable+start it with the user's systemd manager.
+
+    Headless startup after reboot depends on administrator-configured lingering; ARA deliberately
+    does not enable or claim that host policy.
+    """
     _require_linux()
     path = _unit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +167,31 @@ def status() -> str:
     out, _err = _checked(
         ["systemctl", "--user", "status", UNIT_NAME], allowed=(0, 3))
     return out
+
+
+def status_info() -> dict:
+    """Return stable service state for ``ara node status --json`` (never localized prose)."""
+    _require_linux()
+    out, _err = _checked([
+        "systemctl", "--user", "show", UNIT_NAME, "--no-pager",
+        "--property=LoadState", "--property=ActiveState", "--property=SubState",
+        "--property=StatusText",
+    ])
+    values = {}
+    for line in out.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    load = values.get("LoadState", "unknown")
+    active = values.get("ActiveState", "unknown")
+    return {
+        "installed": load not in {"not-found", "unknown"},
+        "active": active == "active",
+        "load_state": load,
+        "active_state": active,
+        "sub_state": values.get("SubState", "unknown"),
+        "status_text": values.get("StatusText") or None,
+    }
 
 
 def uninstall() -> None:
