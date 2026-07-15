@@ -123,6 +123,7 @@ class Score:
     repeat_count: int | None = None
     total_generations: int | None = None
     run_scores: tuple[float, ...] | None = None
+    evidence_warning: str | None = None
     # Set by :func:`flag_inversions` when a same-base quant of a different precision upset this
     # reading's expected precision ordering — a short disclosure, never a re-ranking (Rule #3).
     inversion: str | None = None
@@ -146,13 +147,34 @@ def score_for(model_id: str, use_case: str, *,
                          repeat_count=hit.get("repeat_count"),
                          total_generations=hit.get("total_generations"),
                          run_scores=(tuple(hit["run_scores"])
-                                     if hit.get("run_scores") is not None else None))
+                                     if hit.get("run_scores") is not None else None),
+                         evidence_warning=hit.get("evidence_warning"))
     if imported:
         bucket = imported.get(model_id) or imported.get(base_key(model_id))
         if bucket and use_case in bucket:
             entry = bucket[use_case]
             return Score("imported", entry["score"], entry["source"])
     return None
+
+
+def decode_run_scores(raw: str | None, repeat_count: int | None
+                      ) -> tuple[list[float] | None, str | None]:
+    """Decode persisted per-run scores without trusting corrupt local evidence."""
+    if raw is None:
+        return None, None
+    warning = "invalid stored run-score provenance"
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, warning
+    valid_repeat = (isinstance(repeat_count, int) and not isinstance(repeat_count, bool)
+                    and repeat_count > 0)
+    if not isinstance(values, list) or not valid_repeat or len(values) != repeat_count:
+        return None, warning
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) or not 0 <= value <= 1 for value in values):
+        return None, warning
+    return [float(value) for value in values], None
 
 
 def _normalise_imported(raw: dict) -> dict:

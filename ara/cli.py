@@ -1608,17 +1608,21 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                          "base": scoring.base_key(row["model_id"])})
         if use_case is not None:
             rows = db.list_benchmark_results(evidence_con, profile.machine_key())
-            bench_measured = ({(r["model_id"], r["use_case"]):
-                               {"score": r["score"], "source": r["source"],
-                                "sample_size": r.get("sample_size"),
-                                "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n"),
-                                "probe_context": r.get("probe_context"),
-                                "generation_cap": r.get("generation_cap"),
-                                "repeat_count": r.get("repeat_count"),
-                                "total_generations": r.get("total_generations"),
-                                "run_scores": (json.loads(r["run_scores_json"])
-                                               if r.get("run_scores_json") else None)}
-                               for r in rows} or None)
+            bench_measured = {}
+            for row in rows:
+                run_scores, evidence_warning = scoring.decode_run_scores(
+                    row.get("run_scores_json"), row.get("repeat_count"))
+                bench_measured[(row["model_id"], row["use_case"])] = {
+                    "score": row["score"], "source": row["source"],
+                    "sample_size": row.get("sample_size"),
+                    "refused_n": row.get("refused_n"), "errored_n": row.get("errored_n"),
+                    "probe_context": row.get("probe_context"),
+                    "generation_cap": row.get("generation_cap"),
+                    "repeat_count": row.get("repeat_count"),
+                    "total_generations": row.get("total_generations"),
+                    "run_scores": run_scores, "evidence_warning": evidence_warning,
+                }
+            bench_measured = bench_measured or None
             recs = scoring.rank(recs, use_case, measured=bench_measured,
                                 imported=scoring.load_imported())
         else:
@@ -1637,6 +1641,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                                      "repeat_count": r["score"].repeat_count,
                                      "total_generations": r["score"].total_generations,
                                      "run_scores": r["score"].run_scores,
+                                     "evidence_warning": r["score"].evidence_warning,
                                      "inversion": r["score"].inversion})} for r in recs]
         print(json.dumps(recs, indent=2))
         return 0
@@ -1688,6 +1693,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                         head += f" [low-confidence n={s.sample_size}]"
                     if s.inversion:
                         head += f" [quant-inversion: {s.inversion}]"
+                    if s.evidence_warning:
+                        head += f" [{s.evidence_warning}]"
                     if c.verbose and s.sample_size is not None:
                         repeat_text = (f" × {s.repeat_count} runs"
                                        if s.repeat_count and s.repeat_count > 1 else "")
@@ -1754,7 +1761,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         return err("the coding benchmark executes model-generated Python on this machine "
                    "(NOT a security sandbox) — re-run with --exec-consent to allow it")
 
-    key = engines.resolve(engine) if engine else engines.for_hardware()
+    if engine is None or engine == "auto":
+        key = engines.for_backend(detect.backend_name()) or engines.for_hardware()
+    else:
+        key = engines.resolve(engine)
     if key is None:
         if engine is not None:
             return err(f"benchmark doesn't support --engine {engine!r} — choose one of: "
@@ -1875,10 +1885,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         # No generation anywhere produced a completion (all refused by governance and/or errored
         # mid-generation) — NOT a 0% capability measurement; refuse to store a misleading score.
         return err("every prompt was refused or errored — no measurement taken")
-    if refused_n:
+    if refused_n and not as_json:
         c.emit(c.style("warn", f"  note: {refused_n}/{total} prompts were refused by "
                                f"governance and scored 0 — the result is depressed accordingly"))
-    if errored_n:
+    if errored_n and not as_json:
         c.emit(c.style("warn", f"  note: {errored_n}/{total} prompts errored (engine "
                                f"exception) and scored 0 — the result is depressed accordingly"))
 

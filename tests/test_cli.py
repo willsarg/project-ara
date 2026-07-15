@@ -7959,6 +7959,7 @@ def test_render_benchmark_explicit_ctx_cannot_replace_characterization(
 
 def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
     # A backend without a `benchmark` attr → clear engine-named error.
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
     monkeypatch.setattr(cli.engines, "for_hardware", lambda: "fauxengine")
     orig = dict(cli.engines.ENGINES)
     orig["fauxengine"] = {**orig.get("fauxengine", {}), "backend": "fauxengine"}
@@ -7987,11 +7988,30 @@ def test_render_benchmark_names_invalid_or_unsupported_engine(
 
 def test_render_benchmark_reports_when_no_engine_matches(make_console, monkeypatch):
     monkeypatch.setattr(cli.engines, "for_hardware", lambda: None)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")
     c, buf = make_console()
 
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
 
     assert "no benchmark-capable engine matches this machine" in buf.getvalue()
+
+
+@pytest.mark.parametrize("engine", [None, "auto"])
+def test_render_benchmark_auto_uses_detected_cpu_backend(
+        make_console, monkeypatch, engine):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli.engines, "for_hardware", lambda: None)
+    monkeypatch.setattr(cli.engines, "resolve",
+                        lambda value: cli.engines.for_hardware() if value == "auto" else value)
+    catalog = dict(cli.engines.ENGINES)
+    catalog["cpu"] = {**catalog["cpu"], "backend": "cpu"}
+    monkeypatch.setattr(cli.engines, "ENGINES", catalog)
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine=engine,
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
 
 
 def test_render_benchmark_verbose_discloses_execution_and_evidence(
@@ -8497,6 +8517,32 @@ def test_recommend_verbose_handles_legacy_benchmark_provenance(
     assert "[evidence: 100 prompts]" in buf.getvalue()
 
 
+@pytest.mark.parametrize("stored", ["not-json", "{}", "[0.5, true]", "[1.5, 0.5]",
+                                     "[0.5]", "[NaN, 0.5]"])
+def test_recommend_discloses_invalid_stored_run_scores(
+        make_console, monkeypatch, set_platform, capsys, stored):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
+        "model_id": "org/Corrupt", "use_case": "coding", "score": 0.6,
+        "source": "mlx probe=100", "sample_size": 100,
+        "refused_n": 0, "errored_n": 0,
+        "probe_context": 4096, "generation_cap": 512, "repeat_count": 2,
+        "total_generations": 200, "run_scores_json": stored,
+    }])
+
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    assert "invalid stored run-score provenance" in buf.getvalue()
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
+    score = json.loads(capsys.readouterr().out)[0]["score"]
+    assert score["run_scores"] is None
+    assert score["evidence_warning"] == "invalid stored run-score provenance"
+
+
 def test_render_benchmark_rejects_nonpositive_ctx(make_console, monkeypatch):
     _wire_benchmark(monkeypatch)
     c, buf = make_console()
@@ -8699,6 +8745,19 @@ def test_render_benchmark_partial_refusal_stores_counts_and_annotates(make_conso
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
     assert saved["refused_n"] == 1 and saved["errored_n"] == 0
     assert "(partial: 1 refused)" in buf.getvalue()
+
+
+def test_render_benchmark_partial_json_is_one_clean_document(monkeypatch, capsys):
+    _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "refused": True, "reason": "x"},
+                                 {"prompt_index": 1, "completion": "ans"}])
+    c = cli.Console(color=False, stream=sys.stdout)
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True,
+                                as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["refused"] == 1
+    assert payload["errored"] == 0
 
 
 def test_render_benchmark_some_prompts_errored_warns_and_depresses(make_console, monkeypatch):
