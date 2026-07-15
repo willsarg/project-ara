@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ara.dev/wire/enroll-poll.response.json",
   "title": "Enrollment approval poll (server → node)",
-  "description": "Reply to GET /api/enroll/{id}. Either still pending, or active with the one-time per-node session token.",
+  "description": "Reply to GET /api/enroll/{id}. Either still pending, or active with the per-node session token. The active response is repeatable until successful session authentication acknowledges receipt.",
   "oneOf": [
     {
       "type": "object",

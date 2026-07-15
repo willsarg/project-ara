@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // GET /api/enroll/{id} — the node polls for approval. Auth: enrollment token (Bearer). Returns
-// {status:"pending"} until an admin approves, then {status:"active", session_token} exactly ONCE.
+// {status:"pending"} until an admin approves, then repeats {status:"active", session_token} until
+// the node successfully authenticates with that session token.
 import { NextResponse } from "next/server";
 import { bearerToken } from "@/lib/node-auth";
 import { pollApproval } from "@/lib/enrollment";
@@ -21,7 +22,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     case "denied":
       return NextResponse.json({ error: "enrollment denied" }, { status: 403 });
     case "consumed":
-      // The one-time session token was already delivered; a well-behaved node won't re-poll.
+      // Successful session auth already acknowledged durable receipt.
       return NextResponse.json({ error: "session token already delivered" }, { status: 409 });
     case "pending":
       return NextResponse.json({ status: "pending" });

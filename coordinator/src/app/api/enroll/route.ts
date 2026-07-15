@@ -32,7 +32,9 @@ export async function POST(req: Request) {
   }
 
   const token = bearerToken(req);
-  if (!verifyEnrollmentToken(token)) {
+  // Used tokens are admitted so enroll() can resolve response-loss retries idempotently. The lib
+  // still rejects a used token that is not bound to an existing enrollment.
+  if (!verifyEnrollmentToken(token, { allowUsed: true })) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 

@@ -106,6 +106,8 @@ def test_get_work_returns_job_on_200():
     {"job": {"id": "", "kind": "run", "args": {}}},
     {"job": {"id": "j", "kind": "", "args": {}}},
     {"job": {"id": "j", "kind": "run", "args": []}},
+    {"job": {"id": "j", "kind": "serve", "args": {}}},
+    {"job": {"id": "j", "kind": "profile", "args": {}}},
 ])
 def test_get_work_rejects_malformed_wire_jobs(payload):
     nc, _fake = _client(FakeResponse(status_code=200, payload=payload))

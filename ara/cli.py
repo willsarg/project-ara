@@ -3539,14 +3539,22 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
 
     if sub == "enroll":
         server_url = rest[2] if len(rest) > 2 else None
-        if not server_url or not token:
+        if bool(server_url) != bool(token):
             return _node_err(c, as_json, "usage: ara node enroll <server_url> --token <token>")
-        cfg = config.NodeConfig(server_url=server_url, enrollment_token=token)
         try:
+            if server_url and token:
+                cfg = config.NodeConfig(server_url=server_url, enrollment_token=token)
+            else:
+                pending = config.load_pending()
+                if pending is None:
+                    return _node_err(
+                        c, as_json, "usage: ara node enroll <server_url> --token <token>")
+                cfg = config.NodeConfig(
+                    server_url=pending.server_url, enrollment_token=pending.enrollment_token)
             enroll.enroll_flow(cfg)
         except Exception as exc:                    # surface, don't swallow: enrollment can fail
             return _node_err(c, as_json, f"enrollment failed: {exc}")
-        return _node_say(c, as_json, f"enrolled with {server_url}", endpoint=server_url)
+        return _node_say(c, as_json, f"enrolled with {cfg.server_url}", endpoint=cfg.server_url)
 
     if sub == "run":
         try:
@@ -3556,6 +3564,10 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
         if cfg is None or not cfg.session_token:
             return _node_err(c, as_json,
                              "not enrolled — run: ara node enroll <server_url> --token <token>")
+        try:
+            config.clear_pending()  # finish cleanup if enrollment crashed after saving authority
+        except OSError as exc:
+            return _node_err(c, as_json, f"cannot clear completed enrollment state: {exc}")
         agent.run_loop(cfg)                         # blocks: phone-home work loop until stopped
         return _node_say(c, as_json, "run loop exited")
 
@@ -4185,14 +4197,15 @@ def _click_node() -> None:
 
 @_click_node.command("enroll", context_settings=_HELP_SETTINGS,
                      epilog="Example:\n  ara node enroll https://ara.example --token TOKEN")
-@click.argument("server_url")
-@click.option("--token", required=True, help="One-time coordinator enrollment token.")
+@click.argument("server_url", required=False)
+@click.option("--token", help="One-time coordinator enrollment token.")
 @_json_verbose_options
 @click.pass_context
-def _click_node_enroll(ctx: click.Context, server_url: str, token: str,
+def _click_node_enroll(ctx: click.Context, server_url: str | None, token: str | None,
                        verbose: bool, as_json: bool) -> int:
-    """Enroll this node with a coordinator."""
-    return render_node(_mark_json(ctx, as_json), ["node", "enroll", server_url],
+    """Enroll this node with a coordinator; omit arguments to resume a pending enrollment."""
+    rest = ["node", "enroll", *([server_url] if server_url else [])]
+    return render_node(_mark_json(ctx, as_json), rest,
                        token=token, as_json=as_json)
 
 

@@ -64,10 +64,14 @@ def _cfg(session_token="SES"):
 
 # --- default_runner dispatch ---
 def test_default_runner_routes_workers_providers_and_rejects_unknown(monkeypatch):
-    monkeypatch.setattr(agent.wiring, "default_workers",
-                        lambda: {"run": lambda args: {"ran": args}})
-    monkeypatch.setattr(agent.wiring, "default_providers",
-                        lambda: {"detect": lambda: {"detected": True}})
+    monkeypatch.setattr(agent.wiring, "default_workers", lambda: {
+        "run": lambda args: {"ran": args},
+        "serve": lambda args: pytest.fail("serve is not a wire-contract action"),
+    })
+    monkeypatch.setattr(agent.wiring, "default_providers", lambda: {
+        "detect": lambda: {"detected": True},
+        "profile": lambda: pytest.fail("profile is not a wire-contract action"),
+    })
     run = agent.default_runner()
     assert run("run", {"x": 1}) == {"ran": {"x": 1}}       # action verb → worker
     assert run("detect", {}) == {"detected": True}         # read verb → provider
@@ -89,8 +93,8 @@ def test_result_payload_failed_when_worker_returns_error():
 def test_result_payload_failed_retains_actionable_stderr():
     payload = agent._result_payload({"error": "boom", "stderr": "daemon detail"})
     assert payload["status"] == "failed"
-    assert payload["error"] == "boom"
-    assert payload["stderr"] == "daemon detail"
+    assert payload["error"] == "boom\nstderr: daemon detail"
+    assert "stderr" not in payload
 
 
 @pytest.mark.parametrize("stderr", ["", None, 7])
@@ -127,11 +131,12 @@ def test_real_wiring_nonzero_result_is_always_reported_failed(monkeypatch, stdou
             self.stdout = stdout
 
     monkeypatch.setattr(agent.wiring.subprocess, "run", lambda *_a, **_k: Proc())
-    result = agent.default_runner()("status", {})
+    result = agent.default_runner()("run", {"model": "m"})
     payload = agent._result_payload(result)
     assert payload["status"] == "failed"
     assert "exited 5" in payload["error"]
-    assert payload["stderr"] == "actionable stderr"
+    assert payload["error"].endswith("stderr: actionable stderr")
+    assert "stderr" not in payload
 
 
 def test_runner_exception_is_reported_failed():
@@ -215,6 +220,14 @@ def test_get_work_401_invalidates_session_and_stops_for_explicit_reenrollment(mo
     assert n == 1 and cfg.session_token is None
     assert config.load().session_token is None
     assert any("re-enrollment required" in status for status in statuses)
+
+
+def test_late_401_from_old_loop_does_not_clobber_newly_enrolled_session():
+    old = _cfg(session_token="OLD")
+    config.save(config.NodeConfig(server_url=old.server_url, session_token="NEW"))
+    agent._invalidate_session(old)
+    assert old.session_token is None
+    assert config.load().session_token == "NEW"
 
 
 @pytest.mark.parametrize("error", [

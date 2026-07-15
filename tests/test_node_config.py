@@ -35,7 +35,7 @@ def test_require_secure_url_accepts_https_and_local_http():
 
 
 @pytest.mark.parametrize("bad", ["http://coordinator.example", "http://10.0.0.5:8000",
-                                 "ftp://x", "coordinator.example"])
+                                 "ftp://x", "coordinator.example", "https:///missing-host"])
 def test_require_secure_url_rejects_insecure(bad):
     with pytest.raises(ValueError):
         config.require_secure_url(bad)
@@ -43,6 +43,20 @@ def test_require_secure_url_rejects_insecure(bad):
 
 def test_load_is_none_when_absent():
     assert config.load() is None
+
+
+@pytest.mark.parametrize("value", [
+    [], {}, {"server_url": 7}, {"server_url": ""},
+    {"server_url": "http://remote.example"},
+    {"server_url": "https://c.example", "enrollment_token": 7},
+    {"server_url": "https://c.example", "session_token": ""},
+])
+def test_load_normalizes_invalid_saved_shapes_to_value_error(value):
+    path = config._config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(__import__("json").dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid node configuration"):
+        config.load()
 
 
 def test_save_then_load_round_trips():
@@ -60,6 +74,30 @@ def test_save_defaults_tokens_to_none():
     config.save(config.NodeConfig(server_url="https://c.example"))
     loaded = config.load()
     assert loaded.enrollment_token is None and loaded.session_token is None
+
+
+def test_pending_enrollment_round_trips_and_clears_without_touching_active_config():
+    active = config.NodeConfig(server_url="https://old.example", session_token="LIVE")
+    config.save(active)
+    pending = config.PendingEnrollment(
+        server_url="https://new.example", enrollment_token="ONE-SHOT", enrollment_id="e1")
+    config.save_pending(pending)
+    assert config.load_pending() == pending
+    assert config.load() == active
+    config.clear_pending()
+    assert config.load_pending() is None and config.load() == active
+
+
+@pytest.mark.parametrize("value", [
+    [], {}, {"server_url": "https://c.example"},
+    {"server_url": "http://remote.example", "enrollment_token": "ENR"},
+])
+def test_load_pending_rejects_invalid_shape(value):
+    path = config._pending_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(__import__("json").dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid pending enrollment"):
+        config.load_pending()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode is advisory on Windows")
@@ -122,3 +160,7 @@ def test_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(config.os, "name", "nt")
     monkeypatch.setattr(config.os, "open", lambda *_a: pytest.fail("must not open a directory"))
     assert config._fsync_parent(tmp_path / "config.json") is None
+
+
+def test_clear_pending_is_idempotent_when_absent():
+    assert config.clear_pending() is None

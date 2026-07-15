@@ -31,11 +31,12 @@ def default_runner() -> Callable[[str, dict], dict]:
     read providers. Raises ``ValueError`` for a kind this node can't run (reported as failed)."""
     workers = wiring.default_workers()
     providers = wiring.default_providers()
+    action_kinds = frozenset({"run", "characterize", "benchmark"})
 
     def _run(kind: str, args: dict) -> dict:
-        if kind in workers:
+        if kind in action_kinds and kind in workers:
             return workers[kind](args)
-        if kind in providers:
+        if kind == "detect" and kind in providers:
             return providers[kind]()
         raise ValueError(f"unknown job kind: {kind!r}")
 
@@ -47,11 +48,11 @@ def _result_payload(result: dict) -> dict:
     ``{"error": ...}`` dict (the wiring convention), which becomes a ``failed`` result."""
     env = capabilities.environment()
     if isinstance(result, dict) and "error" in result:
-        payload = {"status": "failed", "error": str(result["error"]), "environment": env}
+        error = str(result["error"])
         stderr = result.get("stderr")
         if isinstance(stderr, str) and stderr:
-            payload["stderr"] = stderr
-        return payload
+            error = f"{error}\nstderr: {stderr}"
+        return {"status": "failed", "error": error, "environment": env}
     return {"status": "done", "result": result, "environment": env}
 
 
@@ -66,8 +67,15 @@ class _ReenrollmentRequired(RuntimeError):
 
 def _invalidate_session(config) -> None:
     """Persist the rejected session as unusable; one-shot enrollment tokens are never retried."""
+    rejected_server = config.server_url
+    rejected_session = config.session_token
     config.session_token = None
     config.enrollment_token = None
+    current = config_mod.load()
+    if (current is not None
+            and (current.server_url != rejected_server
+                 or current.session_token != rejected_session)):
+        return  # a concurrent explicit enrollment already installed newer authority
     config_mod.save(config)
 
 

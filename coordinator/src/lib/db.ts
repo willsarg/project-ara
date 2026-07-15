@@ -37,7 +37,7 @@ function open(): Database.Database {
       enrollment_id         TEXT NOT NULL UNIQUE,
       status                TEXT NOT NULL DEFAULT 'pending',
       session_token_hash    TEXT,          -- permanent: sha256(session token); the plaintext is never stored
-      pending_session_token TEXT,          -- transient: plaintext held for ONE poll, then NULLed
+      pending_session_token TEXT,          -- transient: plaintext held until the new session authenticates
       identity_json         TEXT,
       caps_json             TEXT,
       environment_json      TEXT,
@@ -215,13 +215,51 @@ export function getAgentByEnrollmentId(enrollmentId: string): AgentRow | null {
     .get(enrollmentId) as AgentRow | undefined) ?? null;
 }
 
+export function getAgentByEnrollmentTokenId(enrollmentTokenId: number): AgentRow | null {
+  return (open()
+    .prepare("SELECT * FROM agents WHERE enrollment_token_id = ? ORDER BY id DESC LIMIT 1")
+    .get(enrollmentTokenId) as AgentRow | undefined) ?? null;
+}
+
+export function getAgentByMachineKey(machineKey: string): AgentRow | null {
+  return (open()
+    .prepare("SELECT * FROM agents WHERE machine_key = ? ORDER BY id DESC LIMIT 1")
+    .get(machineKey) as AgentRow | undefined) ?? null;
+}
+
 export function getAgentBySessionHash(sessionTokenHash: string): AgentRow | null {
   return (open()
     .prepare("SELECT * FROM agents WHERE session_token_hash = ?")
     .get(sessionTokenHash) as AgentRow | undefined) ?? null;
 }
 
-/** Approve: flip to active, persist the session-token HASH, stash the plaintext for one poll. */
+/** Re-enroll a known machine on its existing identity. Rotating the enrollment handle/token binding
+ *  prevents the old enrollment token from polling, while clearing session state revokes the old
+ *  bearer immediately. Work remains attached to the stable agent id. */
+export function reenrollAgent(
+  id: number,
+  a: {
+    enrollment_id: string;
+    enrollment_token_id: number;
+    identity_json: string | null;
+    caps_json: string | null;
+    environment_json: string | null;
+  },
+): AgentRow {
+  open()
+    .prepare(
+      `UPDATE agents
+       SET enrollment_id = @enrollment_id, enrollment_token_id = @enrollment_token_id,
+           status = 'pending', session_token_hash = NULL, pending_session_token = NULL,
+           identity_json = @identity_json, caps_json = @caps_json,
+           environment_json = @environment_json, last_seen = NULL
+       WHERE id = @id`,
+    )
+    .run({ id, ...a });
+  return getAgentById(id)!;
+}
+
+/** Approve: flip to active, persist the session-token HASH, and stash plaintext until session auth. */
 export function activateAgent(id: number, sessionTokenHash: string, plaintext: string): void {
   open()
     .prepare(
@@ -235,23 +273,36 @@ export function setAgentStatus(id: number, status: string): void {
   open().prepare("UPDATE agents SET status = ? WHERE id = ?").run(status, id);
 }
 
-/** Revoke an agent: deny it AND NULL its session-token hash, so any session token it already holds
- *  stops authenticating immediately (verifySessionToken can no longer match a NULL hash). */
+/** Revoke an agent: deny it and erase both the live hash and any unacknowledged plaintext, so no
+ *  session token can authenticate and no revoked credential remains recoverable from storage. */
 export function revokeAgent(id: number): void {
   open()
-    .prepare("UPDATE agents SET status = 'denied', session_token_hash = NULL WHERE id = ?")
+    .prepare(
+      `UPDATE agents
+       SET status = 'denied', session_token_hash = NULL, pending_session_token = NULL
+       WHERE id = ?`,
+    )
     .run(id);
 }
 
-/** Read the transient plaintext session token exactly once, NULLing it in the same statement. */
-export function takePendingSessionToken(id: number): string | null {
-  const db = open();
-  const row = db.prepare("SELECT pending_session_token FROM agents WHERE id = ?").get(id) as
+/** Read the transient plaintext without consuming it. Poll retries return this same value until the
+ *  node proves receipt by authenticating with the matching session token. */
+export function getPendingSessionToken(id: number): string | null {
+  const row = open().prepare("SELECT pending_session_token FROM agents WHERE id = ?").get(id) as
     | { pending_session_token: string | null }
     | undefined;
-  const token = row?.pending_session_token ?? null;
-  if (token != null) db.prepare("UPDATE agents SET pending_session_token = NULL WHERE id = ?").run(id);
-  return token;
+  return row?.pending_session_token ?? null;
+}
+
+/** A successful bearer authentication acknowledges durable session-token receipt. The hash guard
+ *  ensures an old concurrent auth can never clear plaintext for a newly rotated session. */
+export function acknowledgeSessionToken(id: number, sessionTokenHash: string): void {
+  open()
+    .prepare(
+      `UPDATE agents SET pending_session_token = NULL
+       WHERE id = ? AND status = 'active' AND session_token_hash = ?`,
+    )
+    .run(id, sessionTokenHash);
 }
 
 export function touchAgentLastSeen(id: number): void {

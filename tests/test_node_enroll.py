@@ -47,6 +47,14 @@ def test_enroll_flow_refuses_insecure_url_before_sending_token():
     assert fake.enrolled_with is None            # token was never sent
 
 
+def test_enroll_flow_requires_a_real_one_shot_token():
+    with pytest.raises(ValueError, match="one-time enrollment token"):
+        enroll.enroll_flow(
+            config.NodeConfig(server_url="https://c.example"),
+            client=FakeClient([]),
+        )
+
+
 def test_active_immediately_stores_and_saves_session_token():
     slept = []
     fake = FakeClient([{"status": "active", "session_token": "SES"}])
@@ -55,6 +63,7 @@ def test_active_immediately_stores_and_saves_session_token():
     assert cfg.enrollment_token is None                    # consumed one-shot secret is discarded
     assert config.load().session_token == "SES"            # persisted to disk
     assert config.load().enrollment_token is None
+    assert config.load_pending() is None
     assert fake.enrolled_with == {"machine_key": "m"}
     assert slept == []                                     # approved on the first poll → never slept
 
@@ -80,7 +89,38 @@ def test_times_out_when_never_approved():
     with pytest.raises(TimeoutError):
         enroll.enroll_flow(_cfg(), client=fake, sleep=lambda s: slept.append(s), max_polls=3)
     assert fake.poll_count == 3 and len(slept) == 3
-    assert config.load() is None                           # nothing persisted on failure
+    assert config.load() is None                           # active config stays untouched
+    pending = config.load_pending()
+    assert pending.enrollment_token == "ENR" and pending.enrollment_id == "e1"
+
+
+def test_resumes_durably_saved_pending_enrollment_without_reposting():
+    config.save_pending(config.PendingEnrollment(
+        server_url="https://c.example", enrollment_token="ENR", enrollment_id="e1"))
+    fake = FakeClient([{"status": "active", "session_token": "SES"}])
+    fake.enroll = lambda _desc: pytest.fail("must resume the saved enrollment handle")
+    cfg = enroll.enroll_flow(_cfg(), client=fake, sleep=lambda _s: None)
+    assert cfg.session_token == "SES" and config.load_pending() is None
+
+
+def test_saves_one_shot_token_before_first_enrollment_request(monkeypatch):
+    fake = FakeClient([])
+    def fail_after_observing_pending(_desc):
+        pending = config.load_pending()
+        assert pending.enrollment_token == "ENR" and pending.enrollment_id is None
+        raise RuntimeError("response lost")
+    fake.enroll = fail_after_observing_pending
+    with pytest.raises(RuntimeError, match="response lost"):
+        enroll.enroll_flow(_cfg(), client=fake)
+
+
+def test_save_failure_after_approval_keeps_resumable_pending_state(monkeypatch):
+    fake = FakeClient([{"status": "active", "session_token": "SES"}])
+    monkeypatch.setattr(config, "save",
+                        lambda _cfg: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        enroll.enroll_flow(_cfg(), client=fake)
+    assert config.load_pending().enrollment_id == "e1"
 
 
 def test_builds_a_default_client_when_none_injected(monkeypatch):

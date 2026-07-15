@@ -126,6 +126,7 @@ def _unit_text() -> str:
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        "NotifyAccess=main\n"
         f"ExecStart={_systemd_quote(sys.executable)} -m ara node run\n"
         "Restart=on-failure\n"
         f"RestartSec={RESTART_SEC}\n"

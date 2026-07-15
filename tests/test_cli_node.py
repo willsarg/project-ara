@@ -63,6 +63,21 @@ def test_enroll_without_token_is_usage_error(con):
     assert "usage: ara node enroll" in con[1].getvalue()
 
 
+def test_enroll_without_arguments_resumes_saved_pending_handshake(con, monkeypatch):
+    config.save_pending(config.PendingEnrollment(
+        server_url="https://c.example", enrollment_token="ENR", enrollment_id="e1"))
+    seen = {}
+    monkeypatch.setattr(enroll, "enroll_flow", lambda cfg: seen.setdefault("cfg", cfg))
+    assert _node(con, "enroll") == 0
+    assert seen["cfg"].server_url == "https://c.example"
+    assert seen["cfg"].enrollment_token == "ENR"
+
+
+def test_enroll_without_arguments_requires_pending_handshake(con):
+    assert _node(con, "enroll") == 1
+    assert "usage: ara node enroll" in con[1].getvalue()
+
+
 def test_enroll_failure_is_surfaced(con, monkeypatch):
     def _boom(cfg):
         raise RuntimeError("coordinator refused")
@@ -97,11 +112,36 @@ def test_run_invokes_the_agent_loop(con, monkeypatch):
     assert "run loop exited" in con[1].getvalue()
 
 
+def test_run_cleans_pending_enrollment_left_after_active_config_save(con, monkeypatch):
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="SES"))
+    config.save_pending(config.PendingEnrollment(
+        server_url="https://c.example", enrollment_token="ENR", enrollment_id="e1"))
+    monkeypatch.setattr(agent, "run_loop", lambda _cfg: None)
+    assert _node(con, "run") == 0
+    assert config.load_pending() is None
+
+
+def test_run_surfaces_pending_cleanup_failure(con, monkeypatch):
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="SES"))
+    monkeypatch.setattr(
+        config, "clear_pending", lambda: (_ for _ in ()).throw(OSError("unlink denied")))
+    assert _node(con, "run") == 1
+    assert "cannot clear completed enrollment state: unlink denied" in con[1].getvalue()
+
+
 def test_run_surfaces_invalid_saved_config_cleanly(con, monkeypatch):
     config._config_path().parent.mkdir(parents=True)
     config._config_path().write_text("{broken", encoding="utf-8")
     assert _node(con, "run") == 1
     assert "cannot load node configuration" in con[1].getvalue()
+
+
+@pytest.mark.parametrize("sub", ["run", "install", "start"])
+def test_node_actions_surface_invalid_config_shape_cleanly(con, sub):
+    config._config_path().parent.mkdir(parents=True)
+    config._config_path().write_text("{}", encoding="utf-8")
+    assert _node(con, sub) == 1
+    assert "invalid node configuration" in con[1].getvalue()
 
 
 # --- install / status / lifecycle ---

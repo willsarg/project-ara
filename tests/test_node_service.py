@@ -60,6 +60,7 @@ def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     text = unit.read_text()
     assert f'ExecStart="{service.sys.executable}" -m ara node run' in text
     assert "Type=simple" in text                            # long jobs must not trip a loop watchdog
+    assert "NotifyAccess=main" in text                      # STATUS works without a watchdog
     assert "WatchdogSec=" not in text
     assert f"RestartSec={service.RESTART_SEC}" in text      # daemon failures never rapid-loop
     assert "WantedBy=default.target" in text

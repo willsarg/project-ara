@@ -67,10 +67,29 @@ describe("POST /api/enroll", () => {
     expect(json).toEqual({ enrollment_id: expect.stringMatching(/^enr_/), status: "pending" });
     expect(db.getAgentByEnrollmentId(json.enrollment_id)!.status).toBe("pending");
   });
+
+  it("returns the same enrollment handle when the used token retries after response loss", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const request = () =>
+      enrollRoute.POST(
+        req("http://x/api/enroll", {
+          method: "POST",
+          bearer: token,
+          body: JSON.stringify({ ...enrollBody, machine_key: "box-enroll-retry" }),
+        }),
+      );
+
+    const first = await request();
+    expect(first.status).toBe(201);
+    const firstBody = await first.json();
+    const retry = await request();
+    expect(retry.status).toBe(201);
+    expect(await retry.json()).toEqual(firstBody);
+  });
 });
 
 describe("full enroll → approve → poll → work → result flow", () => {
-  it("delivers the session token once and dispatches/records a job", async () => {
+  it("delivers the session token until auth acknowledgement and dispatches/records a job", async () => {
     // enroll
     const { token } = enroll.issueEnrollmentToken();
     const enrRes = await enrollRoute.POST(
@@ -97,7 +116,7 @@ describe("full enroll → approve → poll → work → result flow", () => {
     const agent = db.getAgentByEnrollmentId(enrollment_id)!;
     enroll.approveAgent(agent.id);
 
-    // poll → active, session token delivered once
+    // poll → active, then a response-loss re-poll returns the same session token
     const activeRes = await pollRoute.GET(
       req(`http://x/api/enroll/${enrollment_id}`, { bearer: token }),
       params(enrollment_id),
@@ -108,12 +127,13 @@ describe("full enroll → approve → poll → work → result flow", () => {
     const sessionToken: string = active.session_token;
     expect(sessionToken.length).toBeGreaterThan(10);
 
-    // re-poll → 409 (already delivered)
+    // re-poll before session auth proves receipt → same token
     const again = await pollRoute.GET(
       req(`http://x/api/enroll/${enrollment_id}`, { bearer: token }),
       params(enrollment_id),
     );
-    expect(again.status).toBe(409);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual(active);
 
     // work poll with bad session token → 401
     const badWork = await workRoute.GET(req("http://x/api/work?wait=0", { bearer: "nope" }));
@@ -122,6 +142,13 @@ describe("full enroll → approve → poll → work → result flow", () => {
     // work poll, nothing queued → 204
     const empty = await workRoute.GET(req("http://x/api/work?wait=0", { bearer: sessionToken }));
     expect(empty.status).toBe(204);
+
+    // Successful bearer auth acknowledges durable receipt, so enrollment polling is now consumed.
+    const acknowledged = await pollRoute.GET(
+      req(`http://x/api/enroll/${enrollment_id}`, { bearer: token }),
+      params(enrollment_id),
+    );
+    expect(acknowledged.status).toBe(409);
 
     // enqueue a job, then the node long-poll picks it up → 200 with the wire job shape
     const jobId = (await import("@/lib/work")).enqueue(agent.id, "run", {

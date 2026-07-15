@@ -16,6 +16,7 @@
 import "server-only";
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
+  acknowledgeSessionToken,
   getAgentBySessionHash,
   getEnrollmentTokenByHash,
   type AgentRow,
@@ -64,5 +65,6 @@ export function verifySessionToken(token: string | null | undefined): AgentRow |
   const agent = getAgentBySessionHash(h);
   if (!agent || agent.status !== "active" || !agent.session_token_hash) return null;
   if (!timingSafeEqualStr(h, agent.session_token_hash)) return null;
+  acknowledgeSessionToken(agent.id, h);
   return agent;
 }

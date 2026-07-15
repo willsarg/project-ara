@@ -20,6 +20,8 @@ import httpx
 
 from ara.node import config as config_mod
 
+WIRE_JOB_KINDS = frozenset({"run", "characterize", "detect", "benchmark"})
+
 
 class NodeClient:
     """A thin, bearer-authed httpx wrapper over the coordinator's push-only endpoints."""
@@ -60,7 +62,7 @@ class NodeClient:
         job = payload.get("job") if isinstance(payload, dict) else None
         if (not isinstance(job, dict)
                 or not isinstance(job.get("id"), str) or not job["id"]
-                or not isinstance(job.get("kind"), str) or not job["kind"]
+                or job.get("kind") not in WIRE_JOB_KINDS
                 or not isinstance(job.get("args"), dict)):
             raise ValueError("invalid work response from coordinator")
         return job

@@ -246,7 +246,7 @@ def test_generated_help_matches_frozen_visible_tree_and_examples(capsys):
         ("models", "search"): (
             "Usage: ara models search [OPTIONS] QUERY...", 'ara models search "small vision model" --json'),
         ("node", "enroll"): (
-            "Usage: ara node enroll [OPTIONS] SERVER_URL", "ara node enroll https://ara.example --token TOKEN"),
+            "Usage: ara node enroll [OPTIONS] [SERVER_URL]", "ara node enroll https://ara.example --token TOKEN"),
         ("run",): ("Usage: ara run [OPTIONS] MODEL PROMPT...", 'ara run org/model "Explain this" --json'),
     }
     for path, anchors in examples.items():

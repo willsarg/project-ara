@@ -55,15 +55,15 @@ describe("enrollment tokens", () => {
     expect(auth.verifyEnrollmentToken(null)).toBeNull();
   });
 
-  it("is single-use for enroll but still authorizes the poll (allowUsed)", () => {
+  it("retries enrollment idempotently with the same used token", () => {
     const { token } = enroll.issueEnrollmentToken();
     const out = enroll.enroll(token, selfDesc("box-a"));
     expect(out).toEqual({ enrollment_id: expect.stringMatching(/^enr_/), status: "pending" });
 
-    // consumed for enroll…
+    // The token is consumed for a different enrollment, but a response-loss retry resolves to the
+    // original handle instead of rejecting or creating another agent.
     expect(auth.verifyEnrollmentToken(token)).toBeNull();
-    expect(enroll.enroll(token, selfDesc("box-a2"))).toBeNull();
-    // …but a poll may still present it.
+    expect(enroll.enroll(token, selfDesc("box-a"))).toEqual(out);
     expect(auth.verifyEnrollmentToken(token, { allowUsed: true })).toBeTruthy();
   });
 
@@ -74,10 +74,18 @@ describe("enrollment tokens", () => {
     expect(row!.token_hash).toBe(auth.hashToken(token));
     expect(row!.token_hash).not.toBe(token);
   });
+
+  it("rejects a used token that was never bound to an enrollment", () => {
+    expect(enroll.enroll("not-a-real-token", selfDesc("box-invalid-token"))).toBeNull();
+    const { token } = enroll.issueEnrollmentToken();
+    const row = db.getEnrollmentTokenByHash(auth.hashToken(token))!;
+    db.markEnrollmentTokenUsed(row.id);
+    expect(enroll.enroll(token, selfDesc("box-orphan-token"))).toBeNull();
+  });
 });
 
 describe("approval + session token delivery", () => {
-  it("pending → approve → active token delivered ONCE, then consumed", () => {
+  it("repeats the approved token until successful session auth proves durable receipt", () => {
     const { token } = enroll.issueEnrollmentToken();
     const { enrollment_id } = enroll.enroll(token, selfDesc("box-b"))!;
 
@@ -87,23 +95,67 @@ describe("approval + session token delivery", () => {
     const agent = db.getAgentByEnrollmentId(enrollment_id)!;
     enroll.approveAgent(agent.id);
 
-    // first poll delivers the session token
+    // Polls repeat the same token while the node may still be recovering from response loss.
     const first = enroll.pollApproval(enrollment_id, token);
     expect(first.kind).toBe("active");
     const sessionToken = (first as { kind: "active"; session_token: string }).session_token;
     expect(sessionToken.length).toBeGreaterThan(10);
+    expect(enroll.pollApproval(enrollment_id, token)).toEqual(first);
 
-    // the plaintext is now gone from the DB; only the hash remains
+    // Successful session authentication is the receipt acknowledgement and clears plaintext.
+    expect(db.getAgentByEnrollmentId(enrollment_id)!.pending_session_token).toBe(sessionToken);
+    expect(auth.verifySessionToken(sessionToken)!.id).toBe(agent.id);
     const after = db.getAgentByEnrollmentId(enrollment_id)!;
     expect(after.pending_session_token).toBeNull();
     expect(after.session_token_hash).toBe(auth.hashToken(sessionToken));
-
-    // second poll: consumed
     expect(enroll.pollApproval(enrollment_id, token)).toEqual({ kind: "consumed" });
 
-    // the session token authenticates its agent; a bad one does not
+    // The token remains valid after acknowledging receipt; a bad one does not authenticate.
     expect(auth.verifySessionToken(sessionToken)!.id).toBe(agent.id);
     expect(auth.verifySessionToken("wrong")).toBeNull();
+  });
+
+  it("re-enrolls a known nonempty machine on the same agent and invalidates its old session", () => {
+    const firstEnrollment = enroll.issueEnrollmentToken();
+    const first = enroll.enroll(firstEnrollment.token, selfDesc("box-rotate"))!;
+    const original = db.getAgentByEnrollmentId(first.enrollment_id)!;
+    enroll.approveAgent(original.id);
+    const oldSession = (
+      enroll.pollApproval(first.enrollment_id, firstEnrollment.token) as {
+        kind: "active";
+        session_token: string;
+      }
+    ).session_token;
+    expect(auth.verifySessionToken(oldSession)!.id).toBe(original.id);
+    const jobId = work.enqueue(original.id, "run", { model: "qwen" });
+
+    const freshEnrollment = enroll.issueEnrollmentToken();
+    const rotated = enroll.enroll(freshEnrollment.token, {
+      ...selfDesc("box-rotate"),
+      identity: { hostname: "box-rotate-new", os: "linux", arch: "x86_64" },
+    })!;
+    const reenrolled = db.getAgentByEnrollmentId(rotated.enrollment_id)!;
+
+    expect(rotated.enrollment_id).not.toBe(first.enrollment_id);
+    expect(reenrolled.id).toBe(original.id);
+    expect(reenrolled.status).toBe("pending");
+    expect(reenrolled.session_token_hash).toBeNull();
+    expect(JSON.parse(reenrolled.identity_json!)).toMatchObject({ hostname: "box-rotate-new" });
+    expect(auth.verifySessionToken(oldSession)).toBeNull();
+    expect(db.getWorkById(jobId)!.agent_id).toBe(original.id);
+    expect(enroll.pollApproval(rotated.enrollment_id, firstEnrollment.token)).toEqual({
+      kind: "unauthorized",
+    });
+
+    enroll.approveAgent(reenrolled.id);
+    const newSession = (
+      enroll.pollApproval(rotated.enrollment_id, freshEnrollment.token) as {
+        kind: "active";
+        session_token: string;
+      }
+    ).session_token;
+    expect(newSession).not.toBe(oldSession);
+    expect(auth.verifySessionToken(newSession)!.id).toBe(original.id);
   });
 
   it("unknown enrollment id → not_found; wrong token → unauthorized; denied → denied", () => {
@@ -122,14 +174,14 @@ describe("approval + session token delivery", () => {
     const victim = enroll.issueEnrollmentToken();
     const { enrollment_id } = enroll.enroll(victim.token, selfDesc("victim"))!;
     const agent = db.getAgentByEnrollmentId(enrollment_id)!;
-    enroll.approveAgent(agent.id); // session token now waiting to be delivered ONCE
+    enroll.approveAgent(agent.id); // session token now waiting for its bound enrollment to poll
 
     // An attacker holds their own valid (even used) enrollment token and knows the enrollment_id.
     const attacker = enroll.issueEnrollmentToken();
     enroll.enroll(attacker.token, selfDesc("attacker")); // marks it used → still allowUsed for polling
     expect(enroll.pollApproval(enrollment_id, attacker.token).kind).toBe("unauthorized");
 
-    // The bound (victim's own) token still works and gets the token exactly once.
+    // The bound (victim's own) token still works and gets the pending session token.
     expect(enroll.pollApproval(enrollment_id, victim.token).kind).toBe("active");
   });
 
@@ -151,7 +203,7 @@ describe("approval + session token delivery", () => {
     const agent = db.getAgentByEnrollmentId(enrollment_id)!;
     enroll.approveAgent(agent.id);
 
-    // deliver + capture the one-time session token; it authenticates while active
+    // deliver + capture the session token; it authenticates while active
     const first = enroll.pollApproval(enrollment_id, token);
     const sessionToken = (first as { kind: "active"; session_token: string }).session_token;
     expect(auth.verifySessionToken(sessionToken)!.id).toBe(agent.id);
@@ -163,6 +215,20 @@ describe("approval + session token delivery", () => {
     expect(after.session_token_hash).toBeNull();
     expect(auth.verifySessionToken(sessionToken)).toBeNull();
     expect(enroll.listActive().some((a) => a.id === agent.id)).toBe(false);
+  });
+
+  it("revoke clears an approved session plaintext that was never acknowledged", () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(token, selfDesc("box-revoke-before-auth"))!;
+    const agent = db.getAgentByEnrollmentId(enrollment_id)!;
+    enroll.approveAgent(agent.id);
+    expect(db.getAgentById(agent.id)!.pending_session_token).not.toBeNull();
+
+    enroll.revoke(agent.id);
+
+    const after = db.getAgentById(agent.id)!;
+    expect(after.session_token_hash).toBeNull();
+    expect(after.pending_session_token).toBeNull();
   });
 });
 
