@@ -996,11 +996,15 @@ def test_flush_survives_quarantine_filesystem_failure(tmp_path, monkeypatch):
     d.mkdir(parents=True)
     bad = d / "bad.json"
     bad.write_text("{broken", encoding="utf-8")
+    agent._spool_result("later", {"status": "done", "result": {"ok": True}})
     monkeypatch.setattr(agent, "_quarantine_spool",
                         lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
-    assert agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
-                          max_iterations=1, sleep=lambda s: None) == 1
+    client = FakeClient([None])
+    assert agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                          sleep=lambda s: None) == 1
     assert bad.exists()
+    assert client.posted == []
+    assert agent._spool_path("later").exists()
 
 
 def test_flush_401_invalidates_session_and_stops_with_spool_intact(tmp_path):

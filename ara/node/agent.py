@@ -442,6 +442,7 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
         return client
     entries = []
     order_counts: dict[int, int] = {}
+    blocked = False
     for f in d.glob("*.json"):
         try:
             modified_ns = f.lstat().st_mtime_ns
@@ -451,14 +452,17 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
         except (OSError, ValueError):
             try:
                 _quarantine_spool(f)
-            except OSError:
-                pass
+            except OSError as exc:
+                health.status(f"could not quarantine unreadable result spool {f.name}: {exc}")
+                blocked = True
             continue
         # Versioned order is authoritative. Legacy entries predate ordered envelopes, so their
         # persisted write time is only usable when unique; a tie is honestly unknowable.
         order_key = order if order is not None else modified_ns
         order_counts[order_key] = order_counts.get(order_key, 0) + 1
         entries.append((order_key, f.name, f, job_id, payload))
+    if blocked:
+        return client
     for order_key, _name, f, job_id, payload in sorted(entries):
         if order_counts[order_key] > 1:
             health.status("result spool order is ambiguous; preserving evidence and blocking work")
