@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     sample_size  INTEGER,
     refused_n    INTEGER,
     errored_n    INTEGER,
+    probe_context INTEGER,
+    generation_cap INTEGER,
+    repeat_count INTEGER,
+    total_generations INTEGER,
+    run_scores_json TEXT,
     source       TEXT NOT NULL,
     measured_at  TEXT NOT NULL,
     PRIMARY KEY (machine_key, model_id, use_case)
@@ -124,6 +129,15 @@ def connect() -> sqlite3.Connection:
         con.execute("ALTER TABLE benchmark_results ADD COLUMN refused_n INTEGER")
     if "errored_n" not in bench_cols:
         con.execute("ALTER TABLE benchmark_results ADD COLUMN errored_n INTEGER")
+    for column, column_type in (
+        ("probe_context", "INTEGER"),
+        ("generation_cap", "INTEGER"),
+        ("repeat_count", "INTEGER"),
+        ("total_generations", "INTEGER"),
+        ("run_scores_json", "TEXT"),
+    ):
+        if column not in bench_cols:
+            con.execute(f"ALTER TABLE benchmark_results ADD COLUMN {column} {column_type}")  # noqa: S608
     # One-time data fix (user_version 0→1): wmx calibrations stored before 2026-07-02 carry
     # decimal-GB walls (~7.4% high vs ARA's binary-GiB contract — the apple boundary now
     # converts). A float can't reveal its own units, so honest re-measurement beats arithmetic
@@ -510,24 +524,34 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
                           base_model: str | None = None, quant: str | None = None,
                           benchmark_id: str | None = None, max_score: float | None = None,
                           sample_size: int | None = None, tier: str = "measured",
-                          refused_n: int | None = None, errored_n: int | None = None) -> None:
+                          refused_n: int | None = None, errored_n: int | None = None,
+                          probe_context: int | None = None,
+                          generation_cap: int | None = None,
+                          repeat_count: int | None = None,
+                          total_generations: int | None = None,
+                          run_scores: list[float] | None = None) -> None:
     from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO benchmark_results "
         "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
         "benchmark_id, tier, score, max_score, sample_size, refused_n, errored_n, "
+        "probe_context, generation_cap, repeat_count, total_generations, run_scores_json, "
         "source, measured_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(machine_key, model_id, use_case) DO UPDATE SET "
         "engine_key=excluded.engine_key, backend=excluded.backend, "
         "base_model=excluded.base_model, quant=excluded.quant, "
         "benchmark_id=excluded.benchmark_id, tier=excluded.tier, score=excluded.score, "
         "max_score=excluded.max_score, sample_size=excluded.sample_size, "
         "refused_n=excluded.refused_n, errored_n=excluded.errored_n, "
+        "probe_context=excluded.probe_context, generation_cap=excluded.generation_cap, "
+        "repeat_count=excluded.repeat_count, total_generations=excluded.total_generations, "
+        "run_scores_json=excluded.run_scores_json, "
         "source=excluded.source, measured_at=excluded.measured_at",
         (machine_key, model_id, use_case, canonical_engine(engine_key), backend, base_model, quant,
          benchmark_id, tier, score, max_score, sample_size, refused_n, errored_n,
-         source, _now()))
+         probe_context, generation_cap, repeat_count, total_generations,
+         json.dumps(run_scores) if run_scores is not None else None, source, _now()))
     con.commit()
 
 

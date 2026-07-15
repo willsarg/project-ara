@@ -464,7 +464,9 @@ def test_benchmark_result_save_and_get_round_trips_all_fields(store):
         store, "machine-abc", "org/model", "coding",
         score=0.72, source="mmlu-v1",
         engine_key="wcx", backend="cuda", base_model="llama3", quant="q4_0",
-        benchmark_id="run-001", max_score=1.0, sample_size=100, tier="measured")
+        benchmark_id="run-001", max_score=1.0, sample_size=100, tier="measured",
+        probe_context=4096, generation_cap=512, repeat_count=3,
+        total_generations=300, run_scores=[0.7, 0.72, 0.74])
     row = db.get_benchmark_result(store, "machine-abc", "org/model", "coding")
     assert row is not None
     assert row["machine_key"] == "machine-abc"
@@ -479,6 +481,11 @@ def test_benchmark_result_save_and_get_round_trips_all_fields(store):
     assert row["benchmark_id"] == "run-001"
     assert row["max_score"] == 1.0
     assert row["sample_size"] == 100
+    assert row["probe_context"] == 4096
+    assert row["generation_cap"] == 512
+    assert row["repeat_count"] == 3
+    assert row["total_generations"] == 300
+    assert row["run_scores_json"] == "[0.7, 0.72, 0.74]"
     assert row["tier"] == "measured"
     assert row["measured_at"]   # auto-filled timestamp
 
@@ -549,9 +556,9 @@ def test_benchmark_result_upsert_updates_refused_errored_counts(store):
     assert row["refused_n"] == 0 and row["errored_n"] == 0 and row["score"] == 0.8
 
 
-def test_migration_adds_refused_errored_columns_to_old_schema(tmp_path, monkeypatch):
-    """An existing DB whose benchmark_results predates the honesty columns gets them after
-    connect(), old rows readable with NULL counts. Spec 2026-07-02-benchmark-honesty-persistence."""
+def test_migration_adds_benchmark_honesty_columns_to_old_schema(tmp_path, monkeypatch):
+    """An old benchmark table gains every structured honesty/provenance column; legacy rows
+    remain readable with NULL for evidence that was never recorded."""
     import sqlite3 as _sqlite3
     db_path = tmp_path / "old.db"
     monkeypatch.setenv("ARA_DB_PATH", str(db_path))
@@ -581,10 +588,14 @@ def test_migration_adds_refused_errored_columns_to_old_schema(tmp_path, monkeypa
 
     con = db.connect()
     cols = {r["name"] for r in con.execute("PRAGMA table_info(benchmark_results)")}
-    assert {"refused_n", "errored_n"} <= cols
+    assert {"refused_n", "errored_n", "probe_context", "generation_cap", "repeat_count",
+            "total_generations", "run_scores_json"} <= cols
     row = db.get_benchmark_result(con, "m", "org/model", "coding")
     assert row is not None and row["score"] == 0.5
     assert row["refused_n"] is None and row["errored_n"] is None
+    assert row["probe_context"] is None and row["generation_cap"] is None
+    assert row["repeat_count"] is None and row["total_generations"] is None
+    assert row["run_scores_json"] is None
 
 
 # --- canonical engine identity migration (user_version 2 -> 3) ---

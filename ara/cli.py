@@ -1759,7 +1759,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             if msg := _ctx_gate_msg(ctx, row["safe_context"], model):
                 return err(msg)
             safe = ctx
-            ceiling_measured_at = None       # explicit --ctx, not a stored ceiling — nothing to age
+            # The requested cap is lower, but its authority still comes from this characterization;
+            # preserve that evidence timestamp so changed cache artifacts remain visibly stale.
+            ceiling_measured_at = row.get("measured_at")
         else:
             safe = row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
@@ -1862,11 +1864,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     score = sum(run_scores) / repeat         # MEAN across runs — a better estimate than any one roll
     lo, hi = min(run_scores), max(run_scores)
     low_confidence = n < 100
-    source = f"{key} probe={n} ({model})"
+    effective_generation_cap = max_tokens if max_tokens is not None else 256
+    band_source = f" band={lo * 100:.0f}-{hi * 100:.0f}" if repeat > 1 else ""
+    source = (f"{key} probe={n} ctx={safe} max_tokens={effective_generation_cap} "
+              f"repeat={repeat}{band_source} ({model})")
     if low_confidence:
         source += f"; low_confidence n={n}"
-    if repeat > 1:
-        source += f"; repeat={repeat} band={lo * 100:.0f}-{hi * 100:.0f}"
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
     with db.connected() as con:
@@ -1877,7 +1880,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                                  engine_key=key, backend=backend,
                                  base_model=scoring.base_key(model), quant=quant,
                                  benchmark_id=use_case, sample_size=n,
-                                 refused_n=refused_n, errored_n=errored_n)
+                                 refused_n=refused_n, errored_n=errored_n,
+                                 probe_context=safe, generation_cap=effective_generation_cap,
+                                 repeat_count=repeat, total_generations=total,
+                                 run_scores=run_scores)
         con.commit()
 
     if as_json:
@@ -1887,7 +1893,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             payload.update(
                 backend=backend,
                 probe_context=safe,
-                generation_cap=max_tokens if max_tokens is not None else "backend_default",
+                generation_cap=effective_generation_cap,
+                generation_cap_source=("explicit" if max_tokens is not None
+                                       else "backend_default"),
                 total_generations=total,
                 source=source,
             )
@@ -1909,7 +1917,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if c.verbose:
         c.emit(c.field("engine", f"{key} ({backend})"))
         c.emit(c.field("probe context", f"{safe} tokens"))
-        generation_cap = f"{max_tokens} tokens" if max_tokens is not None else "backend default"
+        generation_cap = (f"{max_tokens} tokens" if max_tokens is not None
+                          else f"{effective_generation_cap} tokens (backend default)")
         c.emit(c.field("generation cap", generation_cap))
         evidence = f"{n} prompts" if repeat == 1 else f"{n} prompts × {repeat} runs"
         c.emit(c.field("evidence", evidence))

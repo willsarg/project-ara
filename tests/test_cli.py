@@ -7807,7 +7807,7 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
                   refused_n=None, errored_n=None, **kw):
         saved.update(model=model, use_case=uc, score=score, source=source,
                      engine_key=engine_key, sample_size=sample_size, quant=quant,
-                     refused_n=refused_n, errored_n=errored_n)
+                     refused_n=refused_n, errored_n=errored_n, **kw)
 
     monkeypatch.setattr(cli.db, "save_benchmark_result", fake_save)
     monkeypatch.setattr(cli.benchmark, "load_probe", lambda uc: list(items))
@@ -7882,6 +7882,24 @@ def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
     c = cli.Console(color=False, stream=sys.stderr)
     rc = cli.render_benchmark(c, "org/m", use_case="extraction", as_json=True, assume_yes=True)
     assert rc == 0
+    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
+
+
+def test_render_benchmark_lower_ctx_preserves_ceiling_staleness(monkeypatch, capsys):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
+        "safe_context": 8000, "measured_at": "2026-01-02T03:04:05+00:00"})
+    seen = {}
+    monkeypatch.setattr(
+        cli.staleness, "ceiling_is_stale",
+        lambda model, measured_at: seen.update(model=model, measured_at=measured_at) or True,
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_benchmark(c, "org/m", use_case="extraction", ctx=4000,
+                                as_json=True, assume_yes=True) == 0
+
+    assert seen == {"model": "org/m", "measured_at": "2026-01-02T03:04:05+00:00"}
     assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
 
 
@@ -8014,7 +8032,8 @@ def test_render_benchmark_verbose_json_includes_execution_evidence(
     payload = json.loads(capsys.readouterr().out)
     assert payload["backend"] == "apple"
     assert payload["probe_context"] == 8000
-    assert payload["generation_cap"] == "backend_default"
+    assert payload["generation_cap"] == 256
+    assert payload["generation_cap_source"] == "backend_default"
     assert payload["total_generations"] == 2
 
 
@@ -8595,6 +8614,33 @@ def test_render_benchmark_clean_run_stores_zero_counts(make_console, monkeypatch
     c, _ = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
     assert saved["refused_n"] == 0 and saved["errored_n"] == 0
+
+
+def test_render_benchmark_persists_structured_execution_provenance(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}])
+    seq = iter([0.4, 0.8])
+    monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda *_a: next(seq))
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+                                max_tokens=512, repeat=2, assume_yes=True) == 0
+
+    assert saved["probe_context"] == 4000
+    assert saved["generation_cap"] == 512
+    assert saved["repeat_count"] == 2
+    assert saved["total_generations"] == 4
+    assert saved["run_scores"] == [0.4, 0.8]
+
+
+def test_render_benchmark_persists_effective_default_generation_cap(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+
+    assert saved["generation_cap"] == 256
 
 
 def test_render_benchmark_partial_refusal_stores_counts_and_annotates(make_console, monkeypatch):

@@ -216,6 +216,34 @@ def test_agentic_invalid_json_scores_0():
     assert score("agentic", item, "not json at all") == 0.0
 
 
+def test_agentic_non_object_arguments_score_0_without_crashing():
+    from ara.benchmark import score
+    item = {
+        "id": "t1", "question": "q", "function": {},
+        "expected": {"name": "fn", "arguments": {"x": 1}},
+    }
+    assert score("agentic", item, '{"name": "fn", "arguments": []}') == 0.0
+
+
+def test_agentic_extra_arguments_fail_exact_match():
+    from ara.benchmark import score
+    item = {
+        "id": "t1", "question": "q", "function": {},
+        "expected": {"name": "fn", "arguments": {"x": 1}},
+    }
+    completion = '{"name": "fn", "arguments": {"x": 1, "danger": true}}'
+    assert score("agentic", item, completion) == 0.0
+
+
+def test_agentic_null_argument_fails_exact_match():
+    from ara.benchmark import score
+    item = {
+        "id": "t1", "question": "q", "function": {},
+        "expected": {"name": "fn", "arguments": {"x": 1}},
+    }
+    assert score("agentic", item, '{"name": "fn", "arguments": {"x": null}}') == 0.0
+
+
 # ── extraction scorer ─────────────────────────────────────────────────────────
 
 def test_extraction_exact_match_scores_1():

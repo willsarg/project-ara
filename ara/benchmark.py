@@ -242,7 +242,10 @@ def _score_agentic(item: dict, completion: str) -> float:
     if str(parsed.get("name", "")).lower() != str(expected["name"]).lower():
         return 0.0
     pred_args = parsed.get("arguments", {})
-    for arg, exp_val in expected["arguments"].items():
+    expected_args = expected["arguments"]
+    if not isinstance(pred_args, dict) or set(pred_args) != set(expected_args):
+        return 0.0
+    for arg, exp_val in expected_args.items():
         pred_val = pred_args.get(arg)
         if pred_val is None:
             return 0.0
