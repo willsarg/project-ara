@@ -1543,6 +1543,17 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     if db._db_path().is_file():
         with db.connected_readonly() as stored:
             best = _best_ceilings(stored)
+            # A cache scan discovers repos, not exact repo:file GGUF variants or loose local files.
+            # Merge only durable variants that are still physically present so their exact
+            # characterization remains inspectable without resurrecting deleted artifacts.
+            present = {model["model_id"] for model in models}
+            for durable in catalog.all_models(stored):
+                model_id = durable["model_id"]
+                is_variant = ":" in model_id or model_id.lower().endswith(".gguf")
+                if (is_variant and model_id not in present
+                        and staleness.artifact_identity(model_id) is not None):
+                    models.append(durable)
+                    present.add(model_id)
 
     if as_json:
         print(json.dumps(

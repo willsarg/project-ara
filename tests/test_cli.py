@@ -5485,6 +5485,33 @@ def test_render_models_marks_missing_or_mismatched_artifact_authority_stale(
     assert json.loads(capsys.readouterr().out)[0]["stale_ceiling"] is True
 
 
+def test_render_models_merges_present_durable_gguf_selector(
+        monkeypatch, capsys, store):
+    selector = "org/repo:Model-Q4_K_M.gguf"
+    cli.db.upsert_model(store, selector, modality="text", quant="q4_k_m",
+                        n_layers=12, hidden_size=768, kv_heads=4, head_dim=64,
+                        max_context=4096, weights_gb=1.0)
+    cli.db.save_characterization(
+        store, "mkey", "cpu", selector, safe_context=3000, points=[],
+        config={}, artifact_id="artifact:test")
+
+    def scan(con):
+        cli.db.upsert_model(con, "org/repo", modality="text", n_layers=12,
+                            hidden_size=768, kv_heads=4, head_dim=64,
+                            max_context=4096, weights_gb=2.0)
+        return 1
+
+    monkeypatch.setattr(cli.catalog, "scan", scan)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    by_id = {row["model_id"]: row for row in json.loads(capsys.readouterr().out)}
+    assert by_id[selector]["safe_context"] == 3000
+    assert by_id[selector]["characterized"] is True
+    assert by_id[selector]["stale_ceiling"] is False
+
+
 def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")

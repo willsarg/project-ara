@@ -50,14 +50,18 @@ def _infer_modality(cfg: dict, model_id: str = "") -> str:
 
 
 def _cached_gguf_path(model_id: str) -> str | None:
-    """Return the path to the smallest cached .gguf for *model_id*, or None (no download)."""
+    """Return the selected cached GGUF, or the smallest GGUF for a bare repo (no download)."""
     from huggingface_hub import scan_cache_dir
 
     try:
+        repo_id, separator, selected_name = model_id.partition(":")
+        exact_selector = separator and selected_name.lower().endswith(".gguf")
+        if not exact_selector:
+            repo_id, selected_name = model_id, ""
         cache = scan_cache_dir()
         repo = next(
             (r for r in cache.repos
-             if r.repo_id == model_id and r.repo_type == "model"),
+             if r.repo_id == repo_id and r.repo_type == "model"),
             None,
         )
         if repo is None:
@@ -67,6 +71,7 @@ def _cached_gguf_path(model_id: str) -> str | None:
             for rev in repo.revisions
             for f in rev.files
             if f.file_name.endswith(".gguf")
+            and (not exact_selector or f.file_name == selected_name)
         ]
         if not gguf_files:
             return None
@@ -256,6 +261,9 @@ def describe(model_id: str) -> dict | None:
     3. Cached .safetensors header — safetensors models with no config.json cached;
        recovers n_layers + hidden_size; leaves kv_heads/head_dim/max_context/quant None.
     """
+    _, separator, selected_name = model_id.partition(":")
+    if separator and selected_name.lower().endswith(".gguf"):
+        return _describe_gguf(model_id)
     cfg = _read_config(model_id)
     if cfg is None:
         gguf_result = _describe_gguf(model_id)

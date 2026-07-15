@@ -214,6 +214,31 @@ def test_cached_gguf_path_returns_smallest(monkeypatch):
     assert result == "/cache/small.gguf"
 
 
+def test_cached_gguf_path_resolves_exact_repo_selector(monkeypatch):
+    first = _make_file("Model-Q4_K_M.gguf", "/cache/q4.gguf", 500)
+    selected = _make_file("Model-Q8_0.gguf", "/cache/q8.gguf", 1000)
+    repo = _make_repo("org/myrepo", "model", [first, selected])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+    assert catalog._cached_gguf_path("org/myrepo:Model-Q8_0.gguf") == "/cache/q8.gguf"
+    assert catalog._cached_gguf_path("org/myrepo:missing.gguf") is None
+
+
+def test_describe_repo_selector_reads_selected_gguf_not_repo_config(monkeypatch):
+    monkeypatch.setattr(catalog, "_read_config",
+                        lambda _model: pytest.fail("selector must not be passed as a repo id"))
+    monkeypatch.setattr(catalog, "_cached_gguf_path", lambda _model: "/cache/selected.gguf")
+    monkeypatch.setattr(catalog, "_gguf_fields", lambda _path: {
+        "general.architecture": _F("llama"),
+        "llama.block_count": _F(12),
+        "llama.embedding_length": _F(768),
+        "llama.attention.head_count": _F(12),
+        "llama.attention.head_count_kv": _F(4),
+        "llama.context_length": _F(4096),
+    })
+    meta = catalog.describe("org/myrepo:Model-Q8_0.gguf")
+    assert meta is not None and meta["n_layers"] == 12
+
+
 def test_cached_gguf_path_none_when_repo_not_present(monkeypatch):
     repo = _make_repo("org/other", "model", [_make_file("m.gguf", "/c/m.gguf", 100)])
     cache = _make_cache([repo])
