@@ -67,6 +67,18 @@ def test_free_disk_gb_none_on_error(monkeypatch):
     assert acquire.free_disk_gb() is None
 
 
+def test_free_disk_gb_uses_hf_cache_volume(tmp_path, monkeypatch):
+    custom = tmp_path / "cache-volume" / "hf-hub"
+    seen = []
+    monkeypatch.setenv("HF_HUB_CACHE", str(custom))
+    monkeypatch.setattr("shutil.disk_usage",
+                        lambda path: seen.append(Path(path)) or types.SimpleNamespace(
+                            free=7_000_000_000))
+
+    assert acquire.free_disk_gb() == 7.0
+    assert seen == [tmp_path]
+
+
 # --------------------------------------------------------------------------- #
 # download (silences HF progress bars, restores prior setting)
 # --------------------------------------------------------------------------- #

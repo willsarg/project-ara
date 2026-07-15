@@ -295,6 +295,21 @@ def test_transformer_identity_refuses_shard_index_escape(
     assert staleness.artifact_identity("org/model") is None
 
 
+def test_transformer_identity_refuses_external_direct_symlink(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    snapshot = _revision_cache(tmp_path, "a" * 40)
+    nested = snapshot / "nested"
+    nested.mkdir()
+    external = tmp_path / "external.safetensors"
+    external.write_bytes(b"unbound")
+    (nested / "shard.safetensors").symlink_to(external)
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"layer.0": "nested/shard.safetensors"},
+    }))
+
+    assert staleness.artifact_identity("org/model") is None
+
+
 def test_transformer_identity_validates_duplicate_corrupt_and_complete_indexes(
         tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
@@ -391,6 +406,18 @@ def test_content_authority_refuses_read_races_and_digest_failures(tmp_path, monk
     selected.write_bytes(b"weights")
     monkeypatch.setattr(staleness, "_content_digest", lambda _path: None)
     assert staleness._file_descriptor(snapshot, selected) is None
+
+
+def test_file_descriptor_refuses_external_parent_directory_symlink(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    outside = tmp_path / "outside"
+    snapshot.mkdir()
+    outside.mkdir()
+    (outside / "model.safetensors").write_bytes(b"outside")
+    (snapshot / "linked").symlink_to(outside, target_is_directory=True)
+
+    assert staleness._file_descriptor(
+        snapshot, snapshot / "linked" / "model.safetensors") is None
 
 
 def test_local_gguf_identity_tolerates_resolve_race(tmp_path, monkeypatch):

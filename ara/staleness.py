@@ -74,15 +74,25 @@ def _file_descriptor(snapshot: Path, path: Path) -> str | None:
         relative = path.relative_to(snapshot).as_posix()
     except (OSError, ValueError):
         return None
+    if path.is_symlink():
+        # Normal HF snapshots link into this repository's content-addressed blob store. Any other
+        # external link would let a lexical shard name load mutable bytes outside the authority.
+        blob_dir = snapshot.parent.parent / "blobs"
+        if resolved.parent != blob_dir or not _BLOB_RE.fullmatch(resolved.name):
+            return None
+        kind = f"blob:{resolved.name}"
+    else:
+        try:
+            resolved.relative_to(snapshot.resolve(strict=True))
+        except (OSError, ValueError):
+            return None
+        kind = "direct"
     content = _content_digest(resolved)
     if content is None:
         return None
     size, digest = content
-    if _BLOB_RE.fullmatch(resolved.name):
-        authority = f"blob:{resolved.name}:{size}:sha256:{digest}"
-    else:
-        # huggingface_hub uses a direct snapshot file when Windows cannot create symlinks.
-        authority = f"direct:{size}:sha256:{digest}"
+    # huggingface_hub uses direct snapshot files when Windows cannot create symlinks.
+    authority = f"{kind}:{size}:sha256:{digest}"
     return f"{relative}:{authority}"
 
 

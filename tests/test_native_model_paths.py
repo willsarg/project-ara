@@ -71,3 +71,26 @@ def test_native_weight_sizing_uses_only_confined_index_shards(tmp_path):
     }))
     assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 0
     assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 0
+
+
+def test_native_weight_sizing_refuses_external_direct_symlink(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    (snapshot / "model.safetensors").unlink()
+    external = tmp_path / "outside.safetensors"
+    external.write_bytes(b"outside")
+    (snapshot / "model.safetensors").symlink_to(external)
+
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 0
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 0
+
+
+def test_native_weight_sizing_accepts_repository_blob_symlink(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    (snapshot / "model.safetensors").unlink()
+    blob = tmp_path / "blobs" / ("b" * 40)
+    blob.parent.mkdir()
+    blob.write_bytes(b"weights")
+    (snapshot / "model.safetensors").symlink_to(blob)
+
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 7
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 7

@@ -133,6 +133,19 @@ def _snapshot_weight_bytes(snapshot: str) -> int:
                  for filename in filenames if filename.lower().endswith(_WEIGHT_SUFFIXES)]
     for path in paths:
         resolved = os.path.realpath(path)
+        root = os.path.abspath(snapshot)
+        if os.path.islink(path):
+            blob_dir = os.path.join(os.path.dirname(os.path.dirname(root)), "blobs")
+            blob_name = os.path.basename(resolved)
+            authorized = (os.path.dirname(resolved) == blob_dir and len(blob_name) in (40, 64)
+                          and all(char in "0123456789abcdefABCDEF" for char in blob_name))
+        else:
+            try:
+                authorized = os.path.commonpath((root, resolved)) == root
+            except ValueError:
+                authorized = False
+        if not authorized:
+            return 0
         if resolved in seen or not os.path.isfile(resolved):
             continue
         seen.add(resolved)

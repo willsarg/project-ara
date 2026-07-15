@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 
 # Headroom we insist on beyond the raw download, so a fetch never fills the disk
 # (unpacking, the snapshot's own .incomplete temp files, normal system churn).
@@ -124,12 +125,19 @@ def repo_size_gb(repo_id: str) -> float | None:
 
 
 def free_disk_gb() -> float | None:
-    """Free space (GB, decimal) on the volume holding the home directory."""
+    """Free space (GB, decimal) on the volume that will hold the Hugging Face cache."""
     import shutil
-    from pathlib import Path
 
     try:
-        return shutil.disk_usage(Path.home()).free / 1e9
+        default = (Path(os.path.expanduser(os.environ["XDG_CACHE_HOME"])) / "huggingface" / "hub"
+                   if os.environ.get("XDG_CACHE_HOME") else Path.home() / ".cache" / "huggingface" / "hub")
+        target = (Path(os.path.expanduser(os.environ["HF_HUB_CACHE"]))
+                  if os.environ.get("HF_HUB_CACHE") else
+                  Path(os.path.expanduser(os.environ["HF_HOME"])) / "hub"
+                  if os.environ.get("HF_HOME") else default)
+        while not target.exists() and target.parent != target:
+            target = target.parent
+        return shutil.disk_usage(target).free / 1e9
     except Exception:
         return None
 
