@@ -11,6 +11,8 @@ from ara import staleness
 
 
 def _point_hub_at(home: Path, monkeypatch) -> None:
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(
         staleness, "_HUB", home / ".cache" / "huggingface" / "hub", raising=False)
@@ -97,6 +99,25 @@ def test_artifact_identity_tracks_hf_revision_and_exact_gguf(tmp_path, monkeypat
     _revision_cache(tmp_path, rev_b)
     assert staleness.artifact_identity("org/model") == f"hf:org/model@{rev_b}"
     assert staleness.artifact_identity("org/model:Model-Q4_K_M.gguf") is None
+
+
+def test_artifact_identity_honors_hugging_face_cache_environment(tmp_path, monkeypatch):
+    revision = "a" * 40
+    custom = tmp_path / "custom-hub"
+    root = custom / "models--org--model"
+    (root / "refs").mkdir(parents=True)
+    (root / "refs" / "main").write_text(revision)
+    (root / "snapshots" / revision).mkdir(parents=True)
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(custom))
+    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
+
+    monkeypatch.delenv("HF_HUB_CACHE")
+    hf_home = tmp_path / "hf-home"
+    (hf_home / "hub").mkdir(parents=True)
+    (root).rename(hf_home / "hub" / root.name)
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
 
 
 def test_artifact_identity_tracks_local_gguf_stat(tmp_path):

@@ -25,6 +25,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
+from ara import acquire
+
 _IMPORTED_PATH = Path(__file__).parent / "data" / "usecase_scores.json"
 
 # Trailing quantization / format tokens to strip so a quant variant matches its base model
@@ -46,8 +48,10 @@ def base_key(model_id: str) -> str:
 
 def canonical_model_id(model_id: str) -> str:
     """Catalog identity for an exact model selector; preserves local paths and bare repo ids."""
-    repo, separator, filename = model_id.partition(":")
-    return repo if separator and filename.lower().endswith(".gguf") else model_id
+    if (model_id.startswith(("/", "./", "../", "~/"))
+            or re.match(r"^[A-Za-z]:[\\/]", model_id)):
+        return model_id
+    return model_id.partition(":")[0] if acquire.valid_repo_gguf_ref(model_id) else model_id
 
 
 # Genuine quantization tokens only — bit-widths, llama.cpp quant classes (Q/IQ/TQ), and the

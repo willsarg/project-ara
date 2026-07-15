@@ -23,7 +23,11 @@ _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 def _cache_dir(model_id: str) -> Path:
-    return _HUB / ("models--" + model_id.replace("/", "--"))
+    hub = (Path(os.path.expanduser(os.environ["HF_HUB_CACHE"]))
+           if os.environ.get("HF_HUB_CACHE") else
+           Path(os.path.expanduser(os.environ["HF_HOME"])) / "hub"
+           if os.environ.get("HF_HOME") else _HUB)
+    return hub / ("models--" + model_id.replace("/", "--"))
 
 
 def _cache_updated_at(model_id: str) -> float | None:
