@@ -3,6 +3,8 @@
 // in-memory DB — enroll → approve → poll (token delivered once) → long-poll work → report result,
 // plus the 401 (bad/missing token) and 204 (long-poll timeout) paths.
 import { describe, it, expect, beforeAll, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 process.env.ARA_COORDINATOR_DB = ":memory:";
 
@@ -27,6 +29,9 @@ const enrollBody = {
   capabilities: [{ kind: "serve_model", id: "qwen", engine: "vulkan", evidence: "characterized" }],
   environment: ENV,
 };
+const canonicalEnrollBody = JSON.parse(
+  readFileSync(path.resolve(__dirname, "../../contracts/wire/fixtures/enroll.request.valid.json"), "utf8"),
+) as Record<string, unknown>;
 
 const req = (url: string, init?: RequestInit & { bearer?: string }) => {
   const headers = new Headers(init?.headers);
@@ -325,6 +330,91 @@ describe("POST /api/enroll boundary validation", () => {
       req("http://x/api/enroll", { method: "POST", bearer: token, body: "{not json" }),
     );
     expect(res.status).toBe(400);
+  });
+
+  it("enforces the complete pinned enroll.request shape before consuming the token or mutating agents", async () => {
+    const invalidBodies: unknown[] = [
+      null,
+      [],
+      "not an object",
+      { ...canonicalEnrollBody, machine_key: undefined },
+      { ...canonicalEnrollBody, machine_key: "" },
+      { ...canonicalEnrollBody, machine_key: 7 },
+      { ...canonicalEnrollBody, identity: undefined },
+      { ...canonicalEnrollBody, identity: null },
+      { ...canonicalEnrollBody, identity: [] },
+      { ...canonicalEnrollBody, identity: {} },
+      { ...canonicalEnrollBody, identity: { hostname: "" } },
+      { ...canonicalEnrollBody, identity: { hostname: 7 } },
+      { ...canonicalEnrollBody, identity: { hostname: "box", os: 7 } },
+      { ...canonicalEnrollBody, identity: { hostname: "box", arch: 7 } },
+      { ...canonicalEnrollBody, profile_projection: [] },
+      { ...canonicalEnrollBody, capabilities: undefined },
+      { ...canonicalEnrollBody, capabilities: {} },
+      { ...canonicalEnrollBody, capabilities: [null] },
+      { ...canonicalEnrollBody, capabilities: [{}] },
+      { ...canonicalEnrollBody, capabilities: [{ kind: "chat", id: "m", engine: "cpu", evidence: "none" }] },
+      { ...canonicalEnrollBody, capabilities: [{ kind: "serve_model", id: "", engine: "cpu", evidence: "none" }] },
+      { ...canonicalEnrollBody, capabilities: [{ kind: "serve_model", id: "m", engine: "", evidence: "none" }] },
+      { ...canonicalEnrollBody, capabilities: [{ kind: "serve_model", id: "m", engine: "cpu", evidence: "guessed" }] },
+      { ...canonicalEnrollBody, capabilities: [{ kind: "serve_model", id: "m", engine: "cpu", evidence: "none", extra: true }] },
+      { ...canonicalEnrollBody, environment: undefined },
+      { ...canonicalEnrollBody, environment: [] },
+      { ...canonicalEnrollBody, environment: { ...ENV, platform: "plan9" } },
+      { ...canonicalEnrollBody, environment: { ...ENV, accel: "tpu" } },
+      { ...canonicalEnrollBody, environment: { ...ENV, containerized: "false" } },
+      { ...canonicalEnrollBody, environment: { ...ENV, virtualization_layer: 7 } },
+      { ...canonicalEnrollBody, environment: { ...ENV, wall_source: "guessed" } },
+      { ...canonicalEnrollBody, environment: { ...ENV, surprise: true } },
+      { ...canonicalEnrollBody, environment: { ...ENV, platform: undefined } },
+      { ...canonicalEnrollBody, environment: { ...ENV, accel: undefined } },
+      { ...canonicalEnrollBody, environment: { ...ENV, containerized: undefined } },
+      { ...canonicalEnrollBody, environment: { ...ENV, wall_source: undefined } },
+      { ...canonicalEnrollBody, sneaky_extra: true },
+    ];
+    const before = enroll.listAgentSummaries().length;
+    const { token } = enroll.issueEnrollmentToken();
+
+    for (const [index, body] of invalidBodies.entries()) {
+      const res = await enrollRoute.POST(
+        req("http://x/api/enroll", {
+          method: "POST",
+          bearer: token,
+          headers: { "x-forwarded-for": `192.0.2.${index + 1}` },
+          body: JSON.stringify(body),
+        }),
+      );
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect(enroll.listAgentSummaries()).toHaveLength(before);
+    }
+
+    const valid = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: token,
+        headers: { "x-forwarded-for": "192.0.2.254" },
+        body: JSON.stringify(canonicalEnrollBody),
+      }),
+    );
+    expect(valid.status).toBe(201);
+    expect(enroll.listAgentSummaries()).toHaveLength(before + 1);
+  });
+
+  it("accepts contract-permitted open identity and profile projection objects", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const res = await enrollRoute.POST(
+      req("http://x/api/enroll", {
+        method: "POST",
+        bearer: token,
+        body: JSON.stringify({
+          ...canonicalEnrollBody,
+          machine_key: "box-open-enroll-fields",
+          identity: { hostname: "box", vendor_detail: { serial: 7 } },
+          profile_projection: { nested: ["is", "allowed"] },
+        }),
+      }),
+    );
+    expect(res.status).toBe(201);
   });
 });
 

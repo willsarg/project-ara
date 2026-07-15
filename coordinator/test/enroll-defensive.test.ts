@@ -28,7 +28,17 @@ describe("POST /api/enroll — enroll() returns null after the route's own token
       new Request("http://x/api/enroll", {
         method: "POST",
         headers: { authorization: `Bearer ${token}` },
-        body: JSON.stringify({ machine_key: "box", environment: {} }),
+        body: JSON.stringify({
+          machine_key: "box",
+          identity: { hostname: "box" },
+          capabilities: [],
+          environment: {
+            platform: "unknown",
+            accel: "unknown",
+            containerized: false,
+            wall_source: "physical",
+          },
+        }),
       }),
     );
     expect(res.status).toBe(401);

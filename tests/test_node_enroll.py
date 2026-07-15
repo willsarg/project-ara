@@ -3,6 +3,9 @@
 """Enrollment handshake — enroll, poll to approval, persist the session token, bounded waiting."""
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from ara.node import capabilities, config, enroll
@@ -53,6 +56,50 @@ def test_enroll_flow_requires_a_real_one_shot_token():
             config.NodeConfig(server_url="https://c.example"),
             client=FakeClient([]),
         )
+
+
+def test_concurrent_enrollment_cannot_start_a_stale_handshake():
+    with enroll._enrollment_lease():
+        with pytest.raises(enroll.EnrollmentBusy, match="already owns"):
+            enroll.enroll_flow(
+                _cfg(), client=FakeClient([{"status": "active", "session_token": "STALE"}]),
+            )
+    assert config.load() is None
+
+
+def test_enrollment_lease_uses_windows_locking_protocol(monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LK_NBLCK=1, LK_UNLCK=2,
+        locking=lambda fd, operation, size: calls.append((fd, operation, size)),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(enroll, "_is_windows", lambda: True)
+    with enroll._enrollment_lease():
+        calls.append("inside")
+    assert calls[0][1:] == (fake.LK_NBLCK, 1)
+    assert calls[1] == "inside"
+    assert calls[2][1:] == (fake.LK_UNLCK, 1)
+
+
+def test_enrollment_lease_classifies_windows_contention(monkeypatch):
+    fake = types.SimpleNamespace(
+        LK_NBLCK=1, LK_UNLCK=2,
+        locking=lambda _fd, operation, _size: (
+            (_ for _ in ()).throw(OSError("busy")) if operation == 1 else None),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(enroll, "_is_windows", lambda: True)
+    with pytest.raises(enroll.EnrollmentBusy):
+        with enroll._enrollment_lease():
+            pytest.fail("busy lease must not enter")
+
+
+def test_enrollment_lease_supports_platform_without_optional_open_features(monkeypatch):
+    monkeypatch.delattr(enroll.os, "O_NOFOLLOW")
+    monkeypatch.delattr(enroll.os, "fchmod")
+    with enroll._enrollment_lease():
+        pass
 
 
 def test_active_immediately_stores_and_saves_session_token():

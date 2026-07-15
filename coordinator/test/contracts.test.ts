@@ -8,12 +8,29 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { ALLOWED_JOB_KINDS } from "@/lib/job-kinds";
 import { isResultRequest } from "@/lib/result-schema";
+import {
+  CAPABILITY_SCHEMA,
+  ENROLL_REQUEST_SCHEMA,
+  ENVIRONMENT_SCHEMA,
+  RESULT_REQUEST_SCHEMA,
+  isEnrollmentRequest,
+} from "@/lib/wire-schema";
 
 const WIRE = path.resolve(__dirname, "../../contracts/wire");
 const SCHEMA_DIR = path.join(WIRE, "schema");
 const FIXTURE_DIR = path.join(WIRE, "fixtures");
 
 const readJson = (p: string): unknown => JSON.parse(readFileSync(p, "utf8"));
+
+function withoutAnnotations(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutAnnotations);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "title" && key !== "description")
+      .map(([key, entry]) => [key, withoutAnnotations(entry)]),
+  );
+}
 
 function buildAjv(): Ajv2020 {
   // strict:false — the contract uses descriptive keywords; we validate shape, not lint the schema.
@@ -55,6 +72,24 @@ describe("wire contract fixtures (shared with the node's test_wire_contract.py)"
   it("keeps production result validation aligned with every pinned result fixture", () => {
     for (const c of manifest.cases.filter((entry) => entry.schema.endsWith("result.request.json"))) {
       expect(isResultRequest(readJson(path.join(FIXTURE_DIR, c.fixture))), c.fixture).toBe(c.valid);
+    }
+  });
+
+  it("keeps production enrollment validation aligned with every pinned enrollment fixture", () => {
+    for (const c of manifest.cases.filter((entry) => entry.schema.endsWith("enroll.request.json"))) {
+      expect(isEnrollmentRequest(readJson(path.join(FIXTURE_DIR, c.fixture))), c.fixture).toBe(c.valid);
+    }
+  });
+
+  it("keeps production validation vocabulary equal to the pinned schemas", () => {
+    const productionByFile = new Map<string, object>([
+      ["capability.schema.json", CAPABILITY_SCHEMA],
+      ["environment.schema.json", ENVIRONMENT_SCHEMA],
+      ["enroll.request.schema.json", ENROLL_REQUEST_SCHEMA],
+      ["result.request.schema.json", RESULT_REQUEST_SCHEMA],
+    ]);
+    for (const [file, production] of productionByFile) {
+      expect(production, file).toEqual(withoutAnnotations(readJson(path.join(SCHEMA_DIR, file))));
     }
   });
 });

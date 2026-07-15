@@ -10,15 +10,83 @@ actually wait — and so a never-approved node fails loudly instead of spinning 
 """
 from __future__ import annotations
 
+import os
 import time
+from contextlib import contextmanager
 
 from ara.node import capabilities, config as config_mod
 from ara.node.client import NodeClient
 
 
+class EnrollmentBusy(RuntimeError):
+    """Another enrollment handshake already owns this node state directory."""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _try_lock_enrollment(fd: int) -> bool:
+    if _is_windows():
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_enrollment(fd: int) -> None:
+    if _is_windows():
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _enrollment_lease():
+    """Lease the entire one-shot handshake so stale completions cannot replace newer authority."""
+    path = config_mod.node_dir() / "enrollment.lock"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        if not _try_lock_enrollment(fd):
+            raise EnrollmentBusy(
+                "another ARA node enrollment already owns this node state directory")
+        try:
+            yield
+        finally:
+            _unlock_enrollment(fd)
+    finally:
+        os.close(fd)
+
+
 def enroll_flow(config: config_mod.NodeConfig, *, client: NodeClient | None = None,
                 sleep=time.sleep, poll_interval: float = 2.0,
                 max_polls: int = 30) -> config_mod.NodeConfig:
+    """Run one process-exclusive enrollment handshake for this node state directory."""
+    with _enrollment_lease():
+        return _enroll_flow(
+            config, client=client, sleep=sleep, poll_interval=poll_interval, max_polls=max_polls,
+        )
+
+
+def _enroll_flow(config: config_mod.NodeConfig, *, client: NodeClient | None = None,
+                 sleep=time.sleep, poll_interval: float = 2.0,
+                 max_polls: int = 30) -> config_mod.NodeConfig:
     """Enroll *config*'s node and block until approved, then persist its session token.
 
     Raises ``TimeoutError`` if approval doesn't arrive within ``max_polls`` polls, or ``ValueError``
