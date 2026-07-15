@@ -13,6 +13,7 @@ code never imports a nested engine package in-process.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -56,12 +57,50 @@ def _file_descriptor(snapshot: Path, path: Path) -> str | None:
         relative = path.relative_to(snapshot).as_posix()
     except (OSError, ValueError):
         return None
+    fingerprint = (f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:"
+                   f"{stat.st_mtime_ns}:{stat.st_ctime_ns}")
     if _BLOB_RE.fullmatch(resolved.name):
-        authority = f"blob:{resolved.name}:{stat.st_size}"
+        authority = f"blob:{resolved.name}:{fingerprint}"
     else:
         # huggingface_hub uses a direct snapshot file when Windows cannot create symlinks.
-        authority = f"direct:{stat.st_size}:{stat.st_mtime_ns}"
+        authority = f"direct:{fingerprint}"
     return f"{relative}:{authority}"
+
+
+def _selected_weights(snapshot: Path) -> list[Path] | None:
+    """Exact bare-ref weight selection: all transformer shards or the smallest GGUF."""
+    weights = [
+        path for path in snapshot.rglob("*")
+        if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
+        and not (path.suffix.lower() == ".gguf"
+                 and path.name.lower().startswith("mmproj-"))
+    ]
+    ggufs = [path for path in weights if path.suffix.lower() == ".gguf"]
+    transformer = [path for path in weights if path.suffix.lower() != ".gguf"]
+    if ggufs and transformer:
+        return None
+    if ggufs:
+        return [min(ggufs, key=lambda path: path.stat().st_size)]
+    return transformer or None
+
+
+def _transformer_manifest(snapshot: Path) -> list[Path] | None:
+    """All files consumed from a transformer snapshot, with complete shard-index validation."""
+    files = [path for path in snapshot.rglob("*") if path.is_file()]
+    indexes = [path for path in files if path.name.endswith(".safetensors.index.json")]
+    if len(indexes) > 1:
+        return None
+    if indexes:
+        try:
+            index = json.loads(indexes[0].read_text(encoding="utf-8"))
+            weight_map = index.get("weight_map")
+            if (not isinstance(weight_map, dict)
+                    or not all(isinstance(name, str) and (snapshot / name).is_file()
+                               for name in weight_map.values())):
+                return None
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return None
+    return files
 
 
 def _authorized_snapshot(repo_id: str, artifact_id: str) -> Path | None:
@@ -120,7 +159,7 @@ def artifact_identity(model: str) -> str | None:
         try:
             stat = local.stat()
             return (f"local-gguf:{local.resolve()}:{stat.st_dev}:{stat.st_ino}:"
-                    f"{stat.st_size}:{stat.st_mtime_ns}")
+                    f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}")
         except OSError:
             return None
 
@@ -137,23 +176,15 @@ def artifact_identity(model: str) -> str | None:
             return None
         return f"hf-gguf:{repo_id}@{revision}:{descriptor}"
     try:
-        weights = [
-            path for path in snapshot.rglob("*")
-            if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
-            and not (path.suffix.lower() == ".gguf"
-                     and path.name.lower().startswith("mmproj-"))
-        ]
-        ggufs = [path for path in weights if path.suffix.lower() == ".gguf"]
-        other_weights = [path for path in weights if path.suffix.lower() != ".gguf"]
-        # A mixed-format repository has backend-dependent bare-ref semantics. Refuse to invent a
-        # single identity; callers can use an exact repo:file.gguf selector for the GGUF lane.
-        if ggufs and other_weights:
+        selected = _selected_weights(snapshot)
+        if selected is None:
             return None
-        selected = [min(ggufs, key=lambda path: path.stat().st_size)] if ggufs else other_weights
-        if not selected:
+        authority_files = (selected if selected[0].suffix.lower() == ".gguf"
+                           else _transformer_manifest(snapshot))
+        if authority_files is None:
             return None
         descriptors = []
-        for path in sorted(selected):
+        for path in sorted(authority_files):
             descriptor = _file_descriptor(snapshot, path)
             if descriptor is None:
                 return None
@@ -185,13 +216,12 @@ def pinned_model_ref(model: str, expected_artifact_id: str | None) -> str | None
     if separator:
         selected = snapshot / filename
         return str(selected) if selected.is_file() else None
-    descriptor_blob = expected_artifact_id.split(":", 2)[-1]
-    descriptors = descriptor_blob.split("|")
-    if len(descriptors) == 1:
-        relative = descriptors[0].split(":", 1)[0]
-        if relative.lower().endswith(".gguf"):
-            selected = snapshot / relative
-            return str(selected) if selected.is_file() else None
+    try:
+        selected = _selected_weights(snapshot)
+    except OSError:
+        return None
+    if selected and selected[0].suffix.lower() == ".gguf":
+        return str(selected[0])
     return str(snapshot)
 
 

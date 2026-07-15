@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 
@@ -212,6 +213,9 @@ def test_pinned_model_ref_handles_multishard_transformer_and_filesystem_races(
     assert staleness.pinned_model_ref("org/not-cached", "artifact") is None
     assert staleness.pinned_model_ref("org/model:missing.gguf", "artifact") is None
     assert staleness._authorized_snapshot("org/model", "hf:other/model@bad:x") is None
+    monkeypatch.setattr(staleness, "_selected_weights",
+                        lambda _snapshot: (_ for _ in ()).throw(OSError("race")))
+    assert staleness.pinned_model_ref("org/model", identity) is None
 
 
 def test_bare_hf_identity_refuses_unidentifiable_selected_weight(tmp_path, monkeypatch):
@@ -232,6 +236,61 @@ def test_bare_hf_identity_supports_direct_snapshot_files_on_windows_style_cache(
     identity = staleness.artifact_identity("org/model")
     assert identity is not None and "direct:" in identity
     assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
+
+
+def test_transformer_identity_tracks_same_size_weight_and_support_file_changes(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
+    config = snapshot / "config.json"
+    config.write_text('{"a":1}')
+    first = staleness.artifact_identity("org/model")
+
+    blob = (snapshot / "model.safetensors").resolve()
+    blob.write_bytes(b"changed")  # same byte length as b"weights"
+    second = staleness.artifact_identity("org/model")
+    assert second != first
+
+    config.write_text('{"a":2}')  # same-size load-critical config mutation
+    third = staleness.artifact_identity("org/model")
+    assert third != second
+    config.unlink()
+    assert staleness.artifact_identity("org/model") != third
+
+
+def test_transformer_identity_refuses_incomplete_shard_index(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model-00001-of-00002.safetensors")
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "layer.0": "model-00001-of-00002.safetensors",
+            "layer.1": "model-00002-of-00002.safetensors",
+        }}))
+    assert staleness.artifact_identity("org/model") is None
+
+
+def test_transformer_identity_validates_duplicate_corrupt_and_complete_indexes(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
+    first = snapshot / "model.safetensors.index.json"
+    second = snapshot / "other.safetensors.index.json"
+    first.write_text('{}')
+    second.write_text('{}')
+    assert staleness.artifact_identity("org/model") is None
+
+    second.unlink()
+    first.write_text("not json")
+    assert staleness.artifact_identity("org/model") is None
+    first.write_text('{"weight_map": []}')
+    assert staleness.artifact_identity("org/model") is None
+    first.write_text(json.dumps({
+        "weight_map": {"layer.0": "model.safetensors"}}))
+    assert staleness.artifact_identity("org/model") is not None
 
 
 def test_bare_hf_identity_rejects_mixed_formats_and_noncanonical_blobs(

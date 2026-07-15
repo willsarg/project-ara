@@ -34,6 +34,7 @@ PREFILL_SPIKE_MULT = 5.0
 # MLX quantized-KV group size (matches production: kv_group_size=64). Each group also carries
 # an fp16 scale + bias, the per-element overhead in kv_bytes_per_token().
 KV_GROUP_SIZE = 64
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 
 @dataclass
@@ -90,6 +91,27 @@ def _cache_dir(hf_id: str) -> str:
     return os.path.join(HUB, "models--" + hf_id.replace("/", "--"))
 
 
+def _local_snapshot(hf_id: str) -> str | None:
+    path = os.path.abspath(os.path.expanduser(hf_id))
+    return path if os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")) else None
+
+
+def _snapshot_weight_bytes(snapshot: str) -> int:
+    """Weight bytes in a local snapshot, deduplicating resolved HF blob links."""
+    seen: set[str] = set()
+    total = 0
+    for dirpath, _, filenames in os.walk(snapshot):
+        for filename in filenames:
+            if not filename.lower().endswith(_WEIGHT_SUFFIXES):
+                continue
+            resolved = os.path.realpath(os.path.join(dirpath, filename))
+            if resolved in seen or not os.path.isfile(resolved):
+                continue
+            seen.add(resolved)
+            total += os.path.getsize(resolved)
+    return total
+
+
 def cache_updated_at(hf_id: str) -> float | None:
     """Newest artifact mtime in any locally cached model snapshot."""
     root = _cache_dir(hf_id)
@@ -126,6 +148,9 @@ def fit_is_stale(hf_id: str, characterized_at: str | None) -> bool:
 
 def weights_gb(hf_id: str) -> float:
     """Real on-disk weight size from the cache `blobs/` dir (not the symlinked snapshot)."""
+    local = _local_snapshot(hf_id)
+    if local is not None:
+        return _snapshot_weight_bytes(local) / 1e9
     blobs = os.path.join(_cache_dir(hf_id), "blobs")
     total = 0
     for f in glob.glob(os.path.join(blobs, "*")):
@@ -137,7 +162,9 @@ def weights_gb(hf_id: str) -> float:
 
 
 def _read_raw_config(hf_id: str) -> dict | None:
-    cfgs = glob.glob(os.path.join(_cache_dir(hf_id), "snapshots", "*", "config.json"))
+    local = _local_snapshot(hf_id)
+    cfgs = ([os.path.join(local, "config.json")] if local is not None else
+            glob.glob(os.path.join(_cache_dir(hf_id), "snapshots", "*", "config.json")))
     if not cfgs:
         return None
     with open(cfgs[0]) as fh:

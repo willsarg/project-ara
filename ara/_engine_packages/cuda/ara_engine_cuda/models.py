@@ -37,6 +37,7 @@ GIB = 1024 ** 3
 # the effective bytes/elem is kv_bits/8 + 2·2/group — the same scheme MLX uses. The `hqq` backend
 # does both 8- and 4-bit (unlike quanto's 2/4-only KV path), so q8_0 and q4_0 both work.
 KV_GROUP_SIZE = 64
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 
 # Runtime WEIGHT quantization (NVIDIA-native; no GGUF/MLX parallel — they ship pre-quantized files).
@@ -141,8 +142,32 @@ def _cache_dir(hf_id: str) -> str:
     return os.path.join(HUB, "models--" + hf_id.replace("/", "--"))
 
 
+def _local_snapshot(hf_id: str) -> str | None:
+    path = os.path.abspath(os.path.expanduser(hf_id))
+    return path if os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")) else None
+
+
+def _snapshot_weight_bytes(snapshot: str) -> int:
+    """Weight bytes in a local snapshot, deduplicating resolved HF blob links."""
+    seen: set[str] = set()
+    total = 0
+    for dirpath, _, filenames in os.walk(snapshot):
+        for filename in filenames:
+            if not filename.lower().endswith(_WEIGHT_SUFFIXES):
+                continue
+            resolved = os.path.realpath(os.path.join(dirpath, filename))
+            if resolved in seen or not os.path.isfile(resolved):
+                continue
+            seen.add(resolved)
+            total += os.path.getsize(resolved)
+    return total
+
+
 def weights_gb(hf_id: str) -> float:
     """Real on-disk weight size from the cache ``blobs/`` dir (not the symlinked snapshot)."""
+    local = _local_snapshot(hf_id)
+    if local is not None:
+        return _snapshot_weight_bytes(local) / GIB
     total = 0
     for f in glob.glob(os.path.join(_cache_dir(hf_id), "blobs", "*")):
         if os.path.islink(f) or not os.path.isfile(f):
@@ -153,7 +178,9 @@ def weights_gb(hf_id: str) -> float:
 
 
 def _read_config(hf_id: str) -> dict | None:
-    cfgs = glob.glob(os.path.join(_cache_dir(hf_id), "snapshots", "*", "config.json"))
+    local = _local_snapshot(hf_id)
+    cfgs = ([os.path.join(local, "config.json")] if local is not None else
+            glob.glob(os.path.join(_cache_dir(hf_id), "snapshots", "*", "config.json")))
     if not cfgs:
         return None
     with open(cfgs[0]) as fh:
