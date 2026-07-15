@@ -40,7 +40,9 @@ export default async function NodesPage({ searchParams }: NodesPageProps) {
       </header>
 
       <main className="wrap">
-        {receipt.job === "not-active" ? (
+        {receipt.job === "invalid" ? (
+          <p className="notice error">Job was not queued: node, model, and prompt are required.</p>
+        ) : receipt.job === "not-active" ? (
           <p className="notice error">Job was not queued: the selected node is no longer active.</p>
         ) : receipt.job === "queued" && receipt.jobId ? (
           <p className="notice">Queued job <code>{receipt.jobId}</code>.</p>
@@ -132,7 +134,7 @@ export default async function NodesPage({ searchParams }: NodesPageProps) {
                       <form action={submitJobAction} className="rowacts">
                         <input type="hidden" name="agentId" value={a.id} />
                         <input name="model" placeholder="model" required />
-                        <input name="prompt" placeholder="prompt" />
+                        <input name="prompt" placeholder="prompt" required />
                         <button className="btn" type="submit">
                           run
                         </button>

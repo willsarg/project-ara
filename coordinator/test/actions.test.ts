@@ -263,26 +263,49 @@ describe("submitJobAction", () => {
     expect(job).toMatchObject({ kind: "run", args: { model: "qwen", prompt: "hello" } });
   });
 
-  it("no-ops when model is missing/blank", async () => {
+  it("rejects when model is missing/blank", async () => {
     const agent = await pendingAgent("box-job-nomodel");
     const form = new FormData();
     form.set("agentId", String(agent.id));
     form.set("model", "   "); // trims to empty -> falsy
-    await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=invalid",
+    );
     expect(await work.nextForAgent(agent.id, 0)).toBeNull();
   });
 
-  it("no-ops when agentId is missing/falsy", async () => {
+  it("rejects when agentId is missing/falsy", async () => {
     const form = new FormData();
     form.set("model", "qwen");
-    await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    form.set("prompt", "hello");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=invalid",
+    );
   });
 
-  it("no-ops when the model field is entirely absent (?? \"\" fallback)", async () => {
+  it("rejects when the model field is entirely absent (?? \"\" fallback)", async () => {
     const agent = await pendingAgent("box-job-nofield");
     const form = new FormData();
     form.set("agentId", String(agent.id)); // no "model" key at all
-    await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    form.set("prompt", "hello");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=invalid",
+    );
+    expect(await work.nextForAgent(agent.id, 0)).toBeNull();
+  });
+
+  it("rejects a missing or blank prompt before enqueueing", async () => {
+    const agent = await pendingAgent("box-job-noprompt");
+    enroll.approveAgent(agent.id);
+    for (const prompt of [undefined, "   "]) {
+      const form = new FormData();
+      form.set("agentId", String(agent.id));
+      form.set("model", "qwen");
+      if (prompt !== undefined) form.set("prompt", prompt);
+      await expect(actions.submitJobAction(form)).rejects.toThrow(
+        "NEXT_REDIRECT:/nodes?job=invalid",
+      );
+    }
     expect(await work.nextForAgent(agent.id, 0)).toBeNull();
   });
 
@@ -292,6 +315,7 @@ describe("submitJobAction", () => {
       const form = new FormData();
       form.set("agentId", String(id));
       form.set("model", "qwen");
+      form.set("prompt", "hello");
       await expect(actions.submitJobAction(form)).rejects.toThrow(
         "NEXT_REDIRECT:/nodes?job=not-active",
       );
@@ -300,6 +324,7 @@ describe("submitJobAction", () => {
     const denied = new FormData();
     denied.set("agentId", String(pending.id));
     denied.set("model", "qwen");
+    denied.set("prompt", "hello");
     await expect(actions.submitJobAction(denied)).rejects.toThrow(
       "NEXT_REDIRECT:/nodes?job=not-active",
     );
@@ -314,6 +339,7 @@ describe("submitJobAction", () => {
     const form = new FormData();
     form.set("agentId", String(active.id));
     form.set("model", "qwen");
+    form.set("prompt", "hello");
     await expect(actions.submitJobAction(form)).rejects.toThrow("database unavailable");
     broken.mockRestore();
   });
