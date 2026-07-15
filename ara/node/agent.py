@@ -179,9 +179,18 @@ def _fsync_parent(path: Path) -> None:
         os.close(fd)
 
 
+def _ensure_private_directory(path: Path) -> None:
+    """Create a state directory without accepting a symlink or non-directory in its place."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink():
+        raise OSError(f"ARA node state directory must not be a symlink: {path}")
+    if not path.is_dir():
+        raise OSError(f"ARA node state path is not a directory: {path}")
+
+
 def _write_json_atomic(path: Path, value: dict) -> None:
     """Write JSON through a same-directory owner-only temporary, then atomically replace *path*."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_private_directory(path.parent)
     fd, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(temporary_name)
@@ -264,7 +273,21 @@ def _quarantine_spool(path: Path) -> None:
     os.replace(path, destination)
     _fsync_parent(destination)
     if not destination.is_symlink():
-        destination.chmod(0o600)
+        destination.chmod(0o700 if destination.is_dir() else 0o600)
+
+
+def _retire_accepted(path: Path) -> bool:
+    """Remove a completed job journal, quarantining malformed paths while preserving evidence."""
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        try:
+            _quarantine_spool(path)
+            return True
+        except OSError as exc:
+            health.status(f"could not retire completed job journal {path.name}: {exc}")
+            return False
 
 
 def _read_accepted_job(path: Path) -> dict:
@@ -352,10 +375,12 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
     on success — so finished work survives a restart. Corrupt spool files are quarantined for
     inspection rather than retried forever or destroyed."""
     d = _results_dir()
+    if d.is_symlink():
+        return client
     if not d.exists():
         return client
     entries = []
-    order_counts: dict[tuple[int, int], int] = {}
+    order_counts: dict[int, int] = {}
     for f in d.glob("*.json"):
         try:
             modified_ns = f.lstat().st_mtime_ns
@@ -370,7 +395,7 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
             continue
         # Versioned order is authoritative. Legacy entries predate ordered envelopes, so their
         # persisted write time is only usable when unique; a tie is honestly unknowable.
-        order_key = (1, order) if order is not None else (0, modified_ns)
+        order_key = order if order is not None else modified_ns
         order_counts[order_key] = order_counts.get(order_key, 0) + 1
         entries.append((order_key, f.name, f, job_id, payload))
     for order_key, _name, f, job_id, payload in sorted(entries):
@@ -379,18 +404,22 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
             break
         # The completion spool is durable proof that execution already finished. Its older
         # accepted-job journal is now redundant even if result delivery remains unavailable.
-        _accepted_path(job_id).unlink(missing_ok=True)
+        accepted_retired = _retire_accepted(_accepted_path(job_id))
         try:
             delivered, client = _try_post(client, config, job_id, payload)
         except _TerminalResultRejection as exc:
             health.status(str(exc))
-            try:
-                _quarantine_spool(f)
-            except OSError:
-                pass
-            continue
-        if delivered:
+            if accepted_retired:
+                try:
+                    _quarantine_spool(f)
+                except OSError:
+                    pass
+                continue
+            break
+        if delivered and accepted_retired:
             f.unlink(missing_ok=True)
+        elif delivered:
+            break
         else:
             # Do not report a later completion ahead of the oldest transient failure. Leaving the
             # remaining files untouched also lets the loop recognize that it must not accept work.
@@ -437,6 +466,12 @@ def _run_loop(config, *, client: NodeClient | None = None,
         except _ReenrollmentRequired:
             health.status("re-enrollment required — session rejected while reporting a result")
             return count
+        try:
+            _ensure_private_directory(_results_dir())
+        except OSError as exc:
+            health.status(f"result spool unavailable; refusing work: {exc}")
+            sleep(reauth_backoff)
+            continue
         if any(_results_dir().glob("*.json")):
             health.status("waiting to deliver a completed result before accepting more work")
             sleep(reauth_backoff)
@@ -494,7 +529,7 @@ def _run_loop(config, *, client: NodeClient | None = None,
         # Durable BEFORE the network: spool the finished result, then post. Only remove it once the
         # server has acknowledged it — so a 401/5xx/crash retries later instead of losing the work.
         _spool_result(job["id"], payload)
-        accepted_path.unlink(missing_ok=True)
+        accepted_retired = _retire_accepted(accepted_path)
         try:
             delivered, client = _try_post(client, config, job["id"], payload)
         except _ReenrollmentRequired:
@@ -502,12 +537,13 @@ def _run_loop(config, *, client: NodeClient | None = None,
             return count
         except _TerminalResultRejection as exc:
             health.status(str(exc))
-            try:
-                _quarantine_spool(_spool_path(job["id"]))
-            except OSError:
-                pass
+            if accepted_retired:
+                try:
+                    _quarantine_spool(_spool_path(job["id"]))
+                except OSError:
+                    pass
             continue
-        if delivered:
+        if delivered and accepted_retired:
             _spool_path(job["id"]).unlink(missing_ok=True)
         else:
             sleep(reauth_backoff)              # bounded backoff; the result stays spooled for retry

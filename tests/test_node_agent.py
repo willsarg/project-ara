@@ -586,6 +586,23 @@ def test_undelivered_result_blocks_polling_and_execution_of_later_work(tmp_path)
     assert len(_spool_files(tmp_path)) == 1
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_unavailable_results_directory_blocks_ack_and_execution(tmp_path):
+    agent._journal_job({"id": "j1", "kind": "run", "args": {}})
+    results = tmp_path / "node" / "results"
+    results.symlink_to(tmp_path / "missing-results")
+    client = FakeClient([])
+
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _kind, _args: pytest.fail("work must not run without durable result storage"),
+        max_iterations=2, sleep=lambda _seconds: None,
+    )
+
+    assert client.acked == []
+    assert len(_accepted_files(tmp_path)) == 1
+
+
 def test_flush_replays_results_in_persisted_write_order(tmp_path):
     """Opaque hash filenames and tied mtimes must not decide current-envelope replay order."""
     job_ids = ["first candidate", "second candidate"]
@@ -618,6 +635,22 @@ def test_flush_preserves_tied_legacy_results_when_fifo_order_is_unknown(tmp_path
     assert client.posted == []
     assert len(_spool_files(tmp_path)) == 2
     assert statuses == ["result spool order is ambiguous; preserving evidence and blocking work"]
+
+
+def test_flush_orders_mixed_envelopes_by_completion_time_not_format(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "_last_spool_order", 0)
+    monkeypatch.setattr(agent.time, "time_ns", lambda: 1_000_000_000)
+    agent._spool_result("current-first", {"status": "done", "result": {"order": 1}})
+    legacy = tmp_path / "node" / "results" / "legacy-second.json"
+    legacy.write_text(json.dumps({"status": "done", "result": {"order": 2}}))
+    os.utime(legacy, ns=(2_000_000_000, 2_000_000_000))
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert [job_id for job_id, _payload in client.posted] == [
+        "current-first", "legacy-second",
+    ]
 
 
 def test_previous_envelope_version_remains_deliverable(tmp_path):
@@ -654,6 +687,87 @@ def test_flush_quarantines_permanently_rejected_result_and_continues(tmp_path):
                    sleep=lambda s: None)
     assert _spool_files(tmp_path) == []
     assert len(list((d / "quarantine").iterdir())) == 1
+
+
+def test_flush_quarantines_malformed_accepted_path_before_posting(tmp_path):
+    payload = {"status": "done", "result": {"ok": True}}
+    agent._spool_result("j1", payload)
+    accepted = agent._accepted_path("j1")
+    accepted.mkdir(parents=True)
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert client.posted == [("j1", payload)]
+    assert not accepted.exists()
+    assert len(list((accepted.parent / "quarantine").iterdir())) == 1
+
+
+def test_flush_posts_but_retains_spool_when_accepted_cleanup_is_impossible(
+        tmp_path, monkeypatch):
+    payload = {"status": "done", "result": {"ok": True}}
+    agent._spool_result("j1", payload)
+    accepted = agent._accepted_path("j1")
+    accepted.mkdir(parents=True)
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+    statuses = []
+    monkeypatch.setattr(agent.health, "status", statuses.append)
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert client.posted == [("j1", payload)]
+    assert len(_spool_files(tmp_path)) == 1
+    assert statuses and "could not retire completed job journal" in statuses[0]
+
+
+def test_immediate_post_retains_spool_when_accepted_cleanup_is_impossible(
+        tmp_path, monkeypatch):
+    client = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+
+    def runner(_kind, _args):
+        accepted = agent._accepted_path("j1")
+        accepted.unlink()
+        accepted.mkdir()
+        return {"ok": True}
+
+    agent.run_loop(_cfg(), client=client, runner=runner, max_iterations=1)
+
+    assert client.posted and client.posted[0][0] == "j1"
+    assert len(_spool_files(tmp_path)) == 1
+
+
+def test_permanent_flush_rejection_retains_spool_when_accepted_cleanup_is_impossible(
+        tmp_path, monkeypatch):
+    agent._spool_result("j1", {"status": "done", "result": {"ok": True}})
+    agent._accepted_path("j1").mkdir(parents=True)
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+
+    agent._flush_spool(RaisingClient(post_error=_status_error(404)), _cfg())
+
+    assert len(_spool_files(tmp_path)) == 1
+
+
+def test_permanent_immediate_rejection_retains_spool_when_accepted_cleanup_is_impossible(
+        tmp_path, monkeypatch):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=_status_error(404))
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+
+    def runner(_kind, _args):
+        accepted = agent._accepted_path("j1")
+        accepted.unlink()
+        accepted.mkdir()
+        return {"ok": True}
+
+    agent.run_loop(_cfg(), client=client, runner=runner, max_iterations=1)
+
+    assert len(_spool_files(tmp_path)) == 1
 
 
 @pytest.mark.parametrize("phase", ["flush", "ack", "post"])
@@ -813,3 +927,25 @@ def test_spool_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(agent.os, "name", "nt")
     monkeypatch.setattr(agent.os, "open", lambda *_a: pytest.fail("must not open a directory"))
     assert agent._fsync_parent(tmp_path / "result.json") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_private_directory_rejects_symlink_to_existing_directory(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    with pytest.raises(OSError, match="must not be a symlink"):
+        agent._ensure_private_directory(link)
+
+
+def test_private_directory_rejects_non_directory_after_creation_check():
+    fake_path = types.SimpleNamespace(
+        mkdir=lambda **_kwargs: None,
+        is_symlink=lambda: False,
+        is_dir=lambda: False,
+    )
+
+    with pytest.raises(OSError, match="is not a directory"):
+        agent._ensure_private_directory(fake_path)
