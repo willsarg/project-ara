@@ -112,6 +112,18 @@ def test_run_invokes_the_agent_loop(con, monkeypatch):
     assert "run loop exited" in con[1].getvalue()
 
 
+@pytest.mark.parametrize("failure", [
+    agent.NodeAgentBusy("another loop is active"),
+    agent.CoordinatorWorkRejected("coordinator rejected polling"),
+])
+def test_run_surfaces_terminal_agent_failures(con, monkeypatch, failure):
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="SES"))
+    monkeypatch.setattr(
+        agent, "run_loop", lambda _cfg: (_ for _ in ()).throw(failure))
+    assert _node(con, "run") == 1
+    assert str(failure) in con[1].getvalue()
+
+
 def test_run_cleans_pending_enrollment_left_after_active_config_save(con, monkeypatch):
     config.save(config.NodeConfig(server_url="https://c.example", session_token="SES"))
     config.save_pending(config.PendingEnrollment(

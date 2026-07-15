@@ -315,25 +315,34 @@ describe("work.recordResult ternary branches (result/error/measurement presence 
   it("string error is stored verbatim", async () => {
     const agentId = await activeAgentHelper("box-err-string");
     const jobId = work.enqueue(agentId, "run", { model: "qwen" });
-    work.recordResult(jobId, { status: "failed", error: "boom" });
+    db.claimNextWorkForAgent(agentId);
+    db.acknowledgeWorkForAgent(jobId, agentId);
+    work.recordResult(jobId, agentId, { status: "failed", error: "boom", environment: VALID_ENV });
     expect(db.getWorkById(jobId)!.error).toBe("boom");
   });
 
   it("non-string, non-null error is stringified", async () => {
     const agentId = await activeAgentHelper("box-err-object");
     const jobId = work.enqueue(agentId, "run", { model: "qwen" });
-    work.recordResult(jobId, { status: "failed", error: { code: 42 } });
+    db.claimNextWorkForAgent(agentId);
+    db.acknowledgeWorkForAgent(jobId, agentId);
+    work.recordResult(jobId, agentId, {
+      status: "failed", error: { code: 42 }, environment: VALID_ENV,
+    });
     expect(db.getWorkById(jobId)!.error).toBe("[object Object]");
   });
 
   it("absent error/result/measurement all persist as null", async () => {
     const agentId = await activeAgentHelper("box-err-absent");
     const jobId = work.enqueue(agentId, "run", { model: "qwen" });
-    work.recordResult(jobId, { status: "failed" });
+    db.claimNextWorkForAgent(agentId);
+    db.acknowledgeWorkForAgent(jobId, agentId);
+    work.recordResult(jobId, agentId, { status: "failed", environment: VALID_ENV });
     const row = db.getWorkById(jobId)!;
     expect(row.error).toBeNull();
     expect(row.result_json).toBeNull();
     expect(row.measurement_json).toBeNull();
+    expect(row.result_environment_json).toBe(JSON.stringify(VALID_ENV));
   });
 });
 
@@ -602,15 +611,30 @@ describe("work queue", () => {
     expect(job).toEqual({ id: jobId, kind: "run", args: {} });
   });
 
-  it("recordResult writes status + result; unknown job → false", () => {
+  it("atomically records only the first terminal result and preserves its exact environment", () => {
     const agentIdP = activeAgent("box-w3");
     return agentIdP.then((agentId) => {
       const jobId = work.enqueue(agentId, "run", { model: "qwen" });
-      expect(work.recordResult(jobId, { status: "done", result: { output: "ok" } })).toBe(true);
+      db.claimNextWorkForAgent(agentId);
+      db.acknowledgeWorkForAgent(jobId, agentId);
+      expect(work.recordResult(jobId, agentId, {
+        status: "weird", result: { output: "bad" }, environment: VALID_ENV,
+      })).toBe("conflict");
+      expect(db.getWorkById(jobId)!.status).toBe("dispatched");
+      expect(work.recordResult(jobId, agentId, {
+        status: "done", result: { output: "ok" }, environment: VALID_ENV,
+      })).toBe("recorded");
+      expect(work.recordResult(jobId, agentId, {
+        status: "failed", error: "late", environment: { ...VALID_ENV, accel: "cpu" },
+      })).toBe("already_recorded");
       const row = db.getWorkById(jobId)!;
       expect(row.status).toBe("done");
       expect(JSON.parse(row.result_json!)).toEqual({ output: "ok" });
-      expect(work.recordResult("job_missing", { status: "failed", error: "x" })).toBe(false);
+      expect(row.error).toBeNull();
+      expect(row.result_environment_json).toBe(JSON.stringify(VALID_ENV));
+      expect(work.recordResult("job_missing", agentId, {
+        status: "failed", error: "x", environment: VALID_ENV,
+      })).toBe("unknown");
     });
   });
 });

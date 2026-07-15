@@ -31,9 +31,12 @@ beforeAll(async () => {
     );
     INSERT INTO agents (machine_key, enrollment_id, enrollment_token_id)
     VALUES ('old-a', 'enr_old_a', 7), ('old-b', 'enr_old_b', 7);
+    INSERT INTO work (id, agent_id, kind, args_json, status, result_json)
+    VALUES ('job_legacy', 2, 'run', '{"model":"qwen"}', 'done', '{"output":"kept"}');
   `);
-  const { migrateEnrollmentBindings } = await import("@/lib/db");
+  const { migrateEnrollmentBindings, migrateWorkResultEnvironment } = await import("@/lib/db");
   migrateEnrollmentBindings(old);
+  migrateWorkResultEnvironment(old);
   old.close();
 });
 
@@ -54,6 +57,21 @@ describe("existing enrollment-token binding migration", () => {
         .prepare("INSERT INTO agents (machine_key, enrollment_id, enrollment_token_id) VALUES (?, ?, ?)")
         .run("new", "enr_new", 7),
     ).toThrow(/unique/i);
+    migrated.close();
+  });
+
+  it("adds nullable result environment storage without rebuilding legacy work rows", () => {
+    const migrated = new Database(dbPath);
+    const columns = migrated.prepare("PRAGMA table_info(work)").all() as { name: string }[];
+    expect(columns.map((column) => column.name)).toContain("result_environment_json");
+    expect(migrated.prepare(
+      "SELECT id, status, result_json, result_environment_json FROM work WHERE id = 'job_legacy'",
+    ).get()).toEqual({
+      id: "job_legacy",
+      status: "done",
+      result_json: '{"output":"kept"}',
+      result_environment_json: null,
+    });
     migrated.close();
   });
 });

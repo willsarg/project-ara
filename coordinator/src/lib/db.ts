@@ -63,6 +63,7 @@ function open(): Database.Database {
       result_json      TEXT,
       error            TEXT,
       measurement_json TEXT,
+      result_environment_json TEXT,
       created_at       TEXT NOT NULL DEFAULT (datetime('now')),
       dispatched_at    TEXT,
       finished_at      TEXT
@@ -71,6 +72,7 @@ function open(): Database.Database {
   // Pre-transaction databases could contain duplicate token bindings after a race. Preserve every
   // agent/job, keep only the newest poll binding, then enforce one bound enrollment per token.
   migrateEnrollmentBindings(db);
+  migrateWorkResultEnvironment(db);
   const allowedKindsSql = ALLOWED_JOB_KINDS.map((kind) => `'${kind}'`).join(", ");
   // Triggers migrate existing databases without rebuilding the work table or rejecting historical
   // rows. From this version onward, both new inserts and kind updates are defended in SQLite too.
@@ -106,6 +108,16 @@ export function migrateEnrollmentBindings(db: Database.Database): void {
       CREATE UNIQUE INDEX IF NOT EXISTS agents_one_enrollment_per_token
       ON agents (enrollment_token_id) WHERE enrollment_token_id IS NOT NULL;
     `);
+  }).immediate();
+}
+
+/** Add result-environment storage to databases created before result provenance was persisted. */
+export function migrateWorkResultEnvironment(db: Database.Database): void {
+  db.transaction(() => {
+    const columns = db.prepare("PRAGMA table_info(work)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "result_environment_json")) {
+      db.exec("ALTER TABLE work ADD COLUMN result_environment_json TEXT");
+    }
   }).immediate();
 }
 
@@ -203,6 +215,7 @@ export interface WorkRow {
   result_json: string | null;
   error: string | null;
   measurement_json: string | null;
+  result_environment_json: string | null;
   created_at: string;
   dispatched_at: string | null;
   finished_at: string | null;
@@ -419,16 +432,36 @@ export function getWorkById(id: string): WorkRow | null {
   return (open().prepare("SELECT * FROM work WHERE id = ?").get(id) as WorkRow | undefined) ?? null;
 }
 
+export type WorkResultWrite = "recorded" | "already_recorded" | "unknown" | "conflict";
+
+/** Atomically claim the dispatched -> terminal transition for an owned job. */
 export function recordWorkResult(
   id: string,
-  p: { status: string; result_json: string | null; error: string | null; measurement_json: string | null },
-): void {
-  open()
+  agentId: number,
+  p: {
+    status: string;
+    result_json: string | null;
+    error: string | null;
+    measurement_json: string | null;
+    result_environment_json: string;
+  },
+): WorkResultWrite {
+  const db = open();
+  const changed = db
     .prepare(
       `UPDATE work
        SET status = @status, result_json = @result_json, error = @error,
-           measurement_json = @measurement_json, finished_at = datetime('now')
-       WHERE id = @id`,
+           measurement_json = @measurement_json,
+           result_environment_json = @result_environment_json,
+           finished_at = datetime('now')
+       WHERE id = @id AND agent_id = @agent_id AND status = 'dispatched'
+         AND @status IN ('done', 'failed')`,
     )
-    .run({ id, ...p });
+    .run({ id, agent_id: agentId, ...p });
+  if (changed.changes === 1) return "recorded";
+  const row = db.prepare("SELECT agent_id, status FROM work WHERE id = ?").get(id) as
+    | { agent_id: number; status: string }
+    | undefined;
+  if (!row || row.agent_id !== agentId) return "unknown";
+  return row.status === "done" || row.status === "failed" ? "already_recorded" : "conflict";
 }

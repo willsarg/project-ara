@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 
 import httpx
 import pytest
@@ -121,6 +122,49 @@ def test_one_iteration_runs_job_and_posts_done():
     assert job_id == "j1" and payload["status"] == "done" and payload["result"] == {"ok": "run"}
     assert payload["environment"]["platform"] == "linux"
     assert fake.acked == ["j1"]
+
+
+def test_second_run_loop_cannot_share_one_node_state_directory():
+    with agent._agent_lease():
+        with pytest.raises(agent.NodeAgentBusy, match="already owns"):
+            agent.run_loop(
+                _cfg(), client=FakeClient([None]), runner=lambda _k, _a: {}, max_iterations=1,
+            )
+
+
+def test_agent_lease_uses_windows_locking_protocol(monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LK_NBLCK=1, LK_UNLCK=2,
+        locking=lambda fd, operation, size: calls.append((fd, operation, size)),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(agent, "_is_windows", lambda: True)
+    with agent._agent_lease():
+        calls.append("inside")
+    assert calls[0][1:] == (fake.LK_NBLCK, 1)
+    assert calls[1] == "inside"
+    assert calls[2][1:] == (fake.LK_UNLCK, 1)
+
+
+def test_agent_lease_classifies_windows_lock_contention(monkeypatch):
+    fake = types.SimpleNamespace(
+        LK_NBLCK=1, LK_UNLCK=2,
+        locking=lambda _fd, operation, _size: (
+            (_ for _ in ()).throw(OSError("busy")) if operation == 1 else None),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(agent, "_is_windows", lambda: True)
+    with pytest.raises(agent.NodeAgentBusy):
+        with agent._agent_lease():
+            pytest.fail("busy lease must not enter")
+
+
+def test_agent_lease_supports_platform_without_optional_open_features(monkeypatch):
+    monkeypatch.delattr(agent.os, "O_NOFOLLOW")
+    monkeypatch.delattr(agent.os, "fchmod")
+    with agent._agent_lease():
+        pass
 
 
 def test_job_is_durable_and_acknowledged_before_runner(tmp_path):
@@ -383,6 +427,18 @@ def test_get_work_transient_or_invalid_response_backs_off_without_crashing(error
         sleep=slept.append, reauth_backoff=7.0,
     ) == 1
     assert slept == [7.0]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422])
+def test_get_work_permanent_rejection_stops_instead_of_retrying(status, monkeypatch):
+    statuses = []
+    monkeypatch.setattr(agent.health, "status", statuses.append)
+    with pytest.raises(agent.CoordinatorWorkRejected, match=f"HTTP {status}"):
+        agent.run_loop(
+            _cfg(), client=RaisingClient(get_work_error=_status_error(status)),
+            runner=lambda _k, _a: {}, max_iterations=2, sleep=lambda _seconds: None,
+        )
+    assert statuses[-1].endswith(f"HTTP {status}")
 
 
 def test_post_result_401_invalidates_session_and_keeps_spool(monkeypatch, tmp_path):

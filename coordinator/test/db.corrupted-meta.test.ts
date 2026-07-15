@@ -17,6 +17,9 @@ vi.mock("better-sqlite3", () => {
       }
       return undefined;
     }
+    all() {
+      return [{ name: "result_environment_json" }];
+    }
     run(...args: unknown[]) {
       if (this.sql.includes("INSERT INTO meta")) {
         const [key, value] = args as [string, string];

@@ -5,8 +5,8 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
 import {
-  acknowledgeWorkForAgent, claimNextWorkForAgent, getWorkById, insertWork, recordWorkResult,
-  type WorkAckResult,
+  acknowledgeWorkForAgent, claimNextWorkForAgent, insertWork, recordWorkResult,
+  type WorkAckResult, type WorkResultWrite,
 } from "./db";
 import { assertAllowedJobKind } from "./job-kinds";
 
@@ -52,22 +52,23 @@ export function acknowledge(jobId: string, agentId: number): WorkAckResult {
   return acknowledgeWorkForAgent(jobId, agentId);
 }
 
-/** Record a job's result. Returns false if the job id is unknown (→ the route answers 404). */
+/** Atomically record the first terminal result for an owned, dispatched job. */
 export function recordResult(
   jobId: string,
+  agentId: number,
   payload: {
     status: string;
     result?: unknown;
     error?: unknown;
     measurement?: unknown;
+    environment: Record<string, unknown>;
   },
-): boolean {
-  if (!getWorkById(jobId)) return false;
-  recordWorkResult(jobId, {
+): WorkResultWrite {
+  return recordWorkResult(jobId, agentId, {
     status: payload.status,
     result_json: payload.result != null ? JSON.stringify(payload.result) : null,
     error: typeof payload.error === "string" ? payload.error : payload.error != null ? String(payload.error) : null,
     measurement_json: payload.measurement != null ? JSON.stringify(payload.measurement) : null,
+    result_environment_json: JSON.stringify(payload.environment),
   });
-  return true;
 }

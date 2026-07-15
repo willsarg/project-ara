@@ -19,6 +19,7 @@ import re
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -72,6 +73,67 @@ class _TerminalResultRejection(RuntimeError):
 
 class _TerminalJobRejection(RuntimeError):
     """The coordinator permanently rejected an accepted-job acknowledgement."""
+
+
+class NodeAgentBusy(RuntimeError):
+    """Another node loop already owns this state directory."""
+
+
+class CoordinatorWorkRejected(RuntimeError):
+    """The coordinator permanently rejected the node's work-poll request."""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _try_lock_agent(fd: int) -> bool:
+    """Try to lease the node state directory without blocking."""
+    if _is_windows():
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_agent(fd: int) -> None:
+    if _is_windows():
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _agent_lease():
+    """Ensure only one process can poll and execute work from one node state directory."""
+    path = config_mod.node_dir() / "agent.lock"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        if not _try_lock_agent(fd):
+            raise NodeAgentBusy(
+                "another ARA node run loop already owns this node state directory")
+        try:
+            yield
+        finally:
+            _unlock_agent(fd)
+    finally:
+        os.close(fd)
 
 
 def _invalidate_session(config) -> None:
@@ -299,6 +361,18 @@ def run_loop(config, *, client: NodeClient | None = None,
              runner: Callable[[str, dict], dict] | None = None, wait: float = 20.0,
              max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0,
              reauth_backoff: float = 5.0) -> int:
+    """Run one process-exclusive node loop for this state directory."""
+    with _agent_lease():
+        return _run_loop(
+            config, client=client, runner=runner, wait=wait, max_iterations=max_iterations,
+            sleep=sleep, poll_gap=poll_gap, reauth_backoff=reauth_backoff,
+        )
+
+
+def _run_loop(config, *, client: NodeClient | None = None,
+              runner: Callable[[str, dict], dict] | None = None, wait: float = 20.0,
+              max_iterations: int | None = None, sleep=time.sleep, poll_gap: float = 0.0,
+              reauth_backoff: float = 5.0) -> int:
     """Run the phone-home work loop, returning the number of poll iterations performed.
 
     Requires an active session, then for each iteration recovers accepted work or long-polls for a
@@ -331,9 +405,16 @@ def run_loop(config, *, client: NodeClient | None = None,
                     _invalidate_session(config)
                     health.status("re-enrollment required — coordinator rejected the session")
                     return count
-                health.status(f"coordinator unavailable: {exc}")
-                sleep(reauth_backoff)
-                continue
+                if exc.response.status_code in {408, 429} or exc.response.status_code >= 500:
+                    health.status(f"coordinator unavailable: {exc}")
+                    sleep(reauth_backoff)
+                    continue
+                message = (
+                    "coordinator permanently rejected the work poll "
+                    f"with HTTP {exc.response.status_code}"
+                )
+                health.status(message)
+                raise CoordinatorWorkRejected(message) from exc
             except (httpx.HTTPError, ValueError) as exc:
                 health.status(f"coordinator unavailable: {exc}")
                 sleep(reauth_backoff)

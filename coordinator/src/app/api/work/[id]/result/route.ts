@@ -31,18 +31,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ error: "invalid result payload" }, { status: 400 });
   }
 
-  if (job.status === "done" || job.status === "failed") {
-    return NextResponse.json({ ok: true, already_recorded: true });
-  }
-  if (job.status !== "dispatched") {
-    return NextResponse.json({ error: "job was not acknowledged for execution" }, { status: 409 });
-  }
-
-  recordResult(id, {
+  const recorded = recordResult(id, agent.id, {
     status: body.status,
     result: body.result,
     error: body.error,
     measurement: body.measurement,
+    environment: body.environment,
   });
-  return NextResponse.json({ ok: true });
+  if (recorded === "recorded") return NextResponse.json({ ok: true });
+  if (recorded === "already_recorded") {
+    return NextResponse.json({ ok: true, already_recorded: true });
+  }
+  if (recorded === "unknown") {
+    return NextResponse.json({ error: "unknown job" }, { status: 404 });
+  }
+  return NextResponse.json({ error: "job was not acknowledged for execution" }, { status: 409 });
 }

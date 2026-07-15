@@ -3568,7 +3568,10 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
             config.clear_pending()  # finish cleanup if enrollment crashed after saving authority
         except OSError as exc:
             return _node_err(c, as_json, f"cannot clear completed enrollment state: {exc}")
-        agent.run_loop(cfg)                         # blocks: phone-home work loop until stopped
+        try:
+            agent.run_loop(cfg)                     # blocks: phone-home work loop until stopped
+        except (agent.NodeAgentBusy, agent.CoordinatorWorkRejected) as exc:
+            return _node_err(c, as_json, str(exc))
         return _node_say(c, as_json, "run loop exited")
 
     if sub in ("install", "start", "stop", "status", "uninstall"):

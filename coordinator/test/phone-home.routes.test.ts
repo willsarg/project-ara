@@ -204,6 +204,7 @@ describe("full enroll → approve → poll → work → result flow", () => {
     const row = db.getWorkById(jobId)!;
     expect(row.status).toBe("done");
     expect(JSON.parse(row.result_json!)).toEqual({ output: "Paris." });
+    expect(row.result_environment_json).toBe(JSON.stringify(ENV));
 
     // Result and acknowledgement response loss are both idempotent/terminal-safe.
     const repeatedResult = await resultRoute.POST(
@@ -215,6 +216,7 @@ describe("full enroll → approve → poll → work → result flow", () => {
     );
     expect(repeatedResult.status).toBe(200);
     expect(JSON.parse(db.getWorkById(jobId)!.result_json!)).toEqual({ output: "Paris." });
+    expect(db.getWorkById(jobId)!.result_environment_json).toBe(JSON.stringify(ENV));
     const lateAck = await ackRoute.POST(
       req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: sessionToken }),
       params(jobId),
@@ -327,6 +329,57 @@ describe("POST /api/enroll boundary validation", () => {
 });
 
 describe("POST /api/work/[id]/result boundary + error paths", () => {
+  it("lets one of two requests past the terminal gate without allowing the loser to overwrite", async () => {
+    const { agentId, sessionToken } = await activate("box-result-race");
+    const jobId = (await import("@/lib/work")).enqueue(agentId, "run", {});
+    expect(db.claimNextWorkForAgent(agentId)!.id).toBe(jobId);
+    expect(db.acknowledgeWorkForAgent(jobId, agentId)).toBe("ok");
+
+    let arrivals = 0;
+    let releaseJson!: () => void;
+    let bothReading!: () => void;
+    const release = new Promise<void>((resolve) => { releaseJson = resolve; });
+    const bothAtAwait = new Promise<void>((resolve) => { bothReading = resolve; });
+    const bodies = [
+      { status: "done", result: { winner: "first" }, environment: ENV },
+      {
+        status: "failed", error: "second", environment: { ...ENV, accel: "cpu" },
+      },
+    ];
+    const delayedRequest = (body: (typeof bodies)[number]) => {
+      const request = req(`http://x/api/work/${jobId}/result`, {
+        method: "POST", bearer: sessionToken,
+      });
+      Object.defineProperty(request, "json", { value: async () => {
+        arrivals += 1;
+        if (arrivals === 2) bothReading();
+        await release;
+        return body;
+      } });
+      return request;
+    };
+
+    const pending = bodies.map((body) =>
+      resultRoute.POST(delayedRequest(body), params(jobId)));
+    await bothAtAwait;
+    releaseJson();
+    const responses = await Promise.all(pending);
+    const responseBodies = await Promise.all(responses.map((response) => response.json()));
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    const recordedIndex = responseBodies.findIndex((body) => !("already_recorded" in body));
+    expect(recordedIndex).toBeGreaterThanOrEqual(0);
+    expect(responseBodies.filter((body) => body.already_recorded === true)).toHaveLength(1);
+    const row = db.getWorkById(jobId)!;
+    const winningBody = bodies[recordedIndex];
+    expect(row.status).toBe(winningBody.status);
+    expect(row.result_json).toBe(
+      "result" in winningBody ? JSON.stringify(winningBody.result) : null,
+    );
+    expect(row.error).toBe("error" in winningBody ? winningBody.error : null);
+    expect(row.result_environment_json).toBe(JSON.stringify(winningBody.environment));
+  });
+
   it("409s a valid result for work that was never offered and acknowledged", async () => {
     const { agentId, sessionToken } = await activate("box-result-unacked");
     const jobId = (await import("@/lib/work")).enqueue(agentId, "run", {});
@@ -352,6 +405,25 @@ describe("POST /api/work/[id]/result boundary + error paths", () => {
       params("job_does_not_exist"),
     );
     expect(res.status).toBe(404);
+  });
+
+  it("404s if an owned job disappears after the ownership read", async () => {
+    const { agentId, sessionToken } = await activate("box-result-disappeared");
+    const workLib = await import("@/lib/work");
+    const jobId = workLib.enqueue(agentId, "run", {});
+    const record = vi.spyOn(workLib, "recordResult").mockReturnValueOnce("unknown");
+    try {
+      const res = await resultRoute.POST(
+        req(`http://x/api/work/${jobId}/result`, {
+          method: "POST", bearer: sessionToken,
+          body: JSON.stringify({ status: "done", result: {}, environment: ENV }),
+        }),
+        params(jobId),
+      );
+      expect(res.status).toBe(404);
+    } finally {
+      record.mockRestore();
+    }
   });
 
   it("404 when reporting on ANOTHER agent's job (still 404, no leak)", async () => {
