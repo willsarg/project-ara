@@ -255,7 +255,9 @@ describe("submitJobAction", () => {
     form.set("agentId", String(agent.id));
     form.set("model", "qwen");
     form.set("prompt", "hello");
-    await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      /^NEXT_REDIRECT:\/nodes\?job=queued&jobId=job_[0-9a-f]{24}$/,
+    );
 
     const job = await work.nextForAgent(agent.id, 0);
     expect(job).toMatchObject({ kind: "run", args: { model: "qwen", prompt: "hello" } });
@@ -290,13 +292,17 @@ describe("submitJobAction", () => {
       const form = new FormData();
       form.set("agentId", String(id));
       form.set("model", "qwen");
-      await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+      await expect(actions.submitJobAction(form)).rejects.toThrow(
+        "NEXT_REDIRECT:/nodes?job=not-active",
+      );
     }
     enroll.denyAgent(pending.id);
     const denied = new FormData();
     denied.set("agentId", String(pending.id));
     denied.set("model", "qwen");
-    await expect(actions.submitJobAction(denied)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    await expect(actions.submitJobAction(denied)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=not-active",
+    );
   });
 
   it("does not hide unexpected enqueue failures", async () => {

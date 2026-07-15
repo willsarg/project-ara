@@ -252,10 +252,11 @@ def test_advertised_capabilities_skip_nondefault_or_unknown_configurable_rows(mo
 # --------------------------------------------------------------------------- #
 def test_self_description_conforms_to_enroll_request(stub_host, env_io, monkeypatch):
     stub_host()
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1_testbox")
     monkeypatch.setattr(capabilities.platform, "node", lambda: "test-box")
     monkeypatch.setattr(capabilities.platform, "machine", lambda: "x86_64")
     desc = capabilities.self_description()
-    assert desc["machine_key"] == "chip|GPU|16|Linux"
+    assert desc["machine_key"] == "node1_testbox"
     assert desc["identity"] == {"hostname": "test-box", "os": "Linux", "arch": "x86_64"}
     assert desc["capabilities"] == []                                     # isolated db → none yet
     _validate(desc, "https://ara.dev/wire/enroll.request.json")
@@ -263,6 +264,7 @@ def test_self_description_conforms_to_enroll_request(stub_host, env_io, monkeypa
 
 def test_self_description_advertises_characterized_models(stub_host, env_io, monkeypatch):
     stub_host()
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1_testbox")
     monkeypatch.setattr(capabilities.platform, "node", lambda: "test-box")
     monkeypatch.setattr(capabilities.platform, "machine", lambda: "x86_64")
     con = capabilities.db.connect()
@@ -277,6 +279,7 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
 
 def test_self_description_falls_back_when_host_fields_empty(stub_host, env_io, monkeypatch):
     stub_host()
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1_testbox")
     monkeypatch.setattr(capabilities.platform, "node", lambda: "")
     monkeypatch.setattr(capabilities.platform, "machine", lambda: "")
     desc = capabilities.self_description()

@@ -90,11 +90,16 @@ export async function submitJobAction(form: FormData) {
   const model = String(form.get("model") ?? "").trim();
   const prompt = String(form.get("prompt") ?? "").trim();
   if (agentId && model) {
+    let jobId: string;
     try {
-      enqueue(agentId, "run", { model, prompt });
+      jobId = enqueue(agentId, "run", { model, prompt });
     } catch (error) {
       if (!(error instanceof AgentNotActiveError)) throw error;
+      revalidatePath("/nodes");
+      redirect("/nodes?job=not-active");
     }
+    revalidatePath("/nodes");
+    redirect(`/nodes?job=queued&jobId=${encodeURIComponent(jobId)}`);
   }
   revalidatePath("/nodes");
   redirect("/nodes");

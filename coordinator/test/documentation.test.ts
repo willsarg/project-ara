@@ -20,6 +20,12 @@ describe("coordinator operator documentation", () => {
     expect(readme).toContain("coordinator never opens SSH or connects back to a node");
     expect(compose).toContain("ARA_COORDINATOR_TRUST_PROXY");
     expect(compose).toContain("ARA_COORDINATOR_BIND:-127.0.0.1");
+    expect(compose).toContain("data-init:");
+    expect(compose).toContain('user: "0:0"');
+    expect(compose).toContain("chown -R 1001:1001 /app/data");
+    expect(compose).toContain("condition: service_completed_successfully");
+    expect(compose).toContain("./data:/app/data");
+    expect(readme).toContain("one-shot ownership initializer");
   });
 
   it("keeps persisted job outcomes and their provenance visible to the administrator", () => {
@@ -30,5 +36,7 @@ describe("coordinator operator documentation", () => {
     expect(nodes).toContain("job.result_environment_json");
     expect(nodes).toContain("job.dispatched_at");
     expect(nodes).toContain("job.finished_at");
+    expect(nodes).toContain("Job was not queued: the selected node is no longer active.");
+    expect(nodes).toContain("jobId");
   });
 });

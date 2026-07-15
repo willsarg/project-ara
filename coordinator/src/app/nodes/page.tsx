@@ -14,7 +14,12 @@ import { listRecentWork } from "@/lib/work";
 
 export const dynamic = "force-dynamic";
 
-export default function NodesPage() {
+interface NodesPageProps {
+  searchParams: Promise<{ job?: string; jobId?: string }>;
+}
+
+export default async function NodesPage({ searchParams }: NodesPageProps) {
+  const receipt = await searchParams;
   const pending = listPending();
   const active = listActive();
   const recentWork = listRecentWork();
@@ -35,6 +40,11 @@ export default function NodesPage() {
       </header>
 
       <main className="wrap">
+        {receipt.job === "not-active" ? (
+          <p className="notice error">Job was not queued: the selected node is no longer active.</p>
+        ) : receipt.job === "queued" && receipt.jobId ? (
+          <p className="notice">Queued job <code>{receipt.jobId}</code>.</p>
+        ) : null}
         <section className="lede">
           <h1>Phone-home agents</h1>
           <p>
@@ -56,7 +66,7 @@ export default function NodesPage() {
             <table className="table">
               <thead>
                 <tr>
-                  <th>machine key</th>
+                  <th>node id</th>
                   <th>enrollment id</th>
                   <th></th>
                 </tr>
@@ -97,7 +107,7 @@ export default function NodesPage() {
             <table className="table">
               <thead>
                 <tr>
-                  <th>machine key</th>
+                  <th>node id</th>
                   <th>last seen</th>
                   <th>serves</th>
                   <th>run a job</th>

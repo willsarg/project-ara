@@ -2,9 +2,10 @@
 # Copyright 2026 Will Sarg
 """What this node tells the coordinator about itself — the enroll-time self-description.
 
-Reuses ARA's own recon (``profile.machine_key`` for stable identity, ``detect`` for the
-accelerator) rather than reinventing host probing, and shapes it to the pinned wire contract
-(``enroll.request`` + the shared ``environment`` label).
+Uses a durable random node identity for coordinator ownership, while reusing ARA's own recon
+(``profile.machine_key`` for local measurements and ``detect`` for the accelerator) rather than
+reinventing host probing. Shapes all of it to the pinned wire contract (``enroll.request`` + the
+shared ``environment`` label).
 
 The environment label is **container-honest** (Rule #1): it reads the *real* memory ceiling from
 the cgroup, not just ``psutil``. A container capped below the host's RAM is labelled ``wall_source =
@@ -21,6 +22,7 @@ from pathlib import Path
 import psutil
 
 from ara import db, detect, hardware, profile
+from ara.node import config
 
 # platform.system() → the environment schema's platform enum (linux | darwin | windows).
 _PLATFORMS = {"Linux": "linux", "Darwin": "darwin", "Windows": "windows"}
@@ -128,11 +130,11 @@ def advertised_capabilities() -> list[dict]:
 def self_description() -> dict:
     """This node's enrollment payload (schema: ``enroll.request.json``).
 
-    ``machine_key`` is ARA's stable per-machine identity (reused, not reinvented); ``capabilities``
-    advertises the characterized models; ``environment`` is the container-honest label. Validates
-    against the wire contract."""
+    ``machine_key`` is this node installation's durable unique coordinator identity; local
+    characterized capability lookup remains keyed by ARA's hardware profile. ``environment`` is
+    the container-honest label. Validates against the wire contract."""
     return {
-        "machine_key": profile.machine_key(),
+        "machine_key": config.node_identity(),
         "identity": {
             "hostname": platform.node() or "unknown",
             "os": platform.system(),

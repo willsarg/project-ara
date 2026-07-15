@@ -46,6 +46,53 @@ def test_load_is_none_when_absent():
     assert config.load() is None
 
 
+def test_node_identity_is_stable_per_node_state_and_unique_between_nodes(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    monkeypatch.setenv("ARA_NODE_DIR", str(first))
+    first_id = config.node_identity()
+    assert config.node_identity() == first_id
+    assert first_id.startswith("node1_")
+
+    monkeypatch.setenv("ARA_NODE_DIR", str(second))
+    second_id = config.node_identity()
+    assert second_id.startswith("node1_")
+    assert second_id != first_id
+
+
+def test_node_identity_rejects_unreadable_persisted_identity():
+    path = config._identity_path()
+    path.parent.mkdir(parents=True)
+    path.write_text("not-a-node-identity\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid node identity"):
+        config.node_identity()
+
+
+def test_node_identity_rejects_malformed_persisted_identity():
+    path = config._identity_path()
+    path.parent.mkdir(parents=True)
+    path.write_text('{"node_identity":"not-valid"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed persisted identity"):
+        config.node_identity()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_node_identity_refuses_symlink(tmp_path):
+    target = tmp_path / "identity.json"
+    target.write_text('{"node_identity":"node1_0123456789abcdef0123456789abcdef"}')
+    path = config._identity_path()
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        config.node_identity()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode is advisory on Windows")
+def test_node_identity_file_is_owner_only():
+    config.node_identity()
+    assert os.stat(config._identity_path()).st_mode & 0o777 == 0o600
+
+
 @pytest.mark.parametrize("value", [
     [], {}, {"server_url": 7}, {"server_url": ""},
     {"server_url": "http://remote.example"},

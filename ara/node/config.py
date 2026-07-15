@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""The push-only node's on-disk config — where it phones home and the tokens it carries.
+"""The push-only node's on-disk state — identity, coordinator address, and credentials.
 
-A node holds three facts: the coordinator ``server_url``, the one-shot ``enrollment_token`` an
-admin handed it, and (once approved) the durable ``session_token`` it auths work with. They live in
-the node data dir as ``config.json`` (``ARA_NODE_DIR`` override for tests, else the OS data dir),
-written mode 0600 with an owner-only same-directory atomic replacement: a session token is a
-credential and must never be world/group-readable, even for the instant between create and chmod.
+A node installation has a durable random identity, plus the coordinator ``server_url``, the
+one-shot ``enrollment_token`` an admin handed it, and (once approved) the durable ``session_token``
+it auths work with. They live in the node data dir (``ARA_NODE_DIR`` override for tests, else the OS
+data dir), written mode 0600 with owner-only same-directory atomic replacement: credentials must
+never be world/group-readable, even for the instant between create and chmod.
 """
 from __future__ import annotations
 
 import dataclasses
 import json
 import os
+import re
+import secrets
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ from urllib.parse import urlparse
 import platformdirs
 
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+_NODE_IDENTITY_RE = re.compile(r"^node1_[0-9a-f]{32}$")
 
 
 def require_secure_url(url: str) -> None:
@@ -67,6 +70,10 @@ def _config_path():
 
 def _pending_path():
     return node_dir() / "pending-enrollment.json"
+
+
+def _identity_path():
+    return node_dir() / "node-identity.json"
 
 
 def _is_windows() -> bool:
@@ -174,6 +181,32 @@ def _write_json_atomic(path: Path, value: dict) -> None:
         _fsync_parent(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def node_identity() -> str:
+    """Return this node installation's durable, collision-resistant coordinator identity.
+
+    Hardware facts are deliberately unsuitable as a fleet identity: two machines can have the
+    same CPU, accelerator, RAM, and OS. Keep ARA's hardware-derived ``profile.machine_key`` for
+    local measurement lookup, while this owner-only random identifier gives coordinator work a
+    unique execution owner across otherwise identical nodes.
+    """
+    with _credential_lock():
+        path = _identity_path()
+        if path.exists() or path.is_symlink():
+            if path.is_symlink():
+                raise ValueError("invalid node identity: identity path must not be a symlink")
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("invalid node identity: unreadable persisted identity") from exc
+            identity = data.get("node_identity") if isinstance(data, dict) else None
+            if not isinstance(identity, str) or not _NODE_IDENTITY_RE.fullmatch(identity):
+                raise ValueError("invalid node identity: malformed persisted identity")
+            return identity
+        identity = f"node1_{secrets.token_hex(16)}"
+        _write_json_atomic(path, {"node_identity": identity})
+        return identity
 
 
 def save(config: NodeConfig) -> None:

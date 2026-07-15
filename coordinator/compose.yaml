@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 services:
+  data-init:
+    build: .
+    image: ara-coordinator
+    # Docker creates a missing bind-source directory as root on Linux. Normalize only this
+    # coordinator-owned data path before the unprivileged application starts.
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown -R 1001:1001 /app/data"]
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+
   coordinator:
     build: .
     image: ara-coordinator
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     ports:
       # Secure default: expose only on the host. Put a TLS reverse proxy in front for remote nodes.
       - "${ARA_COORDINATOR_BIND:-127.0.0.1}:3000:3000"

@@ -37,8 +37,10 @@ docker compose ps
 docker compose down
 ```
 
-Compose binds port `3000` to `127.0.0.1` and bind-mounts `./data` for the SQLite registry. This is
-safe for same-host use. Remote nodes require a TLS reverse proxy in front of that loopback port;
+Compose binds port `3000` to `127.0.0.1` and preserves the SQLite registry under `./data`.
+A one-shot ownership initializer prepares that bind mount before the unprivileged coordinator
+starts, including when Docker creates the directory as root on a clean Linux host. Remote nodes
+require a TLS reverse proxy in front of that loopback port;
 the production admin cookie is `Secure`, and ARA nodes reject remote plaintext HTTP. Set an explicit
 password in the environment when desired:
 

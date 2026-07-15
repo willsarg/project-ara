@@ -402,6 +402,18 @@ header {
   font-size: 12px;
 }
 
+.notice {
+  margin: 24px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--cool);
+  background: rgba(63, 208, 201, 0.08);
+}
+
+.notice.error {
+  border-color: var(--hot);
+  background: rgba(255, 77, 61, 0.08);
+}
+
 /* ---- empty ---- */
 .empty {
   border: 1px dashed var(--line);
