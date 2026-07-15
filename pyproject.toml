@@ -45,6 +45,19 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["ara"]
 
+# ``ara hub`` builds the exact coordinator paired with the installed ARA version. Keep the wheel
+# context explicit so local node_modules, tests, coverage, and Next build output never leak in.
+[tool.hatch.build.targets.wheel.force-include]
+"coordinator/.dockerignore" = "ara/_hub_source/.dockerignore"
+"coordinator/Dockerfile" = "ara/_hub_source/Dockerfile"
+"coordinator/compose.yaml" = "ara/_hub_source/compose.yaml"
+"coordinator/next.config.ts" = "ara/_hub_source/next.config.ts"
+"coordinator/package-lock.json" = "ara/_hub_source/package-lock.json"
+"coordinator/package.json" = "ara/_hub_source/package.json"
+"coordinator/public" = "ara/_hub_source/public"
+"coordinator/src" = "ara/_hub_source/src"
+"coordinator/tsconfig.json" = "ara/_hub_source/tsconfig.json"
+
 [tool.hatch.build.targets.sdist]
 # Hatch reads the repository-root build configuration, not the coordinator's nested .gitignore.
 # Keep local JavaScript installs/build output out of PyPI source archives.

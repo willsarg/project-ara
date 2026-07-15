@@ -189,6 +189,7 @@ def test_deprecated_aliases_are_hidden_from_root_help(mocked_world, capsys):
     (["benchmark", "org/m", "--json"], "Missing option '--use-case'"),
     (["profile", "--json", "--model"], "Option '--model' requires an argument"),
     (["serve", "org/m", "--json", "--ctx", "many"], "Invalid value for '--ctx'"),
+    (["hub", "--port", "70000"], "Invalid value for '--port'"),
     (["benchmark", "org/m", "--json", "--use-case", "reasoning", "--repeat", "lots"],
      "Invalid value for '--repeat'"),
     (["detect", "--json", "--made-up"], "No such option '--made-up'"),

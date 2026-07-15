@@ -24,7 +24,11 @@ describe("coordinator operator documentation", () => {
     expect(compose).toContain('user: "0:0"');
     expect(compose).toContain("chown -R 1001:1001 /app/data");
     expect(compose).toContain("condition: service_completed_successfully");
-    expect(compose).toContain("./data:/app/data");
+    expect(compose).toContain("ARA_HUB_DATA_DIR:-./data");
+    expect(compose).toContain("ARA_COORDINATOR_PORT:-3000");
+    expect(compose).toContain("ARA_HUB_IMAGE:-ara-hub:local");
+    expect(compose).not.toContain("./data:/app/data");
+    expect(readme).toContain("ara hub");
     expect(readme).toContain("one-shot ownership initializer");
     expect(readme).toContain("temporarily holds the plaintext session token");
   });

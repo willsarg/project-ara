@@ -30,16 +30,35 @@ ara node run
 Use HTTPS whenever the node is not connecting to loopback; ARA refuses to send node credentials
 over remote plaintext HTTP.
 
-## Deploy with Docker Compose
+## Run the coordinator
+
+The public lifecycle is one foreground command:
 
 ```bash
-docker compose up --build -d
+ara hub
+```
+
+ARA builds the coordinator image paired with that installed ARA version, attaches to its logs, and
+persists SQLite state in ARA's host data directory. Ctrl-C stops the coordinator. The secure default
+is `http://127.0.0.1:3000`; use `--bind`, `--port`, or `--data-dir` to change the host deployment,
+and `--rebuild` to force a no-cache image rebuild. The first start prints the generated administrator
+password once in the attached logs.
+
+Remote nodes require HTTPS. Keep the default loopback bind and put a TLS reverse proxy in front, or
+bind another interface only when the surrounding network and TLS termination are configured.
+
+## Develop or run Compose directly
+
+```bash
+mkdir -p data
+ARA_HUB_DATA_DIR="$PWD/data" docker compose up --build -d
 docker compose logs coordinator
 docker compose ps
 docker compose down
 ```
 
-Compose binds port `3000` to `127.0.0.1` and preserves the SQLite registry under `./data`.
+Compose binds port `3000` to `127.0.0.1` and preserves the SQLite registry in the host directory
+named by `ARA_HUB_DATA_DIR`.
 A one-shot ownership initializer prepares that bind mount before the unprivileged coordinator
 starts, including when Docker creates the directory as root on a clean Linux host. Remote nodes
 require a TLS reverse proxy in front of that loopback port;
@@ -47,7 +66,8 @@ the production admin cookie is `Secure`, and ARA nodes reject remote plaintext H
 password in the environment when desired:
 
 ```bash
-ARA_COORDINATOR_PASSWORD='choose-a-strong-password' docker compose up --build -d
+ARA_HUB_DATA_DIR="$PWD/data" ARA_COORDINATOR_PASSWORD='choose-a-strong-password' \
+  docker compose up --build -d
 ```
 
 The image is a multi-stage Next.js standalone build. Its public `/api/health` endpoint verifies
@@ -63,6 +83,8 @@ healthcheck.
 | `ARA_COORDINATOR_DB` | `./data/coordinator.db` | SQLite registry path. Use a persistent volume in production. |
 | `ARA_COORDINATOR_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that overwrites `X-Forwarded-For`; enables per-client rate-limit buckets. |
 | `ARA_COORDINATOR_BIND` | `127.0.0.1` | Compose host bind address. Keep loopback when a host TLS proxy fronts the coordinator. |
+| `ARA_COORDINATOR_PORT` | `3000` | Compose host port. The container always listens on port 3000. |
+| `ARA_HUB_DATA_DIR` | `./data`; selected automatically by `ara hub` | Persistent host directory bind-mounted at `/app/data`. |
 | `PORT` | `3000` | Listen port. |
 
 Without trusted-proxy mode, forwarding headers are ignored and login/enrollment use conservative
@@ -82,5 +104,5 @@ transactional or single-statement atomic operations. A generic enrollment token 
 takeover of an existing node ID or its work. Every reported result retains its measured environment
 provenance.
 
-The current supported lifecycle is npm or Docker Compose. The repository does not yet expose an
-ARA-owned coordinator lifecycle command; that will be the `ara hub` surface.
+`ara hub` is intentionally attached and single-purpose. Expanded background lifecycle commands can
+be added later without changing the coordinator or node protocols.

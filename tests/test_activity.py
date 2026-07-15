@@ -265,7 +265,7 @@ def test_directory_close_failure_without_body_exception_is_surfaced(monkeypatch)
 
 
 @pytest.mark.parametrize("kind", [
-    "characterizing", "benchmarking", "searching", "running", "serving",
+    "characterizing", "benchmarking", "searching", "running", "serving", "hosting",
 ])
 def test_all_and_only_contract_kinds_are_accepted(activity_dir, monkeypatch, kind):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())

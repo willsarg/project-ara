@@ -230,7 +230,7 @@ def test_detect_runtime_text_renders_truthful_apple_mlx_detail(
 def test_generated_help_matches_frozen_visible_tree_and_examples(capsys):
     expected = {
         (): {"benchmark", "characterize", "detect", "doctor", "hf", "install", "models",
-             "node", "profile", "run", "serve", "status", "uninstall"},
+             "hub", "node", "profile", "run", "serve", "status", "uninstall"},
         ("models",): {"recommend", "search", "show"},
         ("node",): {"enroll", "install", "run", "start", "status", "stop", "uninstall"},
         ("hf",): {"login", "logout", "status"},

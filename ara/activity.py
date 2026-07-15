@@ -24,7 +24,7 @@ import psutil
 from platformdirs import user_data_path
 
 _KINDS = frozenset({
-    "characterizing", "benchmarking", "searching", "running", "serving",
+    "characterizing", "benchmarking", "searching", "running", "serving", "hosting",
 })
 _REQUIRED_FIELDS = {"kind", "pid", "process_created_at", "started_at"}
 _ALLOWED_FIELDS = _REQUIRED_FIELDS | {"model"}

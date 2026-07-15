@@ -2,24 +2,26 @@
 services:
   data-init:
     build: .
-    image: ara-coordinator
+    image: ${ARA_HUB_IMAGE:-ara-hub:local}
     # Docker creates a missing bind-source directory as root on Linux. Normalize only this
     # coordinator-owned data path before the unprivileged application starts.
     user: "0:0"
     entrypoint: ["sh", "-c", "chown -R 1001:1001 /app/data"]
     volumes:
-      - ./data:/app/data
+      - type: bind
+        source: ${ARA_HUB_DATA_DIR:-./data}
+        target: /app/data
     restart: "no"
 
   coordinator:
     build: .
-    image: ara-coordinator
+    image: ${ARA_HUB_IMAGE:-ara-hub:local}
     depends_on:
       data-init:
         condition: service_completed_successfully
     ports:
       # Secure default: expose only on the host. Put a TLS reverse proxy in front for remote nodes.
-      - "${ARA_COORDINATOR_BIND:-127.0.0.1}:3000:3000"
+      - "${ARA_COORDINATOR_BIND:-127.0.0.1}:${ARA_COORDINATOR_PORT:-3000}:3000"
     environment:
       # Set this to your admin password. If omitted, one is generated on first run and printed once
       # to the container logs (docker compose logs coordinator).
@@ -31,5 +33,7 @@ services:
       ARA_COORDINATOR_DB: /app/data/coordinator.db
     volumes:
       # Persist the SQLite registry across restarts.
-      - ./data:/app/data
+      - type: bind
+        source: ${ARA_HUB_DATA_DIR:-./data}
+        target: /app/data
     restart: unless-stopped

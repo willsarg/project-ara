@@ -95,6 +95,8 @@ def _capture_dispatch(monkeypatch):
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_serve",
                         lambda c, model, **kw: (rec.update(serve={"model": model, **kw}) or 0))
+    monkeypatch.setattr(cli, "render_hub",
+                        lambda c, **kw: (rec.update(hub=kw) or 0))
     monkeypatch.setattr(cli, "render_benchmark",
                         lambda c, model, **kw: (rec.update(benchmark={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_install", lambda c, **kw: (rec.update(install=kw) or 0))
@@ -120,6 +122,54 @@ def test_main_node_routes_subcommand(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["node", "run"]) == 0
     assert rec["node"] == ["run"]              # push-only node: no --host/--port plumbing
+
+
+def test_main_hub_routes_typed_coordinator_options(monkeypatch, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(monkeypatch, [
+        "hub", "--bind", "0.0.0.0", "--port", "4312",
+        "--data-dir", str(tmp_path), "--rebuild",
+    ]) == 0
+    assert rec["hub"] == {
+        "bind": "0.0.0.0", "port": 4312, "data_dir": tmp_path, "rebuild": True,
+    }
+
+
+def test_render_hub_tracks_foreground_coordinator(make_console, monkeypatch, tmp_path):
+    c, buf = make_console()
+    seen = {}
+    monkeypatch.setattr(cli.activity, "track", lambda *args: contextlib.nullcontext(
+        seen.update(track=args)))
+    monkeypatch.setattr(
+        cli.hub_server, "run",
+        lambda **kwargs: seen.update(run=kwargs) or 0,
+    )
+    monkeypatch.setattr(cli, "_ara_version", lambda: "1.2.3")
+
+    assert cli.render_hub(
+        c, bind="127.0.0.1", port=4312, data_dir=tmp_path, rebuild=False,
+    ) == 0
+    assert seen["track"] == ("hosting",)
+    assert seen["run"] == {
+        "bind": "127.0.0.1", "port": 4312, "data_dir": tmp_path,
+        "version": "1.2.3", "rebuild": False,
+    }
+    assert "http://127.0.0.1:4312" in buf.getvalue()
+    assert str(tmp_path) in buf.getvalue()
+
+
+def test_render_hub_reports_preflight_failure(make_console, monkeypatch, tmp_path):
+    c, buf = make_console()
+    monkeypatch.setattr(
+        cli.hub_server, "run",
+        lambda **_kwargs: (_ for _ in ()).throw(cli.hub_server.HubError("Docker is absent")),
+    )
+
+    assert cli.render_hub(
+        c, bind="127.0.0.1", port=3000, data_dir=tmp_path, rebuild=False,
+    ) == 1
+    assert "Docker is absent" in buf.getvalue()
 
 
 def test_main_node_enroll_threads_token(monkeypatch):
@@ -1019,6 +1069,7 @@ def test_render_status_empty(make_console, monkeypatch):
     ("searching", None, "ARA is searching for models.\n"),
     ("running", "org/model", "ARA is running org/model.\n"),
     ("serving", "org/model", "ARA is serving org/model.\n"),
+    ("hosting", None, "ARA is hosting the fleet coordinator.\n"),
 ])
 def test_render_status_single_activity_text(make_console, monkeypatch, kind, model, expected):
     monkeypatch.setattr(cli.activity, "snapshot", lambda: [_activity(kind=kind, model=model)])

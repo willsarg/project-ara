@@ -4,7 +4,7 @@
 
 ``ara`` with no arguments renders the landing screen. The full command roster —
 detect recon, live ARA activity, models/search, profile/characterize/recommend,
-governed run/serve, benchmark, install/uninstall, hf auth, node (fleet), doctor — is
+governed run/serve, benchmark, hub/node (fleet), install/uninstall, hf auth, doctor — is
 dispatched below; an unrecognized command falls through to a clear error.
 """
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pathlib import Path
 import click
 
 from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
+                 hub_server,
                  hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
                  staleness, versions)
 from ara.contracts import ramp
@@ -188,6 +189,7 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
     c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
     c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
+    c.emit(_cmd(c, "hub", "host the coordinator that ARA nodes phone home to"))
     c.emit(_cmd(c, "node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))
     c.emit()
     if not accelerated:
@@ -738,6 +740,8 @@ def render_apps(c: Console, *, as_json: bool = False, want=None) -> None:
 def _activity_text(item: activity.Activity) -> str:
     if item.kind == "searching":
         return "searching for models"
+    if item.kind == "hosting":
+        return "hosting the fleet coordinator"
     return f"{item.kind} {item.model or 'a model'}"
 
 
@@ -766,6 +770,23 @@ def render_status(c: Console, *, as_json: bool = False) -> None:
         c.emit("ARA is active:")
         for item in activities:
             c.emit(f"  {_activity_text(item)}")
+
+
+def render_hub(c: Console, *, bind: str, port: int, data_dir: Path,
+               rebuild: bool) -> int:
+    """Build and attach to the Docker-backed fleet coordinator."""
+    endpoint = f"http://{bind}:{port}"
+    c.emit(c.field("hub", endpoint, "starting in Docker; Ctrl-C stops it"))
+    c.emit(c.field("data", str(data_dir), "persistent host storage"))
+    try:
+        with activity.track("hosting"):
+            return hub_server.run(
+                bind=bind, port=port, data_dir=data_dir,
+                version=_ara_version(), rebuild=rebuild,
+            )
+    except hub_server.HubError as exc:
+        c.emit(c.style("bad", f"  hub failed: {exc}"))
+        return 1
 
 
 # --------------------------------------------------------------------------- #
@@ -3857,6 +3878,23 @@ def _click_status(ctx: click.Context, verbose: bool, as_json: bool) -> int:
     """Show what ARA is doing right now."""
     render_status(_mark_json(ctx, as_json), as_json=as_json)
     return 0
+
+
+@_click_cli.command("hub", context_settings=_HELP_SETTINGS)
+@click.option("--bind", default="127.0.0.1", show_default=True, metavar="ADDRESS",
+              help="Host address to expose; use a TLS proxy for remote nodes.")
+@click.option("--port", type=click.IntRange(min=1, max=65535), default=3000,
+              show_default=True, metavar="PORT", help="Host port for the coordinator.")
+@click.option("--data-dir", type=click.Path(file_okay=False, path_type=Path),
+              default=hub_server.default_data_dir(), show_default=True, metavar="PATH",
+              help="Persistent host directory for coordinator state.")
+@click.option("--rebuild", is_flag=True,
+              help="Rebuild the coordinator image without Docker's build cache.")
+def _click_hub(bind: str, port: int, data_dir: Path, rebuild: bool) -> int:
+    """Run the fleet coordinator in Docker and attach to its logs."""
+    return render_hub(
+        Console.from_env(), bind=bind, port=port, data_dir=data_dir, rebuild=rebuild,
+    )
 
 
 @_click_cli.command("python", hidden=True, context_settings=_HELP_SETTINGS)

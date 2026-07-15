@@ -49,6 +49,9 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
     (and measured capability, where `benchmark` has run, via `--use-case`).
   - `run` — governed one-shot inference, capped under the measured safe ceiling (CPU · MLX · CUDA).
   - `serve` — governed OpenAI-compatible endpoint, capped under the measured ceiling (on Ollama / MLX).
+  - `hub` — the fleet coordinator server. Builds and runs ARA's version-matched coordinator in
+    Docker, attached in the foreground, with its SQLite state bind-mounted to the host. Nodes phone
+    home to it; it never reaches into nodes.
   - `models show` / `models search` — inspect one model (with measured ceilings) / search the HF Hub.
   - `hf login` / `logout` / `status` — manage the Hugging Face token (needed for gated models). An
     **action** command (writes the standard HF token store, so every fetch + worker reads it), not
@@ -61,7 +64,7 @@ system, answers to all three. Canonical statement: the private vault's `ARA - Pr
 
 The visible tree is `detect` (facets `--python`, `--apps`, `--runtime`, `--models`), `profile`,
 `status`, `models {search,recommend,show}`, `run`, `serve`, `characterize`, `benchmark`, `install`,
-`uninstall`, `node {enroll,install,run,start,status,stop,uninstall}`,
+`uninstall`, `hub`, `node {enroll,install,run,start,status,stop,uninstall}`,
 `hf {login,logout,status}`, and `doctor`.
 `models list` is deferred. `status` reports only live ARA-owned activity; it is not a generic
 process monitor. `detect --runtime` reports common runtime/backend inventory on every platform and

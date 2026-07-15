@@ -52,7 +52,7 @@ From [AGENTS.md](./AGENTS.md) — a change must not violate these:
   output.
 
 The public command tree is `detect`, `profile`, `status`, `models {search,recommend,show}`, `run`,
-`serve`, `characterize`, `benchmark`, `install`, `uninstall`, `node`, `hf`, and `doctor`. Hidden
+`serve`, `characterize`, `benchmark`, `install`, `uninstall`, `hub`, `node`, `hf`, and `doctor`. Hidden
 one-release compatibility aliases must not be used in new examples. Production subprocesses use
 the same `python -m ara` main as the `ara` console script.
 

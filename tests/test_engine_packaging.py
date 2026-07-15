@@ -21,6 +21,23 @@ def test_sdist_excludes_coordinator_build_artifacts():
     assert {"/coordinator/node_modules", "/coordinator/.next"} <= excludes
 
 
+def test_wheel_carries_only_the_coordinator_runtime_build_context():
+    manifest = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    force_include = manifest["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+
+    assert force_include == {
+        "coordinator/.dockerignore": "ara/_hub_source/.dockerignore",
+        "coordinator/Dockerfile": "ara/_hub_source/Dockerfile",
+        "coordinator/compose.yaml": "ara/_hub_source/compose.yaml",
+        "coordinator/next.config.ts": "ara/_hub_source/next.config.ts",
+        "coordinator/package-lock.json": "ara/_hub_source/package-lock.json",
+        "coordinator/package.json": "ara/_hub_source/package.json",
+        "coordinator/public": "ara/_hub_source/public",
+        "coordinator/src": "ara/_hub_source/src",
+        "coordinator/tsconfig.json": "ara/_hub_source/tsconfig.json",
+    }
+
+
 def test_retired_revendor_script_is_absent():
     assert not (_ROOT / "scripts" / "vendor_engine.py").exists()
 
