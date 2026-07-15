@@ -1843,6 +1843,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             # ceiling.  A CPU-characterized GGUF therefore remains usable on a CUDA host.
             candidates = []
             config_errors = []
+            unavailable = []
             artifact_mismatch = False
             missing_artifact_authority = False
             for candidate_key in dict.fromkeys([key, *engines.ENGINES]):
@@ -1853,6 +1854,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 candidate_row = db.get_characterization(
                     con, mk, candidate_key, evidence_model)
                 if not candidate_row or candidate_row.get("safe_context") is None:
+                    continue
+                installed, label = engine_status(candidate_backend)
+                if not installed:
+                    unavailable.append((candidate_key, label))
                     continue
                 config_error = _measurement_config_error(
                     candidate_row, _measurement_config(candidate_backend),
@@ -1878,10 +1883,17 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 if artifact_mismatch:
                     return err(f"the cached artifact for {model} differs from its measured "
                                f"ceiling — re-run: ara characterize {model}")
+                if unavailable:
+                    unavailable_key, label = unavailable[0]
+                    return err(f"the {label} isn't installed — run: ara install "
+                               f"--engine {unavailable_key}")
                 return err(f"no measured ceiling for {model} — run: ara characterize {model}")
             _, key, backend, bk, row = max(candidates, key=lambda candidate: candidate[0])
         else:
             backend, bk = default_backend, default_bk
+            installed, label = engine_status(backend)
+            if not installed:
+                return err(f"the {label} isn't installed — run: ara install --engine {key}")
             row = db.get_characterization(
                 con, mk, key, evidence_model)  # keyed by engine key, not backend
             if not row or row.get("safe_context") is None:
@@ -1951,7 +1963,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         refused_n = 0
         errored_n = 0
         for _ in range(repeat):
-            result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+            try:
+                result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+            except (SystemExit, Exception) as exc:
+                return err(f"benchmark failed: {exc}")
             if not isinstance(result, dict):
                 return err("invalid benchmark result: the engine returned a non-object response")
             reported_context = result.get("context")
@@ -2196,7 +2211,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                     flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
                     prefill_chunk=prefill_chunk) is None
             }
-            runnable = {
+            config_runnable = {
                 k: v for k, v in lever_supported.items()
                 if _measurement_config_error(
                     v[4], _effective_measurement_config(
@@ -2205,7 +2220,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                         kv_quant=kv_quant, weight_quant=weight_quant,
                         prefill_chunk=prefill_chunk), v[1], model) is None
             }
-            if not runnable:
+            if not config_runnable:
                 mismatches = [
                     _measurement_config_error(
                         v[4], _effective_measurement_config(
@@ -2231,6 +2246,33 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 where = ", ".join(fitted)
                 return err(f"{model} is characterized on {where}, but run isn't supported on "
                            f"that engine yet")
+            runnable = {}
+            missing_artifact_authority = False
+            artifact_mismatch = False
+            unavailable = []
+            for candidate_key, candidate in config_runnable.items():
+                candidate_artifact = candidate[4].get("artifact_id")
+                if not candidate_artifact:
+                    missing_artifact_authority = True
+                    continue
+                if not staleness.artifact_matches(evidence_model, candidate_artifact):
+                    artifact_mismatch = True
+                    continue
+                installed, label = engine_status(candidate[1])
+                if not installed:
+                    unavailable.append((candidate_key, label))
+                    continue
+                runnable[candidate_key] = candidate
+            if not runnable:
+                if missing_artifact_authority:
+                    return err(f"the measured ceiling for {model} is not bound to an exact "
+                               f"artifact — re-run: ara characterize {model}")
+                if artifact_mismatch:
+                    return err(f"the artifact for {model} differs from its measured ceiling — "
+                               f"re-run: ara characterize {model}")
+                unavailable_key, label = unavailable[0]
+                return err(f"the {label} isn't installed — run: ara install "
+                           f"--engine {unavailable_key}")
             # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
             engine_key = max(runnable, key=lambda k: runnable[k][0])
             safe, backend, _, ceiling_measured_at, selected_row = runnable[engine_key]

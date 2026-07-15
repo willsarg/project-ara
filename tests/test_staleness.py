@@ -92,13 +92,14 @@ def test_artifact_identity_tracks_hf_revision_and_exact_gguf(tmp_path, monkeypat
     rev_a, rev_b = "a" * 40, "c" * 40
     _revision_cache(tmp_path, rev_a, filename="Model-Q4_K_M.gguf")
 
-    assert staleness.artifact_identity("org/model") == f"hf:org/model@{rev_a}"
+    bare = staleness.artifact_identity("org/model")
+    assert bare is not None and bare.startswith(f"hf:org/model@{rev_a}:")
     selected = staleness.artifact_identity("org/model:Model-Q4_K_M.gguf")
     assert selected.startswith(f"hf-gguf:org/model@{rev_a}:Model-Q4_K_M.gguf:")
     assert staleness.artifact_size_gb("org/model:Model-Q4_K_M.gguf") == 0.0
 
     _revision_cache(tmp_path, rev_b)
-    assert staleness.artifact_identity("org/model") == f"hf:org/model@{rev_b}"
+    assert staleness.artifact_identity("org/model") is None
     assert staleness.artifact_identity("org/model:Model-Q4_K_M.gguf") is None
 
 
@@ -108,24 +109,78 @@ def test_artifact_identity_honors_hugging_face_cache_environment(tmp_path, monke
     root = custom / "models--org--model"
     (root / "refs").mkdir(parents=True)
     (root / "refs" / "main").write_text(revision)
-    (root / "snapshots" / revision).mkdir(parents=True)
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    blob = root / "blobs" / ("b" * 40)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"weights")
+    (snapshot / "model.safetensors").symlink_to(Path("../../blobs") / blob.name)
 
     monkeypatch.setenv("HF_HUB_CACHE", str(custom))
-    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
+    assert staleness.artifact_identity("org/model").startswith(f"hf:org/model@{revision}:")
 
     monkeypatch.delenv("HF_HUB_CACHE")
     hf_home = tmp_path / "hf-home"
     (hf_home / "hub").mkdir(parents=True)
     (root).rename(hf_home / "hub" / root.name)
     monkeypatch.setenv("HF_HOME", str(hf_home))
-    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
+    assert staleness.artifact_identity("org/model").startswith(f"hf:org/model@{revision}:")
 
     monkeypatch.delenv("HF_HOME")
     xdg = tmp_path / "xdg"
     (xdg / "huggingface" / "hub").mkdir(parents=True)
     (hf_home / "hub" / root.name).rename(xdg / "huggingface" / "hub" / root.name)
     monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
-    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
+    assert staleness.artifact_identity("org/model").startswith(f"hf:org/model@{revision}:")
+
+
+def test_bare_hf_identity_rejects_empty_snapshot_and_binds_weight_blob(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision)
+    assert staleness.artifact_identity("org/model") is None
+
+    root = snapshot.parents[1]
+    blob = root / "blobs" / ("d" * 40)
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(b"actual weights")
+    (snapshot / "model.safetensors").symlink_to(blob)
+    identity = staleness.artifact_identity("org/model")
+    assert identity is not None
+    assert "model.safetensors" in identity and "d" * 40 in identity
+
+
+def test_bare_hf_identity_rejects_mixed_formats_and_noncanonical_blobs(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.gguf")
+    root = snapshot.parents[1]
+    tensor_blob = root / "blobs" / ("d" * 40)
+    tensor_blob.write_bytes(b"tensor")
+    (snapshot / "model.safetensors").symlink_to(tensor_blob)
+    assert staleness.artifact_identity("org/model") is None
+
+    (snapshot / "model.gguf").unlink()
+    (snapshot / "model.safetensors").unlink()
+    direct = snapshot / "model.safetensors"
+    direct.write_bytes(b"not a standard HF blob link")
+    assert staleness.artifact_identity("org/model") is None
+
+
+def test_bare_hf_identity_tolerates_snapshot_walk_race(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
+    original_rglob = Path.rglob
+
+    def fail_snapshot(path, pattern):
+        if path == snapshot:
+            raise OSError("snapshot disappeared")
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", fail_snapshot)
+    assert staleness.artifact_identity("org/model") is None
 
 
 def test_artifact_identity_tracks_local_gguf_stat(tmp_path):

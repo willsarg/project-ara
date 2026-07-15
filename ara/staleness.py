@@ -20,6 +20,8 @@ from pathlib import Path
 
 _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_BLOB_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
 
 
 def _cache_dir(model_id: str) -> Path:
@@ -99,9 +101,36 @@ def artifact_identity(model: str) -> str | None:
         except OSError:
             return None
         return f"hf-gguf:{repo_id}@{revision}:{filename}:{blob.name}:{stat.st_size}"
-    if not (root / "snapshots" / revision).is_dir():
+    snapshot = root / "snapshots" / revision
+    if not snapshot.is_dir():
         return None
-    return f"hf:{repo_id}@{revision}"
+    try:
+        weights = [
+            path for path in snapshot.rglob("*")
+            if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
+            and not (path.suffix.lower() == ".gguf"
+                     and path.name.lower().startswith("mmproj-"))
+        ]
+        ggufs = [path for path in weights if path.suffix.lower() == ".gguf"]
+        other_weights = [path for path in weights if path.suffix.lower() != ".gguf"]
+        # A mixed-format repository has backend-dependent bare-ref semantics. Refuse to invent a
+        # single identity; callers can use an exact repo:file.gguf selector for the GGUF lane.
+        if ggufs and other_weights:
+            return None
+        selected = [min(ggufs, key=lambda path: path.stat().st_size)] if ggufs else other_weights
+        if not selected:
+            return None
+        descriptors = []
+        for path in sorted(selected):
+            blob = path.resolve(strict=True)
+            stat = blob.stat()
+            if not _BLOB_RE.fullmatch(blob.name):
+                return None
+            descriptors.append(
+                f"{path.relative_to(snapshot).as_posix()}:{blob.name}:{stat.st_size}")
+    except (OSError, ValueError):
+        return None
+    return f"hf:{repo_id}@{revision}:" + "|".join(descriptors)
 
 
 def artifact_matches(model: str, expected_artifact_id: str | None) -> bool:

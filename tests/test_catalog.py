@@ -195,9 +195,10 @@ def _make_cache(repos):
     return _types.SimpleNamespace(repos=repos)
 
 
-def _make_repo(repo_id, repo_type, files):
-    rev = _types.SimpleNamespace(files=files)
-    return _types.SimpleNamespace(repo_id=repo_id, repo_type=repo_type, revisions=[rev])
+def _make_repo(repo_id, repo_type, files, *, revisions=None):
+    rev = _types.SimpleNamespace(files=files, refs={"main"})
+    return _types.SimpleNamespace(
+        repo_id=repo_id, repo_type=repo_type, revisions=revisions or [rev])
 
 
 def _make_file(name, path, size):
@@ -221,6 +222,17 @@ def test_cached_gguf_path_resolves_exact_repo_selector(monkeypatch):
     monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
     assert catalog._cached_gguf_path("org/myrepo:Model-Q8_0.gguf") == "/cache/q8.gguf"
     assert catalog._cached_gguf_path("org/myrepo:missing.gguf") is None
+
+
+def test_cached_gguf_path_uses_current_main_revision_only(monkeypatch):
+    old_small = _make_file("Model-Q2_K.gguf", "/cache/old-q2.gguf", 100)
+    current = _make_file("Model-Q4_K_M.gguf", "/cache/current-q4.gguf", 500)
+    old_rev = _types.SimpleNamespace(files=[old_small], refs=set())
+    main_rev = _types.SimpleNamespace(files=[current], refs={"main"})
+    repo = _make_repo("org/myrepo", "model", [], revisions=[old_rev, main_rev])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+    assert catalog._cached_gguf_path("org/myrepo") == "/cache/current-q4.gguf"
+    assert catalog._cached_gguf_path("org/myrepo:Model-Q2_K.gguf") is None
 
 
 def test_describe_repo_selector_reads_selected_gguf_not_repo_config(monkeypatch):

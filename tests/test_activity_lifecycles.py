@@ -276,6 +276,7 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setitem(cli.engines.ENGINES, "cpu", {
         **cli.engines.ENGINES["cpu"], "backend": "cpu"})
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "CPU engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
         "safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"})
@@ -365,8 +366,8 @@ def test_benchmark_invalid_gate_never_creates_activity(
     assert activity.snapshot() == []
 
 
-@pytest.mark.parametrize("raised", [RuntimeError("boom"), KeyboardInterrupt(), SystemExit(5)])
-def test_benchmark_activity_cleans_up_on_operational_and_base_exceptions(
+@pytest.mark.parametrize("raised", [RuntimeError("boom"), SystemExit(5)])
+def test_benchmark_activity_cleans_up_and_reports_operational_exceptions(
         make_console, monkeypatch, activity_registry, raised):
     def run(*_a, **_k):
         _assert_activity("benchmarking", "org/model")
@@ -378,8 +379,26 @@ def test_benchmark_activity_cleans_up_on_operational_and_base_exceptions(
         benchmark=run,
     )
     _wire_benchmark(monkeypatch, backend)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/model", use_case="reasoning", engine="cpu") == 1
+    assert "benchmark failed" in buf.getvalue()
+    assert activity.snapshot() == []
+
+
+def test_benchmark_activity_cleans_up_and_propagates_keyboard_interrupt(
+        make_console, monkeypatch, activity_registry):
+    def run(*_a, **_k):
+        _assert_activity("benchmarking", "org/model")
+        raise KeyboardInterrupt()
+
+    backend = types.SimpleNamespace(
+        calibration_model_cached=lambda _m: True,
+        download_calibration_model=lambda *_a, **_k: None,
+        benchmark=run,
+    )
+    _wire_benchmark(monkeypatch, backend)
     c, _ = make_console()
-    with pytest.raises(type(raised)):
+    with pytest.raises(KeyboardInterrupt):
         cli.render_benchmark(c, "org/model", use_case="reasoning", engine="cpu")
     assert activity.snapshot() == []
 

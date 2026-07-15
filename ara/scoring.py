@@ -273,10 +273,13 @@ def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
         return None, warning
     if any(value is not None for value in structured) and any(value is None for value in structured):
         return None, warning
+    if any(value is not None for value in structured) and measured_at is None:
+        return None, warning
     if (total is not None and sample_size is not None and repeat_count is not None
             and total != sample_size * repeat_count):
         return None, warning
-    if total is not None and sum(row.get(name) or 0 for name in ("refused_n", "errored_n")) > total:
+    if total is not None and sum(
+            row.get(name) or 0 for name in ("refused_n", "errored_n")) >= total:
         return None, warning
 
     run_scores, run_warning = decode_run_scores(row.get("run_scores_json"), repeat_count)

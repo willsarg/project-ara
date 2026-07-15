@@ -3033,7 +3033,8 @@ def test_run_engine_not_installed(make_console, monkeypatch):
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (False, "CUDA engine"))
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi") == 1
-    assert buf.getvalue() == "  the CUDA engine isn't installed — run: ara install\n"
+    assert buf.getvalue() == \
+        "  the CUDA engine isn't installed — run: ara install --engine cpu\n"
 
 
 def test_run_engine_not_installed_json_uses_complete_label(monkeypatch, capsys):
@@ -3042,7 +3043,14 @@ def test_run_engine_not_installed_json_uses_complete_label(monkeypatch, capsys):
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True) == 1
     assert json.loads(capsys.readouterr().out) == {
-        "error": "the CUDA engine isn't installed — run: ara install"}
+        "error": "the CUDA engine isn't installed — run: ara install --engine cpu"}
+
+
+def test_run_pinned_engine_not_installed_uses_pinned_hint(make_console, monkeypatch):
+    _wire_run(monkeypatch, engine_ok=False, characterization=_CHAR)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "ara install --engine cpu" in buf.getvalue()
 
 
 def test_run_unsupported_engine(make_console, monkeypatch):
@@ -3081,12 +3089,35 @@ def test_run_refuses_missing_or_changed_artifact_authority(make_console, monkeyp
     assert "differs from its measured ceiling" in buf.getvalue()
 
 
+def test_run_pinned_refuses_missing_artifact_authority(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={**_CHAR, "artifact_id": None})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "not bound to an exact artifact" in buf.getvalue()
+
+
+def test_run_refuses_when_artifact_changes_after_auto_selection_before_load(
+        make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: _CHAR if engine == "cpu" else None)
+    matches = iter((True, False))
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: next(matches))
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "differs from its measured ceiling" in buf.getvalue()
+
+
 def test_run_refuses_result_when_artifact_changes_during_generation(
         make_console, monkeypatch):
     generated = []
     _wire_run(monkeypatch, characterization=_CHAR,
               generate=lambda *_a, **_k: generated.append(True) or {"completion": "unsafe"})
-    matches = iter((True, False))
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: _CHAR if engine == "cpu" else None)
+    matches = iter((True, True, False))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: next(matches))
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi") == 1
@@ -3242,6 +3273,37 @@ def test_run_picks_largest_safe_context_engine(monkeypatch, capsys):
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["engine"] == "cuda" and payload["safe_context"] == 16000
+
+
+def test_run_auto_skips_larger_stale_artifact_for_valid_fallback(
+        make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cuda",
+        chars={
+            "cuda": {"model_id": "org/m", "safe_context": 16000,
+                     "artifact_id": "artifact:stale"},
+            "cpu": {"model_id": "org/m", "safe_context": 8000,
+                    "artifact_id": "artifact:test"},
+        },
+        supports={"cpu": True, "cuda": True})
+    monkeypatch.setattr(
+        cli.staleness, "artifact_matches",
+        lambda _model, artifact: artifact == "artifact:test")
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+    assert "ran on cpu" in buf.getvalue()
+
+
+def test_run_auto_reports_only_uninstalled_characterized_engine(
+        make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cuda",
+        chars={"cuda": {"model_id": "org/m", "safe_context": 16000}},
+        supports={"cuda": True}, engine_ok=False)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "cuda pkg isn't installed" in buf.getvalue()
+    assert "ara install --engine cuda" in buf.getvalue()
 
 
 def test_run_engine_override_pins_named_engine(make_console, monkeypatch):
@@ -8041,6 +8103,7 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     orig[engine_key] = {**orig.get(engine_key, {}), "backend": "apple"}
     monkeypatch.setattr(cli.engines, "ENGINES", orig)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "test engine"))
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: {
                             "safe_context": ceiling, "artifact_id": "artifact:test"
@@ -8277,6 +8340,63 @@ def test_render_benchmark_auto_reuses_cpu_ceiling_on_cuda_host(
     assert cli.render_benchmark(c, "org/m", use_case="reasoning",
                                 assume_yes=True) == 0
     assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_auto_skips_uninstalled_engine_for_installed_fallback(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    catalog = dict(cli.engines.ENGINES)
+    catalog["cuda"] = {**catalog["cuda"], "backend": "cuda"}
+    catalog["cpu"] = {**catalog["cpu"], "backend": "cpu"}
+    monkeypatch.setattr(cli.engines, "ENGINES", catalog)
+    monkeypatch.setattr(cli.engines, "for_backend",
+                        lambda backend: "cuda" if backend == "cuda" else None)
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, engine, _model: {
+                            "safe_context": 16000 if engine == "cuda" else 8000,
+                            "artifact_id": "artifact:test",
+                        } if engine in {"cuda", "cpu"} else None)
+    monkeypatch.setattr(cli, "engine_status",
+                        lambda backend=None: (backend == "cpu", f"{backend} engine"))
+    c, _ = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_auto_reports_only_uninstalled_characterized_engine(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (False, "CPU engine"))
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 1
+    assert "CPU engine isn't installed" in buf.getvalue()
+    assert "ara install --engine cpu" in buf.getvalue()
+
+
+def test_render_benchmark_explicit_uninstalled_engine_is_actionable(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (False, "CPU engine"))
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="cpu",
+                                assume_yes=True) == 1
+    assert "CPU engine isn't installed" in buf.getvalue()
+    assert "ara install --engine cpu" in buf.getvalue()
+
+
+def test_render_benchmark_backend_exception_is_clean_json(monkeypatch, capsys):
+    _wire_benchmark(monkeypatch, engine_key="cpu")
+    bk = cli.get_backend("cpu")
+    bk.benchmark = lambda *_a, **_k: (_ for _ in ()).throw(
+        cli.EngineEnvError("worker environment missing"))
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="cpu",
+                                assume_yes=True, as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "benchmark failed: worker environment missing"}
 
 
 def test_render_benchmark_auto_skips_higher_stale_engine_ceiling(

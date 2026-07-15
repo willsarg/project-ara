@@ -83,6 +83,25 @@ def test_measured_evidence_rejects_stale_methodology_or_partial_probe():
     assert scoring.validate_measured_evidence(row)[0] is not None
     row["methodology_id"] = "sha256:old"
     assert scoring.validate_measured_evidence(row)[0] is None
+
+
+def test_structured_measured_evidence_rejects_all_failures_and_missing_timestamp():
+    n = len(benchmark.load_probe("reasoning"))
+    row = {
+        "model_id": "org/model", "use_case": "reasoning", "tier": "measured",
+        "benchmark_id": "reasoning", "methodology_id": benchmark.methodology_id("reasoning"),
+        "canonical_model_id": "org/model", "base_model": scoring.base_key("org/model"),
+        "artifact_id": "artifact", "engine_key": "cpu", "backend": "cpu",
+        "quant": None, "score": 0.0, "source": "probe", "max_score": 1.0,
+        "sample_size": n, "refused_n": n, "errored_n": 0,
+        "probe_context": 4096, "generation_cap": 256, "repeat_count": 1,
+        "total_generations": n, "run_scores_json": "[0.0]", "measured_at": None,
+    }
+    assert scoring.validate_measured_evidence(row)[0] is None
+    row["refused_n"] = 0
+    assert scoring.validate_measured_evidence(row)[0] is None
+    row["measured_at"] = "2026-07-15T12:00:00+00:00"
+    assert scoring.validate_measured_evidence(row)[0] is not None
     row["methodology_id"] = benchmark.methodology_id("reasoning")
     row["sample_size"] = 1
     assert scoring.validate_measured_evidence(row)[0] is None

@@ -66,11 +66,13 @@ def _cached_gguf_path(model_id: str) -> str | None:
         )
         if repo is None:
             return None
+        main_revisions = [rev for rev in repo.revisions if "main" in getattr(rev, "refs", ())]
         gguf_files = [
             f
-            for rev in repo.revisions
+            for rev in main_revisions
             for f in rev.files
             if f.file_name.endswith(".gguf")
+            and (exact_selector or not f.file_name.lower().startswith("mmproj-"))
             and (not exact_selector or f.file_name == selected_name)
         ]
         if not gguf_files:
