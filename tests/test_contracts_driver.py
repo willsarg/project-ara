@@ -219,6 +219,20 @@ def test_decode_context_describes_repo_for_quant_selector(monkeypatch):
     assert r["decode_context"] is not None          # so the analytic ceiling is computed
 
 
+def test_decode_context_preserves_local_colon_gguf_path(tmp_path, monkeypatch):
+    from ara.contracts import driver as drv
+    from ara import catalog
+    monkeypatch.chdir(tmp_path)
+    model = "repo:Model-Q4_K_M.gguf"
+    (tmp_path / model).write_bytes(b"weights")
+    seen = {}
+    monkeypatch.setattr(catalog, "describe",
+                        lambda m: seen.update(arg=m) or dict(_META_DICT))
+    drv.characterize(model, preflight=lambda m: _est(slope_gb_per_k=2.0),
+                     measure=_linear(5.0, 2.0), schedule=[2000, 4000, 8000])
+    assert seen["arg"] == model
+
+
 def test_decode_context_scales_with_kv_dtype_bytes(monkeypatch):
     # KV-quant: a smaller per-element byte count → smaller analytic KV slope → larger decode
     # ceiling. The driver stays engine-agnostic (just a byte count). Slug: 2026-06-25-vulkan-kv-cache-quant

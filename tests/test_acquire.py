@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import huggingface_hub
 import huggingface_hub.utils as hf_utils
@@ -250,6 +251,17 @@ def test_valid_model_ref_accepts_repo_quant_selector():
     # supports it, so the CLI must too (essential for quant-ladder benchmarking).
     assert acquire.valid_model_ref("bartowski/Qwen2.5-14B-Instruct-GGUF:"
                                    "Qwen2.5-14B-Instruct-Q4_K_M.gguf") is True
+
+
+def test_repo_quant_selector_excludes_local_colon_and_windows_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    local = Path("repo:Model-Q4_K_M.gguf")
+    local.write_bytes(b"weights")
+    assert acquire.is_local_gguf(str(local)) is True
+    assert acquire.valid_repo_gguf_ref(str(local)) is False
+    assert acquire.valid_model_ref(str(local)) is True
+    assert acquire.valid_repo_gguf_ref(r"C:\models\M-Q4_K_M.gguf") is False
+    assert acquire.valid_repo_gguf_ref("C:/models/M-Q4_K_M.gguf") is False
 
 
 def test_valid_model_ref_rejects_repo_quant_selector_when_not_gguf():

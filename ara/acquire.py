@@ -49,6 +49,9 @@ def valid_repo_gguf_ref(model: str) -> bool:
     the repo half is id-validated and the file half must be a non-flag ``.gguf``."""
     if not isinstance(model, str) or ":" not in model:
         return False
+    if (is_local_gguf(model) or model.startswith(("/", "./", "../", "~/"))
+            or re.match(r"^[A-Za-z]:[\\/]", model)):
+        return False
     repo, _, fname = model.partition(":")
     return (valid_model_id(repo) and fname.endswith(".gguf")
             and not fname.startswith("-"))

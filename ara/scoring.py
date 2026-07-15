@@ -72,7 +72,7 @@ def quant_key(model_id: str) -> str | None:
     carry the precision it was taken at."""
     name = model_id.partition(":")[2] or model_id.rsplit("/", 1)[-1]
     name = name.lower().removesuffix(".gguf")
-    for tok in name.split("-"):
+    for tok in re.split(r"[-.]", name):
         if _QUANT_ONLY_RE.fullmatch(tok):
             return tok
     return None

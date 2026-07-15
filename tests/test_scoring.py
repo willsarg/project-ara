@@ -40,6 +40,7 @@ def test_gguf_selector_has_canonical_repo_and_exact_quant():
         "/tmp/local:Model-Q4_K_M.gguf"
     assert scoring.canonical_model_id(r"C:\models\Model-Q4_K_M.gguf") == \
         r"C:\models\Model-Q4_K_M.gguf"
+    assert scoring.quant_key("org/repo:Model.Q4_K_M.gguf") == "q4_k_m"
 
 
 def test_measured_evidence_rejects_selector_quant_mismatch():

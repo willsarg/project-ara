@@ -13,6 +13,7 @@ from ara import staleness
 def _point_hub_at(home: Path, monkeypatch) -> None:
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(
         staleness, "_HUB", home / ".cache" / "huggingface" / "hub", raising=False)
@@ -117,6 +118,13 @@ def test_artifact_identity_honors_hugging_face_cache_environment(tmp_path, monke
     (hf_home / "hub").mkdir(parents=True)
     (root).rename(hf_home / "hub" / root.name)
     monkeypatch.setenv("HF_HOME", str(hf_home))
+    assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
+
+    monkeypatch.delenv("HF_HOME")
+    xdg = tmp_path / "xdg"
+    (xdg / "huggingface" / "hub").mkdir(parents=True)
+    (hf_home / "hub" / root.name).rename(xdg / "huggingface" / "hub" / root.name)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
     assert staleness.artifact_identity("org/model") == f"hf:org/model@{revision}"
 
 

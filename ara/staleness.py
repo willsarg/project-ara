@@ -23,10 +23,13 @@ _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 def _cache_dir(model_id: str) -> Path:
+    default_hub = (Path(os.path.expanduser(os.environ["XDG_CACHE_HOME"]))
+                   / "huggingface" / "hub"
+                   if os.environ.get("XDG_CACHE_HOME") else _HUB)
     hub = (Path(os.path.expanduser(os.environ["HF_HUB_CACHE"]))
            if os.environ.get("HF_HUB_CACHE") else
            Path(os.path.expanduser(os.environ["HF_HOME"])) / "hub"
-           if os.environ.get("HF_HOME") else _HUB)
+           if os.environ.get("HF_HOME") else default_hub)
     return hub / ("models--" + model_id.replace("/", "--"))
 
 
