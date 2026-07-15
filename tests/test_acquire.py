@@ -269,6 +269,9 @@ def test_valid_model_ref_rejects_repo_quant_selector_when_not_gguf():
     assert acquire.valid_model_ref("org/name:notes.txt") is False
     assert acquire.valid_model_ref("org/name:-rf.gguf") is False
     assert acquire.valid_model_ref("--evil/x:m.gguf") is False     # repo half must be valid
+    assert acquire.valid_model_ref("org/name:../../outside.gguf") is False
+    assert acquire.valid_model_ref("org/name:/absolute.gguf") is False
+    assert acquire.valid_model_ref(r"org/name:dir\outside.gguf") is False
 
 
 def test_valid_model_ref_rejects_flag_like_and_malformed():

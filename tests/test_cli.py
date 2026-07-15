@@ -21,6 +21,8 @@ from ara.hardware import (BoardInfo, CpuInfo, Drive, MemoryInfo, MemoryModule, S
 def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
+    monkeypatch.setattr(
+        cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
 
 
 def _raise_input(exc):
@@ -3076,6 +3078,29 @@ def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
     assert seen["max_context"] == 8192 and seen["prompt"] == "meaning?"   # governed ceiling
 
 
+def test_run_loads_immutable_pinned_artifact_reference(make_console, monkeypatch):
+    seen = {}
+
+    def gen(model, *_a, **_k):
+        seen["model"] = model
+        return {"completion": "ok"}
+
+    _wire_run(monkeypatch, characterization=_CHAR, generate=gen)
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
+                        lambda _model, _artifact: "/cache/snapshots/rev")
+    c, _ = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+    assert seen["model"] == "/cache/snapshots/rev"
+
+
+def test_run_refuses_when_authorized_artifact_cannot_be_pinned(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda *_a: None)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 1
+    assert "cannot pin" in buf.getvalue()
+
+
 def test_run_refuses_missing_or_changed_artifact_authority(make_console, monkeypatch):
     _wire_run(monkeypatch, characterization={**_CHAR, "artifact_id": None})
     c, buf = make_console()
@@ -4662,6 +4687,32 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
     assert row["artifact_id"] == "artifact:test"
+
+
+def test_render_characterize_loads_immutable_pinned_artifact(
+        make_console, store, monkeypatch):
+    seen = {}
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda model: seen.update(model=model) or {
+            "model": model, "safe_context": 20000,
+            "decode_context": None, "points": [[512, 1.4]]})
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
+                        lambda _model, _artifact: "/cache/snapshots/rev")
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/Model") == 0
+    assert seen["model"] == "/cache/snapshots/rev"
+
+
+def test_render_characterize_refuses_when_artifact_cannot_be_pinned(
+        make_console, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda _model: pytest.fail("characterize must not run"))
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda *_a: None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 1
+    assert "cannot pin" in buf.getvalue()
 
 
 def test_render_characterize_refuses_to_store_unidentified_artifact(
@@ -8125,6 +8176,7 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
 
     n = len(items)
     def fake_bench(model, prompts, *, max_context, **kw):
+        saved["backend_model"] = model
         saved["bench_kw"] = kw          # capture max_tokens threading
         return {
             "context": max_context,
@@ -8151,6 +8203,30 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
     assert "ara models recommend --use-case coding" in out
+
+
+def test_render_benchmark_loads_pinned_gguf_and_records_exact_quant(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    pinned = "/cache/snapshots/rev/Model-Q4_K_M.gguf"
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
+                        lambda _model, _artifact: pinned)
+    c, _ = make_console()
+    assert cli.render_benchmark(
+        c, "org/model-GGUF", use_case="reasoning", engine="cpu",
+        assume_yes=True) == 0
+    assert saved["backend_model"] == pinned
+    assert saved["quant"] == "q4_k_m"
+
+
+def test_render_benchmark_refuses_when_authorized_artifact_cannot_be_pinned(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda *_a: None)
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="cpu",
+                                assume_yes=True) == 1
+    assert "cannot pin" in buf.getvalue()
 
 
 def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, monkeypatch):

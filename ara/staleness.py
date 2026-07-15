@@ -35,6 +35,48 @@ def _cache_dir(model_id: str) -> Path:
     return hub / ("models--" + model_id.replace("/", "--"))
 
 
+def _current_snapshot(repo_id: str) -> tuple[str, Path] | None:
+    """Return the current ``main`` revision and snapshot directory for a cached HF repo."""
+    root = _cache_dir(repo_id)
+    try:
+        revision = (root / "refs" / "main").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    snapshot = root / "snapshots" / revision
+    if not _REVISION_RE.fullmatch(revision) or not snapshot.is_dir():
+        return None
+    return revision, snapshot
+
+
+def _file_descriptor(snapshot: Path, path: Path) -> str | None:
+    """Stable HF-cache identity for a snapshot file, including Windows' direct-file fallback."""
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        relative = path.relative_to(snapshot).as_posix()
+    except (OSError, ValueError):
+        return None
+    if _BLOB_RE.fullmatch(resolved.name):
+        authority = f"blob:{resolved.name}:{stat.st_size}"
+    else:
+        # huggingface_hub uses a direct snapshot file when Windows cannot create symlinks.
+        authority = f"direct:{stat.st_size}:{stat.st_mtime_ns}"
+    return f"{relative}:{authority}"
+
+
+def _authorized_snapshot(repo_id: str, artifact_id: str) -> Path | None:
+    """Snapshot encoded by an already-verified HF artifact identity (never rereads refs/main)."""
+    if not artifact_id.startswith(("hf:", "hf-gguf:")):
+        return None
+    authority = artifact_id.split(":", 2)[1]
+    artifact_repo, separator, revision = authority.rpartition("@")
+    snapshot = _cache_dir(repo_id) / "snapshots" / revision
+    if (not separator or artifact_repo != repo_id or not _REVISION_RE.fullmatch(revision)
+            or not snapshot.is_dir()):
+        return None
+    return snapshot
+
+
 def _cache_updated_at(model_id: str) -> float | None:
     """Newest artifact mtime in any locally cached model snapshot."""
     root = _cache_dir(model_id)
@@ -84,26 +126,16 @@ def artifact_identity(model: str) -> str | None:
 
     repo, separator, filename = model.partition(":")
     repo_id = repo if separator and filename.lower().endswith(".gguf") else model
-    root = _cache_dir(repo_id)
-    try:
-        revision = (root / "refs" / "main").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+    current = _current_snapshot(repo_id)
+    if current is None:
         return None
-    if not _REVISION_RE.fullmatch(revision):
-        return None
+    revision, snapshot = current
     if separator:
-        selected = root / "snapshots" / revision / filename
-        try:
-            if not selected.is_file():
-                return None
-            blob = selected.resolve(strict=True)
-            stat = blob.stat()
-        except OSError:
+        selected = snapshot / filename
+        descriptor = _file_descriptor(snapshot, selected) if selected.is_file() else None
+        if descriptor is None:
             return None
-        return f"hf-gguf:{repo_id}@{revision}:{filename}:{blob.name}:{stat.st_size}"
-    snapshot = root / "snapshots" / revision
-    if not snapshot.is_dir():
-        return None
+        return f"hf-gguf:{repo_id}@{revision}:{descriptor}"
     try:
         weights = [
             path for path in snapshot.rglob("*")
@@ -122,15 +154,45 @@ def artifact_identity(model: str) -> str | None:
             return None
         descriptors = []
         for path in sorted(selected):
-            blob = path.resolve(strict=True)
-            stat = blob.stat()
-            if not _BLOB_RE.fullmatch(blob.name):
+            descriptor = _file_descriptor(snapshot, path)
+            if descriptor is None:
                 return None
-            descriptors.append(
-                f"{path.relative_to(snapshot).as_posix()}:{blob.name}:{stat.st_size}")
+            descriptors.append(descriptor)
     except (OSError, ValueError):
         return None
     return f"hf:{repo_id}@{revision}:" + "|".join(descriptors)
+
+
+def pinned_model_ref(model: str, expected_artifact_id: str | None) -> str | None:
+    """Resolve authorized evidence to an immutable local load reference.
+
+    HF repository names are mutable. Governed commands must load the exact cached snapshot/file
+    that characterization authorized, not ask the Hub for whatever ``main`` means later.
+    """
+    if not artifact_matches(model, expected_artifact_id):
+        return None
+    local = Path(model).expanduser()
+    if model.lower().endswith(".gguf") and local.is_file():
+        try:
+            return str(local.resolve(strict=True))
+        except OSError:
+            return None
+    repo, separator, filename = model.partition(":")
+    repo_id = repo if separator and filename.lower().endswith(".gguf") else model
+    snapshot = _authorized_snapshot(repo_id, expected_artifact_id)
+    if snapshot is None:
+        return None
+    if separator:
+        selected = snapshot / filename
+        return str(selected) if selected.is_file() else None
+    descriptor_blob = expected_artifact_id.split(":", 2)[-1]
+    descriptors = descriptor_blob.split("|")
+    if len(descriptors) == 1:
+        relative = descriptors[0].split(":", 1)[0]
+        if relative.lower().endswith(".gguf"):
+            selected = snapshot / relative
+            return str(selected) if selected.is_file() else None
+    return str(snapshot)
 
 
 def artifact_matches(model: str, expected_artifact_id: str | None) -> bool:

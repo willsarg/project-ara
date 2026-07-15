@@ -53,8 +53,10 @@ def valid_repo_gguf_ref(model: str) -> bool:
             or re.match(r"^[A-Za-z]:[\\/]", model)):
         return False
     repo, _, fname = model.partition(":")
-    return (valid_model_id(repo) and fname.endswith(".gguf")
-            and not fname.startswith("-"))
+    parts = fname.split("/")
+    return (valid_model_id(repo) and fname.endswith(".gguf") and "\\" not in fname
+            and all(part not in ("", ".", "..") and not part.startswith("-")
+                    for part in parts))
 
 
 def valid_model_ref(model: str) -> bool:

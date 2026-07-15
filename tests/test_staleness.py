@@ -148,6 +148,90 @@ def test_bare_hf_identity_rejects_empty_snapshot_and_binds_weight_blob(tmp_path,
     identity = staleness.artifact_identity("org/model")
     assert identity is not None
     assert "model.safetensors" in identity and "d" * 40 in identity
+    assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
+
+
+def test_pinned_model_ref_resolves_exact_and_bare_gguf_to_snapshot_file(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="Model-Q4_K_M.gguf")
+    exact = "org/model:Model-Q4_K_M.gguf"
+    exact_identity = staleness.artifact_identity(exact)
+    assert staleness.pinned_model_ref(exact, exact_identity) == \
+        str(snapshot / "Model-Q4_K_M.gguf")
+    bare_identity = staleness.artifact_identity("org/model")
+    assert staleness.pinned_model_ref("org/model", bare_identity) == \
+        str(snapshot / "Model-Q4_K_M.gguf")
+    assert staleness.pinned_model_ref("org/model", "artifact:stale") is None
+
+
+def test_pinned_model_ref_uses_authorized_revision_if_main_changes_during_pin(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    old_revision = "a" * 40
+    old_snapshot = _revision_cache(
+        tmp_path, old_revision, filename="Model-Q4_K_M.gguf")
+    identity = staleness.artifact_identity("org/model")
+    original_matches = staleness.artifact_matches
+
+    def advance_after_match(model, expected):
+        assert original_matches(model, expected) is True
+        _revision_cache(tmp_path, "c" * 40, filename="Model-Q8_0.gguf")
+        return True
+
+    monkeypatch.setattr(staleness, "artifact_matches", advance_after_match)
+    assert staleness.pinned_model_ref("org/model", identity) == \
+        str(old_snapshot / "Model-Q4_K_M.gguf")
+
+
+def test_pinned_model_ref_handles_multishard_transformer_and_filesystem_races(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model-00001.safetensors")
+    root = snapshot.parents[1]
+    second_blob = root / "blobs" / ("d" * 40)
+    second_blob.write_bytes(b"second")
+    (snapshot / "model-00002.safetensors").symlink_to(second_blob)
+    identity = staleness.artifact_identity("org/model")
+    assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
+
+    local = tmp_path / "local.gguf"
+    local.write_bytes(b"weights")
+    monkeypatch.setattr(staleness, "artifact_matches", lambda *_a: True)
+    original_resolve = Path.resolve
+
+    def fail_local(path, *args, **kwargs):
+        if path == local:
+            raise OSError("disappeared")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_local)
+    assert staleness.pinned_model_ref(str(local), "artifact") is None
+    assert staleness.pinned_model_ref("org/not-cached", "artifact") is None
+    assert staleness.pinned_model_ref("org/model:missing.gguf", "artifact") is None
+    assert staleness._authorized_snapshot("org/model", "hf:other/model@bad:x") is None
+
+
+def test_bare_hf_identity_refuses_unidentifiable_selected_weight(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    _revision_cache(tmp_path, revision, filename="model.safetensors")
+    monkeypatch.setattr(staleness, "_file_descriptor", lambda *_a: None)
+    assert staleness.artifact_identity("org/model") is None
+
+
+def test_bare_hf_identity_supports_direct_snapshot_files_on_windows_style_cache(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision)
+    weights = snapshot / "model.safetensors"
+    weights.write_bytes(b"direct weights")
+    identity = staleness.artifact_identity("org/model")
+    assert identity is not None and "direct:" in identity
+    assert staleness.pinned_model_ref("org/model", identity) == str(snapshot)
 
 
 def test_bare_hf_identity_rejects_mixed_formats_and_noncanonical_blobs(
@@ -165,7 +249,7 @@ def test_bare_hf_identity_rejects_mixed_formats_and_noncanonical_blobs(
     (snapshot / "model.safetensors").unlink()
     direct = snapshot / "model.safetensors"
     direct.write_bytes(b"not a standard HF blob link")
-    assert staleness.artifact_identity("org/model") is None
+    assert ":direct:" in staleness.artifact_identity("org/model")
 
 
 def test_bare_hf_identity_tolerates_snapshot_walk_race(tmp_path, monkeypatch):

@@ -172,6 +172,7 @@ def _cached_safetensors_paths(model_id: str) -> list[str]:
         return [
             str(f.file_path)
             for rev in repo.revisions
+            if "main" in getattr(rev, "refs", ())
             for f in rev.files
             if f.file_name.endswith(".safetensors")
             or f.file_name.endswith(".safetensors.index.json")
@@ -202,6 +203,8 @@ def _describe_safetensors(model_id: str) -> dict | None:
     # Separate index.json from weight shards
     index_paths = [p for p in paths if p.endswith(".safetensors.index.json")]
     shard_paths = [p for p in paths if p.endswith(".safetensors")]
+    if len(index_paths) > 1 or (not index_paths and len(shard_paths) > 1):
+        return None
 
     # --- n_layers: prefer index.json (covers all shards) ---
     _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
@@ -212,11 +215,14 @@ def _describe_safetensors(model_id: str) -> dict | None:
             with open(index_paths[0]) as fh:
                 index = json.load(fh)
             weight_map = index.get("weight_map", {})
+            cached_shards = {os.path.basename(path) for path in shard_paths}
+            if not isinstance(weight_map, dict) or not set(weight_map.values()) <= cached_shards:
+                return None
             indices = {int(m.group(1)) for k in weight_map for m in [_LAYER_RE.search(k)] if m}
             if indices:
                 n_layers = max(indices) + 1
         except Exception:
-            pass
+            return None
 
     # --- hidden_size + fallback n_layers: read one shard header ---
     hidden_size: int | None = None

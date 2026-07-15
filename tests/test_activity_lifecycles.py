@@ -63,6 +63,7 @@ def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 
@@ -109,6 +110,7 @@ def _wire_characterize(monkeypatch, backend):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.catalog, "remember", lambda *_a: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
 
 
 @pytest.mark.parametrize("cached,expected_downloads", [(True, []), (False, ["org/model"])])
@@ -286,6 +288,7 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli.db, "get_model", lambda *_a: None)
     monkeypatch.setattr(cli.db, "save_benchmark_result", lambda *_a, **_k: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 

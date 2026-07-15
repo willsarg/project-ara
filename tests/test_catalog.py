@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from ara import catalog, db
 
@@ -549,6 +550,16 @@ def test_cached_safetensors_paths_includes_index_json(monkeypatch):
     assert "/c/model-00001-of-00002.safetensors" in paths
 
 
+def test_cached_safetensors_paths_uses_current_main_revision_only(monkeypatch):
+    stale = _make_file("model.safetensors", "/old/model.safetensors", 10)
+    current = _make_file("model.safetensors", "/main/model.safetensors", 20)
+    old_rev = _types.SimpleNamespace(files=[stale], refs=set())
+    main_rev = _types.SimpleNamespace(files=[current], refs={"main"})
+    repo = _make_repo("org/myrepo", "model", [], revisions=[old_rev, main_rev])
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+    assert catalog._cached_safetensors_paths("org/myrepo") == ["/main/model.safetensors"]
+
+
 # _describe_safetensors — full recovery
 
 def test_describe_safetensors_recovers_n_layers_and_hidden(tmp_path, monkeypatch):
@@ -586,6 +597,9 @@ def test_describe_safetensors_uses_index_json_for_layer_count(tmp_path, monkeypa
         "model.layers.0.mlp.gate_proj.weight": {"dtype": "BF16", "shape": [1024, 1024], "data_offsets": [0, 0]},
     }
     shard_path = _make_safetensors(tensor_map, tmp_path)
+    named_shard = tmp_path / "model-00001-of-00002.safetensors"
+    Path(shard_path).rename(named_shard)
+    shard_path = str(named_shard)
 
     # index.json weight_map references layers 0-7
     weight_map = {f"model.layers.{i}.mlp.gate_proj.weight": "model-00001-of-00002.safetensors"
@@ -627,8 +641,7 @@ def test_describe_safetensors_falls_back_to_shard_when_index_has_no_layers(tmp_p
     assert d["hidden_size"] == 256
 
 
-def test_describe_safetensors_falls_back_to_shard_when_index_corrupt(tmp_path, monkeypatch):
-    """Corrupt index.json raises exception; shard header supplies n_layers."""
+def test_describe_safetensors_refuses_corrupt_index(tmp_path, monkeypatch):
     shard_tensor_map = {
         "__metadata__": {},
         "model.embed_tokens.weight": {"dtype": "BF16", "shape": [32000, 128], "data_offsets": [0, 0]},
@@ -641,10 +654,30 @@ def test_describe_safetensors_falls_back_to_shard_when_index_corrupt(tmp_path, m
 
     monkeypatch.setattr(catalog, "_cached_safetensors_paths",
                         lambda m: [str(bad_index), shard_path])
-    d = catalog._describe_safetensors("org/mymodel")
-    assert d is not None
-    assert d["n_layers"] == 1
-    assert d["hidden_size"] == 128
+    assert catalog._describe_safetensors("org/mymodel") is None
+
+
+def test_describe_safetensors_refuses_incomplete_sharded_snapshot(tmp_path, monkeypatch):
+    shard_path = _make_safetensors({
+        "model.layers.0.mlp.weight": {
+            "dtype": "BF16", "shape": [128, 128], "data_offsets": [0, 0]}}, tmp_path)
+    index_path = _make_index_json({
+        "model.layers.0.mlp.weight": "model-00001-of-00002.safetensors",
+        "model.layers.1.mlp.weight": "model-00002-of-00002.safetensors",
+    }, tmp_path)
+    monkeypatch.setattr(catalog, "_cached_safetensors_paths",
+                        lambda _m: [index_path, shard_path])
+    assert catalog._describe_safetensors("org/mymodel") is None
+
+
+def test_describe_safetensors_refuses_multiple_indexes(tmp_path, monkeypatch):
+    first = tmp_path / "model.safetensors.index.json"
+    second = tmp_path / "other.safetensors.index.json"
+    first.write_text("{}")
+    second.write_text("{}")
+    monkeypatch.setattr(catalog, "_cached_safetensors_paths",
+                        lambda _m: [str(first), str(second)])
+    assert catalog._describe_safetensors("org/mymodel") is None
 
 
 def test_describe_safetensors_partial_when_no_embed_tensor(tmp_path, monkeypatch):

@@ -1384,8 +1384,13 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
+        pinned_model = staleness.pinned_model_ref(evidence_model, artifact_id_before)
+        if pinned_model is None:
+            msg = f"cannot pin the exact artifact characterized for {model} — result not stored"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return 1
         try:
-            result = bk.characterize(model, progress=progress, **fa_kw)
+            result = bk.characterize(pinned_model, progress=progress, **fa_kw)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
             msg = f"characterization failed: {exc}"
             # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
@@ -1956,6 +1961,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         if artifact_id != characterized_artifact_id:
             return err(f"the cached artifact for {model} differs from its measured ceiling — "
                        f"re-run: ara characterize {model}")
+        pinned_model = staleness.pinned_model_ref(evidence_model, artifact_id)
+        if pinned_model is None:
+            return err(f"cannot pin the exact characterized artifact for {model} — "
+                       f"re-run: ara characterize {model}")
         # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
         # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
         # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
@@ -1964,7 +1973,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         errored_n = 0
         for _ in range(repeat):
             try:
-                result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+                result = bk.benchmark(pinned_model, prompts, max_context=safe, **bench_kw)
             except (SystemExit, Exception) as exc:
                 return err(f"benchmark failed: {exc}")
             if not isinstance(result, dict):
@@ -2040,7 +2049,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     with db.connected() as con:
         canonical_model_id = scoring.canonical_model_id(evidence_model)
         mrow = db.get_model(con, evidence_model) or db.get_model(con, canonical_model_id)
-        quant = scoring.quant_key(evidence_model) or (mrow.get("quant") if mrow else None)
+        quant = (scoring.quant_key(evidence_model) or scoring.quant_key(pinned_model)
+                 or (mrow.get("quant") if mrow else None))
         if evidence_model != canonical_model_id:
             catalog.remember_variant(
                 con, evidence_model, canonical_model_id, quant=quant,
@@ -2316,7 +2326,13 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} differs from its measured ceiling — "
                            f"re-run: ara characterize {model}")
-            result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+            pinned_model = staleness.pinned_model_ref(
+                evidence_model, characterized_artifact_id)
+            if pinned_model is None:
+                return err(f"cannot pin the exact characterized artifact for {model} — "
+                           f"re-run: ara characterize {model}")
+            result = bk.generate(
+                pinned_model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} changed during the run — no result shown")
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
