@@ -136,9 +136,14 @@ def test_generate_returns_completion_when_safe(monkeypatch):
         def __init__(self, **kw):
             seen["n_ctx"] = kw.get("n_ctx")
 
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            seen["rendered_prompt"] = prompt
+            return {"choices": [{"text": " 42"}]}
+
         def create_chat_completion(self, messages, max_tokens):
             seen["messages"], seen["max_tokens"] = messages, max_tokens
-            return {"choices": [{"message": {"content": " 42"}}]}
+            raw = self.create_completion(prompt=[1, 2], max_tokens=max_tokens)
+            return {"choices": [{"message": {"content": raw["choices"][0]["text"]}}]}
 
     monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_Llama))
     out = w.generate("org/m", 4000, "meaning?", margin_gb=2.0, overhead_gb=1.0, max_tokens=8)
@@ -146,6 +151,52 @@ def test_generate_returns_completion_when_safe(monkeypatch):
     # the prompt is wrapped as a chat message so llama.cpp applies the GGUF's embedded template
     assert seen["messages"] == [{"role": "user", "content": "meaning?"}]
     assert seen["max_tokens"] == 8 and seen["n_ctx"] == 4000   # KV capped at ceiling
+
+
+def test_generate_refuses_chat_template_that_fills_ceiling(monkeypatch):
+    import sys as _sys
+    import types as _t
+
+    monkeypatch.setattr(w, "_resolve_gguf", lambda m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda p: _GEN_META)
+    monkeypatch.setattr(w, "_total_gb", lambda: 64.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda p, o: 2.0)
+    monkeypatch.setattr(w, "safety_gate", lambda **k: None)
+
+    class _TemplatedLlama:
+        def __init__(self, **_kw):
+            pass
+
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            pytest.fail("generation must not start after the rendered prompt fills the ceiling")
+
+        def create_chat_completion(self, messages, max_tokens):
+            assert messages == [{"role": "user", "content": "tiny"}]
+            # This token list is the exact rendered template passed by llama-cpp-python's chat
+            # handler to create_completion; it is deliberately much larger than raw "tiny".
+            return self.create_completion(prompt=[1] * 8, max_tokens=max_tokens)
+
+    monkeypatch.setitem(_sys.modules, "llama_cpp", _t.SimpleNamespace(Llama=_TemplatedLlama))
+    out = w.generate("org/m", 8, "tiny", margin_gb=2.0, overhead_gb=1.0, max_tokens=1)
+    assert out["refused"] is True and "ceiling 8" in out["reason"]
+
+
+def test_governed_chat_completion_counts_rendered_token_list():
+    seen = {}
+
+    class _TemplatedLlama:
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            seen.update(prompt=prompt, max_tokens=max_tokens)
+            return {"choices": [{"text": "ok"}]}
+
+        def create_chat_completion(self, messages, max_tokens):
+            raw = self.create_completion(prompt=[11, 12, 13], max_tokens=max_tokens)
+            return {"choices": [{"message": {"content": raw["choices"][0]["text"]}}]}
+
+    out, reason = w._governed_chat_completion(_TemplatedLlama(), "x", 2, 5)
+    assert reason is None and out["choices"][0]["message"]["content"] == "ok"
+    assert seen == {"prompt": [11, 12, 13], "max_tokens": 2}
 
 
 def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
@@ -206,8 +257,16 @@ class _FakeLlama:
     def tokenize(self, b):
         return b.split()                       # 1 "token" per whitespace word
 
+    def create_completion(self, *, prompt, max_tokens, **_kw):
+        content = prompt.decode() if isinstance(prompt, bytes) else prompt
+        if isinstance(content, list):
+            content = " ".join(token.decode() for token in content)
+        return {"choices": [{"text": f"<{max_tokens}>{content}"}]}
+
     def create_chat_completion(self, messages, max_tokens):
-        return {"choices": [{"message": {"content": f"<{max_tokens}>{messages[0]['content']}"}}]}
+        rendered = self.tokenize(messages[0]["content"].encode("utf-8"))
+        raw = self.create_completion(prompt=rendered, max_tokens=max_tokens)
+        return {"choices": [{"message": {"content": raw["choices"][0]["text"]}}]}
 
 
 def test_benchmark_refuses_whole_load_when_gate_blocks(monkeypatch):

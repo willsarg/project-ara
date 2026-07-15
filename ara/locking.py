@@ -14,11 +14,12 @@ Spec 2026-07-04-measurement-flock-lock.
 from __future__ import annotations
 
 import hashlib
-import getpass
 import os
-import tempfile
+import stat
 from contextlib import contextmanager
 from pathlib import Path
+
+import platformdirs
 
 from ara import db
 
@@ -49,13 +50,50 @@ def _ollama_lock_path(endpoint: str, served_name: str) -> Path:
     return db._db_path().parent / f"ollama-setup-{suffix}.lock"
 
 
-def _staging_lock_path(parent: Path) -> Path:
-    """One user-scoped lock per filesystem volume, independent of ARA's data-dir override."""
-    device = parent.stat().st_dev
-    uid = hashlib.sha256(getpass.getuser().encode("utf-8")).hexdigest()[:16]
-    root = Path(tempfile.gettempdir()) / f"ara-stage-locks-{uid}"
+def _staging_lock_root() -> Path:
+    """Stable user-owned root for volume leases (never the OS-cleaned temporary directory)."""
+    return Path(platformdirs.user_data_dir("ara")) / "locks"
+
+
+def _secure_staging_lock_path(parent: Path) -> Path:
+    """Create/validate the durable inode used to lease *parent*'s filesystem volume.
+
+    On POSIX the root becomes read/execute-only after the inode exists. That prevents another
+    ordinary ARA process from unlinking the pathname while a holder still has the old inode locked,
+    which would otherwise let it recreate and independently lock a replacement inode.
+    """
+    root = _staging_lock_root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root / f"volume-{device}.lock"
+    root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise RuntimeError("ARA cannot establish a secure staging lock directory")
+    if not _is_windows() and root_info.st_uid != os.getuid():
+        raise RuntimeError("ARA cannot establish a secure staging lock directory")
+
+    path = root / f"volume-{parent.stat().st_dev}.lock"
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        if not _is_windows():
+            root.chmod(0o700)
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+        path_info = path.lstat()
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+        raise RuntimeError("ARA cannot establish a secure staging lock file")
+    if not _is_windows():
+        if path_info.st_uid != os.getuid():
+            raise RuntimeError("ARA cannot establish a secure staging lock file")
+        path.chmod(0o600)
+        root.chmod(0o500)
+    return path
 
 
 def _is_windows() -> bool:
@@ -141,9 +179,16 @@ def staging_lock(parent: Path):
     The lease spans admission, copy, engine use, and cleanup. A crashed process releases the OS
     lock automatically, allowing its marked stale stage to be reclaimed by the next operation.
     """
-    path = _staging_lock_path(parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    path = _secure_staging_lock_path(parent)
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or (
+                not _is_windows() and info.st_uid != os.getuid()):
+            raise RuntimeError("ARA cannot establish a secure staging lock file")
         if not _acquire(fd):
             raise StagingBusy(
                 "another ARA process is staging or using a governed model on this volume — retry "

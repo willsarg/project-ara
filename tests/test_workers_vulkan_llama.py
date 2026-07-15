@@ -12,6 +12,9 @@ Slug: 2026-06-25-vulkan-amd-engine-lane
 """
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from ara.workers import vulkan_llama as w
@@ -215,3 +218,44 @@ def test_used_gb_takes_conservative_max_of_samples(monkeypatch):
     monkeypatch.setattr(psutil, "virtual_memory",
                         lambda: types.SimpleNamespace(used=next(reads)))
     assert w._used_gb() == pytest.approx(3.0)   # max(1,3,2) GiB, not min (1.0)
+
+
+def test_governed_chat_completion_refuses_expanded_template_before_inference():
+    class _TemplatedLlama:
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            pytest.fail("inference must not start")
+
+        def create_chat_completion(self, messages, max_tokens):
+            return self.create_completion(prompt=[1] * 9, max_tokens=max_tokens)
+
+    out, reason = w._governed_chat_completion(_TemplatedLlama(), "short", 2, 10)
+    assert out is None and "ceiling 10" in reason
+
+
+def test_benchmark_governs_rendered_template_tokens(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_gguf", lambda _m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda _p: {
+        "general.architecture": "llama", "llama.block_count": "2",
+        "llama.embedding_length": "16", "llama.attention.head_count": "4",
+    })
+    monkeypatch.setattr(w, "_total_gb", lambda: 64.0)
+    monkeypatch.setattr(w, "_used_gb", lambda: 1.0)
+    monkeypatch.setattr(w, "_model_base_gb", lambda *_a: 2.0)
+    monkeypatch.setattr(w, "safety_gate", lambda **_kw: None)
+    monkeypatch.setattr(w, "_run_probe_child", lambda *_a, **_kw: {"status": "ok"})
+
+    class _Llama:
+        def __init__(self, **_kw):
+            pass
+
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            pytest.fail("inference must not start")
+
+        def create_chat_completion(self, messages, max_tokens):
+            return self.create_completion(prompt=[1] * 9, max_tokens=max_tokens)
+
+    monkeypatch.setitem(sys.modules, "llama_cpp", types.SimpleNamespace(Llama=_Llama))
+    out = w.benchmark("org/m", 10, ["short"], margin_gb=2.0, overhead_gb=1.0,
+                      max_tokens=2)
+    assert out["results"] == [{"prompt_index": 0, "refused": True,
+                               "reason": "prompt fills context ceiling 10"}]

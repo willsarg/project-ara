@@ -132,6 +132,47 @@ def governed_max_tokens(prompt_tokens: int, requested_max_tokens: int,
     return min(requested_max_tokens, ceiling - prompt_tokens)
 
 
+class _RenderedPromptRefused(RuntimeError):
+    pass
+
+
+def _governed_chat_completion(llm, prompt: str, max_tokens: int,
+                              ceiling: int) -> tuple[dict | None, str | None]:
+    """Govern the exact rendered token list the chat handler submits to inference."""
+    original = llm.create_completion
+    had_override = "create_completion" in getattr(llm, "__dict__", {})
+
+    def guarded(*args, **kwargs):
+        submitted = kwargs.get("prompt", args[0] if args else "")
+        requested = kwargs.get("max_tokens", args[1] if len(args) > 1 else max_tokens)
+        requested = max_tokens if requested is None else requested
+        if isinstance(submitted, list):
+            prompt_tokens = len(submitted)
+        else:
+            encoded = submitted.encode("utf-8")
+            try:
+                prompt_tokens = len(llm.tokenize(encoded, add_bos=True, special=True))
+            except TypeError:
+                prompt_tokens = len(llm.tokenize(encoded))
+        allowed = governed_max_tokens(prompt_tokens, requested, ceiling)
+        if allowed is None:
+            raise _RenderedPromptRefused(f"prompt fills context ceiling {ceiling}")
+        kwargs["max_tokens"] = allowed
+        return original(*args, **kwargs)
+
+    llm.create_completion = guarded
+    try:
+        return (llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens), None)
+    except _RenderedPromptRefused as exc:
+        return None, str(exc)
+    finally:
+        if had_override:
+            llm.create_completion = original
+        else:
+            del llm.create_completion
+
+
 # --------------------------------------------------------------------------- #
 # Engine-touching helpers (import llama_cpp / psutil / huggingface_hub inside).
 # --------------------------------------------------------------------------- #
@@ -340,8 +381,9 @@ def generate(model: str, ctx: int, prompt: str, *, margin_gb: float, overhead_gb
     llm = Llama(model_path=gguf, n_ctx=ctx, verbose=False)
     # create_chat_completion applies the GGUF's embedded chat template (instruct models need it —
     # raw create_completion yields empty/garbage on template-strict models like gemma). Rule #3.
-    out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
-                                     max_tokens=max_tokens)
+    out, refusal = _governed_chat_completion(llm, prompt, max_tokens, ctx)
+    if refusal is not None:
+        return _refused(ctx, refusal)
     return {"context": ctx, "completion": out["choices"][0]["message"]["content"]}
 
 
@@ -373,17 +415,13 @@ def benchmark(model: str, ctx: int, prompts: list, *, margin_gb: float, overhead
     llm = Llama(model_path=gguf, n_ctx=ctx, verbose=False)
     results = []
     for i, prompt in enumerate(prompts):
-        n_prompt = len(llm.tokenize(prompt.encode("utf-8")))
-        allowed = governed_max_tokens(n_prompt, max_tokens, ctx)
-        if allowed is None:
-            results.append({"prompt_index": i, "refused": True,
-                            "reason": f"prompt fills context ceiling {ctx}"})
-            continue
         # A per-prompt exception (decode failure, OOM) must NOT crash the whole run and lose the
         # completed work — capture it as an error result and press on (Rule #3, mirrors MLX).
         try:
-            out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}],
-                                             max_tokens=allowed)
+            out, refusal = _governed_chat_completion(llm, prompt, max_tokens, ctx)
+            if refusal is not None:
+                results.append({"prompt_index": i, "refused": True, "reason": refusal})
+                continue
             results.append({"prompt_index": i,
                             "completion": out["choices"][0]["message"]["content"]})
         except Exception as exc:

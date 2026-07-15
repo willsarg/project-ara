@@ -8566,6 +8566,28 @@ def test_render_benchmark_auto_skips_higher_stale_engine_ceiling(
     assert saved["engine_key"] == "cpu"
 
 
+def test_render_benchmark_auto_keeps_exact_artifact_that_can_be_reacquired(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    revision = "a" * 40
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    authorized = []
+    monkeypatch.setattr(
+        cli.staleness, "authorized_download_ref",
+        lambda model, artifact: authorized.append((model, artifact)) or ("org/m", revision),
+    )
+    # Candidate selection is the behavior under test. The exact-revision acquisition path is
+    # independently covered by the _prefetch_plan tests; keep this regression focused on ensuring
+    # auto does not discard recoverable characterization evidence before it reaches that path.
+    monkeypatch.setattr(cli, "_prefetch_plan", lambda *_a, **_k: (False, None, None))
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
+    assert authorized == [("org/m", "artifact:test")]
+
+
 def test_render_benchmark_auto_ignores_nonbenchmark_candidate_backend(
         make_console, monkeypatch):
     saved = _wire_benchmark(monkeypatch, engine_key="cpu")

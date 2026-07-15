@@ -1935,8 +1935,14 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                     continue
                 if not staleness.artifact_matches(
                         evidence_model, candidate_row["artifact_id"]):
-                    artifact_mismatch = True
-                    continue
+                    # A missing local snapshot is recoverable when the characterization's
+                    # authority names an exact Hub revision (and exact GGUF selector, if any).
+                    # Keep that evidence candidate so _prefetch_plan can reacquire the same bytes;
+                    # only an unparseable/non-recoverable authority is a real mismatch here.
+                    if staleness.authorized_download_ref(
+                            evidence_model, candidate_row["artifact_id"]) is None:
+                        artifact_mismatch = True
+                        continue
                 candidates.append((candidate_row["safe_context"], candidate_key,
                                    candidate_backend, candidate_bk, candidate_row))
             if not candidates:

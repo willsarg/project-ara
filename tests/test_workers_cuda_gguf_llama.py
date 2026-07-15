@@ -12,6 +12,8 @@ Slug: 2026-06-29-cuda-gguf-hybrid
 """
 from __future__ import annotations
 
+import pytest
+
 from ara.workers import cuda_gguf_llama as w
 
 
@@ -131,3 +133,35 @@ def test_governed_max_tokens_reused_unchanged():
     assert w.governed_max_tokens(100, 256, 2048) == 256
     assert w.governed_max_tokens(2048, 1, 2048) is None
     assert w.governed_max_tokens(1900, 256, 2048) is None
+
+
+def test_governed_chat_completion_refuses_expanded_template_before_inference():
+    class _TemplatedLlama:
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            pytest.fail("inference must not start")
+
+        def create_chat_completion(self, messages, max_tokens):
+            return self.create_completion(prompt=[1] * 9, max_tokens=max_tokens)
+
+    out, reason = w._governed_chat_completion(_TemplatedLlama(), "short", 2, 10)
+    assert out is None and "ceiling 10" in reason
+
+
+def test_benchmark_governs_rendered_template_tokens(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_gguf", lambda _m: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda _p: {})
+    monkeypatch.setattr(w, "_gate", lambda *_a: (4, {"vram_gb": 1.0, "ram_gb": 1.0}))
+    monkeypatch.setattr(w, "_verify_offload", lambda *_a: None)
+
+    class _Llama:
+        def create_completion(self, *, prompt, max_tokens, **_kw):
+            pytest.fail("inference must not start")
+
+        def create_chat_completion(self, messages, max_tokens):
+            return self.create_completion(prompt=[1] * 9, max_tokens=max_tokens)
+
+    monkeypatch.setattr(w, "_load", lambda *_a: (_Llama(), "offloaded 4/8 layers to GPU"))
+    out = w.benchmark("org/m", 10, ["short"], vram_margin_gb=1.0,
+                      ram_margin_gb=2.0, max_tokens=2)
+    assert out["results"] == [{"prompt_index": 0, "refused": True,
+                               "reason": "prompt fills context ceiling 10"}]
