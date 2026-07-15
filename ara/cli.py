@@ -1609,22 +1609,23 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         if use_case is not None:
             rows = db.list_benchmark_results(evidence_con, profile.machine_key())
             bench_measured = {}
+            evidence_warnings = {}
             for row in rows:
-                run_scores, evidence_warning = scoring.decode_run_scores(
-                    row.get("run_scores_json"), row.get("repeat_count"))
-                bench_measured[(row["model_id"], row["use_case"])] = {
-                    "score": row["score"], "source": row["source"],
-                    "sample_size": row.get("sample_size"),
-                    "refused_n": row.get("refused_n"), "errored_n": row.get("errored_n"),
-                    "probe_context": row.get("probe_context"),
-                    "generation_cap": row.get("generation_cap"),
-                    "repeat_count": row.get("repeat_count"),
-                    "total_generations": row.get("total_generations"),
-                    "run_scores": run_scores, "evidence_warning": evidence_warning,
-                }
+                evidence_key = (row["model_id"], row["use_case"])
+                if staleness.fit_is_stale(row["model_id"], row.get("measured_at")):
+                    evidence_warnings[evidence_key] = "cached model changed since benchmark"
+                    continue
+                evidence, evidence_warning = scoring.validate_measured_evidence(row)
+                if evidence is None:
+                    evidence_warnings[evidence_key] = evidence_warning
+                    continue
+                bench_measured[evidence_key] = evidence
             bench_measured = bench_measured or None
             recs = scoring.rank(recs, use_case, measured=bench_measured,
                                 imported=scoring.load_imported())
+            for rec in recs:
+                rec["evidence_warning"] = evidence_warnings.get(
+                    (rec["model_id"], use_case))
         else:
             recs.sort(key=lambda r: r["est_context"], reverse=True)
 
@@ -1693,8 +1694,6 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                         head += f" [low-confidence n={s.sample_size}]"
                     if s.inversion:
                         head += f" [quant-inversion: {s.inversion}]"
-                    if s.evidence_warning:
-                        head += f" [{s.evidence_warning}]"
                     if c.verbose and s.sample_size is not None:
                         repeat_text = (f" × {s.repeat_count} runs"
                                        if s.repeat_count and s.repeat_count > 1 else "")
@@ -1704,6 +1703,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                         if s.generation_cap is not None:
                             evidence += f"; max {s.generation_cap}"
                         head += f" [evidence: {evidence}]"
+            if r.get("evidence_warning"):
+                head += f" [{r['evidence_warning']}]"
             tail = f"{head} · {tail}"
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
         quant_tag = c.style("dim", f" [{r['quant']}]") if r["quant"] else ""

@@ -8508,7 +8508,7 @@ def test_recommend_verbose_handles_legacy_benchmark_provenance(
         "model_id": "org/Legacy", "use_case": "coding", "score": 0.6,
         "source": "mlx probe=100", "sample_size": 100,
         "refused_n": 0, "errored_n": 0,
-        "probe_context": None, "generation_cap": None, "repeat_count": 1,
+        "probe_context": None, "generation_cap": None, "repeat_count": None,
         "total_generations": None, "run_scores_json": None,
     }])
 
@@ -8518,7 +8518,7 @@ def test_recommend_verbose_handles_legacy_benchmark_provenance(
 
 
 @pytest.mark.parametrize("stored", ["not-json", "{}", "[0.5, true]", "[1.5, 0.5]",
-                                     "[0.5]", "[NaN, 0.5]"])
+                                     "[0.5]", "[NaN, 0.5]", "[0.1, 0.1]"])
 def test_recommend_discloses_invalid_stored_run_scores(
         make_console, monkeypatch, set_platform, capsys, stored):
     _wire_recommend(monkeypatch, set_platform,
@@ -8534,13 +8534,72 @@ def test_recommend_discloses_invalid_stored_run_scores(
 
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
-    assert "invalid stored run-score provenance" in buf.getvalue()
+    assert "unknown" in buf.getvalue()
+    assert "invalid stored benchmark evidence" in buf.getvalue()
 
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
-    score = json.loads(capsys.readouterr().out)[0]["score"]
-    assert score["run_scores"] is None
-    assert score["evidence_warning"] == "invalid stored run-score provenance"
+    rec = json.loads(capsys.readouterr().out)[0]
+    assert rec["score"] is None
+    assert rec["evidence_warning"] == "invalid stored benchmark evidence"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("score", "bad"), ("score", float("nan")), ("score", 1.1),
+    ("sample_size", 0), ("sample_size", None), ("refused_n", -1),
+    ("refused_n", 201), ("errored_n", True),
+    ("probe_context", 0), ("probe_context", None),
+    ("generation_cap", -1), ("repeat_count", 0),
+    ("total_generations", 199), ("source", ""), ("measured_at", "not-a-date"),
+    ("measured_at", 123),
+])
+def test_recommend_downgrades_other_invalid_stored_evidence(
+        make_console, monkeypatch, set_platform, field, value):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    row = {
+        "model_id": "org/Corrupt", "use_case": "coding", "score": 0.6,
+        "source": "mlx probe=100", "sample_size": 100,
+        "refused_n": 0, "errored_n": 0,
+        "probe_context": 4096, "generation_cap": 512, "repeat_count": 2,
+        "total_generations": 200, "run_scores_json": "[0.6, 0.6]",
+        "measured_at": "2026-07-15T12:00:00+00:00",
+    }
+    row[field] = value
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [row])
+    monkeypatch.setattr(cli.staleness, "fit_is_stale", lambda *_a: False)
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, use_case="coding") == 0
+    assert "unknown" in buf.getvalue()
+    assert "invalid stored benchmark evidence" in buf.getvalue()
+
+
+def test_recommend_downgrades_stale_benchmark_for_changed_cached_artifact(
+        make_console, monkeypatch, set_platform, capsys):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Changed", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
+        "model_id": "org/Changed", "use_case": "coding", "score": 0.9,
+        "source": "mlx probe=100", "sample_size": 100,
+        "refused_n": 0, "errored_n": 0, "probe_context": 4096,
+        "generation_cap": 512, "repeat_count": 1, "total_generations": 100,
+        "run_scores_json": "[0.9]", "measured_at": "2026-01-01T00:00:00+00:00",
+    }])
+    monkeypatch.setattr(cli.staleness, "fit_is_stale", lambda model, when: True)
+
+    c, buf = make_console()
+    assert cli.render_recommend(c, use_case="coding") == 0
+    assert "unknown" in buf.getvalue()
+    assert "cached model changed since benchmark" in buf.getvalue()
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
+    rec = json.loads(capsys.readouterr().out)[0]
+    assert rec["score"] is None
+    assert rec["evidence_warning"] == "cached model changed since benchmark"
 
 
 def test_render_benchmark_rejects_nonpositive_ctx(make_console, monkeypatch):

@@ -22,6 +22,7 @@ import re
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 _IMPORTED_PATH = Path(__file__).parent / "data" / "usecase_scores.json"
@@ -175,6 +176,75 @@ def decode_run_scores(raw: str | None, repeat_count: int | None
            or not math.isfinite(value) or not 0 <= value <= 1 for value in values):
         return None, warning
     return [float(value) for value in values], None
+
+
+def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
+    """Validate a local benchmark row before it can influence recommendation ranking."""
+    warning = "invalid stored benchmark evidence"
+    score = row.get("score")
+    if (isinstance(score, bool) or not isinstance(score, (int, float))
+            or not math.isfinite(score) or not 0 <= score <= 1):
+        return None, warning
+    if not isinstance(row.get("source"), str) or not row["source"]:
+        return None, warning
+    measured_at = row.get("measured_at")
+    if measured_at is not None:
+        if not isinstance(measured_at, str):
+            return None, warning
+        try:
+            datetime.fromisoformat(measured_at)
+        except ValueError:
+            return None, warning
+
+    def optional_nonnegative_int(name: str, *, positive: bool = False) -> bool:
+        value = row.get(name)
+        if value is None:
+            return True
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and (value > 0 if positive else value >= 0))
+
+    if not all((
+        optional_nonnegative_int("sample_size", positive=True),
+        optional_nonnegative_int("refused_n"),
+        optional_nonnegative_int("errored_n"),
+        optional_nonnegative_int("probe_context", positive=True),
+        optional_nonnegative_int("generation_cap", positive=True),
+        optional_nonnegative_int("repeat_count", positive=True),
+        optional_nonnegative_int("total_generations", positive=True),
+    )):
+        return None, warning
+
+    sample_size = row.get("sample_size")
+    repeat_count = row.get("repeat_count")
+    total = row.get("total_generations")
+    structured = (row.get("probe_context"), row.get("generation_cap"), repeat_count,
+                  total, row.get("run_scores_json"))
+    if any(value is not None for value in structured) and any(value is None for value in structured):
+        return None, warning
+    if all(value is not None for value in structured) and sample_size is None:
+        return None, warning
+    if (total is not None and sample_size is not None and repeat_count is not None
+            and total != sample_size * repeat_count):
+        return None, warning
+    if total is not None and sum(row.get(name) or 0 for name in ("refused_n", "errored_n")) > total:
+        return None, warning
+
+    run_scores, run_warning = decode_run_scores(row.get("run_scores_json"), repeat_count)
+    if run_warning is not None:
+        return None, warning
+    if run_scores is not None and not math.isclose(
+            math.fsum(run_scores) / len(run_scores), float(score), abs_tol=1e-9):
+        return None, warning
+
+    return {
+        "score": float(score), "source": row["source"],
+        "sample_size": sample_size,
+        "refused_n": row.get("refused_n"), "errored_n": row.get("errored_n"),
+        "probe_context": row.get("probe_context"),
+        "generation_cap": row.get("generation_cap"),
+        "repeat_count": repeat_count, "total_generations": total,
+        "run_scores": run_scores,
+    }, None
 
 
 def _normalise_imported(raw: dict) -> dict:
