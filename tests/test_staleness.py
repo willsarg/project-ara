@@ -137,6 +137,28 @@ def test_artifact_identity_honors_hugging_face_cache_environment(tmp_path, monke
     assert staleness.artifact_identity("org/model").startswith(f"hf:org/model@{revision}:")
 
 
+def test_artifact_identity_accepts_valid_cache_through_symlinked_ancestor(
+        tmp_path, monkeypatch):
+    revision = "a" * 40
+    real_parent = tmp_path / "real"
+    hub = real_parent / "hub"
+    root = hub / "models--org--model"
+    snapshot = root / "snapshots" / revision
+    blob = root / "blobs" / ("b" * 40)
+    (root / "refs").mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir(parents=True)
+    (root / "refs" / "main").write_text(revision)
+    blob.write_bytes(b"weights")
+    (snapshot / "model.safetensors").symlink_to(blob)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(alias / "hub"))
+
+    assert staleness.artifact_identity("org/model").startswith(
+        f"hf:org/model@{revision}:")
+
+
 def test_bare_hf_identity_rejects_empty_snapshot_and_binds_weight_blob(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     revision = "a" * 40
@@ -252,7 +274,7 @@ def test_stage_model_ref_copies_direct_snapshot_and_preserves_manifest(
         assert (staged / "config.json").read_text() == '{"model_type":"test"}'
 
 
-def test_stage_model_ref_hardlinks_content_addressed_blob(tmp_path, monkeypatch):
+def test_stage_model_ref_privately_copies_content_addressed_blob(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     revision = "a" * 40
     snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
@@ -266,15 +288,15 @@ def test_stage_model_ref_hardlinks_content_addressed_blob(tmp_path, monkeypatch)
         logical.unlink()
         logical.symlink_to(replacement)
         assert staged_weight.read_bytes() == b"weights"
+        replacement.write_bytes(b"mutated in place")
+        assert staged_weight.read_bytes() == b"weights"
 
 
-def test_stage_model_ref_falls_back_to_copy_and_fails_closed(tmp_path, monkeypatch):
+def test_stage_model_ref_copies_blob_and_fails_closed(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     revision = "a" * 40
     _revision_cache(tmp_path, revision, filename="model.safetensors")
     identity = staleness.artifact_identity("org/model")
-    monkeypatch.setattr(staleness.os, "link", lambda *_a: (_ for _ in ()).throw(OSError()))
-
     with staleness.stage_model_ref("org/model", identity) as load_path:
         assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
 
@@ -302,24 +324,66 @@ def test_stage_model_ref_cleans_up_when_authority_changes_during_staging(
     assert not list(tmp_path.glob(".ara-stage-*"))
 
 
-def test_staging_refuses_unverifiable_changed_and_disappeared_sources(
+def test_stage_model_ref_rejects_aba_bytes_even_if_source_authority_is_restored(
+        tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"authorized")
+    identity = staleness.artifact_identity(str(model))
+
+    def stage_unauthorized(_source, destination):
+        Path(destination).write_bytes(b"unauthorized")
+
+    monkeypatch.setattr(staleness.shutil, "copy2", stage_unauthorized)
+    monkeypatch.setattr(staleness, "artifact_matches", lambda *_a, **_k: True)
+    with pytest.raises(RuntimeError, match="authorized digest"):
+        staleness.stage_model_ref(str(model), identity)
+    assert not list(tmp_path.glob(".ara-stage-*"))
+
+
+def test_stage_model_ref_requires_disk_headroom_on_staging_volume(tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"authorized")
+    identity = staleness.artifact_identity(str(model))
+    monkeypatch.setattr(
+        staleness.shutil, "disk_usage",
+        lambda path: type("Usage", (), {"free": staleness._STAGE_DISK_BUFFER_BYTES})())
+
+    with pytest.raises(RuntimeError, match="not enough disk"):
+        staleness.stage_model_ref(str(model), identity)
+
+    monkeypatch.setattr(
+        staleness.shutil, "disk_usage",
+        lambda path: (_ for _ in ()).throw(OSError("unknown")))
+    with pytest.raises(RuntimeError, match="cannot verify free disk"):
+        staleness.stage_model_ref(str(model), identity)
+
+
+def test_stage_model_ref_rejects_invalid_and_multifile_authority_for_one_file(
+        tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.setattr(staleness, "pinned_model_ref", lambda *_a, **_k: str(model))
+    with pytest.raises(RuntimeError, match="cannot decode"):
+        staleness.stage_model_ref("org/model", "unknown:authority")
+
+    descriptor = "model.safetensors:direct:7:sha256:" + "a" * 64
+    authority = f"hf:org/model@{'a' * 40}:{descriptor}|config.json:direct:1:sha256:" + "b" * 64
+    with pytest.raises(RuntimeError, match="does not describe one file"):
+        staleness.stage_model_ref("org/model", authority)
+
+
+def test_staging_refuses_wrong_digest_and_disappeared_sources(
         tmp_path, monkeypatch):
     source = tmp_path / "model.gguf"
     destination = tmp_path / "stage" / "model.gguf"
     source.write_bytes(b"weights")
-    monkeypatch.setattr(staleness, "_content_digest", lambda _path: None)
-    with pytest.raises(RuntimeError, match="before staging"):
-        staleness._stage_file(source, destination)
-
-    digests = iter(((7, "before"), (7, "after")))
-    monkeypatch.setattr(staleness, "_content_digest", lambda _path: next(digests))
-    with pytest.raises(RuntimeError, match="changed while staging"):
-        staleness._stage_file(source, destination)
+    with pytest.raises(RuntimeError, match="authorized digest"):
+        staleness._stage_file(source, destination, (7, "0" * 64))
 
     missing = tmp_path / "missing.gguf"
     monkeypatch.setattr(staleness, "pinned_model_ref", lambda *_a, **_k: str(missing))
     with pytest.raises(RuntimeError, match="disappeared"):
-        staleness.stage_model_ref("org/model", "artifact")
+        staleness.stage_model_ref("org/model", staleness.artifact_identity(str(source)))
 
 
 def test_staging_refuses_empty_transformer_manifest_and_carries_revision(
@@ -331,13 +395,59 @@ def test_staging_refuses_empty_transformer_manifest_and_carries_revision(
         staleness, "pinned_model_ref",
         lambda model, artifact, *, revision: seen.append(
             (model, artifact, revision)) or str(snapshot))
-    monkeypatch.setattr(staleness, "_transformer_manifest", lambda _snapshot: None)
+    local_authority = "local-gguf:/model.gguf:7:sha256:" + "a" * 64
 
     with pytest.raises(RuntimeError, match="cannot verify transformer snapshot"):
         staleness.stage_model_ref(
-            "org/model", "artifact", revision="a" * 40)
-    assert seen == [("org/model", "artifact", "a" * 40)]
+            "org/model", local_authority, revision="a" * 40)
+    assert seen == [("org/model", local_authority, "a" * 40)]
     assert not list((tmp_path / "cache").glob(".ara-stage-*"))
+
+
+@pytest.mark.parametrize("authority", [
+    None,
+    "unknown:artifact",
+    "local-gguf:path:not-an-int:sha256:" + "a" * 64,
+    "local-gguf:path:1:md5:" + "a" * 64,
+    "hf:org/model@rev:bad",
+    "hf:x",
+    "hf:org/model@rev:model:direct:1:md5:" + "a" * 64,
+    "hf:org/model@rev:model:blob:not-a-blob:1:sha256:" + "a" * 64,
+    "hf:org/model@rev:../model:direct:1:sha256:" + "a" * 64,
+])
+def test_authority_manifest_rejects_malformed_authority(authority):
+    assert staleness._authority_manifest(authority) is None
+
+
+def test_authority_manifest_rejects_duplicate_paths():
+    descriptor = "model.safetensors:direct:1:sha256:" + "a" * 64
+    assert staleness._authority_manifest(
+        f"hf:org/model@{'a' * 40}:{descriptor}|{descriptor}") is None
+
+
+def test_file_descriptor_rejects_ambiguous_name_and_missing_blob_directory(
+        tmp_path, monkeypatch):
+    snapshot = tmp_path / "cache" / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    ambiguous = snapshot / "bad|name.safetensors"
+    ambiguous.write_bytes(b"weights")
+    assert staleness._file_descriptor(snapshot, ambiguous) is None
+
+    blob = snapshot.parents[1] / "blobs" / ("b" * 40)
+    blob.parent.mkdir()
+    blob.write_bytes(b"weights")
+    linked = snapshot / "model.safetensors"
+    linked.symlink_to(blob)
+    blob.parent.rename(snapshot.parents[1] / "missing-blobs")
+    assert staleness._file_descriptor(snapshot, linked) is None
+
+    invalid_blob_dir = snapshot.parents[1] / "blobs"
+    invalid_blob_dir.mkdir()
+    invalid_blob = invalid_blob_dir / "not-a-content-hash"
+    invalid_blob.write_bytes(b"weights")
+    linked.unlink()
+    linked.symlink_to(invalid_blob)
+    assert staleness._file_descriptor(snapshot, linked) is None
 
 
 def test_bare_hf_identity_refuses_unidentifiable_selected_weight(tmp_path, monkeypatch):

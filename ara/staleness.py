@@ -26,6 +26,7 @@ _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _BLOB_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+_STAGE_DISK_BUFFER_BYTES = 2_000_000_000
 
 
 class StagedModel:
@@ -112,11 +113,17 @@ def _file_descriptor(snapshot: Path, path: Path) -> str | None:
         relative = path.relative_to(snapshot).as_posix()
     except (OSError, ValueError):
         return None
+    if "|" in relative:
+        return None
     if path.is_symlink():
         # Normal HF snapshots link into this repository's content-addressed blob store. Any other
         # external link would let a lexical shard name load mutable bytes outside the authority.
         blob_dir = snapshot.parent.parent / "blobs"
-        if resolved.parent != blob_dir or not _BLOB_RE.fullmatch(resolved.name):
+        try:
+            resolved_blob_dir = blob_dir.resolve(strict=True)
+        except OSError:
+            return None
+        if resolved.parent != resolved_blob_dir or not _BLOB_RE.fullmatch(resolved.name):
             return None
         kind = f"blob:{resolved.name}"
     else:
@@ -319,25 +326,62 @@ def pinned_model_ref(model: str, expected_artifact_id: str | None, *,
     return str(snapshot)
 
 
-def _stage_file(source: Path, destination: Path) -> None:
-    """Bind one verified source to a private path, then prove the staged bytes match."""
-    resolved = source.resolve(strict=True)
-    before = _content_digest(resolved)
-    if before is None:
-        raise RuntimeError(f"cannot verify {source} before staging")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    linked = (source.is_symlink() and _BLOB_RE.fullmatch(resolved.name)
-              and resolved.parent.name == "blobs")
-    if linked:
-        try:
-            os.link(resolved, destination)
-        except OSError:
-            shutil.copy2(resolved, destination)
+def _authority_entry(descriptor: str) -> tuple[str, tuple[int, str]] | None:
+    """Decode one content descriptor from ARA's opaque stored artifact authority."""
+    try:
+        prefix, encoded_size, algorithm, digest = descriptor.rsplit(":", 3)
+        size = int(encoded_size)
+    except ValueError:
+        return None
+    if size < 0 or algorithm != "sha256" or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    if prefix.endswith(":direct"):
+        relative = prefix[:-len(":direct")]
     else:
-        # Direct Windows snapshots and local GGUFs are mutable paths: isolate their bytes.
-        shutil.copy2(resolved, destination)
-    if _content_digest(destination) != before:
-        raise RuntimeError(f"{source} changed while staging")
+        relative, marker, blob = prefix.rpartition(":blob:")
+        if not marker or not _BLOB_RE.fullmatch(blob):
+            return None
+    logical = PurePosixPath(relative)
+    if (not relative or logical.is_absolute() or "\\" in relative or "|" in relative
+            or any(part in ("", ".", "..") for part in relative.split("/"))):
+        return None
+    return relative, (size, digest)
+
+
+def _authority_manifest(expected_artifact_id: str) -> dict[str | None, tuple[int, str]] | None:
+    """Extract the exact size/digest manifest that an artifact authority authorized."""
+    if not isinstance(expected_artifact_id, str):
+        return None
+    if expected_artifact_id.startswith("local-gguf:"):
+        try:
+            _prefix, encoded_size, algorithm, digest = expected_artifact_id.rsplit(":", 3)
+            size = int(encoded_size)
+        except ValueError:
+            return None
+        if (size < 0 or algorithm != "sha256"
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            return None
+        return {None: (size, digest)}
+    if not expected_artifact_id.startswith(("hf:", "hf-gguf:")):
+        return None
+    try:
+        descriptors = expected_artifact_id.split(":", 2)[2].split("|")
+    except IndexError:
+        return None
+    entries = [_authority_entry(descriptor) for descriptor in descriptors]
+    if not entries or any(entry is None for entry in entries):
+        return None
+    manifest = dict(entries)
+    return manifest if len(manifest) == len(entries) else None
+
+
+def _stage_file(source: Path, destination: Path, expected: tuple[int, str]) -> None:
+    """Copy one source privately, then prove it is the exact authorized content."""
+    resolved = source.resolve(strict=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, destination)
+    if _content_digest(destination) != expected:
+        raise RuntimeError(f"{source} did not match its authorized digest while staging")
 
 
 def stage_model_ref(model: str, expected_artifact_id: str, *,
@@ -347,24 +391,37 @@ def stage_model_ref(model: str, expected_artifact_id: str, *,
               if revision is not None else pinned_model_ref(model, expected_artifact_id))
     if pinned is None:
         raise RuntimeError(f"cannot pin the authorized artifact for {model}")
+    manifest = _authority_manifest(expected_artifact_id)
+    if manifest is None:
+        raise RuntimeError(f"cannot decode the authorized artifact manifest for {model}")
     source = Path(pinned)
     if not source.exists():
         raise RuntimeError(f"authorized artifact disappeared before staging: {source}")
     stage_parent = source.parent if source.is_file() else source.parent.parent
+    required = sum(size for size, _digest in manifest.values()) + _STAGE_DISK_BUFFER_BYTES
+    try:
+        free = shutil.disk_usage(stage_parent).free
+    except OSError as exc:
+        raise RuntimeError(f"cannot verify free disk space for staging {model}") from exc
+    if free < required:
+        raise RuntimeError(
+            f"not enough disk to stage {model}: needs the artifact size plus 2 GB headroom")
     temporary = tempfile.TemporaryDirectory(prefix=".ara-stage-", dir=stage_parent)
     root = Path(temporary.name)
     try:
         if source.is_file():
+            if len(manifest) != 1:
+                raise RuntimeError(f"authorized manifest does not describe one file for {model}")
             destination = root / source.name
-            _stage_file(source, destination)
+            _stage_file(source, destination, next(iter(manifest.values())))
             staged_path = destination
         else:
-            files = _transformer_manifest(source)
-            if files is None or not files:
+            if None in manifest:
                 raise RuntimeError(f"cannot verify transformer snapshot {source}")
             staged_path = root / "snapshot"
-            for item in files:
-                _stage_file(item, staged_path / item.relative_to(source))
+            for relative, expected in manifest.items():
+                item = source.joinpath(*PurePosixPath(relative).parts)
+                _stage_file(item, staged_path / relative, expected)
         matches = (artifact_matches(model, expected_artifact_id, revision=revision)
                    if revision is not None else artifact_matches(model, expected_artifact_id))
         if not matches:
