@@ -8,6 +8,7 @@ from pathlib import Path
 
 import huggingface_hub
 import huggingface_hub.utils as hf_utils
+import pytest
 
 from ara import acquire
 
@@ -202,6 +203,66 @@ def test_download_progress_true_restores_prior_state_even_on_error(monkeypatch):
         pass
     # enable called at start; finally restores was_disabled=True → disable called
     assert order == ["enable", "disable"]
+
+
+def test_download_gguf_exact_selector_fetches_only_selected_file(monkeypatch):
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, filename: calls.append((repo, filename)) or "/cache/model.gguf")
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: None)
+
+    assert acquire.download_gguf("org/repo:Q4/model.gguf") == "/cache/model.gguf"
+    assert calls == [("org/repo", "Q4/model.gguf")]
+
+
+def test_download_gguf_bare_selects_smallest_non_projector(monkeypatch):
+    siblings = [
+        types.SimpleNamespace(rfilename="mmproj-model.gguf", size=1),
+        types.SimpleNamespace(rfilename="model-q8.gguf", size=800),
+        types.SimpleNamespace(rfilename="model-q4.gguf", size=400),
+    ]
+    monkeypatch.setattr(huggingface_hub, "HfApi", _fake_api(siblings))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, filename: f"/cache/{repo}/{filename}")
+    monkeypatch.setattr(hf_utils, "are_progress_bars_disabled", lambda: False)
+    monkeypatch.setattr(hf_utils, "disable_progress_bars", lambda: None)
+    monkeypatch.setattr(hf_utils, "enable_progress_bars", lambda: None)
+
+    assert acquire.download_gguf("org/repo").endswith("model-q4.gguf")
+
+
+def test_gguf_size_gb_matches_selected_remote_file(monkeypatch):
+    siblings = [
+        types.SimpleNamespace(rfilename="mmproj-model.gguf", size=1),
+        types.SimpleNamespace(rfilename="model-q8.gguf", size=8_000_000_000),
+        types.SimpleNamespace(rfilename="model-q4.gguf", size=4_000_000_000),
+    ]
+    monkeypatch.setattr(huggingface_hub, "HfApi", _fake_api(siblings))
+    assert acquire.gguf_size_gb("org/repo") == 4.0
+    assert acquire.gguf_size_gb("org/repo:model-q8.gguf") == 8.0
+
+
+def test_gguf_helpers_cover_local_missing_and_invalid_inputs(tmp_path, monkeypatch):
+    local = tmp_path / "model.gguf"
+    local.write_bytes(b"weights")
+    assert acquire.gguf_size_gb(str(local)) == 0.0
+    assert acquire.download_gguf(str(local)) == str(local.resolve())
+
+    monkeypatch.setattr(acquire.os.path, "getsize", lambda _path: (_ for _ in ()).throw(OSError()))
+    assert acquire.gguf_size_gb(str(local)) is None
+    with pytest.raises(ValueError, match="invalid GGUF"):
+        acquire.download_gguf("../bad")
+
+
+def test_gguf_remote_selection_refuses_missing_weight(monkeypatch):
+    monkeypatch.setattr(huggingface_hub, "HfApi", _fake_api([
+        types.SimpleNamespace(rfilename="mmproj-only.gguf", size=1),
+    ]))
+    with pytest.raises(FileNotFoundError, match="no loadable"):
+        acquire._remote_gguf("org/repo")
+    assert acquire.gguf_size_gb("org/repo") is None
 
 
 def test_valid_model_id_accepts_well_formed_repo_ids():

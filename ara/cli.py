@@ -1212,7 +1212,9 @@ def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
     cached = getattr(bk, "calibration_model_cached", None)
     if incompatible or cached is None or cached(model):
         return False, None, None
-    size_gb = acquire.repo_size_gb(model)
+    size_gb = (acquire.gguf_size_gb(model)
+               if engine_key in {"cpu", "vulkan", "cuda-gguf"}
+               else acquire.repo_size_gb(model))
     free_gb = acquire.free_disk_gb()
     if size_gb and free_gb is not None and free_gb < size_gb + acquire.DISK_BUFFER_GB:
         msg = (f"not enough disk for {model}: needs ~{size_gb:.1f} GB + "
@@ -1241,11 +1243,10 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
                       *, as_json: bool, progress: bool) -> int | None:
     """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
 
-    So the CUDA/MLX engines fetch on demand like the GGUF engines (which download in-worker), instead of the
-    worker refusing an uncached model (#109). Without it the worker's ``blobs/`` scan also yields
+    CUDA/MLX fetch full transformer snapshots; GGUF engines fetch only the selected quant before
+    authority is pinned. Without prefetch the worker's ``blobs/`` scan also yields
     ``weights_gb≈0`` for uncached transformers models, under-predicting the a-priori memory gate.
-    No-op when the model's engine doesn't match *engine_key* or it's already cached — cpu/vulkan/
-    cuda-gguf report cached (they acquire the GGUF in-worker), so this only fetches for apple/cuda.
+    No-op when the model's engine doesn't match *engine_key* or the exact selection is cached.
     Returns 1 (after printing) on a disk-space or fetch error, else None.
     """
     needed, size_gb, rc = _prefetch_plan(c, model, bk, engine_key, as_json=as_json)

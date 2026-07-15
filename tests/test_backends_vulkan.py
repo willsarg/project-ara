@@ -281,17 +281,28 @@ def test_safe_limits_exact_wall_needs_no_calibration(monkeypatch):
     assert m["overhead_gb"] is None and m["calibrated_at"] is None
 
 
-def test_calibration_model_cached_is_always_true():
-    assert vulkan.calibration_model_cached() is True   # worker downloads lazily
+def test_calibration_model_cached_uses_artifact_authority(monkeypatch):
+    monkeypatch.setattr(vulkan.staleness, "artifact_identity", lambda model: None)
+    assert vulkan.calibration_model_cached("org/model") is False
+    monkeypatch.setattr(vulkan.staleness, "artifact_identity", lambda model: "artifact")
+    assert vulkan.calibration_model_cached("org/model") is True
 
 
-def test_download_calibration_model_is_noop():
-    assert vulkan.download_calibration_model() is None
+def test_download_calibration_model_acquires_selected_gguf(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vulkan.acquire, "download_gguf",
+                        lambda model, *, progress=False: calls.append((model, progress)))
+    assert vulkan.download_calibration_model("org/model", progress=True) is None
+    assert calls == [("org/model", True)]
 
 
-def test_download_calibration_model_accepts_progress_and_is_noop():
+def test_download_calibration_model_passes_progress(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vulkan.acquire, "download_gguf",
+                        lambda model, *, progress=False: calls.append(progress))
     assert vulkan.download_calibration_model(progress=True) is None
     assert vulkan.download_calibration_model(progress=False) is None
+    assert calls == [True, False]
 
 
 def test_calibrate_attaches_characterization(monkeypatch):

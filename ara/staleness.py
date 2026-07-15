@@ -14,10 +14,11 @@ code never imports a nested engine package in-process.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -49,21 +50,39 @@ def _current_snapshot(repo_id: str) -> tuple[str, Path] | None:
     return revision, snapshot
 
 
+def _content_digest(path: Path) -> tuple[int, str] | None:
+    """Return a stable content digest, refusing a file that changes while it is read."""
+    try:
+        before = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError:
+        return None
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        return None
+    return after.st_size, digest.hexdigest()
+
+
 def _file_descriptor(snapshot: Path, path: Path) -> str | None:
-    """Stable HF-cache identity for a snapshot file, including Windows' direct-file fallback."""
+    """Content-derived HF-cache identity, including Windows' direct-file fallback."""
     try:
         resolved = path.resolve(strict=True)
-        stat = resolved.stat()
         relative = path.relative_to(snapshot).as_posix()
     except (OSError, ValueError):
         return None
-    fingerprint = (f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:"
-                   f"{stat.st_mtime_ns}:{stat.st_ctime_ns}")
+    content = _content_digest(resolved)
+    if content is None:
+        return None
+    size, digest = content
     if _BLOB_RE.fullmatch(resolved.name):
-        authority = f"blob:{resolved.name}:{fingerprint}"
+        authority = f"blob:{resolved.name}:{size}:sha256:{digest}"
     else:
         # huggingface_hub uses a direct snapshot file when Windows cannot create symlinks.
-        authority = f"direct:{fingerprint}"
+        authority = f"direct:{size}:sha256:{digest}"
     return f"{relative}:{authority}"
 
 
@@ -87,17 +106,31 @@ def _selected_weights(snapshot: Path) -> list[Path] | None:
 def _transformer_manifest(snapshot: Path) -> list[Path] | None:
     """All files consumed from a transformer snapshot, with complete shard-index validation."""
     files = [path for path in snapshot.rglob("*") if path.is_file()]
-    indexes = [path for path in files if path.name.endswith(".safetensors.index.json")]
+    indexes = [path for path in files
+               if (path.name.endswith(".safetensors.index.json")
+                   or path.name.endswith(".bin.index.json"))]
     if len(indexes) > 1:
         return None
     if indexes:
         try:
             index = json.loads(indexes[0].read_text(encoding="utf-8"))
             weight_map = index.get("weight_map")
-            if (not isinstance(weight_map, dict)
-                    or not all(isinstance(name, str) and (snapshot / name).is_file()
-                               for name in weight_map.values())):
+            names = set(weight_map.values()) if isinstance(weight_map, dict) else set()
+            if not names:
                 return None
+            referenced = set()
+            for name in names:
+                logical = PurePosixPath(name) if isinstance(name, str) else None
+                if (logical is None or logical.is_absolute() or "\\" in name
+                        or any(part in ("", ".", "..") for part in name.split("/"))):
+                    return None
+                candidate = snapshot.joinpath(*logical.parts)
+                if not candidate.is_file():
+                    return None
+                referenced.add(candidate)
+            files = [path for path in files
+                     if not path.name.lower().endswith(_WEIGHT_SUFFIXES)
+                     or path in referenced]
         except (OSError, UnicodeError, ValueError, AttributeError):
             return None
     return files
@@ -157,11 +190,14 @@ def artifact_identity(model: str) -> str | None:
     local = Path(model).expanduser()
     if model.lower().endswith(".gguf") and local.is_file():
         try:
-            stat = local.stat()
-            return (f"local-gguf:{local.resolve()}:{stat.st_dev}:{stat.st_ino}:"
-                    f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}")
+            resolved = local.resolve(strict=True)
         except OSError:
             return None
+        content = _content_digest(resolved)
+        if content is None:
+            return None
+        size, digest = content
+        return f"local-gguf:{resolved}:{size}:sha256:{digest}"
 
     repo, separator, filename = model.partition(":")
     repo_id = repo if separator and filename.lower().endswith(".gguf") else model

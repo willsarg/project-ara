@@ -5203,6 +5203,7 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: size_gb)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: size_gb)
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: free_gb)
 
 
@@ -5224,6 +5225,33 @@ def test_render_characterize_prefetch_uncached_transformers(make_console, store,
     assert "16000" in buf.getvalue()                  # characterize result shown
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 16000               # result persisted
+
+
+def test_render_characterize_cold_remote_gguf_downloads_then_pins(
+        make_console, store, monkeypatch):
+    state = {"artifact": None, "loaded": None}
+    bk = FakeBackend(_limits(), cached=False)
+    bk.calibrate_result = None
+
+    def download(model, *, progress=False):
+        bk.downloaded.append(model)
+        state["artifact"] = "hf-gguf:org/model@" + "a" * 40 + ":model-q4.gguf:digest"
+
+    def characterize(model, **_kwargs):
+        state["loaded"] = model
+        return {"safe_context": 4096, "decode_context": None, "points": []}
+
+    bk.download_calibration_model = download
+    bk.characterize = characterize
+    _wire_characterize_bk(monkeypatch, bk, backend="cpu")
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: state["artifact"])
+    monkeypatch.setattr(cli.staleness, "pinned_model_ref",
+                        lambda _model, artifact: "/cache/model-q4.gguf" if artifact else None)
+
+    c, _ = make_console()
+    assert cli.render_characterize(c, "org/model", engine="cpu") == 0
+    assert bk.downloaded == ["org/model"]
+    assert state["loaded"] == "/cache/model-q4.gguf"
 
 
 def test_render_characterize_prefetch_json_stdout_is_pure(store, monkeypatch, capsys):

@@ -134,6 +134,58 @@ def free_disk_gb() -> float | None:
         return None
 
 
+def _remote_gguf(repo_id: str, filename: str | None = None) -> tuple[str, int | None]:
+    """Select one loadable GGUF without downloading it."""
+    from huggingface_hub import HfApi
+
+    siblings = HfApi().model_info(repo_id, files_metadata=True).siblings or []
+    candidates = [item for item in siblings
+                  if item.rfilename.lower().endswith(".gguf")
+                  and not os.path.basename(item.rfilename).lower().startswith("mmproj")]
+    if filename is not None:
+        selected = next((item for item in candidates if item.rfilename == filename), None)
+    else:
+        selected = min(candidates, key=lambda item: item.size or 1 << 62) if candidates else None
+    if selected is None:
+        raise FileNotFoundError(f"no loadable .gguf in {repo_id}")
+    return selected.rfilename, selected.size
+
+
+def gguf_size_gb(model: str) -> float | None:
+    """Size of the one GGUF selected by a local path, exact selector, or bare repository."""
+    if is_local_gguf(model):
+        try:
+            return round(os.path.getsize(model) / 1e9, 3)
+        except OSError:
+            return None
+    try:
+        repo, separator, filename = model.partition(":")
+        _, size = _remote_gguf(repo, filename if separator else None)
+        return round(size / 1e9, 3) if size is not None else None
+    except Exception:
+        return None
+
+
+def download_gguf(model: str, *, progress: bool = False) -> str:
+    """Download only the selected GGUF and return its local immutable cache path."""
+    if is_local_gguf(model):
+        return os.path.realpath(os.path.expanduser(model))
+    if not (valid_model_id(model) or valid_repo_gguf_ref(model)):
+        raise ValueError(f"invalid GGUF model reference: {model!r}")
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
+
+    repo, separator, filename = model.partition(":")
+    if not separator:
+        filename, _ = _remote_gguf(repo)
+    was_disabled = are_progress_bars_disabled()
+    enable_progress_bars() if progress else disable_progress_bars()
+    try:
+        return hf_hub_download(repo, filename)
+    finally:
+        disable_progress_bars() if was_disabled else enable_progress_bars()
+
+
 def download(repo_id: str, *, progress: bool = False) -> None:
     """Download *repo_id* into the HF cache. Network + disk only, no engine load.
 

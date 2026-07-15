@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
-from ara import calibration, db, engine_env
+from ara import acquire, calibration, db, engine_env, staleness
 from ara.contracts import driver
 
 # The built-in worker script (ships in the ARA repo, runs in the isolated cpu env by path).
@@ -58,15 +58,14 @@ def safe_limits() -> dict:
 
 
 def calibration_model_cached(model: str = CALIBRATION_MODEL) -> bool:
-    """Always True: the worker downloads the smallest GGUF on demand during characterization,
-    so the profile flow never blocks on a separate fetch step."""
-    return True
+    """Whether the exact GGUF selection already has a locally identifiable artifact."""
+    return staleness.artifact_identity(model) is not None
 
 
 def download_calibration_model(model: str = CALIBRATION_MODEL, *,
                                progress: bool = False) -> None:
-    """No-op: GGUF acquisition is lazy inside the worker (it pulls only the smallest quant).
-    ``progress`` is accepted for interface symmetry but ignored."""
+    """Download only the selected GGUF before governed measurement pins it."""
+    acquire.download_gguf(model, progress=progress)
 
 
 def calibrate(model: str = CALIBRATION_MODEL) -> dict:

@@ -52,3 +52,22 @@ def test_cuda_models_describe_local_snapshot_directory(tmp_path):
     assert info.hf_id == str(snapshot)
     assert info.n_layers == 4 and info.max_context == 4096
     assert info.weights_gb > 0
+
+
+def test_native_weight_sizing_uses_only_confined_index_shards(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    (snapshot / "model.safetensors").rename(snapshot / "model-00001.safetensors")
+    with open(snapshot / "unreferenced.safetensors", "wb") as weights:
+        weights.truncate(50_000_000)
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"layer.0": "model-00001.safetensors"},
+    }))
+
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 10_000_000
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 10_000_000
+
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"layer.0": "../outside.safetensors"},
+    }))
+    assert mlx_models._snapshot_weight_bytes(str(snapshot)) == 0
+    assert cuda_models._snapshot_weight_bytes(str(snapshot)) == 0

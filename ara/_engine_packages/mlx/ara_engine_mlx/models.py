@@ -98,17 +98,45 @@ def _local_snapshot(hf_id: str) -> str | None:
 
 def _snapshot_weight_bytes(snapshot: str) -> int:
     """Weight bytes in a local snapshot, deduplicating resolved HF blob links."""
+    indexes = []
+    for dirpath, _, filenames in os.walk(snapshot):
+        indexes.extend(os.path.join(dirpath, filename) for filename in filenames
+                       if (filename.endswith(".safetensors.index.json")
+                           or filename.endswith(".bin.index.json")))
+    selected: list[str] | None = None
+    if indexes:
+        if len(indexes) != 1:
+            return 0
+        try:
+            with open(indexes[0], encoding="utf-8") as stream:
+                weight_map = json.load(stream).get("weight_map")
+            names = set(weight_map.values()) if isinstance(weight_map, dict) else set()
+            root = os.path.abspath(snapshot)
+            selected = []
+            for name in names:
+                if (not isinstance(name, str) or not name or "\\" in name
+                        or os.path.isabs(name)
+                        or any(part in ("", ".", "..") for part in name.split("/"))):
+                    return 0
+                candidate = os.path.abspath(os.path.join(root, *name.split("/")))
+                if os.path.commonpath((root, candidate)) != root or not os.path.isfile(candidate):
+                    return 0
+                selected.append(candidate)
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return 0
     seen: set[str] = set()
     total = 0
-    for dirpath, _, filenames in os.walk(snapshot):
-        for filename in filenames:
-            if not filename.lower().endswith(_WEIGHT_SUFFIXES):
-                continue
-            resolved = os.path.realpath(os.path.join(dirpath, filename))
-            if resolved in seen or not os.path.isfile(resolved):
-                continue
-            seen.add(resolved)
-            total += os.path.getsize(resolved)
+    paths = selected
+    if paths is None:
+        paths = [os.path.join(dirpath, filename)
+                 for dirpath, _, filenames in os.walk(snapshot)
+                 for filename in filenames if filename.lower().endswith(_WEIGHT_SUFFIXES)]
+    for path in paths:
+        resolved = os.path.realpath(path)
+        if resolved in seen or not os.path.isfile(resolved):
+            continue
+        seen.add(resolved)
+        total += os.path.getsize(resolved)
     return total
 
 

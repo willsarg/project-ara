@@ -167,21 +167,32 @@ def test_safe_limits_exact_wall_needs_no_calibration(monkeypatch):
     assert m["overhead_gb"] is None and m["calibrated_at"] is None
 
 
-def test_calibration_model_cached_is_always_true():
-    assert cpu.calibration_model_cached() is True   # worker downloads lazily
+def test_calibration_model_cached_uses_artifact_authority(monkeypatch):
+    monkeypatch.setattr(cpu.staleness, "artifact_identity", lambda model: None)
+    assert cpu.calibration_model_cached("org/model") is False
+    monkeypatch.setattr(cpu.staleness, "artifact_identity", lambda model: "artifact")
+    assert cpu.calibration_model_cached("org/model") is True
 
 
-def test_download_calibration_model_is_noop():
-    assert cpu.download_calibration_model() is None
+def test_download_calibration_model_acquires_selected_gguf(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cpu.acquire, "download_gguf",
+                        lambda model, *, progress=False: calls.append((model, progress)))
+    assert cpu.download_calibration_model("org/model", progress=True) is None
+    assert calls == [("org/model", True)]
 
 
-def test_download_calibration_model_accepts_progress_and_is_noop(monkeypatch):
-    """cpu download_calibration_model is a no-op regardless of progress flag.
+def test_download_calibration_model_passes_progress(monkeypatch):
+    """CPU GGUF acquisition preserves the caller's progress choice.
 
     Slug: 2026-06-24-download-progress
     """
+    calls = []
+    monkeypatch.setattr(cpu.acquire, "download_gguf",
+                        lambda model, *, progress=False: calls.append(progress))
     assert cpu.download_calibration_model(progress=True) is None
     assert cpu.download_calibration_model(progress=False) is None
+    assert calls == [True, False]
 
 
 def test_calibrate_attaches_characterization(monkeypatch):

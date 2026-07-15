@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from ara import staleness
 
 
@@ -272,6 +274,27 @@ def test_transformer_identity_refuses_incomplete_shard_index(tmp_path, monkeypat
     assert staleness.artifact_identity("org/model") is None
 
 
+@pytest.mark.parametrize("index_name", [
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+])
+@pytest.mark.parametrize("shard_name", ["../outside.safetensors", "/tmp/outside.safetensors"])
+def test_transformer_identity_refuses_shard_index_escape(
+        tmp_path, monkeypatch, index_name, shard_name):
+    _point_hub_at(tmp_path, monkeypatch)
+    snapshot = _revision_cache(
+        tmp_path, "a" * 40,
+        filename=("model-00001.safetensors" if "safetensors" in index_name
+                  else "pytorch_model-00001.bin"))
+    outside = snapshot.parent / "outside.safetensors"
+    outside.write_bytes(b"outside")
+    (snapshot / index_name).write_text(json.dumps({
+        "weight_map": {"layer.0": shard_name},
+    }))
+
+    assert staleness.artifact_identity("org/model") is None
+
+
 def test_transformer_identity_validates_duplicate_corrupt_and_complete_indexes(
         tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
@@ -334,6 +357,47 @@ def test_artifact_identity_tracks_local_gguf_stat(tmp_path):
     assert staleness.artifact_size_gb(str(model)) == 0.0
     model.write_bytes(b"changed")
     assert staleness.artifact_identity(str(model)) != first
+
+
+def test_artifact_identity_tracks_same_size_local_gguf_with_restored_mtime(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"original")
+    original = model.stat()
+    identity = staleness.artifact_identity(str(model))
+
+    model.write_bytes(b"mutated!")
+    os.utime(model, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert staleness.artifact_identity(str(model)) != identity
+
+
+def test_content_authority_refuses_read_races_and_digest_failures(tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+    real_stat = model.stat()
+    changed = type("Changed", (), {
+        field: getattr(real_stat, field)
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    })()
+    changed.st_size = real_stat.st_size + 1
+    calls = iter((real_stat, changed))
+    monkeypatch.setattr(Path, "stat", lambda _path: next(calls))
+    assert staleness._content_digest(model) is None
+
+    monkeypatch.undo()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    selected = snapshot / "model.safetensors"
+    selected.write_bytes(b"weights")
+    monkeypatch.setattr(staleness, "_content_digest", lambda _path: None)
+    assert staleness._file_descriptor(snapshot, selected) is None
+
+
+def test_local_gguf_identity_tolerates_resolve_race(tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.setattr(Path, "resolve", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
+    assert staleness.artifact_identity(str(model)) is None
 
 
 def test_artifact_matches_requires_exact_nonempty_authority(tmp_path):
