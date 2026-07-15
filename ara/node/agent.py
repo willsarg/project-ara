@@ -50,10 +50,13 @@ def _result_payload(result: dict) -> dict:
     ``{"error": ...}`` dict (the wiring convention), which becomes a ``failed`` result."""
     env = capabilities.environment()
     if isinstance(result, dict) and "error" in result:
-        error = str(result["error"])
+        raw_error = result["error"]
+        error = str(raw_error).strip() if raw_error is not None else ""
+        if not error:
+            error = "node worker failed without an error message"
         stderr = result.get("stderr")
-        if isinstance(stderr, str) and stderr:
-            error = f"{error}\nstderr: {stderr}"
+        if isinstance(stderr, str) and stderr.strip():
+            error = f"{error}\nstderr: {stderr.strip()}"
         return {"status": "failed", "error": error, "environment": env}
     return {"status": "done", "result": result, "environment": env}
 

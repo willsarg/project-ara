@@ -100,6 +100,13 @@ def test_result_payload_failed_when_worker_returns_error():
     assert "result" not in payload
 
 
+@pytest.mark.parametrize("error", ["", "   ", None])
+def test_result_payload_normalizes_missing_failure_reason(error):
+    payload = agent._result_payload({"error": error})
+    assert payload["status"] == "failed"
+    assert payload["error"] == "node worker failed without an error message"
+
+
 def test_result_payload_failed_retains_actionable_stderr():
     payload = agent._result_payload({"error": "boom", "stderr": "daemon detail"})
     assert payload["status"] == "failed"
@@ -107,7 +114,7 @@ def test_result_payload_failed_retains_actionable_stderr():
     assert "stderr" not in payload
 
 
-@pytest.mark.parametrize("stderr", ["", None, 7])
+@pytest.mark.parametrize("stderr", ["", "   ", None, 7])
 def test_result_payload_ignores_non_actionable_stderr(stderr):
     payload = agent._result_payload({"error": "boom", "stderr": stderr})
     assert "stderr" not in payload
