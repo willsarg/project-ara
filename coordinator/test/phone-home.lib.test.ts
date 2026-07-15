@@ -557,6 +557,15 @@ describe("work queue", () => {
     expect(work.acknowledge(jobId, agentId)).toBe("ok"); // idempotent after response loss
   });
 
+  it("does not claim queued work after the owning agent is revoked", async () => {
+    const agentId = await activeAgent("box-revoked-claim");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen" });
+    enroll.revoke(agentId);
+
+    expect(db.claimNextWorkForAgent(agentId)).toBeNull();
+    expect(db.getWorkById(jobId)).toMatchObject({ status: "queued", offered_at: null });
+  });
+
   it("accepts exactly the four coordinator job kinds", async () => {
     const agentId = await activeAgent("box-job-kinds");
     for (const kind of ["run", "characterize", "detect", "benchmark"]) {

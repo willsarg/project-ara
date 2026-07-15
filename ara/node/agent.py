@@ -230,22 +230,34 @@ def _next_spool_order() -> int:
     return _last_spool_order
 
 
-def _spool_result(job_id: str, payload: dict) -> None:
-    """Persist a finished result to disk BEFORE any network attempt, so a report failure or a crash
-    can never lose completed work (Rule #1). Same job → same outcome, so overwrite is fine."""
-    envelope = {
+def _new_result_envelope(job_id: str, payload: dict) -> dict:
+    return {
         "version": 2,
         "order": _next_spool_order(),
         "job_id": job_id,
         "payload": payload,
     }
-    _write_json_atomic(_spool_path(job_id), envelope)
+
+
+def _write_result_envelope(envelope: dict) -> None:
+    _write_json_atomic(_spool_path(envelope["job_id"]), envelope)
+
+
+def _spool_result(job_id: str, payload: dict) -> None:
+    """Persist a finished result to disk BEFORE any network attempt, so a report failure or a crash
+    can never lose completed work (Rule #1). Same job → same outcome, so overwrite is fine."""
+    _write_result_envelope(_new_result_envelope(job_id, payload))
 
 
 def _journal_job(job: dict) -> None:
     """Persist an offered job before acknowledging or executing it."""
     envelope = {"version": 1, "job": job}
     _write_json_atomic(_accepted_path(job["id"]), envelope)
+
+
+def _journal_completion(path: Path, job: dict, result_envelope: dict) -> None:
+    """Atomically convert an accepted job into durable completed work before result spooling."""
+    _write_json_atomic(path, {"version": 2, "job": job, "completion": result_envelope})
 
 
 _SAFE_LEGACY_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -340,6 +352,40 @@ def _next_accepted_job() -> tuple[dict, Path] | None:
             continue
         return job, path
     return None
+
+
+def _recover_completed_journals() -> None:
+    """Materialize completed accepted journals without ever invoking their runners again."""
+    directory = _accepted_dir()
+    if not directory.exists():
+        return
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # malformed pending entries are handled by _next_accepted_job
+        if not isinstance(value, dict) or set(value) != {"version", "job", "completion"}:
+            continue
+        if value["version"] != 2:
+            continue
+        job = value["job"]
+        completion = value["completion"]
+        if (not isinstance(job, dict) or set(job) != {"id", "kind", "args"}
+                or not isinstance(job["id"], str) or not job["id"]
+                or job["kind"] not in WIRE_JOB_KINDS or not isinstance(job["args"], dict)
+                or path != _accepted_path(job["id"])
+                or not isinstance(completion, dict)
+                or set(completion) != {"version", "order", "job_id", "payload"}
+                or completion["version"] != 2 or completion["job_id"] != job["id"]
+                or not isinstance(completion["order"], int)
+                or isinstance(completion["order"], bool) or completion["order"] < 1
+                or not isinstance(completion["payload"], dict)):
+            continue
+        _write_result_envelope(completion)
+        if not _retire_accepted(path):
+            raise _AcceptedJournalBlocked(
+                f"could not retire completed accepted-job journal {path.name}"
+            )
 
 
 def _try_ack(client: NodeClient, config, job_id: str) -> bool:
@@ -477,7 +523,16 @@ def _run_loop(config, *, client: NodeClient | None = None,
         health.heartbeat()
         health.status(f"polling for work (iteration {count})")
         try:
+            _recover_completed_journals()
             client = _flush_spool(client, config)  # deliver work left by a prior failure/crash
+        except _AcceptedJournalBlocked as exc:
+            health.status(str(exc))
+            sleep(reauth_backoff)
+            continue
+        except OSError as exc:
+            health.status(f"completed result recovery unavailable: {exc}")
+            sleep(reauth_backoff)
+            continue
         except _ReenrollmentRequired:
             health.status("re-enrollment required — session rejected while reporting a result")
             return count
@@ -546,9 +601,31 @@ def _run_loop(config, *, client: NodeClient | None = None,
         except Exception as exc:  # noqa: BLE001 — any run failure becomes a reported failed result
             payload = {"status": "failed", "error": f"{type(exc).__name__}: {exc}",
                        "environment": capabilities.environment()}
-        # Durable BEFORE the network: spool the finished result, then post. Only remove it once the
-        # server has acknowledged it — so a 401/5xx/crash retries later instead of losing the work.
-        _spool_result(job["id"], payload)
+        # First atomically turn the accepted journal into a completion WAL. If the separate result
+        # directory disappears after execution, restart recovery reports this payload without
+        # invoking the runner again.
+        result_envelope = _new_result_envelope(job["id"], payload)
+        completion_journaled = False
+        result_spooled = False
+        while not completion_journaled and not result_spooled:
+            try:
+                _journal_completion(accepted_path, job, result_envelope)
+                completion_journaled = True
+            except OSError:
+                try:
+                    _write_result_envelope(result_envelope)
+                    result_spooled = True
+                except OSError as exc:
+                    health.status(f"all completion storage unavailable after execution: {exc}")
+                    sleep(reauth_backoff)
+        if not result_spooled:
+            try:
+                _write_result_envelope(result_envelope)
+            except OSError as exc:
+                health.status(
+                    f"result spool unavailable after completion; preserving journal: {exc}")
+                sleep(reauth_backoff)
+                continue
         accepted_retired = _retire_accepted(accepted_path)
         try:
             delivered, client = _try_post(client, config, job["id"], payload)

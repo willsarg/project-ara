@@ -477,7 +477,9 @@ export function claimNextWorkForAgent(
       `UPDATE work SET status = 'offered', offered_at = datetime('now')
        WHERE id = (
          SELECT id FROM work
-         WHERE agent_id = ? AND (
+         WHERE agent_id = ? AND EXISTS (
+           SELECT 1 FROM agents WHERE agents.id = ? AND agents.status = 'active'
+         ) AND (
            status = 'queued'
            OR (status = 'offered' AND offered_at <= datetime('now', ?))
          )
@@ -491,7 +493,7 @@ export function claimNextWorkForAgent(
        RETURNING id, kind, args_json`,
     )
     .get(
-      agentId, `-${offerLeaseSeconds} seconds`,
+      agentId, agentId, `-${offerLeaseSeconds} seconds`,
       agentId, `-${offerLeaseSeconds} seconds`,
     ) as ClaimedWork | undefined) ?? null;
 }

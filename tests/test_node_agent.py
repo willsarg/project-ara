@@ -251,6 +251,8 @@ def test_ack_permanent_rejection_quarantines_accepted_job(tmp_path):
 
 @pytest.mark.parametrize("value", [
     [], {"version": 2, "job": {}},
+    {"version": 1, "job": {}, "completion": {}},
+    {"version": 2, "job": {}, "completion": {}},
     {"version": 1, "job": {"id": "", "kind": "run", "args": {}}},
     {"version": 1, "job": {"id": "j1", "kind": "serve", "args": {}}},
 ])
@@ -629,6 +631,108 @@ def test_failed_atomic_result_probe_blocks_ack_and_execution(tmp_path, monkeypat
 
     assert client.acked == []
     assert len(_accepted_files(tmp_path)) == 1
+
+
+def test_completed_journal_prevents_reexecution_when_results_disappear_during_runner(tmp_path):
+    results = tmp_path / "node" / "results"
+    executions = []
+    first = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
+
+    def runner(_kind, _args):
+        executions.append("first-completed")
+        results.rmdir()
+        results.write_text("storage replaced", encoding="utf-8")
+        return {"ok": True}
+
+    agent.run_loop(_cfg(), client=first, runner=runner, max_iterations=1,
+                   sleep=lambda _seconds: None)
+    assert first.acked == ["j1"] and first.posted == []
+    completion = json.loads(_accepted_files(tmp_path)[0].read_text(encoding="utf-8"))
+    assert completion["version"] == 2 and completion["completion"]["job_id"] == "j1"
+
+    results.unlink()
+    results.mkdir()
+    restarted = FakeClient([None])
+    agent.run_loop(
+        _cfg(), client=restarted,
+        runner=lambda _kind, _args: pytest.fail("completed work must not execute after restart"),
+        max_iterations=1, sleep=lambda _seconds: None,
+    )
+
+    assert executions == ["first-completed"]
+    assert restarted.posted and restarted.posted[0][0] == "j1"
+    assert _accepted_files(tmp_path) == [] and _spool_files(tmp_path) == []
+
+
+def test_completed_journal_recovery_blocks_when_journal_cannot_be_retired(
+        tmp_path, monkeypatch):
+    job = {"id": "j1", "kind": "run", "args": {}}
+    agent._journal_completion(
+        agent._accepted_path("j1"), job,
+        agent._new_result_envelope("j1", {"status": "done", "result": {"ok": True}}),
+    )
+    monkeypatch.setattr(agent, "_retire_accepted", lambda _path: False)
+    later = {"id": "later", "kind": "run", "args": {}}
+    client = FakeClient([later])
+
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _kind, _args: pytest.fail("recovery failure must block later work"),
+        max_iterations=1, sleep=lambda _seconds: None,
+    )
+
+    assert client.acked == [] and client._jobs == [later]
+    assert len(_spool_files(tmp_path)) == 1
+
+
+def test_completed_journal_recovery_io_failure_blocks_later_work(monkeypatch):
+    later = {"id": "later", "kind": "run", "args": {}}
+    client = FakeClient([later])
+    monkeypatch.setattr(
+        agent, "_recover_completed_journals",
+        lambda: (_ for _ in ()).throw(OSError("result storage unavailable")),
+    )
+
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _kind, _args: pytest.fail("recovery I/O failure must block later work"),
+        max_iterations=1, sleep=lambda _seconds: None,
+    )
+
+    assert client.acked == [] and client._jobs == [later]
+
+
+def test_simultaneous_completion_storage_failure_retries_without_reexecution(tmp_path, monkeypatch):
+    client = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
+    real_journal = agent._journal_completion
+    real_spool = agent._write_result_envelope
+    attempts = {"journal": 0, "spool": 0, "runner": 0}
+
+    def journal(*args):
+        attempts["journal"] += 1
+        if attempts["journal"] == 1:
+            raise OSError("accepted storage unavailable")
+        return real_journal(*args)
+
+    def spool(envelope):
+        attempts["spool"] += 1
+        if attempts["spool"] == 1:
+            raise OSError("result storage unavailable")
+        return real_spool(envelope)
+
+    monkeypatch.setattr(agent, "_journal_completion", journal)
+    monkeypatch.setattr(agent, "_write_result_envelope", spool)
+
+    def runner(_kind, _args):
+        attempts["runner"] += 1
+        return {"ok": True}
+
+    agent.run_loop(_cfg(), client=client, runner=runner, max_iterations=1,
+                   sleep=lambda _seconds: None)
+
+    assert attempts == {"journal": 2, "spool": 2, "runner": 1}
+    assert client.acked == ["j1"] and client.posted and client.posted[0][0] == "j1"
+    assert _accepted_files(tmp_path) == [] and _spool_files(tmp_path) == []
 
 
 def test_flush_replays_results_in_persisted_write_order(tmp_path):
