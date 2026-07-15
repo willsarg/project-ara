@@ -138,6 +138,17 @@ def test_artifact_identity_tracks_local_gguf_stat(tmp_path):
     assert staleness.artifact_identity(str(model)) != first
 
 
+def test_artifact_matches_requires_exact_nonempty_authority(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+    artifact_id = staleness.artifact_identity(str(model))
+    assert staleness.artifact_matches(str(model), artifact_id) is True
+    assert staleness.artifact_matches(str(model), None) is False
+    assert staleness.artifact_matches(str(model), "") is False
+    model.write_bytes(b"different weights")
+    assert staleness.artifact_matches(str(model), artifact_id) is False
+
+
 def test_artifact_identity_rejects_unknown_or_malformed_cache(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     assert staleness.artifact_identity(123) is None

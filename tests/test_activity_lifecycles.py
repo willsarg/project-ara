@@ -62,6 +62,7 @@ def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 

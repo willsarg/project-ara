@@ -2988,7 +2988,8 @@ def test_serve_mlx_passes_measured_slope_from_points(make_console, monkeypatch, 
 # --------------------------------------------------------------------------- #
 # ara run — governed one-shot inference (Spec 2026-06-23-capability-pipeline, Slice 4)
 # --------------------------------------------------------------------------- #
-_CHAR = {"model_id": "org/m", "safe_context": 8192, "decode_context": None}
+_CHAR = {"model_id": "org/m", "safe_context": 8192, "decode_context": None,
+         "artifact_id": "artifact:test"}
 
 
 def _ok_generate(*a, **k):
@@ -3000,8 +3001,11 @@ def _wire_run(monkeypatch, *, engine_ok=True, generate=_ok_generate, characteriz
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "llama.cpp"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    if characterization is not None and "artifact_id" not in characterization:
+        characterization = {**characterization, "artifact_id": "artifact:test"}
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: characterization)
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
     bk = types.SimpleNamespace()
     if generate is not None:
@@ -3062,6 +3066,33 @@ def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
     assert cli.render_run(c, "org/m", prompt="meaning?") == 0
     assert "the answer is 42" in buf.getvalue()
     assert seen["max_context"] == 8192 and seen["prompt"] == "meaning?"   # governed ceiling
+
+
+def test_run_refuses_missing_or_changed_artifact_authority(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization={**_CHAR, "artifact_id": None})
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "not bound to an exact artifact" in buf.getvalue()
+
+    _wire_run(monkeypatch, characterization=_CHAR)
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "differs from its measured ceiling" in buf.getvalue()
+
+
+def test_run_refuses_result_when_artifact_changes_during_generation(
+        make_console, monkeypatch):
+    generated = []
+    _wire_run(monkeypatch, characterization=_CHAR,
+              generate=lambda *_a, **_k: generated.append(True) or {"completion": "unsafe"})
+    matches = iter((True, False))
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: next(matches))
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert generated == [True]
+    assert "changed during the run" in buf.getvalue()
+    assert "unsafe" not in buf.getvalue()
 
 
 def test_run_confirm_declined_skips(make_console, monkeypatch):
@@ -3170,11 +3201,14 @@ def test_run_unknown_engine(make_console):
 # not just the detected engine. Spec 2026-06-23-capability-pipeline.
 def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, isatty=False):
     """chars: {engine_key: characterization|None}; supports: {backend: bool} (has .generate)."""
+    chars = {key: ({**row, "artifact_id": row.get("artifact_id", "artifact:test")}
+                   if row is not None else None) for key, row in chars.items()}
     monkeypatch.setattr(cli.detect, "backend_name", lambda: detected)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, f"{b} pkg"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: chars.get(e))
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
 
     def backend(b=None):
         bk = types.SimpleNamespace()
@@ -4314,6 +4348,26 @@ def test_model_detail_looks_up_local_evidence_by_absolute_key(
     assert set(seen) == {str(model.resolve())}
 
 
+def test_model_detail_marks_replaced_local_artifact_ceiling_stale(
+        monkeypatch, capsys, tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"original")
+    old_artifact = "local-gguf:old"
+    model.write_bytes(b"replacement weights")
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    monkeypatch.setattr(cli.catalog, "describe", lambda _mid: _meta())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, engine, _model: {
+                            "safe_context": 8000, "decode_context": None, "config": {},
+                            "artifact_id": old_artifact,
+                        } if engine == "cpu" else None)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_model_detail(c, str(model), as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
+
+
 def test_model_detail_verbose_discloses_measurement_time(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
@@ -5408,6 +5462,29 @@ def test_render_models_json_includes_decode_context(monkeypatch, capsys, store):
     assert data[0].get("decode_context") == 20000
 
 
+def test_render_models_marks_missing_or_mismatched_artifact_authority_stale(
+        make_console, monkeypatch, capsys, store):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models",
+                        lambda con: [{"model_id": "org/A", "modality": "text"}])
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.db, "list_characterizations",
+                        lambda con, mk, engine: [{
+                            "model_id": "org/A", "safe_context": 16000,
+                            "decode_context": None, "config": {},
+                            "artifact_id": None,
+                        }] if engine == "cpu" else [])
+
+    c, buf = make_console()
+    cli.render_models(c)
+    assert "stale — re-characterize" in buf.getvalue()
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    assert json.loads(capsys.readouterr().out)[0]["stale_ceiling"] is True
+
+
 def test_model_detail_per_engine_decode_gloss(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
@@ -6310,9 +6387,11 @@ def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: {
-                            "safe_context": 8000,
-                            "config": {"kv_quant": "q4_0", "flash_attn": False}
-                        })
+                                "safe_context": 8000,
+                                "config": {"kv_quant": "q4_0", "flash_attn": False},
+                                "artifact_id": "artifact:test",
+                            })
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
     def gen(model, prompt, *, max_context, max_tokens, flash_attn=True, kv_quant="f16"):
@@ -6368,8 +6447,10 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: {
-                            "safe_context": 8000, "config": {"kv_quant": "q4_0"}
-                        })
+                                "safe_context": 8000, "config": {"kv_quant": "q4_0"},
+                                "artifact_id": "artifact:test",
+                            })
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
     def gen(model, prompt, *, max_context, max_tokens, kv_quant="f16"):  # no flash_attn

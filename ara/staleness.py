@@ -104,6 +104,12 @@ def artifact_identity(model: str) -> str | None:
     return f"hf:{repo_id}@{revision}"
 
 
+def artifact_matches(model: str, expected_artifact_id: str | None) -> bool:
+    """Whether *model* still resolves to the exact artifact that authorized stored evidence."""
+    return (isinstance(expected_artifact_id, str) and bool(expected_artifact_id)
+            and artifact_identity(model) == expected_artifact_id)
+
+
 def artifact_size_gb(model: str) -> float | None:
     """Exact selected GGUF size for cataloging a quant variant; otherwise unknown."""
     if not isinstance(model, str):

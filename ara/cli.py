@@ -1012,7 +1012,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     evidence_model = scoring.durable_model_id(model_id)
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
-    per_engine = {}              # engine_key -> (safe_context, decode_context, measured_at, config)
+    per_engine = {}  # engine_key -> (safe_context, decode_context, measured_at, config, artifact_id)
     with ExitStack() as stack:
         scratch = sqlite3.connect(":memory:")
         scratch.row_factory = sqlite3.Row
@@ -1024,22 +1024,23 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
             row = db.get_characterization(con, mk, key, evidence_model)
             if row is not None:
                 per_engine[key] = (row["safe_context"], row.get("decode_context"),
-                                   row.get("measured_at"), row.get("config"))
+                                   row.get("measured_at"), row.get("config"),
+                                   row.get("artifact_id"))
     # Best (largest) ceiling, carrying its decode_context AND measured_at so the top-level scalars
     # and the staleness flag all describe the SAME engine — not independent max() picks.
-    best_triple = max(((sc, dc, at) for (sc, dc, at, _) in per_engine.values() if sc is not None),
-                      key=lambda t: t[0], default=None)
-    best = best_triple[0] if best_triple else None
-    best_decode = best_triple[1] if best_triple else None
+    best_row = max((row for row in per_engine.values() if row[0] is not None),
+                   key=lambda row: row[0], default=None)
+    best = best_row[0] if best_row else None
+    best_decode = best_row[1] if best_row else None
     # Rule #3: a stored ceiling whose cache changed since it was measured isn't authoritative —
     # flag it here just as serve/run do, so no command shows a stale number unqualified.
-    best_stale = (best_triple is not None
-                  and staleness.ceiling_is_stale(evidence_model, best_triple[2]))
+    best_stale = (best_row is not None
+                  and not staleness.artifact_matches(evidence_model, best_row[4]))
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
                           "decode_context": best_decode, "stale_ceiling": best_stale,
-                          "engines": {k: sc for k, (sc, _, _, _) in per_engine.items()},
-                          "engine_configs": {k: cfg for k, (_, _, _, cfg) in per_engine.items()},
+                          "engines": {k: sc for k, (sc, _, _, _, _) in per_engine.items()},
+                          "engine_configs": {k: cfg for k, (_, _, _, cfg, _) in per_engine.items()},
                           "characterized": bool(per_engine)}, indent=2))
         return 0
     kvh, hd = meta["kv_heads"], meta["head_dim"]
@@ -1051,11 +1052,11 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     c.emit(c.field("max context", str(meta["max_context"]) if meta["max_context"] else "?"))
     c.emit(c.field("quant", meta["quant"] or "none"))
     if per_engine:                        # one ceiling line per engine that measured it
-        for key, (sc, dc, at, config) in per_engine.items():
+        for key, (sc, dc, at, config, artifact_id) in per_engine.items():
             ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
             if sc and dc and dc > sc:
                 ceiling_str += f"  · ~{dc} stream-only (est.)"
-            if sc and staleness.ceiling_is_stale(evidence_model, at):
+            if sc and not staleness.artifact_matches(evidence_model, artifact_id):
                 ceiling_str += "  · ⚠ stale — re-characterize"
             if config is None:
                 ceiling_str += "  · settings unknown — re-characterize"
@@ -1505,15 +1506,16 @@ def render_search(c: Console, query: str, *, as_json: bool = False) -> int:
     return 0
 
 
-def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None, dict | None]]:
-    """Best safe-context per model with its engine, decode ceiling, and measurement config.
+def _best_ceilings(
+        con) -> dict[str, tuple[int | None, str, int | None, dict | None, str | None]]:
+    """Best safe-context per model with engine, decode/config, and artifact authority.
 
     A model can be characterized under several engines on one machine (GPU + CPU); ``ara models show``
     shows the largest ceiling and which engine reached it. A real ceiling beats a null
     (measured-but-unfit) one; ties favour the detected default engine (considered first)."""
     mk = profile.machine_key()
     default = engines.for_backend(detect.backend_name())
-    best: dict[str, tuple[int | None, str, int | None, dict | None]] = {}
+    best: dict[str, tuple[int | None, str, int | None, dict | None, str | None]] = {}
     for key in dict.fromkeys([default, *engines.ENGINES]):
         if key is None:
             continue
@@ -1521,7 +1523,8 @@ def _best_ceilings(con) -> dict[str, tuple[int | None, str, int | None, dict | N
             mid, sc = r["model_id"], r["safe_context"]
             cur = best.get(mid)
             if cur is None or (sc is not None and (cur[0] is None or sc > cur[0])):
-                best[mid] = (sc, key, r.get("decode_context"), r.get("config"))
+                best[mid] = (sc, key, r.get("decode_context"), r.get("config"),
+                             r.get("artifact_id"))
     return best
 
 
@@ -1536,7 +1539,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     finally:
         cache_con.close()
 
-    best: dict[str, tuple[int | None, str, int | None, dict | None]] = {}
+    best: dict[str, tuple[int | None, str, int | None, dict | None, str | None]] = {}
     if db._db_path().is_file():
         with db.connected_readonly() as stored:
             best = _best_ceilings(stored)
@@ -1548,6 +1551,9 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
               "engine": best[m["model_id"]][1] if m["model_id"] in best else None,
               "decode_context": best[m["model_id"]][2] if m["model_id"] in best else None,
               "config": best[m["model_id"]][3] if m["model_id"] in best else None,
+              "stale_ceiling": (not staleness.artifact_matches(
+                  m["model_id"], best[m["model_id"]][4])
+                  if m["model_id"] in best and best[m["model_id"]][0] is not None else False),
               "characterized": m["model_id"] in best} for m in models], indent=2))
         return
 
@@ -1556,7 +1562,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     for m in models:
         mid = m["model_id"]
         if mid in best:                           # measured under at least one engine
-            ceiling, ekey, decode, config = best[mid]
+            ceiling, ekey, decode, config, artifact_id = best[mid]
             tail = f"~{ceiling} tokens ({ekey})" if ceiling else "no safe ceiling"
             if ceiling and decode and decode > ceiling:
                 tail = f"~{ceiling} tokens ({ekey}) · ~{decode} stream-only (est.)"
@@ -1564,6 +1570,8 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
                 tail += " · settings unknown"
             elif config:
                 tail += " · " + _measurement_config_text(config)
+            if ceiling and not staleness.artifact_matches(mid, artifact_id):
+                tail += " · ⚠ stale — re-characterize"
             role = "good" if ceiling else "dim"   # measured-but-unfit mirrors profile's '—'
         else:
             tail, role = "not characterized", "dim"
@@ -2145,6 +2153,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 return err(msg)
             engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
+            characterized_artifact_id = row.get("artifact_id")
         else:
             # No --engine: scan every engine this model is characterized under on this machine and pick
             # the largest measured ceiling whose backend can actually run (has `generate`). A model
@@ -2213,7 +2222,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                            f"that engine yet")
             # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
             engine_key = max(runnable, key=lambda k: runnable[k][0])
-            safe, backend, _, ceiling_measured_at, _ = runnable[engine_key]
+            safe, backend, _, ceiling_measured_at, selected_row = runnable[engine_key]
+            characterized_artifact_id = selected_row.get("artifact_id")
 
     stale_ceiling = _stale_ceiling_note(
         c, evidence_model, ceiling_measured_at, as_json=as_json)
@@ -2232,6 +2242,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     hw_err = _weight_quant_hw_error(bk, backend, weight_quant)
     if hw_err is not None:
         return err(hw_err)
+    if not characterized_artifact_id:
+        return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
+                   f"re-run: ara characterize {model}")
 
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
     # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
@@ -2247,7 +2260,12 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
         with activity.track("running", model):
+            if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
+                return err(f"the artifact for {model} differs from its measured ceiling — "
+                           f"re-run: ara characterize {model}")
             result = bk.generate(model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+            if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
+                return err(f"the artifact for {model} changed during the run — no result shown")
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard
         return err(f"run failed: {exc}")
     if not isinstance(result, dict):
