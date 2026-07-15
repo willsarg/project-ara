@@ -509,10 +509,14 @@ export function acknowledgeWorkForAgent(id: string, agentId: number): WorkAckRes
        AND EXISTS (SELECT 1 FROM agents WHERE agents.id = ? AND agents.status = 'active')`,
   ).run(id, agentId, agentId);
   if (changed.changes === 1) return "ok";
-  const row = db.prepare("SELECT agent_id, status FROM work WHERE id = ?").get(id) as
-    | { agent_id: number; status: string }
+  const row = db.prepare(
+    `SELECT work.agent_id, work.status, agents.status AS agent_status
+     FROM work JOIN agents ON agents.id = work.agent_id WHERE work.id = ?`,
+  ).get(id) as
+    | { agent_id: number; status: string; agent_status: string }
     | undefined;
   if (!row || row.agent_id !== agentId) return "unknown";
+  if (row.agent_status !== "active") return "conflict";
   return row.status === "dispatched" ? "ok" : "conflict";
 }
 
@@ -562,9 +566,13 @@ export function recordWorkResult(
     )
     .run({ id, agent_id: agentId, ...p });
   if (changed.changes === 1) return "recorded";
-  const row = db.prepare("SELECT agent_id, status FROM work WHERE id = ?").get(id) as
-    | { agent_id: number; status: string }
+  const row = db.prepare(
+    `SELECT work.agent_id, work.status, agents.status AS agent_status
+     FROM work JOIN agents ON agents.id = work.agent_id WHERE work.id = ?`,
+  ).get(id) as
+    | { agent_id: number; status: string; agent_status: string }
     | undefined;
   if (!row || row.agent_id !== agentId) return "unknown";
+  if (row.agent_status !== "active") return "conflict";
   return row.status === "done" || row.status === "failed" ? "already_recorded" : "conflict";
 }

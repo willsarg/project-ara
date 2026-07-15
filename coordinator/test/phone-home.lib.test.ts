@@ -577,7 +577,12 @@ describe("work queue", () => {
     const resultId = work.enqueue(resultAgent, "run", {});
     expect(db.claimNextWorkForAgent(resultAgent)).not.toBeNull();
     expect(db.acknowledgeWorkForAgent(resultId, resultAgent)).toBe("ok");
+    expect(db.recordWorkResult(resultId, resultAgent, {
+      status: "done", result_json: "{}", error: null, measurement_json: null,
+      result_environment_json: JSON.stringify(VALID_ENV),
+    })).toBe("recorded");
     enroll.revoke(resultAgent);
+    expect(db.acknowledgeWorkForAgent(resultId, resultAgent)).toBe("conflict");
     expect(db.recordWorkResult(resultId, resultAgent, {
       status: "done", result_json: "{}", error: null, measurement_json: null,
       result_environment_json: JSON.stringify(VALID_ENV),

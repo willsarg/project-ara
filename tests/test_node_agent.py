@@ -253,6 +253,7 @@ def test_ack_permanent_rejection_quarantines_accepted_job(tmp_path):
     [], {"version": 2, "job": {}},
     {"version": 1, "job": {}, "completion": {}},
     {"version": 2, "job": {}, "completion": {}},
+    {"version": 2, "order": 0, "job": {"id": "j1", "kind": "run", "args": {}}},
     {"version": 1, "job": {"id": "", "kind": "run", "args": {}}},
     {"version": 1, "job": {"id": "j1", "kind": "serve", "args": {}}},
 ])
@@ -312,6 +313,30 @@ def test_accepted_recovery_skips_job_with_durable_completion(tmp_path):
 
     assert agent._next_accepted_job() is None
     assert _accepted_files(tmp_path) == []
+
+
+def test_accepted_recovery_uses_durable_acceptance_order(monkeypatch):
+    monkeypatch.setattr(agent, "_last_spool_order", 0)
+    monkeypatch.setattr(agent.time, "time_ns", lambda: 1_000)
+    agent._journal_job({"id": "job-0", "kind": "run", "args": {}})
+    agent._journal_job({"id": "job-1", "kind": "run", "args": {}})
+
+    job, _path = agent._next_accepted_job()
+
+    assert job["id"] == "job-0"
+
+
+def test_accepted_recovery_blocks_tied_legacy_order(tmp_path):
+    for job_id in ("legacy-a", "legacy-b"):
+        path = agent._accepted_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1, "job": {"id": job_id, "kind": "run", "args": {}},
+        }), encoding="utf-8")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+
+    with pytest.raises(agent._AcceptedJournalBlocked, match="ambiguous"):
+        agent._next_accepted_job()
 
 
 def test_worker_error_dict_is_reported_failed():
@@ -678,6 +703,7 @@ def test_persisted_order_ignores_unusable_state_and_reads_completion_wal(tmp_pat
     (results / "link.json").symlink_to(tmp_path / "missing")
     (results / "broken.json").write_text("{broken", encoding="utf-8")
     (results / "list.json").write_text("[]", encoding="utf-8")
+    (results / "no-order.json").write_text("{}", encoding="utf-8")
     job = {"id": "j1", "kind": "run", "args": {}}
     completion = {"version": 2, "order": 9_000, "job_id": "j1",
                   "payload": {"status": "done"}}

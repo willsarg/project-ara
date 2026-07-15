@@ -272,7 +272,7 @@ def _spool_result(job_id: str, payload: dict) -> None:
 
 def _journal_job(job: dict) -> None:
     """Persist an offered job before acknowledging or executing it."""
-    envelope = {"version": 1, "job": job}
+    envelope = {"version": 2, "order": _next_spool_order(), "job": job}
     _write_json_atomic(_accepted_path(job["id"]), envelope)
 
 
@@ -336,18 +336,24 @@ def _retire_accepted(path: Path) -> bool:
             return False
 
 
-def _read_accepted_job(path: Path) -> dict:
+def _read_accepted_job(path: Path) -> tuple[dict, int | None]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) != {"version", "job"} or value["version"] != 1:
+    legacy = isinstance(value, dict) and set(value) == {"version", "job"} and value["version"] == 1
+    current = (isinstance(value, dict) and set(value) == {"version", "order", "job"}
+               and value["version"] == 2)
+    if not legacy and not current:
         raise ValueError("invalid accepted-job envelope")
     job = value["job"]
+    order = value.get("order")
+    if current and (not isinstance(order, int) or isinstance(order, bool) or order < 1):
+        raise ValueError("invalid accepted-job order")
     if (not isinstance(job, dict) or set(job) != {"id", "kind", "args"}
             or not isinstance(job["id"], str) or not job["id"]
             or job["kind"] not in WIRE_JOB_KINDS
             or not isinstance(job["args"], dict)
             or path != _accepted_path(job["id"])):
         raise ValueError("invalid accepted job")
-    return job
+    return job, order
 
 
 def _next_accepted_job() -> tuple[dict, Path] | None:
@@ -355,11 +361,14 @@ def _next_accepted_job() -> tuple[dict, Path] | None:
     directory = _accepted_dir()
     if not directory.exists():
         return None
-    for path in sorted(directory.glob("*.json")):
+    entries = []
+    order_counts: dict[int, int] = {}
+    for path in directory.glob("*.json"):
         try:
+            modified_ns = path.lstat().st_mtime_ns
             if path.is_symlink():
                 raise ValueError("accepted-job path is a symlink")
-            job = _read_accepted_job(path)
+            job, order = _read_accepted_job(path)
         except (OSError, ValueError):
             try:
                 _quarantine_spool(path)
@@ -368,6 +377,14 @@ def _next_accepted_job() -> tuple[dict, Path] | None:
                     f"could not quarantine accepted-job journal {path.name}: {exc}"
                 ) from exc
             continue
+        order_key = order if order is not None else modified_ns
+        order_counts[order_key] = order_counts.get(order_key, 0) + 1
+        entries.append((order_key, path.name, job, path))
+    for order_key, _name, job, path in sorted(entries):
+        if order_counts[order_key] > 1:
+            raise _AcceptedJournalBlocked(
+                "accepted-job order is ambiguous; preserving evidence and blocking work"
+            )
         if _spool_path(job["id"]).exists():
             path.unlink(missing_ok=True)  # execution completed before the earlier interruption
             continue
