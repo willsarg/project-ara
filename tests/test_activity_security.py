@@ -29,6 +29,13 @@ def _fake_kernel32(**calls):
     return types.SimpleNamespace(**calls)
 
 
+def _supply_posix_open_flags(monkeypatch):
+    """Let mocked POSIX descriptor branches evaluate on Windows."""
+    monkeypatch.setattr(activity.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(activity.os, "O_NONBLOCK", 0, raising=False)
+    monkeypatch.setattr(activity.os, "O_DIRECTORY", 0, raising=False)
+
+
 def test_low_level_windows_create_file_success_and_failure(monkeypatch, tmp_path):
     import ctypes
 
@@ -100,6 +107,80 @@ def test_platform_mode_and_guard_fd_branches(monkeypatch, tmp_path):
     assert activity._platform_mode() is None
     assert activity._DirectoryGuard(tmp_path, "windows", 1).dir_fd is None
     assert activity._DirectoryGuard(tmp_path, "posix", 2).dir_fd == 2
+
+
+def test_posix_guard_primitives_are_portably_simulated(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
+    closes = []
+    opens = []
+    replacements = []
+    mkdirs = []
+    monkeypatch.setattr(activity.os, "close", lambda value: closes.append(value))
+    monkeypatch.setattr(
+        activity.os, "open",
+        lambda path, flags, *args, **kwargs: opens.append((path, flags, args, kwargs)) or 72,
+    )
+    monkeypatch.setattr(activity.os, "replace", lambda *args, **kwargs: replacements.append(
+        (args, kwargs)))
+    monkeypatch.setattr(activity, "_platform_mode", lambda: "posix")
+    root_path = tmp_path / "activity"
+    root_path.mkdir()
+
+    root = activity._open_directory(root_path, create=False)
+    assert root == activity._DirectoryGuard(root_path, "posix", 72)
+    root.close()
+    assert closes == [72]
+
+    monkeypatch.setattr(
+        activity.os, "mkdir",
+        lambda *args, **kwargs: mkdirs.append((args, kwargs)),
+    )
+    serving = activity._open_serving(root, create=True)
+    assert serving == activity._DirectoryGuard(root_path / "serving", "posix", 72)
+    assert mkdirs
+
+    monkeypatch.setattr(
+        activity.os, "mkdir",
+        lambda *_a, **_k: (_ for _ in ()).throw(FileExistsError()),
+    )
+    assert activity._open_serving(root, create=True).mode == "posix"
+    assert activity._open_serving(root, create=False).mode == "posix"
+
+    activity._replace_record("source", "target", guard=root)
+    assert replacements == [(('source', 'target'), {"src_dir_fd": 72, "dst_dir_fd": 72})]
+    assert opens
+
+
+def test_posix_record_listing_and_missing_tracker_cleanup_are_simulated(
+        monkeypatch, tmp_path):
+    class Entry:
+        def __init__(self, name, regular=True):
+            self.name = name
+            self.regular = regular
+
+        def is_file(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            return self.regular
+
+    class Entries:
+        def __enter__(self):
+            return iter((Entry("b.json"), Entry("a.json"), Entry("ignore.tmp"),
+                         Entry("link.json", regular=False)))
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(activity.os, "scandir", lambda _fd: Entries())
+    guard = activity._DirectoryGuard(tmp_path, "posix", 71)
+    assert activity._record_names(tmp_path, guard=guard) == ["a.json", "b.json"]
+
+    tracker = activity.track("running")
+    tracker._guard = guard
+    tracker._path = tmp_path / "missing.json"
+    monkeypatch.setattr(
+        activity.os, "unlink", lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(activity, "_close_guards", lambda guards, **_kwargs: None)
+    assert tracker.__exit__(None, None, None) is False
 
 
 def test_windows_directory_handle_uses_no_delete_share_and_no_reparse(monkeypatch, tmp_path):
@@ -389,6 +470,7 @@ def test_windows_record_conversion_close_failure_notes_original(monkeypatch, tmp
 
 
 def test_record_fstat_oserror_closes_and_suppresses(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     record = root / "record.json"
@@ -406,6 +488,7 @@ def test_record_fstat_oserror_closes_and_suppresses(monkeypatch, tmp_path):
 
 
 def test_record_fstat_close_failure_notes_baseexception(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     record = root / "record.json"
@@ -429,6 +512,7 @@ def test_record_fstat_close_failure_notes_baseexception(monkeypatch, tmp_path):
 
 
 def test_missing_record_open_is_suppressed(tmp_path, monkeypatch):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     guard = activity._DirectoryGuard(root, "posix", 71)
@@ -500,6 +584,7 @@ def test_posix_record_open_is_nonblocking_and_fifo_is_suppressed(tmp_path, monke
 
 
 def test_reader_fdopen_baseexception_closes_descriptor(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     record = root / "record.json"
@@ -517,6 +602,7 @@ def test_reader_fdopen_baseexception_closes_descriptor(monkeypatch, tmp_path):
 
 
 def test_reader_fdopen_close_failure_notes_original(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     record = root / "record.json"
@@ -651,6 +737,7 @@ def test_reader_stream_close_failure_propagates_without_body_error(tmp_path, mon
 
 
 def test_reader_fstat_baseexception_closes_descriptor(monkeypatch, tmp_path):
+    _supply_posix_open_flags(monkeypatch)
     root = tmp_path / "activity"
     root.mkdir()
     record = root / "record.json"

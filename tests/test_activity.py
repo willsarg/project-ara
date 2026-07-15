@@ -587,10 +587,13 @@ def test_secure_cleanup_tolerates_temp_removed_during_failed_replace(
     real_unlink = activity.os.unlink
 
     def remove_then_fail(source, _target, **kwargs):
-        if "src_dir_fd" in kwargs:
-            real_unlink(source, dir_fd=kwargs["src_dir_fd"])
-        else:
-            Path(source).unlink()
+        try:
+            if "src_dir_fd" in kwargs:
+                real_unlink(source, dir_fd=kwargs["src_dir_fd"])
+            else:
+                Path(source).unlink()
+        except FileNotFoundError:
+            pass
         raise PermissionError("replace denied")
 
     monkeypatch.setattr(activity.os, "replace", remove_then_fail)

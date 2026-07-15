@@ -167,6 +167,40 @@ def test_agent_lease_classifies_windows_lock_contention(monkeypatch):
             pytest.fail("busy lease must not enter")
 
 
+def test_agent_lease_uses_posix_locking_and_optional_permissions(monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LOCK_EX=1, LOCK_NB=2, LOCK_UN=4,
+        flock=lambda fd, operation: calls.append((fd, operation)),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(agent, "_is_windows", lambda: False)
+    monkeypatch.setattr(agent.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(agent.os, "fchmod", lambda fd, mode: calls.append((fd, mode)),
+                        raising=False)
+    with agent._agent_lease():
+        calls.append("inside")
+    assert any(call == "inside" for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == fake.LOCK_EX | fake.LOCK_NB
+               for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == fake.LOCK_UN for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == 0o600 for call in calls)
+
+
+def test_agent_lease_classifies_posix_lock_contention(monkeypatch):
+    fake = types.SimpleNamespace(
+        LOCK_EX=1, LOCK_NB=2, LOCK_UN=4,
+        flock=lambda _fd, operation: (
+            (_ for _ in ()).throw(OSError("busy"))
+            if operation == 3 else None),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(agent, "_is_windows", lambda: False)
+    with pytest.raises(agent.NodeAgentBusy):
+        with agent._agent_lease():
+            pytest.fail("busy lease must not enter")
+
+
 def test_agent_lease_supports_platform_without_optional_open_features(monkeypatch):
     monkeypatch.delattr(agent.os, "O_NOFOLLOW", raising=False)
     monkeypatch.delattr(agent.os, "fchmod", raising=False)
@@ -1226,6 +1260,18 @@ def test_spool_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(agent.os, "name", "nt")
     monkeypatch.setattr(agent.os, "open", lambda *_a: pytest.fail("must not open a directory"))
     assert agent._fsync_parent(tmp_path / "result.json") is None
+
+
+def test_spool_parent_sync_uses_posix_directory_descriptor(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent.os, "name", "posix")
+    monkeypatch.setattr(agent.os, "open", lambda path, flags: calls.append(
+        ("open", path, flags)) or 71)
+    monkeypatch.setattr(agent.os, "fsync", lambda fd: calls.append(("fsync", fd)))
+    monkeypatch.setattr(agent.os, "close", lambda fd: calls.append(("close", fd)))
+    target = tmp_path / "result.json"
+    assert agent._fsync_parent(target) is None
+    assert calls == [("open", target.parent, os.O_RDONLY), ("fsync", 71), ("close", 71)]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")

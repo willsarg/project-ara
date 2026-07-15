@@ -210,6 +210,18 @@ def test_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
     assert config._fsync_parent(tmp_path / "config.json") is None
 
 
+def test_parent_sync_uses_posix_directory_descriptor(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(config.os, "name", "posix")
+    monkeypatch.setattr(config.os, "open", lambda path, flags: calls.append(
+        ("open", path, flags)) or 71)
+    monkeypatch.setattr(config.os, "fsync", lambda fd: calls.append(("fsync", fd)))
+    monkeypatch.setattr(config.os, "close", lambda fd: calls.append(("close", fd)))
+    target = tmp_path / "config.json"
+    assert config._fsync_parent(target) is None
+    assert calls == [("open", target.parent, os.O_RDONLY), ("fsync", 71), ("close", 71)]
+
+
 def test_clear_pending_is_idempotent_when_absent():
     assert config.clear_pending() is None
 
@@ -238,3 +250,44 @@ def test_credential_lock_uses_windows_locking_protocol(tmp_path, monkeypatch):
     assert calls[0][1:] == (fake.LK_LOCK, 1)
     assert calls[1] == "inside"
     assert calls[2][1:] == (fake.LK_UNLCK, 1)
+
+
+def test_credential_lock_uses_posix_locking_protocol(tmp_path, monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LOCK_EX=1, LOCK_UN=2,
+        flock=lambda fd, operation: calls.append((fd, operation)),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(config, "_is_windows", lambda: False)
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
+    with config._credential_lock():
+        calls.append("inside")
+    assert calls[0][1] == fake.LOCK_EX
+    assert calls[1] == "inside"
+    assert calls[2][1] == fake.LOCK_UN
+
+
+def test_atomic_config_write_uses_optional_fchmod(monkeypatch):
+    calls = []
+    monkeypatch.setattr(config.os, "fchmod", lambda fd, mode: calls.append((fd, mode)),
+                        raising=False)
+    config.save(config.NodeConfig(server_url="https://c.example"))
+    assert calls and calls[0][1] == 0o600
+
+
+def test_config_symlink_guards_are_platform_independent(monkeypatch):
+    config_path = config._config_path()
+    identity_path = config._identity_path()
+    real_is_symlink = type(config_path).is_symlink
+
+    def is_symlink(path):
+        return path in {config_path, identity_path} or real_is_symlink(path)
+
+    monkeypatch.setattr(type(config_path), "is_symlink", is_symlink)
+    with pytest.raises(OSError, match="symlink"):
+        config.save(config.NodeConfig(server_url="https://c.example"))
+    identity_path.parent.mkdir(parents=True, exist_ok=True)
+    identity_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="symlink"):
+        config.node_identity()

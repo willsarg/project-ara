@@ -95,6 +95,40 @@ def test_enrollment_lease_classifies_windows_contention(monkeypatch):
             pytest.fail("busy lease must not enter")
 
 
+def test_enrollment_lease_uses_posix_locking_and_optional_permissions(monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LOCK_EX=1, LOCK_NB=2, LOCK_UN=4,
+        flock=lambda fd, operation: calls.append((fd, operation)),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(enroll, "_is_windows", lambda: False)
+    monkeypatch.setattr(enroll.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(enroll.os, "fchmod", lambda fd, mode: calls.append((fd, mode)),
+                        raising=False)
+    with enroll._enrollment_lease():
+        calls.append("inside")
+    assert any(call == "inside" for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == fake.LOCK_EX | fake.LOCK_NB
+               for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == fake.LOCK_UN for call in calls)
+    assert any(isinstance(call, tuple) and call[1] == 0o600 for call in calls)
+
+
+def test_enrollment_lease_classifies_posix_contention(monkeypatch):
+    fake = types.SimpleNamespace(
+        LOCK_EX=1, LOCK_NB=2, LOCK_UN=4,
+        flock=lambda _fd, operation: (
+            (_ for _ in ()).throw(OSError("busy"))
+            if operation == 3 else None),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(enroll, "_is_windows", lambda: False)
+    with pytest.raises(enroll.EnrollmentBusy):
+        with enroll._enrollment_lease():
+            pytest.fail("busy lease must not enter")
+
+
 def test_enrollment_lease_supports_platform_without_optional_open_features(monkeypatch):
     monkeypatch.delattr(enroll.os, "O_NOFOLLOW", raising=False)
     monkeypatch.delattr(enroll.os, "fchmod", raising=False)
