@@ -18,7 +18,7 @@ from ara import cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ARA = Path(sys.executable).with_name("ara")
+ARA = Path(sys.executable).with_name("ara.exe" if os.name == "nt" else "ara")
 
 
 def _direct(argv: list[str]) -> subprocess.CompletedProcess[str]:

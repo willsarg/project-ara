@@ -92,6 +92,9 @@ def test_low_level_windows_handle_to_fd(monkeypatch):
 def test_platform_mode_and_guard_fd_branches(monkeypatch, tmp_path):
     monkeypatch.setattr(activity.os, "name", "nt")
     assert activity._platform_mode() == "windows"
+    monkeypatch.setattr(activity.os, "name", "posix")
+    monkeypatch.setattr(activity, "_POSIX_DIR_FD", True)
+    assert activity._platform_mode() == "posix"
     monkeypatch.setattr(activity.os, "name", "other")
     monkeypatch.setattr(activity, "_POSIX_DIR_FD", False)
     assert activity._platform_mode() is None
@@ -390,20 +393,16 @@ def test_record_fstat_oserror_closes_and_suppresses(monkeypatch, tmp_path):
     root.mkdir()
     record = root / "record.json"
     record.write_text("{}", encoding="utf-8")
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
-    real_close = activity.os.close
+    guard = activity._DirectoryGuard(root, "posix", 71)
     closed = []
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
     monkeypatch.setattr(
         activity.os, "fstat",
         lambda _fd: (_ for _ in ()).throw(OSError("fstat failed")),
     )
-    monkeypatch.setattr(
-        activity.os, "close", lambda fd: closed.append(fd) or real_close(fd))
-    try:
-        assert activity._json_record(record, guard=guard) is None
-        assert closed
-    finally:
-        real_close(guard.value)
+    monkeypatch.setattr(activity.os, "close", lambda fd: closed.append(fd))
+    assert activity._json_record(record, guard=guard) is None
+    assert closed == [72]
 
 
 def test_record_fstat_close_failure_notes_baseexception(monkeypatch, tmp_path):
@@ -411,43 +410,31 @@ def test_record_fstat_close_failure_notes_baseexception(monkeypatch, tmp_path):
     root.mkdir()
     record = root / "record.json"
     record.write_text("{}", encoding="utf-8")
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
-    real_close = activity.os.close
-    target = []
-    real_open = activity.os.open
-
-    def open_file(path, *args, **kwargs):
-        descriptor = real_open(path, *args, **kwargs)
-        target.append(descriptor)
-        return descriptor
+    guard = activity._DirectoryGuard(root, "posix", 71)
+    target = [72]
 
     def close_file(descriptor):
-        real_close(descriptor)
         if descriptor in target:
             raise OSError("fstat descriptor close failed")
 
-    monkeypatch.setattr(activity.os, "open", open_file)
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
     monkeypatch.setattr(
         activity.os, "fstat",
         lambda _fd: (_ for _ in ()).throw(KeyboardInterrupt("fstat interrupted")),
     )
     monkeypatch.setattr(activity.os, "close", close_file)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="fstat interrupted") as caught:
-            activity._json_record(record, guard=guard)
-        assert any("fstat descriptor close failed" in note for note in caught.value.__notes__)
-    finally:
-        real_close(guard.value)
+    with pytest.raises(KeyboardInterrupt, match="fstat interrupted") as caught:
+        activity._json_record(record, guard=guard)
+    assert any("fstat descriptor close failed" in note for note in caught.value.__notes__)
 
 
-def test_missing_record_open_is_suppressed(tmp_path):
+def test_missing_record_open_is_suppressed(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     root.mkdir()
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
-    try:
-        assert activity._json_record(root / "missing.json", guard=guard) is None
-    finally:
-        os.close(guard.value)
+    guard = activity._DirectoryGuard(root, "posix", 71)
+    monkeypatch.setattr(
+        activity.os, "open", lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError()))
+    assert activity._json_record(root / "missing.json", guard=guard) is None
 
 
 def test_windows_record_name_listing_filters_json(tmp_path):
@@ -517,29 +504,16 @@ def test_reader_fdopen_baseexception_closes_descriptor(monkeypatch, tmp_path):
     root.mkdir()
     record = root / "record.json"
     record.write_text(json.dumps({"kind": "running"}), encoding="utf-8")
-    monkeypatch.setenv("ARA_ACTIVITY_DIR", str(root))
-    real_open = activity.os.open
-    real_close = activity.os.close
-    record_fd = []
+    guard = activity._DirectoryGuard(root, "posix", 71)
     closed = []
-
-    def open_file(path, *args, **kwargs):
-        descriptor = real_open(path, *args, **kwargs)
-        if path == record.name:
-            record_fd.append(descriptor)
-        return descriptor
-
-    def close_file(descriptor):
-        closed.append(descriptor)
-        return real_close(descriptor)
-
-    monkeypatch.setattr(activity.os, "open", open_file)
-    monkeypatch.setattr(activity.os, "close", close_file)
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
+    monkeypatch.setattr(activity.os, "fstat", lambda _fd: types.SimpleNamespace(st_mode=0o100600))
+    monkeypatch.setattr(activity.os, "close", lambda descriptor: closed.append(descriptor))
     monkeypatch.setattr(activity.os, "fdopen", lambda *_a, **_k: (_ for _ in ()).throw(
         KeyboardInterrupt("fdopen interrupted")))
     with pytest.raises(KeyboardInterrupt, match="fdopen interrupted"):
-        activity.snapshot()
-    assert record_fd and record_fd[0] in closed
+        activity._json_record(record, guard=guard)
+    assert closed == [72]
 
 
 def test_reader_fdopen_close_failure_notes_original(monkeypatch, tmp_path):
@@ -547,28 +521,20 @@ def test_reader_fdopen_close_failure_notes_original(monkeypatch, tmp_path):
     root.mkdir()
     record = root / "record.json"
     record.write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("ARA_ACTIVITY_DIR", str(root))
-    real_open = activity.os.open
-    real_close = activity.os.close
-    target_fd = []
-
-    def open_file(path, *args, **kwargs):
-        descriptor = real_open(path, *args, **kwargs)
-        if path == record.name:
-            target_fd.append(descriptor)
-        return descriptor
+    guard = activity._DirectoryGuard(root, "posix", 71)
+    target_fd = [72]
 
     def close_file(descriptor):
-        real_close(descriptor)
         if descriptor in target_fd:
             raise OSError("record close failed")
 
-    monkeypatch.setattr(activity.os, "open", open_file)
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
+    monkeypatch.setattr(activity.os, "fstat", lambda _fd: types.SimpleNamespace(st_mode=0o100600))
     monkeypatch.setattr(activity.os, "close", close_file)
     monkeypatch.setattr(activity.os, "fdopen", lambda *_a, **_k: (_ for _ in ()).throw(
         KeyboardInterrupt("fdopen interrupted")))
     with pytest.raises(KeyboardInterrupt, match="fdopen interrupted") as caught:
-        activity.snapshot()
+        activity._json_record(record, guard=guard)
     assert any("record close failed" in note for note in caught.value.__notes__)
 
 
@@ -599,48 +565,48 @@ class _ClosingStream:
 def test_writer_body_baseexception_survives_stream_close_failure(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     root.mkdir()
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    guard = activity._DirectoryGuard(root, "posix", 71)
     stream = _ClosingStream(close_error=OSError("writer stream close failed"))
     original = KeyboardInterrupt("write interrupted")
     monkeypatch.setattr(
         activity.os, "fdopen",
         lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
     )
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
+    monkeypatch.setattr(activity.os, "close", lambda _fd: None)
+    monkeypatch.setattr(activity.os, "unlink", lambda *_a, **_k: None)
     monkeypatch.setattr(
         activity.json, "dump", lambda *_a, **_k: (_ for _ in ()).throw(original),
     )
-    try:
-        with pytest.raises(KeyboardInterrupt) as caught:
-            activity._atomic_write(root / "record.json", {}, guard=guard)
-        assert caught.value is original
-        assert stream.closed
-        assert any("writer stream close failed" in note for note in original.__notes__)
-    finally:
-        os.close(guard.value)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        activity._atomic_write(root / "record.json", {}, guard=guard)
+    assert caught.value is original
+    assert stream.closed
+    assert any("writer stream close failed" in note for note in original.__notes__)
 
 
 def test_writer_stream_close_failure_propagates_without_body_error(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     root.mkdir()
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    guard = activity._DirectoryGuard(root, "posix", 71)
     stream = _ClosingStream(close_error=OSError("writer stream close failed"))
     monkeypatch.setattr(
         activity.os, "fdopen",
         lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
     )
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
+    monkeypatch.setattr(activity.os, "close", lambda _fd: None)
+    monkeypatch.setattr(activity.os, "unlink", lambda *_a, **_k: None)
     monkeypatch.setattr(activity.os, "fsync", lambda _fd: None)
-    try:
-        with pytest.raises(OSError, match="writer stream close failed"):
-            activity._atomic_write(root / "record.json", {}, guard=guard)
-        assert stream.closed
-    finally:
-        os.close(guard.value)
+    with pytest.raises(OSError, match="writer stream close failed"):
+        activity._atomic_write(root / "record.json", {}, guard=guard)
+    assert stream.closed
 
 
 def test_reader_body_baseexception_survives_stream_close_failure(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     root.mkdir()
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    guard = activity._DirectoryGuard(root, "posix", 71)
     stream = _ClosingStream(close_error=OSError("reader stream close failed"))
     original = KeyboardInterrupt("read interrupted")
     record = root / "record.json"
@@ -652,23 +618,21 @@ def test_reader_body_baseexception_survives_stream_close_failure(tmp_path, monke
         activity.os, "fdopen",
         lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
     )
+    monkeypatch.setattr(activity.os, "close", lambda _fd: None)
     monkeypatch.setattr(
         activity.json, "load", lambda *_a, **_k: (_ for _ in ()).throw(original),
     )
-    try:
-        with pytest.raises(KeyboardInterrupt) as caught:
-            activity._json_record(root / "record.json", guard=guard)
-        assert caught.value is original
-        assert stream.closed
-        assert any("reader stream close failed" in note for note in original.__notes__)
-    finally:
-        os.close(guard.value)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        activity._json_record(root / "record.json", guard=guard)
+    assert caught.value is original
+    assert stream.closed
+    assert any("reader stream close failed" in note for note in original.__notes__)
 
 
 def test_reader_stream_close_failure_propagates_without_body_error(tmp_path, monkeypatch):
     root = tmp_path / "activity"
     root.mkdir()
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
+    guard = activity._DirectoryGuard(root, "posix", 71)
     stream = _ClosingStream(close_error=OSError("reader stream close failed"))
     record = root / "record.json"
     record.write_text("{}", encoding="utf-8")
@@ -679,13 +643,11 @@ def test_reader_stream_close_failure_propagates_without_body_error(tmp_path, mon
         activity.os, "fdopen",
         lambda descriptor, *_a, **_k: setattr(stream, "descriptor", descriptor) or stream,
     )
+    monkeypatch.setattr(activity.os, "close", lambda _fd: None)
     monkeypatch.setattr(activity.json, "load", lambda _stream: {})
-    try:
-        with pytest.raises(OSError, match="reader stream close failed"):
-            activity._json_record(root / "record.json", guard=guard)
-        assert stream.closed
-    finally:
-        os.close(guard.value)
+    with pytest.raises(OSError, match="reader stream close failed"):
+        activity._json_record(root / "record.json", guard=guard)
+    assert stream.closed
 
 
 def test_reader_fstat_baseexception_closes_descriptor(monkeypatch, tmp_path):
@@ -693,30 +655,19 @@ def test_reader_fstat_baseexception_closes_descriptor(monkeypatch, tmp_path):
     root.mkdir()
     record = root / "record.json"
     record.write_text("{}", encoding="utf-8")
-    guard = activity._DirectoryGuard(root, "posix", os.open(root, os.O_RDONLY))
-    real_open = activity.os.open
-    real_close = activity.os.close
-    record_fd = []
+    guard = activity._DirectoryGuard(root, "posix", 71)
+    record_fd = [72]
     closed = []
-
-    def open_file(path, *args, **kwargs):
-        descriptor = real_open(path, *args, **kwargs)
-        record_fd.append(descriptor)
-        return descriptor
-
-    monkeypatch.setattr(activity.os, "open", open_file)
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
     monkeypatch.setattr(activity.os, "fstat", lambda _fd: (_ for _ in ()).throw(
         KeyboardInterrupt("fstat interrupted")))
     monkeypatch.setattr(
         activity.os, "close",
-        lambda fd: closed.append(fd) or real_close(fd),
+        lambda fd: closed.append(fd),
     )
-    try:
-        with pytest.raises(KeyboardInterrupt, match="fstat interrupted"):
-            activity._json_record(record, guard=guard)
-        assert record_fd == closed
-    finally:
-        real_close(guard.value)
+    with pytest.raises(KeyboardInterrupt, match="fstat interrupted"):
+        activity._json_record(record, guard=guard)
+    assert record_fd == closed
 
 
 def test_persistent_body_exception_closes_serving_then_root_and_preserves_original(

@@ -618,12 +618,15 @@ def test_venv_stripped_path_no_venv_returns_path_unchanged(monkeypatch):
     assert detect._venv_stripped_path() == "/usr/bin:/bin"
 
 
-def test_venv_stripped_path_uses_sys_prefix_without_virtual_env(monkeypatch):
+def test_venv_stripped_path_uses_sys_prefix_without_virtual_env(monkeypatch, tmp_path):
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    monkeypatch.setattr(sys, "prefix", "/opt/ara-env")
-    monkeypatch.setattr(sys, "base_prefix", "/usr/local")
-    monkeypatch.setenv("PATH", "/opt/ara-env/bin:/usr/bin")
-    assert detect._venv_stripped_path() == "/usr/bin"
+    env = tmp_path / "ara-env"
+    user_bin = tmp_path / "user-bin"
+    env_bin = env / ("Scripts" if os.name == "nt" else "bin")
+    monkeypatch.setattr(sys, "prefix", str(env))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setenv("PATH", os.pathsep.join((str(env_bin), str(user_bin))))
+    assert detect._venv_stripped_path() == str(user_bin)
 
 
 def test_user_python_keeps_outside_invocation_with_same_real_interpreter(monkeypatch):

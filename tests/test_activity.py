@@ -80,8 +80,10 @@ def test_track_atomically_writes_exact_private_record_and_cleans_up(
         assert len(replacements) == 1
         assert replacements[0][0].suffix == ".tmp"
         assert replacements[0][1].name == files[0].name
-        assert replacements[0][2]["src_dir_fd"] == replacements[0][2]["dst_dir_fd"]
-        if os.name != "nt":
+        if os.name == "nt":
+            assert replacements[0][2] == {}
+        else:
+            assert replacements[0][2]["src_dir_fd"] == replacements[0][2]["dst_dir_fd"]
             assert activity_dir.stat().st_mode & 0o777 == 0o700
             assert files[0].stat().st_mode & 0o777 == 0o600
 
@@ -109,6 +111,44 @@ def test_replace_failure_removes_temp_and_never_exposes_final(activity_dir, monk
         with activity.track("running", "org/model"):
             pass
     assert list(activity_dir.iterdir()) == []
+
+
+def test_windows_record_replace_retries_transient_sharing_violation(monkeypatch, tmp_path):
+    calls = []
+    sleeps = []
+
+    def replace(source, target):
+        calls.append((source, target))
+        if len(calls) == 1:
+            raise PermissionError("temporarily shared")
+
+    monkeypatch.setattr(activity.os, "replace", replace)
+    monkeypatch.setattr(activity.time, "sleep", lambda seconds: sleeps.append(seconds))
+    guard = activity._DirectoryGuard(tmp_path, "windows", 1)
+
+    activity._replace_record(tmp_path / "source", tmp_path / "target", guard=guard)
+
+    assert len(calls) == 2
+    assert sleeps == [activity._WIN_REPLACE_RETRY_SECONDS]
+
+
+def test_windows_record_replace_exhausts_bounded_retries(monkeypatch, tmp_path):
+    calls = []
+    sleeps = []
+
+    def replace(source, target):
+        calls.append((source, target))
+        raise PermissionError("persistently shared")
+
+    monkeypatch.setattr(activity.os, "replace", replace)
+    monkeypatch.setattr(activity.time, "sleep", lambda seconds: sleeps.append(seconds))
+    guard = activity._DirectoryGuard(tmp_path, "windows", 1)
+
+    with pytest.raises(PermissionError, match="persistently shared"):
+        activity._replace_record(tmp_path / "source", tmp_path / "target", guard=guard)
+
+    assert len(calls) == activity._WIN_REPLACE_ATTEMPTS
+    assert sleeps == [activity._WIN_REPLACE_RETRY_SECONDS] * (activity._WIN_REPLACE_ATTEMPTS - 1)
 
 
 def test_temp_cleanup_failure_preserves_atomic_write_error(activity_dir, monkeypatch):
@@ -238,30 +278,35 @@ def test_cleanup_failure_without_body_exception_is_surfaced(monkeypatch):
 
 def test_directory_close_failure_preserves_original_body_exception(monkeypatch):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
-    real_close = activity.os.close
+    close_owner = activity if os.name == "nt" else activity.os
+    close_name = "_win_close_handle" if os.name == "nt" else "close"
+    real_close = getattr(close_owner, close_name)
 
     def close_then_fail(descriptor):
         real_close(descriptor)
         raise OSError("directory close failed")
 
+    monkeypatch.setattr(close_owner, close_name, close_then_fail)
     with pytest.raises(RuntimeError, match="original") as caught:
         with activity.track("running"):
-            monkeypatch.setattr(activity.os, "close", close_then_fail)
             raise RuntimeError("original")
     assert any("directory close failed" in note for note in caught.value.__notes__)
 
 
 def test_directory_close_failure_without_body_exception_is_surfaced(monkeypatch):
     monkeypatch.setattr(activity.psutil, "Process", lambda _pid: _Process())
-    real_close = activity.os.close
+    close_owner = activity if os.name == "nt" else activity.os
+    close_name = "_win_close_handle" if os.name == "nt" else "close"
+    real_close = getattr(close_owner, close_name)
 
     def close_then_fail(descriptor):
         real_close(descriptor)
         raise OSError("directory close failed")
 
+    monkeypatch.setattr(close_owner, close_name, close_then_fail)
     with pytest.raises(OSError, match="directory close failed"):
         with activity.track("running"):
-            monkeypatch.setattr(activity.os, "close", close_then_fail)
+            pass
 
 
 @pytest.mark.parametrize("kind", [
@@ -542,7 +587,10 @@ def test_secure_cleanup_tolerates_temp_removed_during_failed_replace(
     real_unlink = activity.os.unlink
 
     def remove_then_fail(source, _target, **kwargs):
-        real_unlink(source, dir_fd=kwargs["src_dir_fd"])
+        if "src_dir_fd" in kwargs:
+            real_unlink(source, dir_fd=kwargs["src_dir_fd"])
+        else:
+            Path(source).unlink()
         raise PermissionError("replace denied")
 
     monkeypatch.setattr(activity.os, "replace", remove_then_fail)

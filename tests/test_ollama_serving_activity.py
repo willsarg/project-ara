@@ -76,9 +76,14 @@ def test_manifest_is_atomic_minimal_and_same_identity_updates_in_place(
         "started_at": 200.0,
     }
     assert len(replacements) == 2
-    assert all(str(source).endswith(".tmp") and target == first.name
-               and options["src_dir_fd"] == options["dst_dir_fd"]
-               for source, target, options in replacements)
+    assert all(str(source).endswith(".tmp") for source, _target, _options in replacements)
+    if os.name == "nt":
+        assert all(target == first and options == {}
+                   for _source, target, options in replacements)
+    else:
+        assert all(target == first.name
+                   and options["src_dir_fd"] == options["dst_dir_fd"]
+                   for _source, target, options in replacements)
 
 
 def test_multiple_served_identities_have_deterministic_distinct_manifests(registry):
@@ -265,6 +270,7 @@ def test_serving_child_symlink_is_never_read_or_written(registry, monkeypatch, t
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor assertion")
 def test_serving_child_open_failure_closes_held_root_descriptor(
         registry, monkeypatch, tmp_path):
     outside = tmp_path / "descriptor-outside"

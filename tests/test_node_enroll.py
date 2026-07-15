@@ -96,8 +96,8 @@ def test_enrollment_lease_classifies_windows_contention(monkeypatch):
 
 
 def test_enrollment_lease_supports_platform_without_optional_open_features(monkeypatch):
-    monkeypatch.delattr(enroll.os, "O_NOFOLLOW")
-    monkeypatch.delattr(enroll.os, "fchmod")
+    monkeypatch.delattr(enroll.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(enroll.os, "fchmod", raising=False)
     with enroll._enrollment_lease():
         pass
 

@@ -325,10 +325,13 @@ def test_render_doctor_reports_database_failure(monkeypatch, make_console, capsy
 
     rendered = capsys.readouterr().out if as_json else buf.getvalue()
     assert "database problem" in rendered
-    assert str(db._db_path()) in rendered
     assert "file is not a database" in rendered
     if as_json:
-        assert json.loads(rendered)["error"].startswith("database problem")
+        payload = json.loads(rendered)
+        assert payload["error"].startswith("database problem")
+        assert payload["database"] == str(db._db_path())
+    else:
+        assert str(db._db_path()) in rendered
 
 
 def test_main_no_args_shows_landing(monkeypatch):
@@ -2215,7 +2218,7 @@ def test_render_uninstall_verbose_shows_exact_scope(make_console, monkeypatch):
     assert cli.render_uninstall(c, engine="mlx") == 0
 
     out = buf.getvalue()
-    assert "environment: /engines/apple" in out
+    assert f"environment: {cli.Path('/engines') / 'apple'}" in out
     assert "kept: models, shared uv cache, ARA database/characterizations, and other engines" in out
 
 

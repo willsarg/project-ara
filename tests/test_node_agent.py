@@ -168,8 +168,8 @@ def test_agent_lease_classifies_windows_lock_contention(monkeypatch):
 
 
 def test_agent_lease_supports_platform_without_optional_open_features(monkeypatch):
-    monkeypatch.delattr(agent.os, "O_NOFOLLOW")
-    monkeypatch.delattr(agent.os, "fchmod")
+    monkeypatch.delattr(agent.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(agent.os, "fchmod", raising=False)
     with agent._agent_lease():
         pass
 
@@ -1217,7 +1217,7 @@ def test_spool_replace_failure_preserves_prior_result(tmp_path, monkeypatch):
 
 
 def test_spool_write_degrades_when_fchmod_is_unavailable(monkeypatch):
-    monkeypatch.delattr(agent.os, "fchmod")
+    monkeypatch.delattr(agent.os, "fchmod", raising=False)
     agent._spool_result("j1", {"status": "done"})
     assert agent._spool_path("j1").exists()
 

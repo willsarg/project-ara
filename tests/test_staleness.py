@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import time
 
 import pytest
@@ -337,8 +337,17 @@ def test_file_descriptor_rejects_ambiguous_name_and_missing_blob_directory(
         tmp_path, monkeypatch):
     snapshot = tmp_path / "cache" / "snapshots" / ("a" * 40)
     snapshot.mkdir(parents=True)
-    ambiguous = snapshot / "bad|name.safetensors"
-    ambiguous.write_bytes(b"weights")
+
+    class AmbiguousPath:
+        def resolve(self, *, strict):
+            assert strict is True
+            return snapshot / "weights.safetensors"
+
+        def relative_to(self, parent):
+            assert parent == snapshot
+            return PurePosixPath("bad|name.safetensors")
+
+    ambiguous = AmbiguousPath()
     assert staleness._file_descriptor(snapshot, ambiguous) is None
 
     blob = snapshot.parents[1] / "blobs" / ("b" * 40)
@@ -388,11 +397,15 @@ def test_transformer_identity_tracks_same_size_weight_and_support_file_changes(
     first = staleness.artifact_identity("org/model")
 
     blob = (snapshot / "model.safetensors").resolve()
+    blob_stat = blob.stat()
     blob.write_bytes(b"changed")  # same byte length as b"weights"
+    os.utime(blob, ns=(blob_stat.st_atime_ns, blob_stat.st_mtime_ns + 1_000_000_000))
     second = staleness.artifact_identity("org/model")
     assert second != first
 
+    config_stat = config.stat()
     config.write_text('{"a":2}')  # same-size load-critical config mutation
+    os.utime(config, ns=(config_stat.st_atime_ns, config_stat.st_mtime_ns + 1_000_000_000))
     third = staleness.artifact_identity("org/model")
     assert third != second
     config.unlink()

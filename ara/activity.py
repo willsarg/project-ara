@@ -90,6 +90,8 @@ _WIN_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_REPLACE_ATTEMPTS = 5
+_WIN_REPLACE_RETRY_SECONDS = 0.01
 
 
 def _platform_mode() -> str | None:
@@ -256,6 +258,23 @@ def _open_serving(root: _DirectoryGuard, *, create: bool) -> _DirectoryGuard:
     return _DirectoryGuard(path, "windows", _win_open_directory(path))
 
 
+def _replace_record(source, target, *, guard: _DirectoryGuard) -> None:
+    """Replace one record, tolerating transient Windows sharing violations."""
+    if guard.mode == "posix":
+        os.replace(source, target, src_dir_fd=guard.value, dst_dir_fd=guard.value)
+        return
+    attempt = 0
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            attempt += 1
+            if attempt >= _WIN_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(_WIN_REPLACE_RETRY_SECONDS)
+
+
 def _atomic_write(path: Path, record: dict, *, guard: _DirectoryGuard) -> None:
     """Write atomically while a no-follow/no-reparse directory guard is held.
 
@@ -292,11 +311,7 @@ def _atomic_write(path: Path, record: dict, *, guard: _DirectoryGuard) -> None:
                 _note_cleanup_failure(original, "close the activity stream", cleanup)
             raise
         stream.close()
-        if relative:
-            os.replace(temporary_arg, target_arg,
-                       src_dir_fd=guard.value, dst_dir_fd=guard.value)
-        else:
-            os.replace(temporary_arg, target_arg)
+        _replace_record(temporary_arg, target_arg, guard=guard)
     except BaseException as original:
         try:
             if relative:

@@ -199,7 +199,7 @@ def test_save_replace_failure_preserves_prior_valid_config(monkeypatch):
 
 
 def test_save_degrades_when_fchmod_is_unavailable(monkeypatch):
-    monkeypatch.delattr(config.os, "fchmod")
+    monkeypatch.delattr(config.os, "fchmod", raising=False)
     config.save(config.NodeConfig(server_url="https://c.example"))
     assert config.load().server_url == "https://c.example"
 

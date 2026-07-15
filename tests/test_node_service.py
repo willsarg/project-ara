@@ -58,7 +58,7 @@ def test_install_writes_unit_and_enables(tmp_path, monkeypatch, linux, calls):
     service.install()
     unit = tmp_path / "sd" / "ara-node.service"
     text = unit.read_text()
-    assert f'ExecStart="{service.sys.executable}" -m ara node run' in text
+    assert f"ExecStart={service._systemd_quote(service.sys.executable)} -m ara node run" in text
     assert "Type=simple" in text                            # long jobs must not trip a loop watchdog
     assert "NotifyAccess=main" in text                      # STATUS works without a watchdog
     assert "WatchdogSec=" not in text
