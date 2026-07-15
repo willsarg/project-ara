@@ -10,12 +10,14 @@ import {
   submitJobAction,
 } from "../actions";
 import { IssueToken } from "./issue-token";
+import { listRecentWork } from "@/lib/work";
 
 export const dynamic = "force-dynamic";
 
 export default function NodesPage() {
   const pending = listPending();
   const active = listActive();
+  const recentWork = listRecentWork();
   return (
     <>
       <header>
@@ -137,6 +139,47 @@ export default function NodesPage() {
                   </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          )}
+        </section>
+
+        <section className="panel">
+          <h2>Recent work</h2>
+          {recentWork.length === 0 ? (
+            <p className="offline-note">no jobs submitted.</p>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>node</th>
+                  <th>job</th>
+                  <th>state</th>
+                  <th>outcome</th>
+                  <th>environment</th>
+                  <th>timestamps</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recentWork.map((job) => (
+                  <tr key={job.id}>
+                    <td>{job.machine_key}</td>
+                    <td>
+                      <code>{job.id}</code><br />
+                      {job.kind}{job.model ? ` · ${job.model}` : ""}
+                    </td>
+                    <td>{job.status}</td>
+                    <td className="job-data">
+                      {job.error ? `error: ${job.error}` : (job.result_json ?? "—")}
+                    </td>
+                    <td className="job-data">{job.result_environment_json ?? "—"}</td>
+                    <td>
+                      queued {job.created_at}<br />
+                      {job.dispatched_at ? `dispatched ${job.dispatched_at}` : "not dispatched"}<br />
+                      {job.finished_at ? `finished ${job.finished_at}` : "not finished"}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           )}

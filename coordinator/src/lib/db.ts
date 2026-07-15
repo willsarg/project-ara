@@ -279,6 +279,10 @@ export interface WorkRow {
   finished_at: string | null;
 }
 
+export interface AdminWorkRow extends WorkRow {
+  machine_key: string;
+}
+
 // --- enrollment tokens ---------------------------------------------------------------------------
 
 export function insertEnrollmentToken(tokenHash: string): void {
@@ -494,6 +498,18 @@ export function acknowledgeWorkForAgent(id: string, agentId: number): WorkAckRes
 
 export function getWorkById(id: string): WorkRow | null {
   return (open().prepare("SELECT * FROM work WHERE id = ?").get(id) as WorkRow | undefined) ?? null;
+}
+
+/** Newest persisted jobs for the administrator. Exact stored payload/provenance stays available
+ * so the UI never invents a friendlier outcome than the node actually reported. */
+export function listRecentWork(): AdminWorkRow[] {
+  return open()
+    .prepare(
+      `SELECT work.*, agents.machine_key
+       FROM work JOIN agents ON agents.id = work.agent_id
+       ORDER BY work.created_at DESC, work.rowid DESC LIMIT 50`,
+    )
+    .all() as AdminWorkRow[];
 }
 
 export type WorkResultWrite = "recorded" | "already_recorded" | "unknown" | "conflict";

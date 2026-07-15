@@ -21,4 +21,14 @@ describe("coordinator operator documentation", () => {
     expect(compose).toContain("ARA_COORDINATOR_TRUST_PROXY");
     expect(compose).toContain("ARA_COORDINATOR_BIND:-127.0.0.1");
   });
+
+  it("keeps persisted job outcomes and their provenance visible to the administrator", () => {
+    const nodes = readFileSync(path.join(root, "src/app/nodes/page.tsx"), "utf8");
+    expect(nodes).toContain("Recent work");
+    expect(nodes).toContain("job.result_json");
+    expect(nodes).toContain("job.error");
+    expect(nodes).toContain("job.result_environment_json");
+    expect(nodes).toContain("job.dispatched_at");
+    expect(nodes).toContain("job.finished_at");
+  });
 });

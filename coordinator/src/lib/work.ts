@@ -5,8 +5,8 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
 import {
-  acknowledgeWorkForAgent, claimNextWorkForAgent, insertWork, recordWorkResult,
-  type WorkAckResult, type WorkResultWrite,
+  acknowledgeWorkForAgent, claimNextWorkForAgent, insertWork, listRecentWork as listRecentWorkRows,
+  recordWorkResult, type WorkAckResult, type WorkResultWrite,
 } from "./db";
 import { assertAllowedJobKind } from "./job-kinds";
 
@@ -21,6 +21,49 @@ export class AgentNotActiveError extends Error {
   constructor() {
     super("work can only be queued for an active agent");
   }
+}
+
+export interface AdminWorkSummary {
+  id: string;
+  machine_key: string;
+  kind: string;
+  model: string | null;
+  status: string;
+  result_json: string | null;
+  error: string | null;
+  result_environment_json: string | null;
+  created_at: string;
+  dispatched_at: string | null;
+  finished_at: string | null;
+}
+
+function modelFromArgs(argsJson: string | null): string | null {
+  if (!argsJson) return null;
+  try {
+    const args: unknown = JSON.parse(argsJson);
+    if (typeof args === "object" && args !== null && "model" in args) {
+      return typeof args.model === "string" ? args.model : null;
+    }
+  } catch {
+    // Preserve the job in the view; only the optional model label is unavailable.
+  }
+  return null;
+}
+
+export function listRecentWork(): AdminWorkSummary[] {
+  return listRecentWorkRows().map((row) => ({
+    id: row.id,
+    machine_key: row.machine_key,
+    kind: row.kind,
+    model: modelFromArgs(row.args_json),
+    status: row.status,
+    result_json: row.result_json,
+    error: row.error,
+    result_environment_json: row.result_environment_json,
+    created_at: row.created_at,
+    dispatched_at: row.dispatched_at,
+    finished_at: row.finished_at,
+  }));
 }
 
 const POLL_STEP_MS = 250; // re-check cadence between sync reads during a long-poll

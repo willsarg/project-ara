@@ -669,4 +669,57 @@ describe("work queue", () => {
       })).toBe("unknown");
     });
   });
+
+  it("lists submitted work with its exact lifecycle outcome and execution environment", async () => {
+    const agentId = await activeAgent("box-admin-work");
+    const jobId = work.enqueue(agentId, "run", { model: "qwen-small", prompt: "hi" });
+
+    expect(work.listRecentWork().find((job) => job.id === jobId)).toMatchObject({
+      machine_key: "box-admin-work",
+      kind: "run",
+      model: "qwen-small",
+      status: "queued",
+      result_json: null,
+      error: null,
+      result_environment_json: null,
+      dispatched_at: null,
+      finished_at: null,
+    });
+
+    expect(await work.nextForAgent(agentId, 0)).toMatchObject({ id: jobId });
+    expect(work.acknowledge(jobId, agentId)).toBe("ok");
+    expect(work.recordResult(jobId, agentId, {
+      status: "done",
+      result: { output: "hello" },
+      environment: VALID_ENV,
+    })).toBe("recorded");
+
+    expect(work.listRecentWork().find((job) => job.id === jobId)).toMatchObject({
+      status: "done",
+      result_json: JSON.stringify({ output: "hello" }),
+      error: null,
+      result_environment_json: JSON.stringify(VALID_ENV),
+      dispatched_at: expect.any(String),
+      finished_at: expect.any(String),
+    });
+  });
+
+  it("keeps jobs visible when their optional model label cannot be decoded", async () => {
+    const agentId = await activeAgent("box-admin-odd-args");
+    const cases: Array<[string, string | null, string | null]> = [
+      ["job_admin_no_args", null, null],
+      ["job_admin_bad_json", "not-json", null],
+      ["job_admin_null_json", "null", null],
+      ["job_admin_scalar_json", "7", null],
+      ["job_admin_no_model", "{}", null],
+      ["job_admin_nonstring_model", '{"model":7}', null],
+      ["job_admin_model", '{"model":"tiny"}', "tiny"],
+    ];
+    for (const [id, argsJson] of cases) db.insertWork(id, agentId, "run", argsJson);
+
+    const listed = new Map(work.listRecentWork().map((job) => [job.id, job]));
+    for (const [id, , model] of cases) {
+      expect(listed.get(id)).toMatchObject({ machine_key: "box-admin-odd-args", model });
+    }
+  });
 });

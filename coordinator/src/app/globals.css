@@ -394,6 +394,14 @@ header {
   color: var(--dim);
 }
 
+.job-data {
+  max-width: 320px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 /* ---- empty ---- */
 .empty {
   border: 1px dashed var(--line);
