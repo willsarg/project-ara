@@ -9,6 +9,7 @@ the internals churn — complementing the per-command behaviour tests in test_cl
 """
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -79,6 +80,8 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.catalog, "remember", lambda con, model: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda model: f"artifact:{model}")
     monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
+    monkeypatch.setattr(cli.staleness, "stage_model_ref",
+                        lambda model, _artifact: contextlib.nullcontext(model))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key: None)
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])

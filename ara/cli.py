@@ -1206,9 +1206,13 @@ def _weight_quant_hw_error(bk, backend: str, weight_quant: str) -> str | None:
 
 
 def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
-                   *, as_json: bool) -> tuple[bool, object | None, int | None]:
+                   *, as_json: bool,
+                   authorized_artifact_id: str | None = None) -> tuple[bool, object | None, int | None]:
     """Run deterministic cache/compatibility/disk gates before live work is claimed."""
     incompatible = engines.engine_for_model(model) not in (None, engine_key)
+    if (authorized_artifact_id is not None
+            and staleness.artifact_matches(model, authorized_artifact_id)):
+        return False, None, None
     cached = getattr(bk, "calibration_model_cached", None)
     if incompatible or cached is None or cached(model):
         return False, None, None
@@ -1246,10 +1250,11 @@ def _artifact_identity_for_plan(model: str, payload: object | None, *,
     return current
 
 
-def _pinned_model_for_plan(model: str, artifact_id: str, payload: object | None) -> str | None:
+def _staged_model_for_plan(model: str, artifact_id: str, payload: object | None):
+    """Bind the verified plan authority to the private path an engine will actually load."""
     if isinstance(payload, acquire.AcquisitionPlan):
-        return staleness.pinned_model_ref(model, artifact_id, revision=payload.revision)
-    return staleness.pinned_model_ref(model, artifact_id)
+        return staleness.stage_model_ref(model, artifact_id, revision=payload.revision)
+    return staleness.stage_model_ref(model, artifact_id)
 
 
 def _download_prefetched_weights(c: Console, model: str, bk, payload: object | None,
@@ -1273,7 +1278,8 @@ def _download_prefetched_weights(c: Console, model: str, bk, payload: object | N
 
 
 def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
-                      *, as_json: bool, progress: bool) -> int | None:
+                      *, as_json: bool, progress: bool,
+                      authorized_artifact_id: str | None = None) -> int | None:
     """Ensure a transformers/MLX model's weights are in the HF cache before the engine runs.
 
     CUDA/MLX fetch full transformer snapshots; GGUF engines fetch only the selected quant before
@@ -1282,7 +1288,9 @@ def _prefetch_weights(c: Console, model: str, bk, engine_key: str | None,
     No-op when the model's engine doesn't match *engine_key* or the exact selection is cached.
     Returns 1 (after printing) on a disk-space or fetch error, else None.
     """
-    needed, size_gb, rc = _prefetch_plan(c, model, bk, engine_key, as_json=as_json)
+    needed, size_gb, rc = _prefetch_plan(
+        c, model, bk, engine_key, as_json=as_json,
+        authorized_artifact_id=authorized_artifact_id)
     if rc is not None or not needed:
         return rc
     return _download_prefetched_weights(
@@ -1418,13 +1426,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
-        pinned_model = _pinned_model_for_plan(evidence_model, artifact_id_before, prefetch_size)
-        if pinned_model is None:
-            msg = f"cannot pin the exact artifact characterized for {model} — result not stored"
-            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-            return 1
         try:
-            result = bk.characterize(pinned_model, progress=progress, **fa_kw)
+            with _staged_model_for_plan(
+                    evidence_model, artifact_id_before, prefetch_size) as staged_model:
+                result = bk.characterize(staged_model, progress=progress, **fa_kw)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
             msg = f"characterization failed: {exc}"
             # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
@@ -1981,7 +1986,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     progress = (not as_json) and sys.stderr.isatty()
     # One record owns the complete operational lifecycle: an on-demand fetch and every repeat
     # backend call. All deterministic gates above run before ARA claims that work is live.
-    prefetch, prefetch_size, rc = _prefetch_plan(c, model, bk, key, as_json=as_json)
+    prefetch, prefetch_size, rc = _prefetch_plan(
+        c, model, bk, key, as_json=as_json,
+        authorized_artifact_id=characterized_artifact_id)
     if rc is not None:
         return rc
     with activity.track("benchmarking", model):
@@ -1994,68 +2001,71 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         if artifact_id != characterized_artifact_id:
             return err(f"the cached artifact for {model} differs from its measured ceiling — "
                        f"re-run: ara characterize {model}")
-        pinned_model = _pinned_model_for_plan(evidence_model, artifact_id, prefetch_size)
-        if pinned_model is None:
-            return err(f"cannot pin the exact characterized artifact for {model} — "
-                       f"re-run: ara characterize {model}")
         # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
         # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
         # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
         run_scores: list[float] = []
         refused_n = 0
         errored_n = 0
-        for _ in range(repeat):
-            try:
-                result = bk.benchmark(pinned_model, prompts, max_context=safe, **bench_kw)
-            except (SystemExit, Exception) as exc:
-                return err(f"benchmark failed: {exc}")
-            if not isinstance(result, dict):
-                return err("invalid benchmark result: the engine returned a non-object response")
-            reported_context = result.get("context")
-            if (not isinstance(reported_context, int) or isinstance(reported_context, bool)
-                    or reported_context != safe):
-                return err(f"invalid benchmark result: the engine reported context "
-                           f"{reported_context!r}, expected {safe}")
-            if result.get("refused"):
-                # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
-                return err(f"the engine refused: {result.get('reason', 'no reason given')}")
-            results = result.get("results")
-            if not isinstance(results, list) or len(results) != len(prompts):
-                return err("invalid benchmark result: expected exactly one result per prompt")
-            completions = [""] * len(prompts)
-            seen: set[int] = set()
-            for r in results:
-                if not isinstance(r, dict):
-                    return err("invalid benchmark result: each prompt result must be an object")
-                idx = r.get("prompt_index")
-                if (not isinstance(idx, int) or isinstance(idx, bool)
-                        or not 0 <= idx < len(completions) or idx in seen):
-                    return err("invalid benchmark result: prompt indexes must be unique and cover "
-                               "the probe set")
-                seen.add(idx)
-                outcomes = [name for name in ("completion", "refused", "error") if name in r]
-                if len(outcomes) != 1:
-                    return err("invalid benchmark result: each prompt needs exactly one completion, "
-                               "refusal, or error")
-                outcome = outcomes[0]
-                if outcome == "completion":
-                    if not isinstance(r["completion"], str):
-                        return err("invalid benchmark result: completion must be text")
-                    completions[idx] = r["completion"]
-                elif outcome == "refused":
-                    if r["refused"] is not True:
-                        return err("invalid benchmark result: refused must be true")
-                    refused_n += 1
-                else:
-                    if not isinstance(r["error"], str):
-                        return err("invalid benchmark result: error must be text")
-                    errored_n += 1
-            run_scores.append(benchmark.score_probe_set(use_case, items, completions))
-            current_artifact_id = _artifact_identity_for_plan(
-                evidence_model, prefetch_size, expected=artifact_id)
-            if current_artifact_id != artifact_id:
-                return err(f"the cached artifact for {model} changed during the benchmark — "
-                           "no measurement taken")
+        loaded_model_ref = evidence_model
+        try:
+            with _staged_model_for_plan(
+                    evidence_model, artifact_id, prefetch_size) as staged_model:
+                loaded_model_ref = staged_model
+                for _ in range(repeat):
+                    try:
+                        result = bk.benchmark(staged_model, prompts, max_context=safe, **bench_kw)
+                    except (SystemExit, Exception) as exc:
+                        return err(f"benchmark failed: {exc}")
+                    if not isinstance(result, dict):
+                        return err("invalid benchmark result: the engine returned a non-object response")
+                    reported_context = result.get("context")
+                    if (not isinstance(reported_context, int) or isinstance(reported_context, bool)
+                            or reported_context != safe):
+                        return err(f"invalid benchmark result: the engine reported context "
+                                   f"{reported_context!r}, expected {safe}")
+                    if result.get("refused"):
+                        # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
+                        return err(f"the engine refused: {result.get('reason', 'no reason given')}")
+                    results = result.get("results")
+                    if not isinstance(results, list) or len(results) != len(prompts):
+                        return err("invalid benchmark result: expected exactly one result per prompt")
+                    completions = [""] * len(prompts)
+                    seen: set[int] = set()
+                    for r in results:
+                        if not isinstance(r, dict):
+                            return err("invalid benchmark result: each prompt result must be an object")
+                        idx = r.get("prompt_index")
+                        if (not isinstance(idx, int) or isinstance(idx, bool)
+                                or not 0 <= idx < len(completions) or idx in seen):
+                            return err("invalid benchmark result: prompt indexes must be unique and cover "
+                                       "the probe set")
+                        seen.add(idx)
+                        outcomes = [name for name in ("completion", "refused", "error") if name in r]
+                        if len(outcomes) != 1:
+                            return err("invalid benchmark result: each prompt needs exactly one completion, "
+                                       "refusal, or error")
+                        outcome = outcomes[0]
+                        if outcome == "completion":
+                            if not isinstance(r["completion"], str):
+                                return err("invalid benchmark result: completion must be text")
+                            completions[idx] = r["completion"]
+                        elif outcome == "refused":
+                            if r["refused"] is not True:
+                                return err("invalid benchmark result: refused must be true")
+                            refused_n += 1
+                        else:
+                            if not isinstance(r["error"], str):
+                                return err("invalid benchmark result: error must be text")
+                            errored_n += 1
+                    run_scores.append(benchmark.score_probe_set(use_case, items, completions))
+                    current_artifact_id = _artifact_identity_for_plan(
+                        evidence_model, prefetch_size, expected=artifact_id)
+                    if current_artifact_id != artifact_id:
+                        return err(f"the cached artifact for {model} changed during the benchmark — "
+                                   "no measurement taken")
+        except (SystemExit, Exception) as exc:
+            return err(f"benchmark failed: {exc}")
 
     total = n * repeat                       # total generations attempted across every run
     if prompts and (refused_n + errored_n) == total:
@@ -2083,7 +2093,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     with db.connected() as con:
         canonical_model_id = scoring.canonical_model_id(evidence_model)
         mrow = db.get_model(con, evidence_model) or db.get_model(con, canonical_model_id)
-        quant = (scoring.quant_key(evidence_model) or scoring.quant_key(pinned_model)
+        quant = (scoring.quant_key(evidence_model) or scoring.quant_key(loaded_model_ref)
                  or (mrow.get("quant") if mrow else None))
         if evidence_model != canonical_model_id:
             catalog.remember_variant(
@@ -2360,13 +2370,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} differs from its measured ceiling — "
                            f"re-run: ara characterize {model}")
-            pinned_model = staleness.pinned_model_ref(
-                evidence_model, characterized_artifact_id)
-            if pinned_model is None:
-                return err(f"cannot pin the exact characterized artifact for {model} — "
-                           f"re-run: ara characterize {model}")
-            result = bk.generate(
-                pinned_model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
+            with staleness.stage_model_ref(
+                    evidence_model, characterized_artifact_id) as staged_model:
+                result = bk.generate(
+                    staged_model, prompt, max_context=safe, max_tokens=max_tokens, **fa_kw)
             if not staleness.artifact_matches(evidence_model, characterized_artifact_id):
                 return err(f"the artifact for {model} changed during the run — no result shown")
     except (SystemExit, Exception) as exc:        # engine may refuse/abort/OOM-guard

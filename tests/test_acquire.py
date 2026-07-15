@@ -339,6 +339,15 @@ def test_prepare_download_covers_local_invalid_revision_and_missing_selection(
     with pytest.raises(RuntimeError, match="immutable revision"):
         acquire.prepare_download("org/repo", gguf=False)
 
+    class ShortRevisionApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 7,
+                siblings=[types.SimpleNamespace(rfilename="model.safetensors", size=1)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: ShortRevisionApi())
+    with pytest.raises(RuntimeError, match="immutable revision"):
+        acquire.prepare_download("org/repo", gguf=False)
+
     class NoGgufApi:
         def model_info(self, *_args, **_kwargs):
             return types.SimpleNamespace(sha="c" * 40, siblings=[])
@@ -369,6 +378,15 @@ def test_prepare_download_refuses_unknown_payload_sizes(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda: UnknownGgufApi())
     with pytest.raises(RuntimeError, match="size"):
         acquire.prepare_download("org/repo", gguf=True)
+
+    class BooleanSizeApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 40,
+                siblings=[types.SimpleNamespace(rfilename="model.safetensors", size=True)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: BooleanSizeApi())
+    with pytest.raises(RuntimeError, match="sizes"):
+        acquire.prepare_download("org/repo", gguf=False)
 
     class ZeroTransformerApi:
         def model_info(self, *_args, **_kwargs):

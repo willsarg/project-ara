@@ -23,6 +23,16 @@ def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
+    @contextlib.contextmanager
+    def stage(model, artifact, *, revision=None):
+        pinned = (cli.staleness.pinned_model_ref(model, artifact, revision=revision)
+                  if revision is not None else
+                  cli.staleness.pinned_model_ref(model, artifact))
+        if pinned is None:
+            raise RuntimeError(f"cannot pin the authorized artifact for {model}")
+        yield pinned
+
+    monkeypatch.setattr(cli.staleness, "stage_model_ref", stage)
 
 
 def _raise_input(exc):
@@ -8263,10 +8273,12 @@ def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, m
     _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
     bk = cli.get_backend("apple")
     bk.calibration_model_cached = lambda m: False        # uncached -> pre-fetch fires
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 999.0)
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
     c, buf = make_console()
-    rc = cli.render_benchmark(c, "org/m", use_case="extraction", assume_yes=True)
+    rc = cli.render_benchmark(
+        c, "org/m", use_case="extraction", engine="mlx", assume_yes=True)
     assert rc == 1
     assert "not enough disk" in buf.getvalue()
 
@@ -9375,7 +9387,7 @@ def test_render_benchmark_refuses_unknown_or_changing_artifact(
     assert "differs from its measured ceiling" in buf.getvalue()
     assert "model" not in saved
 
-    identities = iter(["artifact:test", "artifact:test", "artifact:b"])
+    identities = iter(["artifact:test", "artifact:test", "artifact:test", "artifact:b"])
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
@@ -9398,7 +9410,7 @@ def test_render_benchmark_refuses_ceiling_without_artifact_authority(
 def test_render_benchmark_refuses_artifact_changed_after_auto_selection(
         make_console, monkeypatch):
     saved = _wire_benchmark(monkeypatch)
-    identities = iter(["artifact:test", "artifact:changed"])
+    identities = iter(["artifact:test", "artifact:test", "artifact:changed"])
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
     c, buf = make_console()
 

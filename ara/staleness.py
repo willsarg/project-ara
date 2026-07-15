@@ -17,6 +17,8 @@ import json
 import hashlib
 import os
 import re
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -24,6 +26,20 @@ _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _BLOB_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+
+
+class StagedModel:
+    """A verified operation-private model path with deterministic cleanup."""
+
+    def __init__(self, path: Path, temporary: tempfile.TemporaryDirectory):
+        self.path = str(path)
+        self._temporary = temporary
+
+    def __enter__(self) -> str:
+        return self.path
+
+    def __exit__(self, *_exc) -> None:
+        self._temporary.cleanup()
 
 
 def _cache_dir(model_id: str) -> Path:
@@ -301,6 +317,62 @@ def pinned_model_ref(model: str, expected_artifact_id: str | None, *,
     if selected and selected[0].suffix.lower() == ".gguf":
         return str(selected[0])
     return str(snapshot)
+
+
+def _stage_file(source: Path, destination: Path) -> None:
+    """Bind one verified source to a private path, then prove the staged bytes match."""
+    resolved = source.resolve(strict=True)
+    before = _content_digest(resolved)
+    if before is None:
+        raise RuntimeError(f"cannot verify {source} before staging")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    linked = (source.is_symlink() and _BLOB_RE.fullmatch(resolved.name)
+              and resolved.parent.name == "blobs")
+    if linked:
+        try:
+            os.link(resolved, destination)
+        except OSError:
+            shutil.copy2(resolved, destination)
+    else:
+        # Direct Windows snapshots and local GGUFs are mutable paths: isolate their bytes.
+        shutil.copy2(resolved, destination)
+    if _content_digest(destination) != before:
+        raise RuntimeError(f"{source} changed while staging")
+
+
+def stage_model_ref(model: str, expected_artifact_id: str, *,
+                    revision: str | None = None) -> StagedModel:
+    """Create a private load path whose files cannot be replaced through the source cache paths."""
+    pinned = (pinned_model_ref(model, expected_artifact_id, revision=revision)
+              if revision is not None else pinned_model_ref(model, expected_artifact_id))
+    if pinned is None:
+        raise RuntimeError(f"cannot pin the authorized artifact for {model}")
+    source = Path(pinned)
+    if not source.exists():
+        raise RuntimeError(f"authorized artifact disappeared before staging: {source}")
+    stage_parent = source.parent if source.is_file() else source.parent.parent
+    temporary = tempfile.TemporaryDirectory(prefix=".ara-stage-", dir=stage_parent)
+    root = Path(temporary.name)
+    try:
+        if source.is_file():
+            destination = root / source.name
+            _stage_file(source, destination)
+            staged_path = destination
+        else:
+            files = _transformer_manifest(source)
+            if files is None or not files:
+                raise RuntimeError(f"cannot verify transformer snapshot {source}")
+            staged_path = root / "snapshot"
+            for item in files:
+                _stage_file(item, staged_path / item.relative_to(source))
+        matches = (artifact_matches(model, expected_artifact_id, revision=revision)
+                   if revision is not None else artifact_matches(model, expected_artifact_id))
+        if not matches:
+            raise RuntimeError(f"artifact changed while staging: {model}")
+        return StagedModel(staged_path, temporary)
+    except BaseException:
+        temporary.cleanup()
+        raise
 
 
 def artifact_matches(model: str, expected_artifact_id: str | None, *,

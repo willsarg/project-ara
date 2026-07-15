@@ -220,6 +220,126 @@ def test_pinned_model_ref_handles_multishard_transformer_and_filesystem_races(
     assert staleness.pinned_model_ref("org/model", identity) is None
 
 
+def test_stage_model_ref_copies_local_gguf_and_cleans_up(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"authorized")
+    identity = staleness.artifact_identity(str(model))
+
+    staged = staleness.stage_model_ref(str(model), identity)
+    staged_path = Path(staged.path)
+    with staged as load_path:
+        assert Path(load_path).read_bytes() == b"authorized"
+        model.write_bytes(b"replacement")
+        assert Path(load_path).read_bytes() == b"authorized"
+    assert not staged_path.exists()
+
+
+def test_stage_model_ref_copies_direct_snapshot_and_preserves_manifest(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision)
+    weight = snapshot / "model.safetensors"
+    config = snapshot / "config.json"
+    weight.write_bytes(b"authorized")
+    config.write_text('{"model_type":"test"}')
+    identity = staleness.artifact_identity("org/model")
+
+    with staleness.stage_model_ref("org/model", identity) as load_path:
+        staged = Path(load_path)
+        weight.write_bytes(b"replacement")
+        assert (staged / "model.safetensors").read_bytes() == b"authorized"
+        assert (staged / "config.json").read_text() == '{"model_type":"test"}'
+
+
+def test_stage_model_ref_hardlinks_content_addressed_blob(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    snapshot = _revision_cache(tmp_path, revision, filename="model.safetensors")
+    logical = snapshot / "model.safetensors"
+    identity = staleness.artifact_identity("org/model")
+
+    with staleness.stage_model_ref("org/model", identity) as load_path:
+        staged_weight = Path(load_path) / "model.safetensors"
+        replacement = snapshot.parents[1] / "blobs" / ("d" * 40)
+        replacement.write_bytes(b"replacement")
+        logical.unlink()
+        logical.symlink_to(replacement)
+        assert staged_weight.read_bytes() == b"weights"
+
+
+def test_stage_model_ref_falls_back_to_copy_and_fails_closed(tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    _revision_cache(tmp_path, revision, filename="model.safetensors")
+    identity = staleness.artifact_identity("org/model")
+    monkeypatch.setattr(staleness.os, "link", lambda *_a: (_ for _ in ()).throw(OSError()))
+
+    with staleness.stage_model_ref("org/model", identity) as load_path:
+        assert (Path(load_path) / "model.safetensors").read_bytes() == b"weights"
+
+    monkeypatch.setattr(staleness, "artifact_matches", lambda *_a, **_k: False)
+    with pytest.raises(RuntimeError, match="cannot pin"):
+        staleness.stage_model_ref("org/model", identity)
+
+
+def test_stage_model_ref_cleans_up_when_authority_changes_during_staging(
+        tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"authorized")
+    identity = staleness.artifact_identity(str(model))
+    real_matches = staleness.artifact_matches
+    calls = 0
+
+    def changes_after_pin(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_matches(*args, **kwargs) if calls == 1 else False
+
+    monkeypatch.setattr(staleness, "artifact_matches", changes_after_pin)
+    with pytest.raises(RuntimeError, match="changed while staging"):
+        staleness.stage_model_ref(str(model), identity)
+    assert not list(tmp_path.glob(".ara-stage-*"))
+
+
+def test_staging_refuses_unverifiable_changed_and_disappeared_sources(
+        tmp_path, monkeypatch):
+    source = tmp_path / "model.gguf"
+    destination = tmp_path / "stage" / "model.gguf"
+    source.write_bytes(b"weights")
+    monkeypatch.setattr(staleness, "_content_digest", lambda _path: None)
+    with pytest.raises(RuntimeError, match="before staging"):
+        staleness._stage_file(source, destination)
+
+    digests = iter(((7, "before"), (7, "after")))
+    monkeypatch.setattr(staleness, "_content_digest", lambda _path: next(digests))
+    with pytest.raises(RuntimeError, match="changed while staging"):
+        staleness._stage_file(source, destination)
+
+    missing = tmp_path / "missing.gguf"
+    monkeypatch.setattr(staleness, "pinned_model_ref", lambda *_a, **_k: str(missing))
+    with pytest.raises(RuntimeError, match="disappeared"):
+        staleness.stage_model_ref("org/model", "artifact")
+
+
+def test_staging_refuses_empty_transformer_manifest_and_carries_revision(
+        tmp_path, monkeypatch):
+    snapshot = tmp_path / "cache" / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    seen = []
+    monkeypatch.setattr(
+        staleness, "pinned_model_ref",
+        lambda model, artifact, *, revision: seen.append(
+            (model, artifact, revision)) or str(snapshot))
+    monkeypatch.setattr(staleness, "_transformer_manifest", lambda _snapshot: None)
+
+    with pytest.raises(RuntimeError, match="cannot verify transformer snapshot"):
+        staleness.stage_model_ref(
+            "org/model", "artifact", revision="a" * 40)
+    assert seen == [("org/model", "artifact", "a" * 40)]
+    assert not list((tmp_path / "cache").glob(".ara-stage-*"))
+
+
 def test_bare_hf_identity_refuses_unidentifiable_selected_weight(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     revision = "a" * 40
