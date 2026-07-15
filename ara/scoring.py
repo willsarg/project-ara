@@ -118,6 +118,11 @@ class Score:
     sample_size: int | None = None
     refused_n: int | None = None
     errored_n: int | None = None
+    probe_context: int | None = None
+    generation_cap: int | None = None
+    repeat_count: int | None = None
+    total_generations: int | None = None
+    run_scores: tuple[float, ...] | None = None
     # Set by :func:`flag_inversions` when a same-base quant of a different precision upset this
     # reading's expected precision ordering — a short disclosure, never a re-ranking (Rule #3).
     inversion: str | None = None
@@ -135,7 +140,13 @@ def score_for(model_id: str, use_case: str, *,
         if hit is not None:
             return Score("measured", hit["score"], hit["source"],
                          sample_size=hit.get("sample_size"),
-                         refused_n=hit.get("refused_n"), errored_n=hit.get("errored_n"))
+                         refused_n=hit.get("refused_n"), errored_n=hit.get("errored_n"),
+                         probe_context=hit.get("probe_context"),
+                         generation_cap=hit.get("generation_cap"),
+                         repeat_count=hit.get("repeat_count"),
+                         total_generations=hit.get("total_generations"),
+                         run_scores=(tuple(hit["run_scores"])
+                                     if hit.get("run_scores") is not None else None))
     if imported:
         bucket = imported.get(model_id) or imported.get(base_key(model_id))
         if bucket and use_case in bucket:

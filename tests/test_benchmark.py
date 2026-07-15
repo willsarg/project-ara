@@ -244,6 +244,35 @@ def test_agentic_null_argument_fails_exact_match():
     assert score("agentic", item, '{"name": "fn", "arguments": {"x": null}}') == 0.0
 
 
+@pytest.mark.parametrize("expected,predicted", [
+    (1, True),
+    (True, 1),
+    (True, "true"),
+    ([1, 2], "[1, 2]"),
+    ({"x": 1}, "{'x': 1}"),
+])
+def test_agentic_argument_types_must_match(expected, predicted):
+    from ara.benchmark import score
+    item = {
+        "id": "t1", "question": "q", "function": {},
+        "expected": {"name": "fn", "arguments": {"value": expected}},
+    }
+    completion = json.dumps({"name": "fn", "arguments": {"value": predicted}})
+    assert score("agentic", item, completion) == 0.0
+
+
+def test_agentic_nested_arguments_match_structurally():
+    from ara.benchmark import score
+    value = {"enabled": True, "items": [1, "Two", {"ratio": 3.0, "note": None}]}
+    item = {
+        "id": "t1", "question": "q", "function": {},
+        "expected": {"name": "fn", "arguments": {"value": value}},
+    }
+    predicted = {"enabled": True, "items": [1.00001, "two", {"ratio": 3, "note": None}]}
+    completion = json.dumps({"name": "FN", "arguments": {"value": predicted}})
+    assert score("agentic", item, completion) == 1.0
+
+
 # ── extraction scorer ─────────────────────────────────────────────────────────
 
 def test_extraction_exact_match_scores_1():

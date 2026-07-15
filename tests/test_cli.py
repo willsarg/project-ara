@@ -8450,6 +8450,53 @@ def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platfor
     assert sc["sample_size"] == 30 and sc["refused_n"] == 2 and sc["errored_n"] == 1
 
 
+def test_recommend_carries_repeat_wide_benchmark_provenance(
+        make_console, monkeypatch, set_platform, capsys):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Repeated", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
+        "model_id": "org/Repeated", "use_case": "coding", "score": 0.6,
+        "source": "mlx probe=100", "sample_size": 100,
+        "refused_n": 5, "errored_n": 2,
+        "probe_context": 4096, "generation_cap": 512, "repeat_count": 3,
+        "total_generations": 300, "run_scores_json": "[0.55, 0.6, 0.65]",
+    }])
+
+    c, buf = make_console(verbose=True)
+    assert cli.render_recommend(c, use_case="coding") == 0
+    out = buf.getvalue()
+    assert "[partial: 5/300 refused, 2/300 errored]" in out
+    assert "[evidence: 100 prompts × 3 runs; ctx 4096; max 512]" in out
+
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
+    score = json.loads(capsys.readouterr().out)[0]["score"]
+    assert score["probe_context"] == 4096
+    assert score["generation_cap"] == 512
+    assert score["repeat_count"] == 3
+    assert score["total_generations"] == 300
+    assert score["run_scores"] == [0.55, 0.6, 0.65]
+
+
+def test_recommend_verbose_handles_legacy_benchmark_provenance(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform,
+                    [_model_row("org/Legacy", weights_gb=4.0, max_context=131072)])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [{
+        "model_id": "org/Legacy", "use_case": "coding", "score": 0.6,
+        "source": "mlx probe=100", "sample_size": 100,
+        "refused_n": 0, "errored_n": 0,
+        "probe_context": None, "generation_cap": None, "repeat_count": 1,
+        "total_generations": None, "run_scores_json": None,
+    }])
+
+    c, buf = make_console(verbose=True)
+    assert cli.render_recommend(c, use_case="coding") == 0
+    assert "[evidence: 100 prompts]" in buf.getvalue()
+
+
 def test_render_benchmark_rejects_nonpositive_ctx(make_console, monkeypatch):
     _wire_benchmark(monkeypatch)
     c, buf = make_console()

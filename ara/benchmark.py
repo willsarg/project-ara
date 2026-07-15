@@ -233,6 +233,26 @@ def _extract_json(text: str):
         return None
 
 
+def _agentic_value_matches(expected, predicted) -> bool:
+    """Type-aware recursive BFCL argument comparison with numeric tolerance."""
+    if isinstance(expected, bool):
+        return isinstance(predicted, bool) and predicted is expected
+    if isinstance(expected, (int, float)):
+        return (isinstance(predicted, (int, float)) and not isinstance(predicted, bool)
+                and abs(float(predicted) - float(expected)) <= 1e-4)
+    if isinstance(expected, str):
+        return isinstance(predicted, str) and predicted.lower() == expected.lower()
+    if isinstance(expected, list):
+        return (isinstance(predicted, list) and len(predicted) == len(expected)
+                and all(_agentic_value_matches(exp, pred)
+                        for exp, pred in zip(expected, predicted)))
+    if isinstance(expected, dict):
+        return (isinstance(predicted, dict) and set(predicted) == set(expected)
+                and all(_agentic_value_matches(value, predicted[key])
+                        for key, value in expected.items()))
+    return type(predicted) is type(expected) and predicted == expected
+
+
 def _score_agentic(item: dict, completion: str) -> float:
     """Name + arg exact match (name + str args case-insensitive, numeric ±1e-4)."""
     parsed = _extract_json(completion)
@@ -246,18 +266,8 @@ def _score_agentic(item: dict, completion: str) -> float:
     if not isinstance(pred_args, dict) or set(pred_args) != set(expected_args):
         return 0.0
     for arg, exp_val in expected_args.items():
-        pred_val = pred_args.get(arg)
-        if pred_val is None:
+        if not _agentic_value_matches(exp_val, pred_args[arg]):
             return 0.0
-        if isinstance(exp_val, (int, float)):
-            try:
-                if abs(float(pred_val) - float(exp_val)) > 1e-4:
-                    return 0.0
-            except (TypeError, ValueError):
-                return 0.0
-        else:
-            if str(pred_val).lower() != str(exp_val).lower():
-                return 0.0
     return 1.0
 
 

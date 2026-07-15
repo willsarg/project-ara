@@ -150,12 +150,28 @@ def test_measured_score_carries_sample_size_and_partial_counts():
     assert s.sample_size == 30 and s.refused_n == 3 and s.errored_n == 2
 
 
+def test_measured_score_carries_structured_execution_provenance():
+    measured = {("m", "coding"): {
+        "score": 0.4, "source": "mlx probe", "sample_size": 100,
+        "probe_context": 4096, "generation_cap": 512, "repeat_count": 3,
+        "total_generations": 300, "run_scores": [0.3, 0.4, 0.5],
+    }}
+    s = scoring.score_for("m", "coding", measured=measured)
+    assert s.probe_context == 4096
+    assert s.generation_cap == 512
+    assert s.repeat_count == 3
+    assert s.total_generations == 300
+    assert s.run_scores == (0.3, 0.4, 0.5)
+
+
 def test_imported_score_has_none_partial_fields():
     # An imported score carries no sample-size / partial-count metadata (defaults None).
     # Spec 2026-07-02-benchmark-honesty-persistence.
     imported = {"m": {"coding": {"score": 0.5, "source": "leaderboard"}}}
     s = scoring.score_for("m", "coding", imported=imported)
     assert s.sample_size is None and s.refused_n is None and s.errored_n is None
+    assert s.probe_context is None and s.generation_cap is None
+    assert s.repeat_count is None and s.total_generations is None and s.run_scores is None
 
 
 def test_measured_score_missing_partial_fields_default_none():

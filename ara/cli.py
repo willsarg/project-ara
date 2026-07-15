@@ -1611,7 +1611,13 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             bench_measured = ({(r["model_id"], r["use_case"]):
                                {"score": r["score"], "source": r["source"],
                                 "sample_size": r.get("sample_size"),
-                                "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n")}
+                                "refused_n": r.get("refused_n"), "errored_n": r.get("errored_n"),
+                                "probe_context": r.get("probe_context"),
+                                "generation_cap": r.get("generation_cap"),
+                                "repeat_count": r.get("repeat_count"),
+                                "total_generations": r.get("total_generations"),
+                                "run_scores": (json.loads(r["run_scores_json"])
+                                               if r.get("run_scores_json") else None)}
                                for r in rows} or None)
             recs = scoring.rank(recs, use_case, measured=bench_measured,
                                 imported=scoring.load_imported())
@@ -1626,6 +1632,11 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                                      "sample_size": r["score"].sample_size,
                                      "refused_n": r["score"].refused_n,
                                      "errored_n": r["score"].errored_n,
+                                     "probe_context": r["score"].probe_context,
+                                     "generation_cap": r["score"].generation_cap,
+                                     "repeat_count": r["score"].repeat_count,
+                                     "total_generations": r["score"].total_generations,
+                                     "run_scores": r["score"].run_scores,
                                      "inversion": r["score"].inversion})} for r in recs]
         print(json.dumps(recs, indent=2))
         return 0
@@ -1667,15 +1678,25 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                     # Disclose a depressed / shaky measurement rather than ranking on it silently.
                     if s.refused_n or s.errored_n:
                         partial = []
+                        denominator = f"/{s.total_generations}" if s.total_generations else ""
                         if s.refused_n:
-                            partial.append(f"{s.refused_n} refused")
+                            partial.append(f"{s.refused_n}{denominator} refused")
                         if s.errored_n:
-                            partial.append(f"{s.errored_n} errored")
+                            partial.append(f"{s.errored_n}{denominator} errored")
                         head += f" [partial: {', '.join(partial)}]"
                     if s.sample_size is not None and s.sample_size < 100:
                         head += f" [low-confidence n={s.sample_size}]"
                     if s.inversion:
                         head += f" [quant-inversion: {s.inversion}]"
+                    if c.verbose and s.sample_size is not None:
+                        repeat_text = (f" × {s.repeat_count} runs"
+                                       if s.repeat_count and s.repeat_count > 1 else "")
+                        evidence = f"{s.sample_size} prompts{repeat_text}"
+                        if s.probe_context is not None:
+                            evidence += f"; ctx {s.probe_context}"
+                        if s.generation_cap is not None:
+                            evidence += f"; max {s.generation_cap}"
+                        head += f" [evidence: {evidence}]"
             tail = f"{head} · {tail}"
         mark = c.style("good", "  · characterized here") if r["characterized"] else ""
         quant_tag = c.style("dim", f" [{r['quant']}]") if r["quant"] else ""
