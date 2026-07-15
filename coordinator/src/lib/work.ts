@@ -33,6 +33,7 @@ export interface AdminWorkSummary {
   error: string | null;
   result_environment_json: string | null;
   created_at: string;
+  offered_at: string | null;
   dispatched_at: string | null;
   finished_at: string | null;
 }
@@ -61,6 +62,7 @@ export function listRecentWork(): AdminWorkSummary[] {
     error: row.error,
     result_environment_json: row.result_environment_json,
     created_at: row.created_at,
+    offered_at: row.offered_at,
     dispatched_at: row.dispatched_at,
     finished_at: row.finished_at,
   }));

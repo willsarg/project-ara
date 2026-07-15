@@ -34,8 +34,11 @@ describe("coordinator operator documentation", () => {
     expect(nodes).toContain("job.result_json");
     expect(nodes).toContain("job.error");
     expect(nodes).toContain("job.result_environment_json");
+    expect(nodes).toContain("job.offered_at");
     expect(nodes).toContain("job.dispatched_at");
     expect(nodes).toContain("job.finished_at");
+    expect(nodes).toContain("offer time unknown");
+    expect(nodes).toContain("dispatch time unknown");
     expect(nodes).toContain("Job was not queued: the selected node is no longer active.");
     expect(nodes).toContain("jobId");
   });

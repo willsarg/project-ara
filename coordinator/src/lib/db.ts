@@ -70,6 +70,7 @@ function open(): Database.Database {
       measurement_json TEXT,
       result_environment_json TEXT,
       created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      offered_at       TEXT,
       dispatched_at    TEXT,
       finished_at      TEXT
     );
@@ -78,6 +79,7 @@ function open(): Database.Database {
   // agent/job, keep only the newest poll binding, then enforce one bound enrollment per token.
   migrateEnrollmentBindings(db);
   migrateWorkResultEnvironment(db);
+  migrateWorkOfferTimestamps(db);
   const allowedKindsSql = ALLOWED_JOB_KINDS.map((kind) => `'${kind}'`).join(", ");
   // Triggers migrate existing databases without rebuilding the work table or rejecting historical
   // rows. From this version onward, both new inserts and kind updates are defended in SQLite too.
@@ -122,6 +124,20 @@ export function migrateWorkResultEnvironment(db: Database.Database): void {
     const columns = db.prepare("PRAGMA table_info(work)").all() as { name: string }[];
     if (!columns.some((column) => column.name === "result_environment_json")) {
       db.exec("ALTER TABLE work ADD COLUMN result_environment_json TEXT");
+    }
+  }).immediate();
+}
+
+/** Split legacy offer timestamps from acknowledgements. Older coordinators wrote dispatched_at
+ * when work was merely handed to a poller, so an exact acknowledgement time was never observed.
+ * Preserve that evidence as offered_at and make the unknown dispatch time explicit. */
+export function migrateWorkOfferTimestamps(db: Database.Database): void {
+  db.transaction(() => {
+    const columns = db.prepare("PRAGMA table_info(work)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "offered_at")) {
+      db.exec("ALTER TABLE work ADD COLUMN offered_at TEXT");
+      db.exec(`UPDATE work SET offered_at = dispatched_at, dispatched_at = NULL
+               WHERE dispatched_at IS NOT NULL`);
     }
   }).immediate();
 }
@@ -275,6 +291,7 @@ export interface WorkRow {
   measurement_json: string | null;
   result_environment_json: string | null;
   created_at: string;
+  offered_at: string | null;
   dispatched_at: string | null;
   finished_at: string | null;
 }
@@ -317,10 +334,11 @@ export function getAgentBySessionHash(sessionTokenHash: string): AgentRow | null
     .get(sessionTokenHash) as AgentRow | undefined) ?? null;
 }
 
-/** Consume one enrollment token and create/re-enroll its machine as one BEGIN IMMEDIATE unit.
+/** Consume one enrollment token and create one distinct pending owner as a BEGIN IMMEDIATE unit.
  *  The write lock is acquired before reading `used` or the machine row, so another coordinator
  *  process cannot observe both as fresh and race us to a second binding. Used-token retries return
- *  the single row already bound to that token. */
+ *  the single row already bound to that token. A generic token never authorizes takeover of an
+ *  existing row, even when a client repeats its public node identifier. */
 export function enrollAgentAtomically(a: {
   token_id: number;
   machine_key: string;
@@ -341,30 +359,12 @@ export function enrollAgentAtomically(a: {
         .get(input.token_id) as AgentRow | undefined) ?? null;
     }
 
-    const existing = input.machine_key
-      ? ((db
-          .prepare("SELECT * FROM agents WHERE machine_key = ? ORDER BY id DESC LIMIT 1")
-          .get(input.machine_key) as AgentRow | undefined) ?? null)
-      : null;
-    let id: number;
-    if (existing) {
-      db.prepare(
-        `UPDATE agents
-         SET enrollment_id = @enrollment_id, enrollment_token_id = @token_id,
-             status = 'pending', session_token_hash = NULL, pending_session_token = NULL,
-             identity_json = @identity_json, caps_json = @caps_json,
-             environment_json = @environment_json, last_seen = NULL
-         WHERE id = @id`,
-      ).run({ ...input, id: existing.id });
-      id = existing.id;
-    } else {
-      const inserted = db.prepare(
-        `INSERT INTO agents
-           (machine_key, enrollment_id, enrollment_token_id, identity_json, caps_json, environment_json)
-         VALUES (@machine_key, @enrollment_id, @token_id, @identity_json, @caps_json, @environment_json)`,
-      ).run(input);
-      id = Number(inserted.lastInsertRowid);
-    }
+    const inserted = db.prepare(
+      `INSERT INTO agents
+         (machine_key, enrollment_id, enrollment_token_id, identity_json, caps_json, environment_json)
+       VALUES (@machine_key, @enrollment_id, @token_id, @identity_json, @caps_json, @environment_json)`,
+    ).run(input);
+    const id = Number(inserted.lastInsertRowid);
     db.prepare("UPDATE enrollment_tokens SET used = 1 WHERE id = ? AND used = 0").run(input.token_id);
     return db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow;
   });
@@ -465,12 +465,12 @@ export function claimNextWorkForAgent(
 ): ClaimedWork | null {
   return (open()
     .prepare(
-      `UPDATE work SET status = 'offered', dispatched_at = datetime('now')
+      `UPDATE work SET status = 'offered', offered_at = datetime('now')
        WHERE id = (
          SELECT id FROM work
          WHERE agent_id = ? AND (
            status = 'queued'
-           OR (status = 'offered' AND dispatched_at <= datetime('now', ?))
+           OR (status = 'offered' AND offered_at <= datetime('now', ?))
          )
          ORDER BY CASE status WHEN 'offered' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1
        )
@@ -485,7 +485,7 @@ export type WorkAckResult = "ok" | "unknown" | "conflict";
 export function acknowledgeWorkForAgent(id: string, agentId: number): WorkAckResult {
   const db = open();
   const changed = db.prepare(
-    `UPDATE work SET status = 'dispatched'
+    `UPDATE work SET status = 'dispatched', dispatched_at = datetime('now')
      WHERE id = ? AND agent_id = ? AND status = 'offered'`,
   ).run(id, agentId);
   if (changed.changes === 1) return "ok";

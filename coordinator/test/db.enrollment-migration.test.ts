@@ -31,12 +31,16 @@ beforeAll(async () => {
     );
     INSERT INTO agents (machine_key, enrollment_id, enrollment_token_id)
     VALUES ('old-a', 'enr_old_a', 7), ('old-b', 'enr_old_b', 7);
-    INSERT INTO work (id, agent_id, kind, args_json, status, result_json)
-    VALUES ('job_legacy', 2, 'run', '{"model":"qwen"}', 'done', '{"output":"kept"}');
+    INSERT INTO work (id, agent_id, kind, args_json, status, result_json, dispatched_at)
+    VALUES ('job_legacy', 2, 'run', '{"model":"qwen"}', 'done', '{"output":"kept"}',
+            '2026-07-01 12:00:00');
   `);
-  const { migrateEnrollmentBindings, migrateWorkResultEnvironment } = await import("@/lib/db");
+  const {
+    migrateEnrollmentBindings, migrateWorkOfferTimestamps, migrateWorkResultEnvironment,
+  } = await import("@/lib/db");
   migrateEnrollmentBindings(old);
   migrateWorkResultEnvironment(old);
+  migrateWorkOfferTimestamps(old);
   old.close();
 });
 
@@ -72,6 +76,16 @@ describe("existing enrollment-token binding migration", () => {
       result_json: '{"output":"kept"}',
       result_environment_json: null,
     });
+    migrated.close();
+  });
+
+  it("preserves legacy offer evidence without claiming an unobserved acknowledgement time", () => {
+    const migrated = new Database(dbPath);
+    const columns = migrated.prepare("PRAGMA table_info(work)").all() as { name: string }[];
+    expect(columns.map((column) => column.name)).toContain("offered_at");
+    expect(migrated.prepare(
+      "SELECT offered_at, dispatched_at FROM work WHERE id = 'job_legacy'",
+    ).get()).toEqual({ offered_at: "2026-07-01 12:00:00", dispatched_at: null });
     migrated.close();
   });
 });

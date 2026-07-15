@@ -185,7 +185,13 @@ export default async function NodesPage({ searchParams }: NodesPageProps) {
                     <td className="job-data">{job.result_environment_json ?? "—"}</td>
                     <td>
                       queued {job.created_at}<br />
-                      {job.dispatched_at ? `dispatched ${job.dispatched_at}` : "not dispatched"}<br />
+                      {job.offered_at
+                        ? `offered ${job.offered_at}`
+                        : job.status === "queued" ? "not offered" : "offer time unknown"}<br />
+                      {job.dispatched_at
+                        ? `dispatched ${job.dispatched_at}`
+                        : ["dispatched", "done", "failed"].includes(job.status)
+                          ? "dispatch time unknown" : "not dispatched"}<br />
                       {job.finished_at ? `finished ${job.finished_at}` : "not finished"}
                     </td>
                   </tr>

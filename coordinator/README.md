@@ -75,9 +75,10 @@ Next.js bundles and process restarts. Node `/api/*` routes use their own hashed 
 the public health route is the only unauthenticated non-enrollment surface.
 
 SQLite stores `meta`, `enrollment_tokens`, `agents`, and `work`. Enrollment-token consumption,
-same-machine re-enrollment, work offer/acknowledgement, and first-terminal-result recording are
-transactional or single-statement atomic operations. Every reported result retains its measured
-environment provenance.
+distinct owner creation, work offer/acknowledgement, and first-terminal-result recording are
+transactional or single-statement atomic operations. A generic enrollment token never authorizes
+takeover of an existing node ID or its work. Every reported result retains its measured environment
+provenance.
 
 The current supported lifecycle is npm or Docker Compose. The repository does not yet expose an
 ARA-owned coordinator lifecycle command; that will be the `ara hub` surface.

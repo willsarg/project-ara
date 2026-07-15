@@ -83,7 +83,7 @@ describe("enrollment tokens", () => {
     );
   });
 
-  it("serializes concurrent fresh-token enrollment for one machine onto its stable row", async () => {
+  it("never treats a fresh generic token as authority to take over a matching node id", async () => {
     const tokens = Array.from({ length: 8 }, () => enroll.issueEnrollmentToken().token);
     await Promise.all(
       tokens.map((token) =>
@@ -92,8 +92,10 @@ describe("enrollment tokens", () => {
     );
 
     const matching = db.listAgents().filter((agent) => agent.machine_key === "box-machine-race");
-    expect(matching).toHaveLength(1);
-    expect(matching[0].status).toBe("pending");
+    expect(matching).toHaveLength(8);
+    expect(new Set(matching.map((agent) => agent.id)).size).toBe(8);
+    expect(new Set(matching.map((agent) => agent.enrollment_token_id)).size).toBe(8);
+    expect(matching.every((agent) => agent.status === "pending")).toBe(true);
   });
 
   it("stores only the hash, never the plaintext", () => {
@@ -157,7 +159,7 @@ describe("approval + session token delivery", () => {
     expect(auth.verifySessionToken("wrong")).toBeNull();
   });
 
-  it("re-enrolls a known nonempty machine on the same agent and invalidates its old session", () => {
+  it("a fresh token cannot revoke a matching node or inherit its queued work", async () => {
     const firstEnrollment = enroll.issueEnrollmentToken();
     const first = enroll.enroll(firstEnrollment.token, selfDesc("box-rotate"))!;
     const original = db.getAgentByEnrollmentId(first.enrollment_id)!;
@@ -176,20 +178,21 @@ describe("approval + session token delivery", () => {
       ...selfDesc("box-rotate"),
       identity: { hostname: "box-rotate-new", os: "linux", arch: "x86_64" },
     })!;
-    const reenrolled = db.getAgentByEnrollmentId(rotated.enrollment_id)!;
+    const separate = db.getAgentByEnrollmentId(rotated.enrollment_id)!;
 
     expect(rotated.enrollment_id).not.toBe(first.enrollment_id);
-    expect(reenrolled.id).toBe(original.id);
-    expect(reenrolled.status).toBe("pending");
-    expect(reenrolled.session_token_hash).toBeNull();
-    expect(JSON.parse(reenrolled.identity_json!)).toMatchObject({ hostname: "box-rotate-new" });
-    expect(auth.verifySessionToken(oldSession)).toBeNull();
+    expect(separate.id).not.toBe(original.id);
+    expect(separate.status).toBe("pending");
+    expect(separate.session_token_hash).toBeNull();
+    expect(JSON.parse(separate.identity_json!)).toMatchObject({ hostname: "box-rotate-new" });
+    expect(auth.verifySessionToken(oldSession)!.id).toBe(original.id);
     expect(db.getWorkById(jobId)!.agent_id).toBe(original.id);
+    expect(await work.nextForAgent(separate.id, 0)).toBeNull();
     expect(enroll.pollApproval(rotated.enrollment_id, firstEnrollment.token)).toEqual({
       kind: "unauthorized",
     });
 
-    enroll.approveAgent(reenrolled.id);
+    enroll.approveAgent(separate.id);
     const newSession = (
       enroll.pollApproval(rotated.enrollment_id, freshEnrollment.token) as {
         kind: "active";
@@ -197,7 +200,7 @@ describe("approval + session token delivery", () => {
       }
     ).session_token;
     expect(newSession).not.toBe(oldSession);
-    expect(auth.verifySessionToken(newSession)!.id).toBe(original.id);
+    expect(auth.verifySessionToken(newSession)!.id).toBe(separate.id);
   });
 
   it("unknown enrollment id → not_found; wrong token → unauthorized; denied → denied", () => {
@@ -540,9 +543,17 @@ describe("work queue", () => {
 
     // A live unacknowledged offer is not duplicated by an immediate re-poll.
     expect(await work.nextForAgent(agentId, 0)).toBeNull();
-    expect(db.getWorkById(jobId)!.status).toBe("offered");
+    expect(db.getWorkById(jobId)).toMatchObject({
+      status: "offered",
+      offered_at: expect.any(String),
+      dispatched_at: null,
+    });
     expect(work.acknowledge(jobId, agentId)).toBe("ok");
-    expect(db.getWorkById(jobId)!.status).toBe("dispatched");
+    expect(db.getWorkById(jobId)).toMatchObject({
+      status: "dispatched",
+      offered_at: expect.any(String),
+      dispatched_at: expect.any(String),
+    });
     expect(work.acknowledge(jobId, agentId)).toBe("ok"); // idempotent after response loss
   });
 
@@ -682,6 +693,7 @@ describe("work queue", () => {
       result_json: null,
       error: null,
       result_environment_json: null,
+      offered_at: null,
       dispatched_at: null,
       finished_at: null,
     });
@@ -699,6 +711,7 @@ describe("work queue", () => {
       result_json: JSON.stringify({ output: "hello" }),
       error: null,
       result_environment_json: JSON.stringify(VALID_ENV),
+      offered_at: expect.any(String),
       dispatched_at: expect.any(String),
       finished_at: expect.any(String),
     });
