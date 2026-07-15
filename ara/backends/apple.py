@@ -224,7 +224,18 @@ def serve(model: str, *, port: int, max_context: int,
     if measured_slope_gb_per_k is not None:
         argv += ["--measured-slope", str(measured_slope_gb_per_k)]
     proc, info = engine_env.start_worker_server("apple", argv)
-    return proc, info["url"], info["context"]
+    url, context = info.get("url"), info.get("context")
+    valid = (isinstance(url, str) and url.rstrip("/") == f"http://127.0.0.1:{port}"
+             and isinstance(context, int) and not isinstance(context, bool)
+             and context == max_context)
+    if not valid:
+        for step in (proc.kill, proc.wait):
+            try:
+                step()
+            except Exception:
+                pass
+        raise engine_env.EngineEnvError("server 'apple' emitted an invalid ready signal")
+    return proc, url, context
 
 
 DEFAULT_MAX_TOKENS = 256

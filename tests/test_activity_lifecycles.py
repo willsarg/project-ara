@@ -459,8 +459,12 @@ def test_mlx_serve_wait_cleanup_covers_all_exit_paths(
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         serve=lambda *_a, **_k: (Proc(), "http://127.0.0.1:1234", 4096)))
     c, _ = make_console()
-    with pytest.raises(type(raised)):
-        cli._render_serve_mlx(c, "org/model", engine_key="mlx", assume_yes=True)
+    if isinstance(raised, KeyboardInterrupt):
+        assert cli._render_serve_mlx(
+            c, "org/model", engine_key="mlx", assume_yes=True) == 0
+    else:
+        with pytest.raises(type(raised)):
+            cli._render_serve_mlx(c, "org/model", engine_key="mlx", assume_yes=True)
     assert activity.snapshot() == []
 
 
@@ -607,20 +611,26 @@ def test_ollama_serve_declined_consent_never_claims_activity(
     assert activity.snapshot() == []
 
 
-def test_ollama_manifest_failure_reports_loaded_but_untrackable_service(
+def test_ollama_manifest_failure_unloads_untrackable_service(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {"done": True})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [
+    unloading = []
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1:
+                        unloading.append(name) or {} if keep_alive == 0 else {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
         {"name": "base-model-ara:latest", "context_length": 4096,
          "size": 10, "size_vram": 10}])
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(OSError("disk full")))
     c, buf = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 1
-    assert "loaded" in buf.getvalue()
     assert "ownership could not be recorded" in buf.getvalue()
+    assert "unloaded" in buf.getvalue()
+    assert unloading == ["base-model-ara"] and deleted == ["base-model-ara"]
     assert activity.snapshot() == []
 
 
@@ -628,17 +638,21 @@ def test_ollama_manifest_validation_failure_is_honest_json_not_raw_exception(
         make_console, monkeypatch, activity_registry, capsys):
     _wire_ollama_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {"done": True})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [
+    unloading = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1:
+                        unloading.append(name) or {} if keep_alive == 0 else {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
         {"name": "base-model-ara:latest", "context_length": 4096,
          "size": 10, "size_vram": 10}])
+    monkeypatch.setattr(cli.ollama, "delete", lambda _name: True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(ValueError("invalid identity")))
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096, as_json=True) == 1
     assert json.loads(capsys.readouterr().out) == {
         "error": "base-model-ara loaded at 4096 ctx, but ARA ownership could not be recorded: "
-                 "invalid identity"}
+                 "invalid identity; unloaded the untracked service"}
     assert activity.snapshot() == []
 
 

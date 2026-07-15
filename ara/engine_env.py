@@ -234,6 +234,8 @@ def start_worker_server(name: str, args: list[str], *,
         if ready.get("error") or ready.get("refused"):
             reason = ready.get("reason") or ready.get("error", "unknown")
             raise EngineEnvError(f"server {name!r} refused: {reason}")
+        if ready.get("ready") is not True:
+            raise EngineEnvError(f"server {name!r} emitted an invalid ready signal: ready != true")
         return proc, ready
     except BaseException:
         for _step in (proc.kill, proc.wait):           # reap; never leak the child

@@ -2188,24 +2188,29 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str):
 
 def _cleanup_ollama_probe(probe: str) -> str | None:
     """Unload, verify absence, then delete a characterization probe; return any cleanup error."""
+    return _cleanup_ollama_model(probe, label="probe", delete=True)
+
+
+def _cleanup_ollama_model(name: str, *, label: str, delete: bool) -> str | None:
+    """Unload an ARA-created Ollama model, verify absence, and optionally delete its manifest."""
     errors = []
-    if ollama.load(probe, keep_alive=0) is None:
-        errors.append("couldn't request probe unload")
+    if ollama.load(name, keep_alive=0) is None:
+        errors.append(f"couldn't request {label} unload")
     absent = False
     for attempt in range(10):
         entries = ollama.ps()
         if entries is None:
-            errors.append("couldn't verify probe unload")
+            errors.append(f"couldn't verify {label} unload")
             break
-        if _find_loaded(entries, probe) is None:
+        if _find_loaded(entries, name) is None:
             absent = True
             break
         if attempt < 9:
             time.sleep(0.1)
     if not absent and not any("verify" in error for error in errors):
-        errors.append("probe is still resident after unload")
-    if absent and not ollama.delete(probe):
-        errors.append("couldn't delete probe model")
+        errors.append(f"{label} is still resident after unload")
+    if absent and delete and not ollama.delete(name):
+        errors.append(f"couldn't delete {label} model")
     return "; ".join(errors) if errors else None
 
 
@@ -2311,6 +2316,15 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _stop_mlx_server(proc) -> None:
+    """Best-effort terminate, kill, and reap for a child whose serve lifecycle failed."""
+    for method in ("terminate", "kill", "wait"):
+        try:
+            getattr(proc, method)()
+        except BaseException:
+            pass
+
+
 def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | None = None,
                       assume_yes: bool = False, as_json: bool = False,
                       kv_quant: str = "f16") -> int:
@@ -2327,8 +2341,6 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     expected_config = _measurement_config("apple", kv_quant=kv_quant)
     with db.connected() as con:
         if ctx is not None:
-            if ctx <= 0:
-                return err("--ctx must be a positive integer")
             _row = db.get_characterization(con, mk, engine_key, model)
             if _row and (msg := _measurement_config_error(
                     _row, expected_config, "apple", model)):
@@ -2366,6 +2378,16 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     except Exception as exc:                       # gate refusal / engine not installed / etc.
         return err(f"couldn't start the MLX server: {exc}")
 
+    expected_url = f"http://127.0.0.1:{port}"
+    if not isinstance(url, str) or url.rstrip("/") != expected_url:
+        _stop_mlx_server(proc)
+        return err("invalid MLX server ready signal — endpoint did not match the allocated "
+                   "localhost port")
+    if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
+            or served_ctx != safe):
+        _stop_mlx_server(proc)
+        return err(f"MLX governance failed: server reported {served_ctx!r} ctx, not {safe}")
+
     endpoint = url.rstrip("/") + "/v1"
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": model, "served_context": served_ctx,
@@ -2390,10 +2412,19 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
 
     old = signal.signal(signal.SIGTERM, _stop)
     try:
-        with activity.track("serving", model):
-            proc.wait()                            # our child IS the server; stay alive to serve
+        try:
+            with activity.track("serving", model):
+                returncode = proc.wait()            # our child IS the server; stay alive to serve
+        except KeyboardInterrupt:
+            _stop_mlx_server(proc)
+            return 0
+        except BaseException:
+            _stop_mlx_server(proc)
+            raise
     finally:
         signal.signal(signal.SIGTERM, old)
+    if returncode not in (None, 0):
+        return err(f"MLX server exited with status {returncode}")
     return 0
 
 
@@ -2412,21 +2443,43 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     so a fresh model serves in one command. After load it verifies the ceiling actually took before
     returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
     2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine mlx`` routes to the governed MLX
-    server instead (spec 2026-06-28); the Ollama path below is unchanged."""
-    auto_selected = model is None    # bare `ara serve` → pick the best-fitting model in the store
-    if engine is not None and model is not None:
-        key = engines.resolve(engine)
-        if key and engines.ENGINES.get(key, {}).get("backend") == "apple":
-            return _render_serve_mlx(c, model, engine_key=key, ctx=ctx,
-                                     assume_yes=assume_yes, as_json=as_json)
-
+    server instead (spec 2026-06-28)."""
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
+    auto_selected = model is None    # bare `ara serve` → pick the best-fitting model in the store
+    if ctx is not None and ctx <= 0:
+        return err("--ctx must be a positive integer")
     if engine is not None and model is None:
         return err("`ara serve` with no model picks from the Ollama store — pass a model to use "
                    "--engine.")
+    if engine not in (None, "ollama"):
+        key = engines.resolve(engine)
+        if key and engines.ENGINES.get(key, {}).get("backend") == "apple":
+            if name is not None:
+                return err("--name applies only to Ollama serving; MLX exposes the model name.")
+            return _render_serve_mlx(c, model, engine_key=key, ctx=ctx,
+                                     assume_yes=assume_yes, as_json=as_json)
+        if engine != "auto":
+            return err(f"serve doesn't support --engine {engine!r} — use ollama, mlx, or auto.")
+        # Auto uses native MLX on Apple Silicon (handled above), otherwise Ollama. Ollama owns its
+        # own CPU/GPU routing, so claiming a CUDA/CPU engine pin here would be dishonest.
+
+    # Reject unsafe persistent activity fields before touching Ollama or pulling model data. A
+    # placeholder positive context is sufficient here because the real ceiling is separately
+    # validated before setup; this pass keeps malformed user input side-effect free.
+    def validate_identity(candidate: str) -> int | None:
+        try:
+            activity.validate_ollama_serving(
+                served_name=name or _governed_name(candidate), model=candidate,
+                context=ctx or 1, endpoint=ollama.base_url())
+        except ValueError as exc:
+            return err(f"invalid serving identity: {exc}")
+        return None
+
+    if model is not None and (invalid := validate_identity(model)) is not None:
+        return invalid
 
     # 1. liveness — honest about a server that isn't there (Rule #3)
     if ollama.version() is None:
@@ -2445,6 +2498,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         if model is None:
             return err("no model in Ollama fits this machine — pull a smaller / more-quantized "
                        "one, or name one explicitly.")
+        if (invalid := validate_identity(model)) is not None:
+            return invalid
         if not as_json:
             c.emit(c.style("dim", "  auto-selected ") + c.style("accent", model)
                    + c.style("dim", " (best fit in your Ollama store)"))
@@ -2455,13 +2510,12 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", f"  pulling {model} …"))
         if not ollama.pull(model):
             return err(f"couldn't pull {model} into Ollama — check the model name.")
+        names.append(model)
         if not as_json:
             c.emit(c.style("dim", "  pulled."))
 
     # 3. resolve the safe ceiling — measured, or explicit; never guessed
     if ctx is not None:
-        if ctx <= 0:
-            return err("--ctx must be a positive integer")
         # Rule #1 gate: an explicit --ctx must not exceed what was MEASURED for this model on
         # this machine (previously this path never consulted the measurement at all).
         with db.connected() as con:
@@ -2496,39 +2550,78 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     # 4. bake the ceiling into a derived model. This is temporary process-owned work until exact
     # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
     served = name or _governed_name(model)
+    served_preexisting = served in names or served + ":latest" in names
     endpoint_base = ollama.base_url()
-    try:
-        activity.validate_ollama_serving(
-            served_name=served, model=model, context=safe, endpoint=endpoint_base)
-    except ValueError as exc:
-        return err(f"invalid serving identity: {exc}")
     already_owned = any(
         item.runtime == "ollama" and item.served_name == served
         and item.context == safe and item.endpoint == endpoint_base
         and item.model == model
         for item in activity.snapshot())
+    if served_preexisting and not already_owned:
+        return err(f"Ollama model {served!r} already exists but is not owned by ARA with this "
+                   "exact model, context, and endpoint — refusing to overwrite or unload it.")
+
+    def setup_err(msg: str) -> int:
+        if already_owned:
+            return err(msg)
+        cleanup = _cleanup_ollama_model(served, label="governed model", delete=True)
+        if cleanup:
+            msg += f"; cleanup also failed: {cleanup}"
+        else:
+            msg += "; unloaded the untracked service"
+        return err(msg)
+
     setup_activity = nullcontext() if already_owned else activity.track("serving", model)
-    with setup_activity:
-        if not ollama.create(served, model, safe):
-            return err(f"couldn't create the governed model {served!r} on Ollama.")
-
-        # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
-        ollama.load(served)
-        entry = _find_loaded(ollama.ps() or [], served, expected_context=safe)
-        if entry is None:
-            return err(f"{served} didn't load — Ollama may be out of memory.")
-        served_ctx = entry.get("context_length")
-        if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
-                or served_ctx <= 0 or served_ctx != safe):
-            return err(f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing.")
-        size, vram = entry.get("size"), entry.get("size_vram")
-        spilled = isinstance(size, int) and isinstance(vram, int) and vram < size
-
+    create_confirmed = False
     try:
-        activity.record_ollama_serving(
-            served_name=served, model=model, context=safe, endpoint=endpoint_base)
-    except (OSError, ValueError) as exc:
-        return err(f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
+        with setup_activity:
+            if not already_owned:
+                latest_names = ollama.tags()
+                if latest_names is None:
+                    return err("couldn't recheck Ollama model names before creating the governed "
+                               "model — refusing to risk a collision.")
+                if served in latest_names or served + ":latest" in latest_names:
+                    return err(f"Ollama model {served!r} appeared before ARA could create it — "
+                               "refusing to overwrite or unload it.")
+                if not ollama.create(served, model, safe):
+                    return err(f"couldn't confirm creation of governed model {served!r}; no load "
+                               "or destructive cleanup was attempted because ownership is unknown.")
+                create_confirmed = True
+
+            # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
+            if ollama.load(served) is None:
+                return setup_err(f"couldn't load the governed model {served!r} on Ollama")
+            entries = ollama.ps()
+            if entries is None:
+                return setup_err(f"couldn't verify {served} through Ollama's process inventory")
+            entry = _find_loaded(entries, served, expected_context=safe)
+            if entry is None:
+                return setup_err(f"{served} didn't load — Ollama may be out of memory")
+            served_ctx = entry.get("context_length")
+            if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
+                    or served_ctx <= 0 or served_ctx != safe):
+                return setup_err(
+                    f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing")
+            size, vram = entry.get("size"), entry.get("size_vram")
+            residency_verified = (
+                isinstance(size, int) and not isinstance(size, bool) and size > 0
+                and isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0
+            )
+            spilled = vram < size if residency_verified else None
+
+        if not already_owned:
+            try:
+                activity.record_ollama_serving(
+                    served_name=served, model=model, context=safe, endpoint=endpoint_base)
+            except (OSError, ValueError) as exc:
+                return setup_err(
+                    f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
+    except BaseException:
+        if create_confirmed:
+            cleanup = _cleanup_ollama_model(served, label="governed model", delete=True)
+            if cleanup:
+                c.emit(c.style("warn", f"  interrupted setup cleanup failed: {cleanup}"))
+        raise
 
     # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
     # that is an empirical measurement, not a guess. Record it (engine "ollama") so the next serve
@@ -2537,7 +2630,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     # "estimated" only), never on spill (no clean evidence). Rule #3: labelled measured because we
     # measured it fits.
     recorded_measured = False
-    if source == "estimated" and not spilled:
+    if source == "estimated" and residency_verified and spilled is False:
         with db.connected() as con:
             db.save_characterization(con, profile.machine_key(), "ollama", model,
                                      safe_context=safe, points=[{"context": safe, "fit": True}],
@@ -2549,6 +2642,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
+                          "residency_verified": residency_verified,
                           "auto_selected": auto_selected, "recorded_measured": recorded_measured,
                           "stale_ceiling": stale_ceiling, "openai_base_url": endpoint}, indent=2))
         return 0
@@ -2556,8 +2650,11 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
     c.emit(c.field("endpoint", f"{endpoint}  (OpenAI-compatible)"))
     c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
-    if spilled:
+    if spilled is True:
         c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
+    elif not residency_verified:
+        c.emit(c.style("warn", "  note: Ollama did not report verifiable residency; spill status "
+                               "is unknown and no measured ceiling was recorded."))
     elif recorded_measured:
         c.emit(c.style("dim", "  recorded a measured ceiling — future serves skip the estimate."))
     c.emit()
@@ -3102,6 +3199,14 @@ def _run_engine_option(func):
     )(func)
 
 
+def _serve_engine_option(func):
+    return click.option(
+        "--engine", callback=_engine_callback, metavar="ENGINE",
+        help=("Serve through ollama, mlx, or auto. Omitted uses Ollama; auto uses native MLX on "
+              "Apple Silicon and Ollama elsewhere."),
+    )(func)
+
+
 def _characterize_engine_option(func):
     return click.option(
         "--engine", callback=_engine_callback, metavar="ENGINE",
@@ -3408,16 +3513,22 @@ def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: 
 
 @_click_cli.command("serve", context_settings=_HELP_SETTINGS)
 @click.argument("model", required=False)
-@click.option("--ctx", "serve_ctx", type=int, metavar="N", help="Governed context ceiling.")
-@click.option("--name", "serve_name", help="Name exposed by the endpoint.")
-@_engine_option
+@click.option("--ctx", "serve_ctx", type=click.IntRange(min=1), metavar="N",
+              help="Context cap; never above this model's measured safe ceiling.")
+@click.option("--name", "serve_name", metavar="NAME",
+              help="Ollama-only name exposed by the endpoint.")
+@_serve_engine_option
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_json_verbose_options
 @click.pass_context
 def _click_serve(ctx: click.Context, model: str | None, serve_ctx: int | None,
                  serve_name: str | None, engine: str | None, assume_yes: bool,
                  verbose: bool, as_json: bool) -> int:
-    """Serve a model behind a governed OpenAI-compatible endpoint."""
+    """Serve MODEL behind a governed OpenAI-compatible endpoint.
+
+    With no MODEL, ARA selects the best-fitting model already in Ollama. Ollama hands the endpoint
+    off and exits; MLX serves in the foreground until stopped.
+    """
     return render_serve(_mark_json(ctx, as_json), model, ctx=serve_ctx,
                         name=serve_name or None, engine=engine, assume_yes=assume_yes,
                         as_json=as_json)

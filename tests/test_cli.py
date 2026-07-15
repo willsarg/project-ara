@@ -6452,6 +6452,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     monkeypatch.setattr(cli.ollama, "create", lambda n, f, ctx, timeout=300.0: create_ok)
     monkeypatch.setattr(cli.ollama, "load", lambda n, keep_alive=-1, timeout=300.0: {"done": True})
     monkeypatch.setattr(cli.ollama, "ps", lambda timeout=2.0: (ps_rows or []))
+    monkeypatch.setattr(cli.ollama, "delete", lambda n, timeout=30.0: True)
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.db, "connect", lambda: types.SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
@@ -6521,6 +6522,56 @@ def test_serve_rejects_nonpositive_ctx(make_console, monkeypatch):
     assert "positive integer" in buf.getvalue()
 
 
+def test_serve_rejects_nonpositive_ctx_before_ollama_side_effects(make_console, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "version", lambda *_a: calls.append("version") or "1.0")
+    monkeypatch.setattr(cli.ollama, "pull", lambda *_a, **_k: calls.append("pull") or True)
+    c, buf = make_console()
+    assert cli.render_serve(c, "missing:model", ctx=0) == 1
+    assert "positive integer" in buf.getvalue()
+    assert calls == []
+
+
+def test_serve_rejects_invalid_custom_name_before_ollama_side_effects(make_console, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "version", lambda *_a: calls.append("version") or "1.0")
+    monkeypatch.setattr(cli.ollama, "pull", lambda *_a, **_k: calls.append("pull") or True)
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    c, buf = make_console()
+    assert cli.render_serve(c, "missing:model", ctx=8, name="bad\nname") == 1
+    assert "invalid serving identity" in buf.getvalue()
+    assert calls == []
+
+
+def test_serve_rejects_invalid_model_before_ollama_side_effects(make_console, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "version", lambda *_a: calls.append("version") or "1.0")
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    c, buf = make_console()
+    assert cli.render_serve(c, "bad\nmodel", ctx=8) == 1
+    assert "invalid serving identity" in buf.getvalue()
+    assert calls == []
+
+
+@pytest.mark.parametrize("engine", ["cuda", "cpu", "vulkan", "cuda-gguf", "bogus"])
+def test_serve_rejects_unsupported_explicit_engine(make_console, monkeypatch, engine):
+    monkeypatch.setattr(cli.ollama, "version",
+                        lambda *_a: pytest.fail("unsupported engine reached Ollama"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/model", engine=engine) == 1
+    assert "serve" in buf.getvalue().lower() and "engine" in buf.getvalue().lower()
+
+
+@pytest.mark.parametrize("engine", ["ollama", "auto"])
+def test_serve_accepts_ollama_and_nonapple_auto(
+        make_console, monkeypatch, set_platform, engine):
+    set_platform("Linux", "x86_64")
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, engine=engine) == 0
+    assert "qwen3-0.6b-ara" in buf.getvalue()
+
+
 def test_serve_uses_estimated_ceiling_when_unmeasured(make_console, monkeypatch, capsys):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 100, "size_vram": 100}]
@@ -6564,9 +6615,76 @@ def test_serve_uses_measured_ceiling(make_console, monkeypatch, capsys):
 
 def test_serve_refuses_when_create_fails(make_console, monkeypatch):
     _wire_serve(monkeypatch, create_ok=False)
+    cleaned = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1, timeout=300.0:
+                        cleaned.append(name) or {} if keep_alive == 0 else {"done": True})
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
-    assert "couldn't create" in buf.getvalue()
+    assert "couldn't confirm creation" in buf.getvalue()
+    assert "ownership is unknown" in buf.getvalue()
+    assert cleaned == []
+
+
+def test_serve_interrupt_after_create_cleans_up_then_propagates(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    cleaned = []
+
+    def load(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda name, *, label, delete: cleaned.append(name) or None)
+    c, _ = make_console()
+    with pytest.raises(KeyboardInterrupt):
+        cli.render_serve(c, "qwen3:0.6b", ctx=8192)
+    assert cleaned == ["qwen3-0.6b-ara"]
+
+
+def test_serve_interrupt_reports_cleanup_failure(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: (_ for _ in ()).throw(SystemExit(2)))
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda *_a, **_k: "couldn't verify unload")
+    c, buf = make_console()
+    with pytest.raises(SystemExit):
+        cli.render_serve(c, "qwen3:0.6b", ctx=8192)
+    assert "cleanup failed" in buf.getvalue() and "verify unload" in buf.getvalue()
+
+
+def test_serve_refuses_name_appearing_at_final_collision_check(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    calls = 0
+
+    def tags(*_a, **_k):
+        nonlocal calls
+        calls += 1
+        return ["qwen3:0.6b"] if calls == 1 else ["qwen3:0.6b", "qwen3-0.6b-ara:latest"]
+
+    monkeypatch.setattr(cli.ollama, "tags", tags)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("late collision overwritten"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "appeared" in buf.getvalue() and "refusing" in buf.getvalue()
+
+
+def test_serve_refuses_when_final_collision_check_is_unavailable(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    calls = 0
+
+    def tags(*_a, **_k):
+        nonlocal calls
+        calls += 1
+        return ["qwen3:0.6b"] if calls == 1 else None
+
+    monkeypatch.setattr(cli.ollama, "tags", tags)
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("created without collision check"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "recheck" in buf.getvalue() and "collision" in buf.getvalue()
 
 
 def test_serve_refuses_when_model_does_not_load(make_console, monkeypatch):
@@ -6576,6 +6694,105 @@ def test_serve_refuses_when_model_does_not_load(make_console, monkeypatch):
     assert "didn't load" in buf.getvalue()
 
 
+def test_serve_load_failure_cannot_reuse_stale_ps_row(make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    cleanup_started = []
+    deleted = []
+
+    def load(name, keep_alive=-1, timeout=300.0):
+        if keep_alive == 0:
+            cleanup_started.append(name)
+            return {}
+        return None
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.ollama, "ps",
+                        lambda *_a: [] if cleanup_started else _SERVE_LOADED)
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't load" in buf.getvalue()
+    assert cleanup_started == ["qwen3-0.6b-ara"]
+    assert deleted == ["qwen3-0.6b-ara"]
+
+
+def test_serve_refuses_unowned_preexisting_governed_manifest(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"))
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("pre-existing manifest overwritten"))
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("pre-existing service disrupted"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "already exists" in buf.getvalue() and "refusing" in buf.getvalue()
+
+
+def test_serve_refuses_name_that_collides_with_just_pulled_base(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("pulled base manifest overwritten"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "new:model", ctx=8192, name="new:model") == 1
+    assert "already exists" in buf.getvalue() and "refusing" in buf.getvalue()
+
+
+def test_serve_reuses_exact_owned_manifest_without_recreating(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"),
+                ps_rows=_SERVE_LOADED)
+    monkeypatch.setattr(
+        cli.activity, "snapshot",
+        lambda: [types.SimpleNamespace(runtime="ollama", served_name="qwen3-0.6b-ara",
+                                       context=8192, endpoint="http://127.0.0.1:11434",
+                                       model="qwen3:0.6b")],
+    )
+    monkeypatch.setattr(cli.ollama, "create",
+                        lambda *_a, **_k: pytest.fail("owned manifest recreated"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert "qwen3-0.6b-ara" in buf.getvalue()
+
+
+def test_serve_owned_manifest_failure_does_not_cleanup_user_state(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", "qwen3-0.6b-ara:latest"))
+    monkeypatch.setattr(
+        cli.activity, "snapshot",
+        lambda: [types.SimpleNamespace(runtime="ollama", served_name="qwen3-0.6b-ara",
+                                       context=8192, endpoint="http://127.0.0.1:11434",
+                                       model="qwen3:0.6b")],
+    )
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+                        lambda *_a, **_k: pytest.fail("owned model cleaned up"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't load" in buf.getvalue()
+
+
+def test_serve_reports_cleanup_failure(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: None)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    out = buf.getvalue()
+    assert "cleanup also failed" in out and "verify" in out
+
+
+def test_serve_unverifiable_ps_cleans_up_derived_model(make_console, monkeypatch):
+    _wire_serve(monkeypatch)
+    cleanup_started = []
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1, timeout=300.0:
+                        cleanup_started.append(name) or {} if keep_alive == 0 else {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [] if cleanup_started else None)
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "verify" in buf.getvalue().lower()
+    assert deleted == ["qwen3-0.6b-ara"]
+
+
 def test_serve_refuses_on_governance_mismatch(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 40960,
              "size": 100, "size_vram": 100}]
@@ -6583,6 +6800,22 @@ def test_serve_refuses_on_governance_mismatch(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "governance failed" in buf.getvalue()
+
+
+def test_serve_governance_mismatch_cleans_up_derived_model(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 40960,
+             "size": 100, "size_vram": 100}]
+    _wire_serve(monkeypatch, ps_rows=rows)
+    cleanup_started = []
+    deleted = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda name, keep_alive=-1, timeout=300.0:
+                        cleanup_started.append(name) or {} if keep_alive == 0 else {"done": True})
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [] if cleanup_started else rows)
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert deleted == ["qwen3-0.6b-ara"]
 
 
 def test_serve_confirm_declined_skips(make_console, monkeypatch):
@@ -6810,6 +7043,14 @@ def test_serve_zero_arg_refuses_when_store_empty(make_console, monkeypatch):
     assert "no models in Ollama" in buf.getvalue()
 
 
+def test_serve_zero_arg_rejects_unsafe_selected_model(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("present:model",))
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda _names: "bad\nmodel")
+    c, buf = make_console()
+    assert cli.render_serve(c, None) == 1
+    assert "invalid serving identity" in buf.getvalue()
+
+
 def test_serve_zero_arg_with_engine_refuses(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     c, buf = make_console()
@@ -6867,6 +7108,32 @@ def test_serve_estimated_heal_json_flag(make_console, monkeypatch, capsys):
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
     assert json.loads(capsys.readouterr().out)["recorded_measured"] is True
+
+
+def test_serve_unknown_residency_is_not_reported_or_saved_as_measured(
+        make_console, monkeypatch, capsys):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192}]
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    saved = _wire_save_recorder(monkeypatch)
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["spilled"] is None
+    assert payload["residency_verified"] is False
+    assert payload["recorded_measured"] is False
+    assert saved == []
+
+
+def test_serve_unknown_residency_is_clear_in_text(make_console, monkeypatch):
+    rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
+             "size": True, "size_vram": 100}]
+    _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    out = buf.getvalue()
+    assert "residency" in out and "unknown" in out and "no measured ceiling" in out
 
 
 def test_ollama_safe_ceiling_includes_ollama_engine(monkeypatch):
@@ -6940,6 +7207,14 @@ def test_main_serve_ctx_flag_requires_value(monkeypatch, capsys):
                         lambda c, model, **kw: pytest.fail("renderer must not run"))
     assert _run_main(monkeypatch, ["serve", "m", "--ctx"]) == 2
     assert "Option '--ctx' requires an argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_main_serve_rejects_nonpositive_ctx(monkeypatch, capsys, value):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["serve", "m", "--ctx", value]) == 2
+    assert "serve" not in rec
+    assert "Invalid value" in capsys.readouterr().err
 
 
 def test_main_serve_name_flag_requires_value(monkeypatch, capsys):
@@ -7920,6 +8195,16 @@ def _wire_serve_mlx(monkeypatch, set_platform, *, ceiling=8000, serve=None):
         monkeypatch.setattr("ara.backends.apple.serve", serve)
 
 
+def test_serve_help_explains_runtimes_governance_and_lifecycle(capsys):
+    assert cli.main(["serve", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Ollama" in out and "MLX" in out
+    assert "ollama, mlx, or auto" in out
+    assert "measured safe ceiling" in out
+    assert "foreground" in out
+    assert "--name NAME" in out and "Ollama" in out
+
+
 def test_serve_mlx_rejects_nonpositive_ctx(make_console, monkeypatch, set_platform):
     _wire_serve_mlx(monkeypatch, set_platform)
     c, buf = make_console()
@@ -7944,6 +8229,93 @@ def test_serve_mlx_handles_serve_failure(make_console, monkeypatch, set_platform
     assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
     out = buf.getvalue()
     assert "couldn't start the MLX server" in out and "gate refused" in out
+
+
+def test_serve_mlx_rejects_custom_ollama_name(make_console, monkeypatch, set_platform):
+    _wire_serve_mlx(monkeypatch, set_platform,
+                    serve=lambda *_a, **_k: pytest.fail("MLX server started"))
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", name="custom") == 1
+    assert "--name" in buf.getvalue() and "Ollama" in buf.getvalue()
+
+
+@pytest.mark.parametrize(("url", "served_ctx"), [
+    ("http://127.0.0.1:12399", 4096),
+    (7, 8000),
+    ("http://evil.invalid:12399", 8000),
+])
+def test_serve_mlx_rejects_malformed_ready_contract_and_terminates_child(
+        make_console, monkeypatch, set_platform, url, served_ctx):
+    state = {"terminated": False, "waited": False}
+
+    class _Proc:
+        def terminate(self):
+            state["terminated"] = True
+
+        def wait(self):
+            state["waited"] = True
+            return 0
+
+    _wire_serve_mlx(
+        monkeypatch, set_platform,
+        serve=lambda *_a, **_k: (_Proc(), url, served_ctx))
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
+    assert "governance" in buf.getvalue().lower() or "invalid" in buf.getvalue().lower()
+    assert state == {"terminated": True, "waited": True}
+
+
+def test_serve_mlx_nonzero_child_exit_is_failure(make_console, monkeypatch, set_platform):
+    class _Proc:
+        def wait(self):
+            return 7
+
+    _wire_serve_mlx(
+        monkeypatch, set_platform,
+        serve=lambda *_a, **_k: (_Proc(), "http://127.0.0.1:12399", 8000))
+    c, buf = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
+    assert "exited" in buf.getvalue() and "7" in buf.getvalue()
+
+
+def test_serve_mlx_wait_exception_terminates_child(make_console, monkeypatch, set_platform):
+    state = {"terminated": False}
+
+    class _Proc:
+        def terminate(self):
+            state["terminated"] = True
+
+        def wait(self):
+            raise RuntimeError("server wait failed")
+
+    _wire_serve_mlx(
+        monkeypatch, set_platform,
+        serve=lambda *_a, **_k: (_Proc(), "http://127.0.0.1:12399", 8000))
+    c, _ = make_console()
+    with pytest.raises(RuntimeError, match="server wait failed"):
+        cli.render_serve(c, "org/m", engine="mlx", assume_yes=True)
+    assert state["terminated"] is True
+
+
+def test_serve_mlx_keyboard_interrupt_is_clean_stop(make_console, monkeypatch, set_platform):
+    state = {"terminated": False, "waited": 0}
+
+    class _Proc:
+        def terminate(self):
+            state["terminated"] = True
+
+        def wait(self):
+            state["waited"] += 1
+            if state["waited"] == 1:
+                raise KeyboardInterrupt
+            return 0
+
+    _wire_serve_mlx(
+        monkeypatch, set_platform,
+        serve=lambda *_a, **_k: (_Proc(), "http://127.0.0.1:12399", 8000))
+    c, _ = make_console()
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 0
+    assert state == {"terminated": True, "waited": 2}
 
 
 def test_serve_mlx_json_output(make_console, monkeypatch, set_platform, capsys):
@@ -7987,15 +8359,6 @@ def test_serve_mlx_sigterm_handler_terminates_child(make_console, monkeypatch, s
     with pytest.raises(SystemExit):
         captured["handler"](_signal.SIGTERM, None)
     assert terminated.get("yes") is True
-
-
-def test_serve_non_apple_engine_falls_through_to_ollama(make_console, monkeypatch):
-    # `serve --engine <non-apple>` does NOT route to MLX; it falls through to the Ollama path.
-    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED, isatty=False)
-    monkeypatch.setattr(cli.engines, "resolve", lambda e: "cpu")   # non-apple backend
-    c, buf = make_console()
-    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192, engine="cpu") == 0
-    assert "qwen3-0.6b-ara" in buf.getvalue()
 
 
 def test_main_benchmark_use_case_equals_form(monkeypatch):

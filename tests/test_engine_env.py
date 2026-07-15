@@ -538,6 +538,19 @@ def test_start_worker_server_returns_proc_and_dict_on_ready_json(engines_root, m
     assert not proc.waited
 
 
+@pytest.mark.parametrize("ready", [
+    '{"ready": false, "url": "http://127.0.0.1:8080", "context": 4096}\n',
+    '{"url": "http://127.0.0.1:8080", "context": 4096}\n',
+    '[]\n',
+])
+def test_start_worker_server_rejects_nonready_payload_and_reaps(
+        engines_root, monkeypatch, ready):
+    proc, _ = _mock_server_popen(monkeypatch, [ready])
+    with pytest.raises(engine_env.EngineEnvError, match="ready signal"):
+        engine_env.start_worker_server("apple", ["-m", "ara_engine_mlx.serve"])
+    assert proc.killed and proc.waited
+
+
 def test_start_worker_server_raises_on_refused(engines_root, monkeypatch):
     """refused=true JSON → EngineEnvError with the reason; child is reaped (kill + wait)."""
     refused = '{"refused": true, "reason": "model exceeds safe budget"}\n'

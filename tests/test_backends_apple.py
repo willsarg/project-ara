@@ -487,7 +487,7 @@ def test_serve_appends_measured_slope_when_given(monkeypatch):
     """A measured ramp slope → --measured-slope S appended, so the gate predicts with the real
     growth instead of the a-priori prior (2026-07-02-wmx-serve-measured-provenance-gate)."""
     _patch_budget(monkeypatch)
-    captured = _fake_start_server(monkeypatch)
+    captured = _fake_start_server(monkeypatch, ctx=40960)
     apple.serve("org/m", port=8080, max_context=40960, measured_slope_gb_per_k=0.21)
     argv = captured["argv"]
     assert argv[argv.index("--measured-slope") + 1] == "0.21"
@@ -509,6 +509,50 @@ def test_serve_returns_proc_url_context(monkeypatch):
     assert proc is _SENTINEL_PROC
     assert url == "http://127.0.0.1:9999"
     assert ctx == 8192
+
+
+@pytest.mark.parametrize("info", [
+    {"ready": True},
+    {"ready": True, "url": 7, "context": 4096},
+    {"ready": True, "url": "http://127.0.0.1:8080", "context": True},
+])
+def test_serve_rejects_malformed_ready_fields_and_reaps(monkeypatch, info):
+    _patch_budget(monkeypatch)
+
+    class _Proc:
+        def __init__(self):
+            self.killed = False
+            self.waited = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self):
+            self.waited = True
+
+    proc = _Proc()
+    monkeypatch.setattr(engine_env, "start_worker_server", lambda *_a, **_k: (proc, info))
+    with pytest.raises(engine_env.EngineEnvError, match="ready signal"):
+        apple.serve("org/m", port=8080, max_context=4096)
+    assert proc.killed and proc.waited
+
+
+def test_serve_ignores_cleanup_errors_after_malformed_ready_signal(monkeypatch):
+    _patch_budget(monkeypatch)
+
+    class _Proc:
+        def kill(self):
+            raise OSError("already gone")
+
+        def wait(self):
+            raise OSError("already reaped")
+
+    monkeypatch.setattr(
+        engine_env, "start_worker_server",
+        lambda *_a, **_k: (_Proc(), {"url": "http://evil.invalid", "context": 4096}),
+    )
+    with pytest.raises(engine_env.EngineEnvError, match="invalid ready signal"):
+        apple.serve("org/m", port=8080, max_context=4096)
 
 
 # --------------------------------------------------------------------------- #

@@ -481,7 +481,12 @@ def serve(hf_id: str, ceiling: int, *, margin_gb: float, overhead_gb: float,
     print(json.dumps({"ready": True, "url": f"http://127.0.0.1:{port}",
                       "context": ceiling}), flush=True)
 
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 # --------------------------------------------------------------------------- #
