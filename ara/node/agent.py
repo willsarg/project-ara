@@ -78,6 +78,10 @@ class _TerminalJobRejection(RuntimeError):
     """The coordinator permanently rejected an accepted-job acknowledgement."""
 
 
+class _AcceptedJournalBlocked(RuntimeError):
+    """An older accepted-job journal cannot be recovered or safely quarantined."""
+
+
 class NodeAgentBusy(RuntimeError):
     """Another node loop already owns this state directory."""
 
@@ -207,6 +211,15 @@ def _write_json_atomic(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _verify_result_storage() -> None:
+    """Exercise the real atomic-write path before ARA acknowledges or executes another job."""
+    probe = _results_dir() / f".write-probe-{os.getpid()}-{time.time_ns()}"
+    try:
+        _write_json_atomic(probe, {"probe": True})
+    finally:
+        probe.unlink(missing_ok=True)
+
+
 _last_spool_order = 0
 
 
@@ -317,8 +330,10 @@ def _next_accepted_job() -> tuple[dict, Path] | None:
         except (OSError, ValueError):
             try:
                 _quarantine_spool(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                raise _AcceptedJournalBlocked(
+                    f"could not quarantine accepted-job journal {path.name}: {exc}"
+                ) from exc
             continue
         if _spool_path(job["id"]).exists():
             path.unlink(missing_ok=True)  # execution completed before the earlier interruption
@@ -466,17 +481,16 @@ def _run_loop(config, *, client: NodeClient | None = None,
         except _ReenrollmentRequired:
             health.status("re-enrollment required — session rejected while reporting a result")
             return count
-        try:
-            _ensure_private_directory(_results_dir())
-        except OSError as exc:
-            health.status(f"result spool unavailable; refusing work: {exc}")
-            sleep(reauth_backoff)
-            continue
         if any(_results_dir().glob("*.json")):
             health.status("waiting to deliver a completed result before accepting more work")
             sleep(reauth_backoff)
             continue
-        accepted = _next_accepted_job()
+        try:
+            accepted = _next_accepted_job()
+        except _AcceptedJournalBlocked as exc:
+            health.status(str(exc))
+            sleep(reauth_backoff)
+            continue
         if accepted is None:
             try:
                 job = client.get_work(wait)
@@ -506,6 +520,12 @@ def _run_loop(config, *, client: NodeClient | None = None,
             accepted_path = _accepted_path(job["id"])
         else:
             job, accepted_path = accepted
+        try:
+            _verify_result_storage()
+        except OSError as exc:
+            health.status(f"result spool unavailable; refusing work: {exc}")
+            sleep(reauth_backoff)
+            continue
         try:
             acknowledged = _try_ack(client, config, job["id"])
         except _ReenrollmentRequired:

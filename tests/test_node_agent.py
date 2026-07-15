@@ -283,9 +283,15 @@ def test_invalid_accepted_job_survives_quarantine_failure(tmp_path, monkeypatch)
     bad.write_text("{broken", encoding="utf-8")
     monkeypatch.setattr(agent, "_quarantine_spool",
                         lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
-    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
-                   max_iterations=1, sleep=lambda _s: None)
+    later = {"id": "later", "kind": "run", "args": {}}
+    client = FakeClient([later])
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _k, _a: pytest.fail("later work must not pass an unresolved journal"),
+        max_iterations=1, sleep=lambda _s: None,
+    )
     assert bad.exists()
+    assert client.acked == [] and client._jobs == [later]
 
 
 def test_completed_spool_suppresses_accepted_job_reexecution_when_post_retries(tmp_path):
@@ -597,6 +603,28 @@ def test_unavailable_results_directory_blocks_ack_and_execution(tmp_path):
         _cfg(), client=client,
         runner=lambda _kind, _args: pytest.fail("work must not run without durable result storage"),
         max_iterations=2, sleep=lambda _seconds: None,
+    )
+
+    assert client.acked == []
+    assert len(_accepted_files(tmp_path)) == 1
+
+
+def test_failed_atomic_result_probe_blocks_ack_and_execution(tmp_path, monkeypatch):
+    agent._journal_job({"id": "j1", "kind": "run", "args": {}})
+    real_write = agent._write_json_atomic
+
+    def fail_probe(path, value):
+        if path.name.startswith(".write-probe-"):
+            raise PermissionError("result directory is not writable")
+        return real_write(path, value)
+
+    monkeypatch.setattr(agent, "_write_json_atomic", fail_probe)
+    client = FakeClient([])
+
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda _kind, _args: pytest.fail("work must not run after a failed write probe"),
+        max_iterations=1, sleep=lambda _seconds: None,
     )
 
     assert client.acked == []
