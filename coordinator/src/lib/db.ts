@@ -472,11 +472,19 @@ export function claimNextWorkForAgent(
            status = 'queued'
            OR (status = 'offered' AND offered_at <= datetime('now', ?))
          )
+         AND NOT EXISTS (
+           SELECT 1 FROM work AS live_offer
+           WHERE live_offer.agent_id = ? AND live_offer.status = 'offered'
+             AND live_offer.offered_at > datetime('now', ?)
+         )
          ORDER BY CASE status WHEN 'offered' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1
        )
        RETURNING id, kind, args_json`,
     )
-    .get(agentId, `-${offerLeaseSeconds} seconds`) as ClaimedWork | undefined) ?? null;
+    .get(
+      agentId, `-${offerLeaseSeconds} seconds`,
+      agentId, `-${offerLeaseSeconds} seconds`,
+    ) as ClaimedWork | undefined) ?? null;
 }
 
 export type WorkAckResult = "ok" | "unknown" | "conflict";

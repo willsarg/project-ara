@@ -1,0 +1,12 @@
+{
+  "status": "failed",
+  "result": { "output": "contradictory success" },
+  "error": "worker failed",
+  "environment": {
+    "platform": "linux",
+    "accel": "cpu",
+    "containerized": false,
+    "virtualization_layer": null,
+    "wall_source": "physical"
+  }
+}

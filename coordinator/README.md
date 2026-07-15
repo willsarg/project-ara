@@ -6,8 +6,10 @@ coordinator never opens SSH or connects back to a node.
 
 The web UI provides the single-admin login, enrollment-token issuance, node approval/revocation,
 fleet presence, and governed job submission. Node enrollment/session tokens are random opaque
-credentials; only their hashes are stored in SQLite. The browser sees an enrollment token only
-once, when the administrator issues it.
+credentials. SQLite stores enrollment-token hashes and the durable session-token hash. During
+approval recovery, it temporarily holds the plaintext session token until that node first
+authenticates; database access during this window exposes the credential. The browser sees an
+enrollment token only once, when the administrator issues it.
 
 ## Develop
 

@@ -599,6 +599,20 @@ describe("work queue", () => {
     expect(db.getWorkById(jobId)!.status).toBe("offered");
   });
 
+  it("blocks later queued work while the oldest offer lease is still live", async () => {
+    const agentId = await activeAgent("box-live-offer-fifo");
+    const firstId = work.enqueue(agentId, "run", { prompt: "first" });
+    const secondId = work.enqueue(agentId, "run", { prompt: "second" });
+
+    expect(await work.nextForAgent(agentId, 0)).toMatchObject({ id: firstId });
+    expect(await work.nextForAgent(agentId, 0)).toBeNull();
+    expect(db.getWorkById(secondId)!.status).toBe("queued");
+
+    expect(db.claimNextWorkForAgent(agentId, 0)).toMatchObject({ id: firstId });
+    expect(work.acknowledge(firstId, agentId)).toBe("ok");
+    expect(await work.nextForAgent(agentId, 0)).toMatchObject({ id: secondId });
+  });
+
   it("preserves FIFO when multiple jobs share SQLite's one-second timestamp", async () => {
     const agentId = await activeAgent("box-fifo-tie");
     // Reverse lexical IDs prove the tie-breaker is insertion order, not the random public ID.

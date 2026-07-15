@@ -1,0 +1,12 @@
+{
+  "status": "done",
+  "result": { "output": "ok" },
+  "error": "contradictory failure",
+  "environment": {
+    "platform": "linux",
+    "accel": "cpu",
+    "containerized": false,
+    "virtualization_layer": null,
+    "wall_source": "physical"
+  }
+}

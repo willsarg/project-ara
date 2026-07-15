@@ -19,11 +19,17 @@
   "allOf": [
     {
       "if": { "properties": { "status": { "const": "done" } } },
-      "then": { "required": ["result"] }
+      "then": {
+        "required": ["result"],
+        "properties": { "error": { "type": "null" } }
+      }
     },
     {
       "if": { "properties": { "status": { "const": "failed" } } },
-      "then": { "required": ["error"] }
+      "then": {
+        "required": ["error"],
+        "properties": { "result": { "type": "null" } }
+      }
     }
   ]
 }

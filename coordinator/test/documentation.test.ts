@@ -26,6 +26,7 @@ describe("coordinator operator documentation", () => {
     expect(compose).toContain("condition: service_completed_successfully");
     expect(compose).toContain("./data:/app/data");
     expect(readme).toContain("one-shot ownership initializer");
+    expect(readme).toContain("temporarily holds the plaintext session token");
   });
 
   it("keeps persisted job outcomes and their provenance visible to the administrator", () => {

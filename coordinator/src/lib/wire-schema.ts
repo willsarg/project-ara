@@ -76,11 +76,11 @@ export const RESULT_REQUEST_SCHEMA = {
   allOf: [
     {
       if: { properties: { status: { const: "done" } } },
-      then: { required: ["result"] },
+      then: { required: ["result"], properties: { error: { type: "null" } } },
     },
     {
       if: { properties: { status: { const: "failed" } } },
-      then: { required: ["error"] },
+      then: { required: ["error"], properties: { result: { type: "null" } } },
     },
   ],
 } as const;
@@ -98,13 +98,15 @@ export interface EnrollmentRequest {
   environment: Record<string, unknown>;
 }
 
-export interface ResultRequest {
-  status: "done" | "failed";
-  result?: Record<string, unknown> | null;
-  error?: string | null;
+interface ResultRequestBase {
   measurement?: Record<string, unknown> | null;
   environment: Record<string, unknown>;
 }
+
+export type ResultRequest = ResultRequestBase & (
+  | { status: "done"; result: Record<string, unknown> | null; error?: null }
+  | { status: "failed"; error: string | null; result?: null }
+);
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addSchema(ENVIRONMENT_SCHEMA);
