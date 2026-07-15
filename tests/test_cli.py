@@ -144,6 +144,23 @@ def test_doctor_help_explains_its_purpose(capsys):
     assert "Rewrite legacy machine identity keys in ARA's database." in doctor_help
 
 
+def test_benchmark_help_explains_its_purpose_and_safety_contract(capsys):
+    assert cli.main(["--help"]) == 0
+    root_help = capsys.readouterr().out
+    assert ("benchmark Measure MODEL under its characterized safe ceiling."
+            in " ".join(root_help.split()))
+
+    assert cli.main(["benchmark", "--help"]) == 0
+    benchmark_help = capsys.readouterr().out
+    normalized = " ".join(benchmark_help.split())
+    assert ("Run a judge-free capability probe against MODEL's actual quant on the selected engine, "
+            "then store the measured score for model recommendations.") in normalized
+    assert "Requires a prior matching characterization; --ctx may lower, but never replace or exceed" in normalized
+    assert "Measured capability category." in benchmark_help
+    assert "Choices: auto, mlx, cuda, cpu, vulkan, cuda-gguf." in normalized
+    assert "Authorize execution of coding-probe output." in normalized
+
+
 def test_hf_help_explains_group_and_subcommands(capsys):
     expected = {
         (): "Manage Hugging Face authentication for gated model access.",
@@ -7909,6 +7926,19 @@ def test_render_benchmark_explicit_ctx_still_refuses_mismatched_measurement_conf
     assert "different engine settings" in buf.getvalue()
 
 
+def test_render_benchmark_explicit_ctx_cannot_replace_characterization(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000)
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+                                assume_yes=True) == 1
+
+    assert "no measured ceiling" in buf.getvalue()
+    assert "ara characterize org/m" in buf.getvalue()
+
+
 def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
     # A backend without a `benchmark` attr → clear engine-named error.
     monkeypatch.setattr(cli.engines, "for_hardware", lambda: "fauxengine")
@@ -7921,6 +7951,71 @@ def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
     rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
     assert "benchmark isn't supported on the fauxengine engine" in buf.getvalue()
+
+
+@pytest.mark.parametrize("engine", ["bogus", "ollama"])
+def test_render_benchmark_names_invalid_or_unsupported_engine(
+        make_console, monkeypatch, engine):
+    monkeypatch.setattr(cli.engines, "resolve", lambda _engine: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine=engine,
+                                assume_yes=True) == 1
+
+    out = buf.getvalue()
+    assert f"benchmark doesn't support --engine {engine!r}" in out
+    assert "none engine" not in out
+
+
+def test_render_benchmark_reports_when_no_engine_matches(make_console, monkeypatch):
+    monkeypatch.setattr(cli.engines, "for_hardware", lambda: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "no benchmark-capable engine matches this machine" in buf.getvalue()
+
+
+def test_render_benchmark_verbose_discloses_execution_and_evidence(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
+    monkeypatch.setattr(cli.db, "get_model", lambda *_a: {"quant": "q4_0"})
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+                                max_tokens=512, repeat=2, assume_yes=True) == 0
+
+    out = buf.getvalue()
+    assert "engine" in out and "mlx (apple)" in out
+    assert "probe context" in out and "4000 tokens" in out
+    assert "generation cap" in out and "512 tokens" in out
+    assert "evidence" in out and "2 prompts × 2 runs" in out
+    assert "quant" in out and "q4_0" in out
+
+
+def test_render_benchmark_verbose_labels_default_generation_cap(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+
+    assert "backend default" in buf.getvalue()
+
+
+def test_render_benchmark_verbose_json_includes_execution_evidence(
+        monkeypatch, capsys):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
+    c = cli.Console(color=False, stream=sys.stderr, verbose=True)
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True,
+                                as_json=True) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backend"] == "apple"
+    assert payload["probe_context"] == 8000
+    assert payload["generation_cap"] == "backend_default"
+    assert payload["total_generations"] == 2
 
 
 def test_render_benchmark_consent_decline(make_console, monkeypatch):
@@ -8377,17 +8472,107 @@ def test_render_benchmark_some_prompts_refused_warns(make_console, monkeypatch):
     assert "were refused by" in buf.getvalue()
 
 
-def test_render_benchmark_ignores_out_of_range_prompt_index(make_console, monkeypatch):
-    # A result with a missing/out-of-range prompt_index is ignored, not crashed on.
-    _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
+def test_render_benchmark_refuses_out_of_range_prompt_index(make_console, monkeypatch):
+    # A malformed worker response is not a capability measurement and must never be stored.
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
     bk = types.SimpleNamespace(benchmark=lambda model, prompts, *, max_context, **kw: {
         "context": max_context,
-        "results": [{"prompt_index": 0, "completion": "ans0"},
-                    {"prompt_index": 99, "completion": "out-of-range"},   # ignored
-                    {"completion": "no-index"}]})                          # ignored
+        "results": [{"prompt_index": 99, "completion": "out-of-range"}]})
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     c, buf = make_console()
-    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 0
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "invalid benchmark result" in buf.getvalue()
+    assert "model" not in saved
+
+
+def test_render_benchmark_refuses_missing_prompt_result(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=0.5)
+    _bench_backend(monkeypatch, [{"prompt_index": 0, "completion": "ans"}])
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "invalid benchmark result" in buf.getvalue()
+    assert "one result per prompt" in buf.getvalue()
+    assert "model" not in saved
+
+
+@pytest.mark.parametrize("reported_context", [8001, None, True])
+def test_render_benchmark_refuses_wrong_reported_context(
+        make_console, monkeypatch, reported_context):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
+    bk = types.SimpleNamespace(benchmark=lambda model, prompts, *, max_context, **kw: {
+        "context": reported_context,
+        "results": [{"prompt_index": 0, "completion": "ans"}]})
+    monkeypatch.setattr(cli, "get_backend", lambda b: bk)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "reported context" in buf.getvalue()
+    assert "model" not in saved
+
+
+@pytest.mark.parametrize("entry", [
+    None,
+    {"prompt_index": 0},
+    {"prompt_index": 0, "completion": None},
+    {"prompt_index": 0, "completion": "answer", "error": "also failed"},
+    {"prompt_index": True, "completion": "answer"},
+    {"prompt_index": 0, "refused": False},
+    {"prompt_index": 0, "error": None},
+])
+def test_render_benchmark_refuses_malformed_prompt_result(
+        make_console, monkeypatch, entry):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
+    _bench_backend(monkeypatch, [entry])
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "invalid benchmark result" in buf.getvalue()
+    assert "model" not in saved
+
+
+@pytest.mark.parametrize("response", [
+    None,
+    {"context": 8000, "results": {}},
+])
+def test_render_benchmark_refuses_malformed_worker_response(
+        make_console, monkeypatch, response):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}], score=1.0)
+    bk = types.SimpleNamespace(benchmark=lambda *_a, **_k: response)
+    monkeypatch.setattr(cli, "get_backend", lambda _b: bk)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "invalid benchmark result" in buf.getvalue()
+    assert "model" not in saved
+
+
+def test_render_benchmark_refuses_duplicate_prompt_index(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, items=[{"id": 0}, {"id": 1}], score=1.0)
+    _bench_backend(monkeypatch, [
+        {"prompt_index": 0, "completion": "a"},
+        {"prompt_index": 0, "completion": "b"},
+    ])
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "prompt indexes must be unique" in buf.getvalue()
+    assert "model" not in saved
+
+
+def test_render_benchmark_refuses_empty_probe_set(make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, items=[], score=0.0)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+
+    assert "probe set is empty" in buf.getvalue()
+    assert "model" not in saved
 
 
 # --------------------------------------------------------------------------- #

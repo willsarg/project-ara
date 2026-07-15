@@ -296,7 +296,7 @@ def test_benchmark_one_activity_covers_prefetch_and_every_repeat(
     def run(*_a, **_k):
         _assert_activity("benchmarking", "org/model")
         record_names.append(next(activity_registry.glob("*.json")).name)
-        return {"results": [{"prompt_index": 0, "completion": "a"}]}
+        return {"context": 4096, "results": [{"prompt_index": 0, "completion": "a"}]}
 
     backend = types.SimpleNamespace(
         calibration_model_cached=lambda _m: False,

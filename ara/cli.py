@@ -1734,6 +1734,11 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                    "(NOT a security sandbox) — re-run with --exec-consent to allow it")
 
     key = engines.resolve(engine) if engine else engines.for_hardware()
+    if key is None:
+        if engine is not None:
+            return err(f"benchmark doesn't support --engine {engine!r} — choose one of: "
+                       "auto, mlx, cuda, cpu, vulkan, cuda-gguf")
+        return err("no benchmark-capable engine matches this machine")
     backend = engines.ENGINES.get(key, {}).get("backend") if key else None
     bk = get_backend(backend) if backend else None
     if bk is None or not hasattr(bk, "benchmark"):
@@ -1743,30 +1748,27 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     mk = profile.machine_key()
     expected_config = _measurement_config(backend)
     with db.connected() as con:
+        row = db.get_characterization(con, mk, key, model)  # keyed by engine key, not backend
+        if not row or row.get("safe_context") is None:
+            return err(f"no measured ceiling for {model} — run: ara characterize {model}")
+        if msg := _measurement_config_error(row, expected_config, backend, model):
+            return err(msg)
         if ctx is not None:
             if ctx <= 0:
                 return err("--ctx must be a positive integer")
-            _row = db.get_characterization(con, mk, key, model)
-            if _row and (msg := _measurement_config_error(
-                    _row, expected_config, backend, model)):
-                return err(msg)
-            if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+            if msg := _ctx_gate_msg(ctx, row["safe_context"], model):
                 return err(msg)
             safe = ctx
             ceiling_measured_at = None       # explicit --ctx, not a stored ceiling — nothing to age
         else:
-            row = db.get_characterization(con, mk, key, model)  # keyed by ENGINE KEY, not backend
-            if not row or row.get("safe_context") is None:
-                return err(f"no measured ceiling for {model} — run: ara characterize {model} "
-                           f"(or pass --ctx N)")
-            if msg := _measurement_config_error(row, expected_config, backend, model):
-                return err(msg)
             safe = row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
 
     stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     items = benchmark.load_probe(use_case)
     n = len(items)
+    if n == 0:
+        return err(f"the {use_case} probe set is empty — no measurement taken")
     if not as_json and not assume_yes and sys.stdin.isatty():
         if use_case == "coding":
             c.emit(c.style("warn", "  warning: the coding benchmark EXECUTES model-generated "
@@ -1802,17 +1804,47 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         errored_n = 0
         for _ in range(repeat):
             result = bk.benchmark(model, prompts, max_context=safe, **bench_kw)
+            if not isinstance(result, dict):
+                return err("invalid benchmark result: the engine returned a non-object response")
+            reported_context = result.get("context")
+            if (not isinstance(reported_context, int) or isinstance(reported_context, bool)
+                    or reported_context != safe):
+                return err(f"invalid benchmark result: the engine reported context "
+                           f"{reported_context!r}, expected {safe}")
             if result.get("refused"):
                 # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
                 return err(f"the engine refused: {result.get('reason', 'no reason given')}")
-            results = result.get("results", [])
-            refused_n += sum(1 for r in results if r.get("refused"))
-            errored_n += sum(1 for r in results if r.get("error"))
+            results = result.get("results")
+            if not isinstance(results, list) or len(results) != len(prompts):
+                return err("invalid benchmark result: expected exactly one result per prompt")
             completions = [""] * len(prompts)
+            seen: set[int] = set()
             for r in results:
+                if not isinstance(r, dict):
+                    return err("invalid benchmark result: each prompt result must be an object")
                 idx = r.get("prompt_index")
-                if isinstance(idx, int) and 0 <= idx < len(completions):
-                    completions[idx] = r.get("completion", "")
+                if (not isinstance(idx, int) or isinstance(idx, bool)
+                        or not 0 <= idx < len(completions) or idx in seen):
+                    return err("invalid benchmark result: prompt indexes must be unique and cover "
+                               "the probe set")
+                seen.add(idx)
+                outcomes = [name for name in ("completion", "refused", "error") if name in r]
+                if len(outcomes) != 1:
+                    return err("invalid benchmark result: each prompt needs exactly one completion, "
+                               "refusal, or error")
+                outcome = outcomes[0]
+                if outcome == "completion":
+                    if not isinstance(r["completion"], str):
+                        return err("invalid benchmark result: completion must be text")
+                    completions[idx] = r["completion"]
+                elif outcome == "refused":
+                    if r["refused"] is not True:
+                        return err("invalid benchmark result: refused must be true")
+                    refused_n += 1
+                else:
+                    if not isinstance(r["error"], str):
+                        return err("invalid benchmark result: error must be text")
+                    errored_n += 1
             run_scores.append(benchmark.score_probe_set(use_case, items, completions))
 
     total = n * repeat                       # total generations attempted across every run
@@ -1851,6 +1883,14 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if c.verbose:
+            payload.update(
+                backend=backend,
+                probe_context=safe,
+                generation_cap=max_tokens if max_tokens is not None else "backend_default",
+                total_generations=total,
+                source=source,
+            )
         if stale_ceiling:
             payload["stale_ceiling"] = True
         if repeat > 1:
@@ -1866,6 +1906,14 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             payload["quant"] = quant
         print(json.dumps(payload))
         return 0
+    if c.verbose:
+        c.emit(c.field("engine", f"{key} ({backend})"))
+        c.emit(c.field("probe context", f"{safe} tokens"))
+        generation_cap = f"{max_tokens} tokens" if max_tokens is not None else "backend default"
+        c.emit(c.field("generation cap", generation_cap))
+        evidence = f"{n} prompts" if repeat == 1 else f"{n} prompts × {repeat} runs"
+        c.emit(c.field("evidence", evidence))
+        c.emit(c.field("quant", quant or "unknown"))
     if repeat > 1:
         score_line = (f"  {use_case}: {score * 100:.0f}% measured here  "
                       f"(mean of {repeat} runs, band {lo * 100:.0f}–{hi * 100:.0f}%, "
@@ -3329,7 +3377,8 @@ def _recon_options(func):
 
 def _engine_option(func):
     return click.option("--engine", callback=_engine_callback, metavar="ENGINE",
-                        help="Select an execution engine.")(func)
+                        help=("Select an execution engine. Choices: auto, mlx, cuda, cpu, vulkan, "
+                              "cuda-gguf."))(func)
 
 
 def _run_engine_option(func):
@@ -3678,24 +3727,36 @@ def _click_serve(ctx: click.Context, model: str | None, serve_ctx: int | None,
 _USE_CASE = click.Choice(["coding", "reasoning", "agentic", "extraction", "rag"])
 
 
-@_click_cli.command("benchmark", context_settings=_HELP_SETTINGS)
+@_click_cli.command(
+    "benchmark",
+    context_settings=_HELP_SETTINGS,
+    short_help="Measure MODEL under its characterized safe ceiling.",
+)
 @click.argument("model")
 @click.option("--use-case", type=_USE_CASE, required=True,
-              help="Capability probe set to execute.")
+              help="Measured capability category.")
 @_engine_option
-@click.option("--ctx", "serve_ctx", type=int, metavar="N", help="Context used for probes.")
-@click.option("--max-tokens", type=int, metavar="N", help="Generation-token cap.")
-@click.option("--repeat", "repeat_count", type=int, default=1, show_default=True,
-              metavar="N", help="Repeat count for a variance band.")
+@click.option("--ctx", "serve_ctx", type=click.IntRange(min=1), metavar="N",
+              help="Lower probe context; never above the measured safe ceiling.")
+@click.option("--max-tokens", type=click.IntRange(min=1), metavar="N",
+              help="Maximum new tokens generated for each probe.")
+@click.option("--repeat", "repeat_count", type=click.IntRange(min=1), default=1,
+              show_default=True, metavar="N", help="Independent runs used for a variance band.")
 @click.option("--exec-consent", is_flag=True,
-              help="Allow coding probes to execute model-written code.")
+              help="Authorize execution of coding-probe output.")
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_json_verbose_options
 @click.pass_context
 def _click_benchmark(ctx: click.Context, model: str, use_case: str, engine: str | None,
                      serve_ctx: int | None, max_tokens: int | None, repeat_count: int,
                      exec_consent: bool, assume_yes: bool, verbose: bool, as_json: bool) -> int:
-    """Measure MODEL capability against a canonical probe set."""
+    """Run a judge-free capability probe against MODEL's actual quant on the selected engine,
+    then store the measured score for model recommendations.
+
+    Requires a prior matching characterization; --ctx may lower, but never replace or exceed,
+    that measured safe ceiling. Coding probes execute model-written Python only with
+    --exec-consent.
+    """
     c = _mark_json(ctx, as_json)
     with locking.measurement_lock():
         return render_benchmark(
