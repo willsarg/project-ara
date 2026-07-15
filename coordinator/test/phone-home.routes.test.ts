@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 process.env.ARA_COORDINATOR_DB = ":memory:";
+process.env.ARA_COORDINATOR_TRUST_PROXY = "1";
 
 let enrollRoute: typeof import("@/app/api/enroll/route");
 let pollRoute: typeof import("@/app/api/enroll/[id]/route");
@@ -33,8 +34,12 @@ const canonicalEnrollBody = JSON.parse(
   readFileSync(path.resolve(__dirname, "../../contracts/wire/fixtures/enroll.request.valid.json"), "utf8"),
 ) as Record<string, unknown>;
 
+let requestIp = 1;
 const req = (url: string, init?: RequestInit & { bearer?: string }) => {
   const headers = new Headers(init?.headers);
+  if (!headers.has("x-forwarded-for")) {
+    headers.set("x-forwarded-for", `198.18.0.${requestIp++}`);
+  }
   if (init?.bearer) headers.set("authorization", `Bearer ${init.bearer}`);
   return new Request(url, { ...init, headers });
 };

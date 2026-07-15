@@ -5,6 +5,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 
 process.env.ARA_COORDINATOR_DB = ":memory:";
+process.env.ARA_COORDINATOR_TRUST_PROXY = "1";
 
 let enrollRoute: typeof import("@/app/api/enroll/route");
 

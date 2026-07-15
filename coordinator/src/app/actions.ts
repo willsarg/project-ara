@@ -8,8 +8,8 @@ import { revalidatePath } from "next/cache";
 import { SESSION_COOKIE, createSession, invalidateSessions } from "@/lib/auth";
 import { verifyAdminPassword } from "@/lib/db";
 import { approveAgent, denyAgent, issueEnrollmentToken, revoke } from "@/lib/enrollment";
-import { enqueue } from "@/lib/work";
-import { rateLimit } from "@/lib/rate-limit";
+import { AgentNotActiveError, enqueue } from "@/lib/work";
+import { clientRateLimitKey, rateLimit } from "@/lib/rate-limit";
 
 const SESSION_TTL_S = 60 * 60 * 24 * 7;
 
@@ -20,16 +20,10 @@ const SESSION_TTL_S = 60 * 60 * 24 * 7;
 const LOGIN_MAX = 10;
 const LOGIN_WINDOW_MS = 60_000;
 
-/** Best-effort client identity for rate-limiting: the first hop of X-Forwarded-For, or a single
- *  shared "unknown" bucket when there's no reverse proxy in front of the coordinator (degrades to a
- *  global — not per-IP — limit in that case, which still blunts a single-source burst). */
-function clientKey(h: Headers): string {
-  const fwd = h.get("x-forwarded-for");
-  return fwd ? fwd.split(",")[0].trim() : "unknown";
-}
-
 export async function loginAction(_prev: { error?: string } | undefined, form: FormData) {
-  const rl = rateLimit(`login:${clientKey(await headers())}`, LOGIN_MAX, LOGIN_WINDOW_MS);
+  const rl = rateLimit(
+    `login:${clientRateLimitKey(await headers())}`, LOGIN_MAX, LOGIN_WINDOW_MS,
+  );
   if (rl.limited) {
     return { error: `Too many attempts. Try again in ${rl.retryAfterS}s.` };
   }
@@ -95,7 +89,13 @@ export async function submitJobAction(form: FormData) {
   const agentId = Number(form.get("agentId"));
   const model = String(form.get("model") ?? "").trim();
   const prompt = String(form.get("prompt") ?? "").trim();
-  if (agentId && model) enqueue(agentId, "run", { model, prompt });
+  if (agentId && model) {
+    try {
+      enqueue(agentId, "run", { model, prompt });
+    } catch (error) {
+      if (!(error instanceof AgentNotActiveError)) throw error;
+    }
+  }
   revalidatePath("/nodes");
   redirect("/nodes");
 }

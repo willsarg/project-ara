@@ -400,11 +400,29 @@ describe("dashboard agent-listing helper", () => {
     expect(row.caps_count).toBe(1);
     expect(row.machine_key).toBe("box-dash");
     expect(row.status).toBe("active");
+    expect(row.recently_seen).toBe(false); // approval alone is not a heartbeat observation
     // token-free shape: no secret fields ever leak into the summary
     expect(row).not.toHaveProperty("session_token_hash");
     expect(row).not.toHaveProperty("pending_session_token");
     // newest-first ordering: this fresh agent is at the front
     expect(summaries[0].id).toBe(agent.id);
+  });
+
+  it("reports recent presence only for a fresh heartbeat from an approved node", () => {
+    const now = Date.parse("2026-07-15T12:00:00Z");
+    expect(enroll.wasAgentSeenRecently(null, now)).toBe(false);
+    expect(enroll.wasAgentSeenRecently("not-a-time", now)).toBe(false);
+    expect(enroll.wasAgentSeenRecently("2026-07-15 11:59:01", now)).toBe(true);
+    expect(enroll.wasAgentSeenRecently("2026-07-15T11:58:59Z", now)).toBe(false);
+    expect(enroll.wasAgentSeenRecently("2026-07-15T12:00:01+00:00", now)).toBe(false);
+    const recentTimestamp = new Date(Date.now() - 1_000).toISOString()
+      .replace("T", " ").replace(/\.\d{3}Z$/, "");
+    const recent = enroll.summarizeAgent({
+      id: 1, machine_key: "m", status: "active", last_seen: recentTimestamp,
+      caps_json: null,
+    } as never);
+    expect(recent.recently_seen).toBe(true);
+    expect(enroll.summarizeAgent({ ...recent, status: "denied" } as never).recently_seen).toBe(false);
   });
 
   it("summarizeAgent yields caps_count 0 for absent or malformed caps_json (never throws)", () => {
@@ -498,6 +516,12 @@ describe("dashboard agent-listing helper", () => {
 });
 
 describe("work queue", () => {
+  async function pendingAgent(name: string) {
+    const { token } = enroll.issueEnrollmentToken();
+    const { enrollment_id } = enroll.enroll(token, selfDesc(name))!;
+    return db.getAgentByEnrollmentId(enrollment_id)!.id;
+  }
+
   async function activeAgent(name: string) {
     const { token } = enroll.issueEnrollmentToken();
     const { enrollment_id } = enroll.enroll(token, selfDesc(name))!;
@@ -537,6 +561,14 @@ describe("work queue", () => {
       /invalid job kind/i,
     );
     expect(db.getWorkById("job_invalid_kind")).toBeNull();
+  });
+
+  it("rejects queued work for missing, pending, and denied agents", async () => {
+    const pendingId = await pendingAgent("box-work-pending");
+    expect(() => work.enqueue(pendingId, "run", {})).toThrow(work.AgentNotActiveError);
+    enroll.denyAgent(pendingId);
+    expect(() => work.enqueue(pendingId, "run", {})).toThrow(work.AgentNotActiveError);
+    expect(() => work.enqueue(999_999, "run", {})).toThrow(work.AgentNotActiveError);
   });
 
   it("offers a job exactly once under two back-to-back polls", async () => {

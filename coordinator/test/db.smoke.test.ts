@@ -10,7 +10,9 @@ describe("coordinator db harness", () => {
   });
 
   it("opens an in-memory registry and starts with no agents", async () => {
+    const { checkDatabaseReady } = await import("@/lib/db");
     const { listActive } = await import("@/lib/enrollment");
+    expect(checkDatabaseReady()).toBeUndefined();
     const agents = listActive();
     expect(Array.isArray(agents)).toBe(true);
     expect(agents.length).toBe(0);

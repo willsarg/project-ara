@@ -35,11 +35,12 @@ describe("admin session cookie", () => {
     expect(await verifySession(token)).toBe(true);
   });
 
-  it("FAILS CLOSED with no secret: createSession throws, verifySession is false", async () => {
+  it("generates a durable secret when no env credential is configured", async () => {
     vi.stubEnv("ARA_COORDINATOR_SECRET", "");
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "");
-    await expect(createSession()).rejects.toThrow(/no session secret/i);
-    expect(await verifySession("anything")).toBe(false); // never trusts a token without a secret
+    const token = await createSession();
+    expect(await verifySession(token)).toBe(true);
+    expect(await verifySession("anything")).toBe(false);
   });
 
   it("invalidateSessions() revokes every previously issued token (real logout, not just cookie-clear)", async () => {

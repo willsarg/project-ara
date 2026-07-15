@@ -8,6 +8,7 @@
 // Fixed-window (not token-bucket/sliding-log): simpler, O(1) per check, and "good enough" to blunt
 // brute-force/DoS attempts against login and /api/enroll — the two call sites that use this.
 import "server-only";
+import { isIP } from "node:net";
 
 interface Window {
   count: number;
@@ -15,6 +16,16 @@ interface Window {
 }
 
 const windows = new Map<string, Window>();
+export const MAX_RATE_LIMIT_WINDOWS = 4096;
+const OVERFLOW_KEY = "__overflow__";
+
+/** Direct clients can forge forwarding headers. Honor X-Forwarded-For only when an operator has
+ * explicitly configured a trusted proxy that overwrites it. */
+export function clientRateLimitKey(h: Headers): string {
+  if (process.env.ARA_COORDINATOR_TRUST_PROXY !== "1") return "direct";
+  const candidate = h.get("x-forwarded-for")?.split(",")[0].trim() ?? "";
+  return isIP(candidate) ? candidate : "unknown";
+}
 
 export interface RateLimitResult {
   /** True once this key has exceeded `max` calls within the current window. */
@@ -28,6 +39,12 @@ export interface RateLimitResult {
  *  exceeds `max`, every further call in that window reports `limited: true` until it resets. */
 export function rateLimit(key: string, max: number, windowMs: number): RateLimitResult {
   const now = Date.now();
+  if (!windows.has(key)) {
+    for (const [candidate, window] of windows) {
+      if (now >= window.resetAt) windows.delete(candidate);
+    }
+    if (windows.size >= MAX_RATE_LIMIT_WINDOWS - 1) key = OVERFLOW_KEY;
+  }
   const w = windows.get(key);
 
   if (!w || now >= w.resetAt) {

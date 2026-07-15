@@ -6,8 +6,12 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.test.ts", "src/**/*.test.ts"],
-    // A default session secret so tests that touch auth.ts don't trip the no-secret guard;
-    // auth.test.ts overrides it per-case with vi.stubEnv.
+    // Coordinator tests intentionally exercise process-global env, module reloads, in-memory
+    // SQLite, and fixed-window limiter state. Running files concurrently lets one file reset or
+    // restub another file's runtime, so serialize files while retaining normal in-file execution.
+    fileParallelism: false,
+    // A default session secret keeps ordinary unit files on the configured-secret path;
+    // auth tests override it to exercise durable generated-secret behavior.
     env: { ARA_COORDINATOR_SECRET: "test-secret" },
     coverage: {
       provider: "v8",

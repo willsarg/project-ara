@@ -86,6 +86,7 @@ describe("loginAction — env ARA_COORDINATOR_PASSWORD (direct-compare) path", (
 // yet exist — ensureAdminPassword's "generate + log once" branch only fires on the FIRST call.
 describe("loginAction — per-client rate limiting", () => {
   it("limits repeated attempts from the SAME client, and reports a wait time (not a crash)", async () => {
+    vi.stubEnv("ARA_COORDINATOR_TRUST_PROXY", "1");
     headersMock.mockResolvedValue(new Headers({ "x-forwarded-for": "198.51.100.7" }));
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "hunter2");
 
@@ -104,6 +105,7 @@ describe("loginAction — per-client rate limiting", () => {
   });
 
   it("a DIFFERENT client (different X-Forwarded-For) has its own, unexhausted bucket", async () => {
+    vi.stubEnv("ARA_COORDINATOR_TRUST_PROXY", "1");
     headersMock.mockResolvedValue(new Headers({ "x-forwarded-for": "198.51.100.9" }));
     vi.stubEnv("ARA_COORDINATOR_PASSWORD", "hunter2");
     const form = new FormData();
@@ -280,5 +282,33 @@ describe("submitJobAction", () => {
     form.set("agentId", String(agent.id)); // no "model" key at all
     await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
     expect(await work.nextForAgent(agent.id, 0)).toBeNull();
+  });
+
+  it("does not create work for pending, denied, or nonexistent agents", async () => {
+    const pending = await pendingAgent("box-job-inactive");
+    for (const id of [pending.id, 999_999]) {
+      const form = new FormData();
+      form.set("agentId", String(id));
+      form.set("model", "qwen");
+      await expect(actions.submitJobAction(form)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+    }
+    enroll.denyAgent(pending.id);
+    const denied = new FormData();
+    denied.set("agentId", String(pending.id));
+    denied.set("model", "qwen");
+    await expect(actions.submitJobAction(denied)).rejects.toThrow("NEXT_REDIRECT:/nodes");
+  });
+
+  it("does not hide unexpected enqueue failures", async () => {
+    const active = await pendingAgent("box-job-unexpected-error");
+    enroll.approveAgent(active.id);
+    const broken = vi.spyOn(work, "enqueue").mockImplementationOnce(() => {
+      throw new Error("database unavailable");
+    });
+    const form = new FormData();
+    form.set("agentId", String(active.id));
+    form.set("model", "qwen");
+    await expect(actions.submitJobAction(form)).rejects.toThrow("database unavailable");
+    broken.mockRestore();
   });
 });

@@ -116,8 +116,19 @@ export interface AgentSummary {
   machine_key: string;
   status: string;
   last_seen: string | null;
+  recently_seen: boolean;
   caps_count: number;
   serve_models: { id: string; engine: string }[];
+}
+
+export const RECENT_HEARTBEAT_WINDOW_MS = 60_000;
+
+export function wasAgentSeenRecently(lastSeen: string | null, now: number = Date.now()): boolean {
+  if (!lastSeen) return false;
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/.test(lastSeen) ? lastSeen : `${lastSeen}Z`;
+  const seenAt = Date.parse(timestamp);
+  const age = now - seenAt;
+  return Number.isFinite(seenAt) && age >= 0 && age <= RECENT_HEARTBEAT_WINDOW_MS;
 }
 
 const canonicalEngine = (engine: string) =>
@@ -153,6 +164,7 @@ export function summarizeAgent(a: AgentRow): AgentSummary {
     machine_key: a.machine_key,
     status: a.status,
     last_seen: a.last_seen,
+    recently_seen: a.status === "active" && wasAgentSeenRecently(a.last_seen),
     caps_count,
     serve_models,
   };

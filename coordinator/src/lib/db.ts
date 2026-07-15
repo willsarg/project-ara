@@ -16,6 +16,11 @@ const DB_PATH = process.env.ARA_COORDINATOR_DB || path.join(process.cwd(), "data
 
 let _db: Database.Database | null = null;
 
+/** Open/migrate the registry and prove it can execute a read. Used by readiness health checks. */
+export function checkDatabaseReady(): void {
+  open().prepare("SELECT 1").get();
+}
+
 function open(): Database.Database {
   if (_db) return _db;
   // Ensure the parent dir exists (e.g. ./data on a fresh checkout or empty volume). The resolved
@@ -121,7 +126,7 @@ export function migrateWorkResultEnvironment(db: Database.Database): void {
   }).immediate();
 }
 
-// --- meta: small persisted settings (generated admin password, session secret) -----------------
+// --- meta: small persisted settings (generated admin password, session auth state) --------------
 
 function getMeta(key: string): string | null {
   const row = open().prepare("SELECT value FROM meta WHERE key = ?").get(key) as
@@ -134,6 +139,59 @@ function setMeta(key: string, value: string): void {
   open()
     .prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
     .run(key, value);
+}
+
+const SESSION_SECRET_KEY = "session_secret";
+const SESSION_EPOCH_KEY = "session_epoch";
+
+/** Resolve the session signing secret with the documented precedence. Explicit env secret wins;
+ *  otherwise an env admin password supplies the stable derived key. With neither configured, a
+ *  cryptographically random key is created once in SQLite and reused across bundles/restarts. */
+export function ensureSessionSecret(): string {
+  const configured = process.env.ARA_COORDINATOR_SECRET;
+  if (configured) return configured;
+  const password = process.env.ARA_COORDINATOR_PASSWORD;
+  if (password) return `pw:${password}`;
+
+  const candidate = randomBytes(32).toString("base64url");
+  open()
+    .prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)")
+    .run(SESSION_SECRET_KEY, candidate);
+  const persisted = getMeta(SESSION_SECRET_KEY);
+  if (!persisted) throw new Error("ARA coordinator: failed to persist the generated session secret");
+  return persisted;
+}
+
+function parseSessionEpoch(value: string | null): number {
+  if (value === null) return 0;
+  if (!/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new Error("ARA coordinator: persisted session epoch is invalid");
+  }
+  const epoch = Number(value);
+  if (!Number.isSafeInteger(epoch)) {
+    throw new Error("ARA coordinator: persisted session epoch exceeds the safe integer range");
+  }
+  return epoch;
+}
+
+/** Current durable revocation generation. Missing state is the initial generation zero. */
+export function getSessionEpoch(): number {
+  return parseSessionEpoch(getMeta(SESSION_EPOCH_KEY));
+}
+
+/** Atomically invalidate all sessions issued under the current generation. BEGIN IMMEDIATE makes
+ *  read+increment+write safe across separate Next bundles, processes, and SQLite connections. */
+export function advanceSessionEpoch(): number {
+  const db = open();
+  return db.transaction(() => {
+    const current = parseSessionEpoch(getMeta(SESSION_EPOCH_KEY));
+    if (current === Number.MAX_SAFE_INTEGER) {
+      throw new Error("ARA coordinator: session epoch is exhausted");
+    }
+    const next = current + 1;
+    setMeta(SESSION_EPOCH_KEY, String(next));
+    return next;
+  }).immediate();
 }
 
 // Admin password is NEVER stored in plaintext. When no env password is set we generate one, log it
@@ -374,10 +432,16 @@ export function listAgents(): AgentRow[] {
 
 // --- work queue ----------------------------------------------------------------------------------
 
-export function insertWork(id: string, agentId: number, kind: string, argsJson: string | null): void {
-  open()
-    .prepare("INSERT INTO work (id, agent_id, kind, args_json) VALUES (?, ?, ?, ?)")
-    .run(id, agentId, kind, argsJson);
+export function insertWork(id: string, agentId: number, kind: string, argsJson: string | null): boolean {
+  const inserted = open()
+    .prepare(
+      `INSERT INTO work (id, agent_id, kind, args_json)
+       SELECT ?, ?, ?, ? WHERE EXISTS (
+         SELECT 1 FROM agents WHERE id = ? AND status = 'active'
+       )`,
+    )
+    .run(id, agentId, kind, argsJson, agentId);
+  return inserted.changes === 1;
 }
 
 /** The job offer returned by the atomic queue claim (RETURNING projection). */

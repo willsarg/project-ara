@@ -17,13 +17,21 @@ export interface DispatchedJob {
   args: Record<string, unknown>;
 }
 
+export class AgentNotActiveError extends Error {
+  constructor() {
+    super("work can only be queued for an active agent");
+  }
+}
+
 const POLL_STEP_MS = 250; // re-check cadence between sync reads during a long-poll
 
 /** Queue a job for an agent. Returns the job id (also the wire `job.id`). */
 export function enqueue(agentId: number, kind: string, args: Record<string, unknown>): string {
   assertAllowedJobKind(kind);
   const id = `job_${randomBytes(12).toString("hex")}`;
-  insertWork(id, agentId, kind, JSON.stringify(args ?? {}));
+  if (!insertWork(id, agentId, kind, JSON.stringify(args ?? {}))) {
+    throw new AgentNotActiveError();
+  }
   return id;
 }
 

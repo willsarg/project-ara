@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic"; // always re-read on load; never statica
 export default function Dashboard() {
   const agents = listAgentSummaries();
   const total = agents.length;
-  const active = agents.filter((a) => a.status === "active").length;
+  const recentlySeen = agents.filter((a) => a.recently_seen).length;
   const pending = agents.filter((a) => a.status === "pending").length;
 
   return (
@@ -26,7 +26,7 @@ export default function Dashboard() {
               <b>{total}</b> agent{total === 1 ? "" : "s"}
             </span>
             <span className="chip on">
-              <b>{active}</b> active
+              <b>{recentlySeen}</b> seen recently
             </span>
             {pending > 0 && (
               <span className="chip run">
@@ -82,7 +82,7 @@ export default function Dashboard() {
           <section className="empty">
             <h2>No agents yet.</h2>
             <p>Issue an enrollment token, then enroll a box from its own machine.</p>
-            <code>ara agent enroll --coordinator &lt;url&gt; --token &lt;token&gt;</code>
+            <code>ara node enroll &lt;server_url&gt; --token &lt;token&gt;</code>
           </section>
         )}
       </main>
@@ -92,7 +92,7 @@ export default function Dashboard() {
           <span>ARA — AI Runs Anywhere</span>
           <span className="sep">/</span>
           <span>
-            {active} of {total} agent{total === 1 ? "" : "s"} active
+            {recentlySeen} of {total} agent{total === 1 ? "" : "s"} seen recently
           </span>
         </div>
       </footer>
@@ -101,12 +101,14 @@ export default function Dashboard() {
 }
 
 function AgentRow({ a }: { a: AgentSummary }) {
-  const stateClass =
-    a.status === "active" ? "state-on" : a.status === "pending" ? "state-off" : "state-off";
+  const displayedStatus = a.status === "active"
+    ? (a.recently_seen ? "seen recently" : "not recently seen")
+    : a.status;
+  const stateClass = a.recently_seen ? "state-on" : "state-off";
   return (
     <tr>
       <td>{a.machine_key || "—"}</td>
-      <td className={stateClass}>{a.status}</td>
+      <td className={stateClass}>{displayedStatus}</td>
       <td>
         {a.caps_count} capabilit{a.caps_count === 1 ? "y" : "ies"}
       </td>

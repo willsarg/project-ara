@@ -88,7 +88,7 @@ export default function NodesPage() {
         </section>
 
         <section className="panel">
-          <h2>Active</h2>
+          <h2>Approved nodes</h2>
           {active.length === 0 ? (
             <p className="offline-note">none yet.</p>
           ) : (

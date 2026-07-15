@@ -4,13 +4,16 @@ services:
     build: .
     image: ara-coordinator
     ports:
-      - "3000:3000"
+      # Secure default: expose only on the host. Put a TLS reverse proxy in front for remote nodes.
+      - "${ARA_COORDINATOR_BIND:-127.0.0.1}:3000:3000"
     environment:
       # Set this to your admin password. If omitted, one is generated on first run and printed once
       # to the container logs (docker compose logs coordinator).
       ARA_COORDINATOR_PASSWORD: ${ARA_COORDINATOR_PASSWORD:-}
       # Optional explicit cookie-signing secret. If unset it is derived from the password above.
       ARA_COORDINATOR_SECRET: ${ARA_COORDINATOR_SECRET:-}
+      # Set only behind a proxy that overwrites X-Forwarded-For.
+      ARA_COORDINATOR_TRUST_PROXY: ${ARA_COORDINATOR_TRUST_PROXY:-}
       ARA_COORDINATOR_DB: /app/data/coordinator.db
     volumes:
       # Persist the SQLite registry across restarts.
