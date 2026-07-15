@@ -74,6 +74,12 @@ class NodeClient:
                                  headers=self._headers())
         resp.raise_for_status()
 
+    def ack_work(self, job_id: str) -> None:
+        """Acknowledge only after the offered job is durable locally, authorizing execution."""
+        encoded = quote(job_id, safe="")
+        resp = self._client.post(f"{self._base}/api/work/{encoded}/ack", headers=self._headers())
+        resp.raise_for_status()
+
     def close(self) -> None:
         """Release the underlying httpx connection pool."""
         self._client.close()

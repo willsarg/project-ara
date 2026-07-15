@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 
 import pytest
 
@@ -164,3 +165,29 @@ def test_parent_sync_is_a_noop_on_windows(tmp_path, monkeypatch):
 
 def test_clear_pending_is_idempotent_when_absent():
     assert config.clear_pending() is None
+
+
+def test_clear_session_if_current_is_atomic_and_preserves_newer_authority():
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="OLD"))
+    assert config.clear_session_if_current("https://c.example", "OLD") is True
+    assert config.load().session_token is None
+
+    config.save(config.NodeConfig(server_url="https://c.example", session_token="NEW"))
+    assert config.clear_session_if_current("https://c.example", "OLD") is False
+    assert config.load().session_token == "NEW"
+
+
+def test_credential_lock_uses_windows_locking_protocol(tmp_path, monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        LK_LOCK=1, LK_UNLCK=2,
+        locking=lambda fd, operation, size: calls.append((fd, operation, size)),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(config, "_is_windows", lambda: True)
+    monkeypatch.setenv("ARA_NODE_DIR", str(tmp_path / "node"))
+    with config._credential_lock():
+        calls.append("inside")
+    assert calls[0][1:] == (fake.LK_LOCK, 1)
+    assert calls[1] == "inside"
+    assert calls[2][1:] == (fake.LK_UNLCK, 1)

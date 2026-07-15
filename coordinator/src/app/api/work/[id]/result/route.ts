@@ -5,6 +5,7 @@ import { NextResponse } from "next/server";
 import { bearerToken, verifySessionToken } from "@/lib/node-auth";
 import { getWorkById } from "@/lib/db";
 import { recordResult } from "@/lib/work";
+import { isResultRequest } from "@/lib/result-schema";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,27 +20,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   if (!job || job.agent_id !== agent.id) {
     return NextResponse.json({ error: "unknown job" }, { status: 404 });
   }
-
-  let body: {
-    status?: string;
-    result?: unknown;
-    error?: unknown;
-    measurement?: unknown;
-    environment?: unknown;
-  };
+  let body: unknown;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
-  // Lightweight boundary validation (defense-in-depth): status must be a known terminal state and
-  // the node must report the environment it ran in as an object.
-  if (body?.status !== "done" && body?.status !== "failed") {
-    return NextResponse.json({ error: "status must be done|failed" }, { status: 400 });
+  if (!isResultRequest(body)) {
+    return NextResponse.json({ error: "invalid result payload" }, { status: 400 });
   }
-  if (typeof body?.environment !== "object" || body.environment === null || Array.isArray(body.environment)) {
-    return NextResponse.json({ error: "environment must be an object" }, { status: 400 });
+
+  if (job.status === "done" || job.status === "failed") {
+    return NextResponse.json({ ok: true, already_recorded: true });
+  }
+  if (job.status !== "dispatched") {
+    return NextResponse.json({ error: "job was not acknowledged for execution" }, { status: 409 });
   }
 
   recordResult(id, {

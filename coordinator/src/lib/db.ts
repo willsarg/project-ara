@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { ALLOWED_JOB_KINDS } from "./job-kinds";
 
 // Statically scoped to cwd/data so Turbopack's Node File Trace (for the standalone build output)
 // can see this resolves under the project root and doesn't fall back to tracing the whole project.
@@ -52,7 +53,7 @@ function open(): Database.Database {
       used       INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    -- The server-owned dispatch queue. queued -> dispatched (picked up via long-poll) -> done/failed.
+    -- The server-owned dispatch queue. queued -> offered -> dispatched (durably acked) -> done/failed.
     CREATE TABLE IF NOT EXISTS work (
       id               TEXT PRIMARY KEY,
       agent_id         INTEGER NOT NULL,
@@ -67,8 +68,45 @@ function open(): Database.Database {
       finished_at      TEXT
     );
   `);
+  // Pre-transaction databases could contain duplicate token bindings after a race. Preserve every
+  // agent/job, keep only the newest poll binding, then enforce one bound enrollment per token.
+  migrateEnrollmentBindings(db);
+  const allowedKindsSql = ALLOWED_JOB_KINDS.map((kind) => `'${kind}'`).join(", ");
+  // Triggers migrate existing databases without rebuilding the work table or rejecting historical
+  // rows. From this version onward, both new inserts and kind updates are defended in SQLite too.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS work_kind_insert_guard
+    BEFORE INSERT ON work
+    WHEN NEW.kind NOT IN (${allowedKindsSql})
+    BEGIN
+      SELECT RAISE(ABORT, 'invalid job kind');
+    END;
+    CREATE TRIGGER IF NOT EXISTS work_kind_update_guard
+    BEFORE UPDATE OF kind ON work
+    WHEN NEW.kind NOT IN (${allowedKindsSql})
+    BEGIN
+      SELECT RAISE(ABORT, 'invalid job kind');
+    END;
+  `);
   _db = db;
   return db;
+}
+
+/** Safely upgrade pre-transaction databases before installing the unique binding index. */
+export function migrateEnrollmentBindings(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec(`
+      UPDATE agents AS older
+      SET enrollment_token_id = NULL
+      WHERE enrollment_token_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM agents AS newer
+          WHERE newer.enrollment_token_id = older.enrollment_token_id AND newer.id > older.id
+        );
+      CREATE UNIQUE INDEX IF NOT EXISTS agents_one_enrollment_per_token
+      ON agents (enrollment_token_id) WHERE enrollment_token_id IS NOT NULL;
+    `);
+  }).immediate();
 }
 
 // --- meta: small persisted settings (generated admin password, session secret) -----------------
@@ -161,7 +199,7 @@ export interface WorkRow {
   agent_id: number;
   kind: string;
   args_json: string | null;
-  status: string; // 'queued' | 'dispatched' | 'done' | 'failed'
+  status: string; // 'queued' | 'offered' | 'dispatched' | 'done' | 'failed'
   result_json: string | null;
   error: string | null;
   measurement_json: string | null;
@@ -188,23 +226,6 @@ export function markEnrollmentTokenUsed(id: number): void {
 
 // --- agents --------------------------------------------------------------------------------------
 
-export function createPendingAgent(a: {
-  machine_key: string;
-  enrollment_id: string;
-  enrollment_token_id: number;
-  identity_json: string | null;
-  caps_json: string | null;
-  environment_json: string | null;
-}): AgentRow {
-  const info = open()
-    .prepare(
-      `INSERT INTO agents (machine_key, enrollment_id, enrollment_token_id, identity_json, caps_json, environment_json)
-       VALUES (@machine_key, @enrollment_id, @enrollment_token_id, @identity_json, @caps_json, @environment_json)`,
-    )
-    .run(a);
-  return getAgentById(Number(info.lastInsertRowid))!;
-}
-
 export function getAgentById(id: number): AgentRow | null {
   return (open().prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow | undefined) ?? null;
 }
@@ -215,48 +236,64 @@ export function getAgentByEnrollmentId(enrollmentId: string): AgentRow | null {
     .get(enrollmentId) as AgentRow | undefined) ?? null;
 }
 
-export function getAgentByEnrollmentTokenId(enrollmentTokenId: number): AgentRow | null {
-  return (open()
-    .prepare("SELECT * FROM agents WHERE enrollment_token_id = ? ORDER BY id DESC LIMIT 1")
-    .get(enrollmentTokenId) as AgentRow | undefined) ?? null;
-}
-
-export function getAgentByMachineKey(machineKey: string): AgentRow | null {
-  return (open()
-    .prepare("SELECT * FROM agents WHERE machine_key = ? ORDER BY id DESC LIMIT 1")
-    .get(machineKey) as AgentRow | undefined) ?? null;
-}
-
 export function getAgentBySessionHash(sessionTokenHash: string): AgentRow | null {
   return (open()
     .prepare("SELECT * FROM agents WHERE session_token_hash = ?")
     .get(sessionTokenHash) as AgentRow | undefined) ?? null;
 }
 
-/** Re-enroll a known machine on its existing identity. Rotating the enrollment handle/token binding
- *  prevents the old enrollment token from polling, while clearing session state revokes the old
- *  bearer immediately. Work remains attached to the stable agent id. */
-export function reenrollAgent(
-  id: number,
-  a: {
-    enrollment_id: string;
-    enrollment_token_id: number;
-    identity_json: string | null;
-    caps_json: string | null;
-    environment_json: string | null;
-  },
-): AgentRow {
-  open()
-    .prepare(
-      `UPDATE agents
-       SET enrollment_id = @enrollment_id, enrollment_token_id = @enrollment_token_id,
-           status = 'pending', session_token_hash = NULL, pending_session_token = NULL,
-           identity_json = @identity_json, caps_json = @caps_json,
-           environment_json = @environment_json, last_seen = NULL
-       WHERE id = @id`,
-    )
-    .run({ id, ...a });
-  return getAgentById(id)!;
+/** Consume one enrollment token and create/re-enroll its machine as one BEGIN IMMEDIATE unit.
+ *  The write lock is acquired before reading `used` or the machine row, so another coordinator
+ *  process cannot observe both as fresh and race us to a second binding. Used-token retries return
+ *  the single row already bound to that token. */
+export function enrollAgentAtomically(a: {
+  token_id: number;
+  machine_key: string;
+  enrollment_id: string;
+  identity_json: string | null;
+  caps_json: string | null;
+  environment_json: string | null;
+}): AgentRow | null {
+  const db = open();
+  const complete = db.transaction((input: typeof a): AgentRow | null => {
+    const token = db.prepare("SELECT used FROM enrollment_tokens WHERE id = ?").get(input.token_id) as
+      | { used: number }
+      | undefined;
+    if (!token) return null;
+    if (token.used) {
+      return (db
+        .prepare("SELECT * FROM agents WHERE enrollment_token_id = ? ORDER BY id DESC LIMIT 1")
+        .get(input.token_id) as AgentRow | undefined) ?? null;
+    }
+
+    const existing = input.machine_key
+      ? ((db
+          .prepare("SELECT * FROM agents WHERE machine_key = ? ORDER BY id DESC LIMIT 1")
+          .get(input.machine_key) as AgentRow | undefined) ?? null)
+      : null;
+    let id: number;
+    if (existing) {
+      db.prepare(
+        `UPDATE agents
+         SET enrollment_id = @enrollment_id, enrollment_token_id = @token_id,
+             status = 'pending', session_token_hash = NULL, pending_session_token = NULL,
+             identity_json = @identity_json, caps_json = @caps_json,
+             environment_json = @environment_json, last_seen = NULL
+         WHERE id = @id`,
+      ).run({ ...input, id: existing.id });
+      id = existing.id;
+    } else {
+      const inserted = db.prepare(
+        `INSERT INTO agents
+           (machine_key, enrollment_id, enrollment_token_id, identity_json, caps_json, environment_json)
+         VALUES (@machine_key, @enrollment_id, @token_id, @identity_json, @caps_json, @environment_json)`,
+      ).run(input);
+      id = Number(inserted.lastInsertRowid);
+    }
+    db.prepare("UPDATE enrollment_tokens SET used = 1 WHERE id = ? AND used = 0").run(input.token_id);
+    return db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow;
+  });
+  return complete.immediate(a);
 }
 
 /** Approve: flip to active, persist the session-token HASH, and stash plaintext until session auth. */
@@ -330,27 +367,52 @@ export function insertWork(id: string, agentId: number, kind: string, argsJson: 
     .run(id, agentId, kind, argsJson);
 }
 
-/** The claimed job as returned by the atomic dispatch (RETURNING projection). */
+/** The job offer returned by the atomic queue claim (RETURNING projection). */
 export interface ClaimedWork {
   id: string;
   kind: string;
   args_json: string | null;
 }
 
-/** Atomically claim the oldest queued job for this agent: flip queued→dispatched and return the
- *  claimed row in ONE statement (SQLite RETURNING), so two concurrent polls can never double-dispatch
- *  the same job. Returns the claimed row, or null when nothing is queued. */
-export function claimNextWorkForAgent(agentId: number): ClaimedWork | null {
+/** Offer lease: the node must durably journal + ack within this window. Only unacknowledged offers
+ *  expire; a dispatched long-running model job never expires merely because execution takes hours. */
+export const OFFER_LEASE_SECONDS = 30;
+
+/** Atomically offer the oldest queued job, or reclaim an expired unacknowledged offer. */
+export function claimNextWorkForAgent(
+  agentId: number, offerLeaseSeconds: number = OFFER_LEASE_SECONDS,
+): ClaimedWork | null {
   return (open()
     .prepare(
-      `UPDATE work SET status = 'dispatched', dispatched_at = datetime('now')
+      `UPDATE work SET status = 'offered', dispatched_at = datetime('now')
        WHERE id = (
-         SELECT id FROM work WHERE agent_id = ? AND status = 'queued'
-         ORDER BY created_at, id LIMIT 1
+         SELECT id FROM work
+         WHERE agent_id = ? AND (
+           status = 'queued'
+           OR (status = 'offered' AND dispatched_at <= datetime('now', ?))
+         )
+         ORDER BY CASE status WHEN 'offered' THEN 0 ELSE 1 END, created_at, id LIMIT 1
        )
        RETURNING id, kind, args_json`,
     )
-    .get(agentId) as ClaimedWork | undefined) ?? null;
+    .get(agentId, `-${offerLeaseSeconds} seconds`) as ClaimedWork | undefined) ?? null;
+}
+
+export type WorkAckResult = "ok" | "unknown" | "conflict";
+
+/** Move an owned durable offer to dispatched. Repeated acks are idempotent. */
+export function acknowledgeWorkForAgent(id: string, agentId: number): WorkAckResult {
+  const db = open();
+  const changed = db.prepare(
+    `UPDATE work SET status = 'dispatched'
+     WHERE id = ? AND agent_id = ? AND status = 'offered'`,
+  ).run(id, agentId);
+  if (changed.changes === 1) return "ok";
+  const row = db.prepare("SELECT agent_id, status FROM work WHERE id = ?").get(id) as
+    | { agent_id: number; status: string }
+    | undefined;
+  if (!row || row.agent_id !== agentId) return "unknown";
+  return row.status === "dispatched" ? "ok" : "conflict";
 }
 
 export function getWorkById(id: string): WorkRow | null {

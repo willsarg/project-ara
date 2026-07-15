@@ -37,6 +37,11 @@ def _spool_files(tmp_path):
     return sorted(d.glob("*.json")) if d.exists() else []
 
 
+def _accepted_files(tmp_path):
+    d = tmp_path / "node" / "accepted"
+    return sorted(d.glob("*.json")) if d.exists() else []
+
+
 def _status_error(code: int) -> httpx.HTTPStatusError:
     """A synthetic httpx.HTTPStatusError carrying *code* — mirrors what raise_for_status raises."""
     request = httpx.Request("GET", "https://c.example/api/work")
@@ -50,12 +55,16 @@ class FakeClient:
     def __init__(self, jobs):
         self._jobs = list(jobs)
         self.posted = []
+        self.acked = []
 
     def get_work(self, wait):
         return self._jobs.pop(0)
 
     def post_result(self, job_id, payload):
         self.posted.append((job_id, payload))
+
+    def ack_work(self, job_id):
+        self.acked.append(job_id)
 
 
 def _cfg(session_token="SES"):
@@ -111,6 +120,131 @@ def test_one_iteration_runs_job_and_posts_done():
     job_id, payload = fake.posted[0]
     assert job_id == "j1" and payload["status"] == "done" and payload["result"] == {"ok": "run"}
     assert payload["environment"]["platform"] == "linux"
+    assert fake.acked == ["j1"]
+
+
+def test_job_is_durable_and_acknowledged_before_runner(tmp_path):
+    fake = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
+    def runner(_kind, _args):
+        assert fake.acked == ["j1"]
+        assert len(_accepted_files(tmp_path)) == 1
+        return {"ok": True}
+    agent.run_loop(_cfg(), client=fake, runner=runner, max_iterations=1)
+    assert _accepted_files(tmp_path) == []
+
+
+def test_accepted_job_replays_after_process_restart(tmp_path):
+    job = {"id": "j1", "kind": "run", "args": {"model": "m"}}
+    agent._journal_job(job)
+    fake = FakeClient([])
+    agent.run_loop(_cfg(), client=fake, runner=lambda k, a: {"recovered": a["model"]},
+                   max_iterations=1)
+    assert fake.acked == ["j1"]
+    assert fake.posted[0][1]["result"] == {"recovered": "m"}
+    assert _accepted_files(tmp_path) == []
+
+
+def test_process_interrupt_after_ack_leaves_job_for_restart(tmp_path):
+    job = {"id": "j1", "kind": "run", "args": {}}
+    first = FakeClient([job])
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_loop(_cfg(), client=first,
+                       runner=lambda k, a: (_ for _ in ()).throw(KeyboardInterrupt()),
+                       max_iterations=1)
+    assert first.acked == ["j1"] and len(_accepted_files(tmp_path)) == 1
+
+    recovered = FakeClient([])
+    agent.run_loop(_cfg(), client=recovered, runner=lambda k, a: {"ok": True},
+                   max_iterations=1)
+    assert recovered.posted and _accepted_files(tmp_path) == []
+
+
+def test_ack_transport_failure_keeps_job_without_executing(tmp_path):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           ack_error=httpx.ConnectError("connection refused"))
+    slept = []
+    agent.run_loop(_cfg(), client=client,
+                   runner=lambda k, a: pytest.fail("unacknowledged work must not execute"),
+                   max_iterations=1, sleep=slept.append, reauth_backoff=4.0)
+    assert len(_accepted_files(tmp_path)) == 1 and slept == [4.0]
+
+
+@pytest.mark.parametrize("status", [408, 429, 500])
+def test_ack_retryable_http_failure_keeps_job_without_executing(tmp_path, status):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           ack_error=_status_error(status))
+    agent.run_loop(_cfg(), client=client,
+                   runner=lambda k, a: pytest.fail("unacknowledged work must not execute"),
+                   max_iterations=1, sleep=lambda _s: None)
+    assert len(_accepted_files(tmp_path)) == 1
+
+
+def test_ack_401_invalidates_session_and_keeps_accepted_job(tmp_path):
+    cfg = _cfg()
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           ack_error=_status_error(401))
+    assert agent.run_loop(cfg, client=client,
+                          runner=lambda k, a: pytest.fail("must not execute"),
+                          max_iterations=1) == 1
+    assert cfg.session_token is None and len(_accepted_files(tmp_path)) == 1
+
+
+def test_ack_permanent_rejection_quarantines_accepted_job(tmp_path):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           ack_error=_status_error(404))
+    agent.run_loop(_cfg(), client=client,
+                   runner=lambda k, a: pytest.fail("must not execute"), max_iterations=1)
+    assert _accepted_files(tmp_path) == []
+    assert len(list((tmp_path / "node" / "accepted" / "quarantine").iterdir())) == 1
+
+
+@pytest.mark.parametrize("value", [
+    [], {"version": 2, "job": {}},
+    {"version": 1, "job": {"id": "", "kind": "run", "args": {}}},
+    {"version": 1, "job": {"id": "j1", "kind": "serve", "args": {}}},
+])
+def test_invalid_accepted_job_is_quarantined(tmp_path, value):
+    directory = tmp_path / "node" / "accepted"
+    directory.mkdir(parents=True)
+    (directory / "bad.json").write_text(json.dumps(value), encoding="utf-8")
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda _s: None)
+    assert _accepted_files(tmp_path) == []
+    assert len(list((directory / "quarantine").iterdir())) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_accepted_job_symlink_is_quarantined(tmp_path):
+    directory = tmp_path / "node" / "accepted"
+    directory.mkdir(parents=True)
+    target = tmp_path / "target.json"
+    target.write_text("evidence", encoding="utf-8")
+    (directory / "link.json").symlink_to(target)
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda _s: None)
+    assert (directory / "quarantine" / "link.json").is_symlink()
+
+
+def test_invalid_accepted_job_survives_quarantine_failure(tmp_path, monkeypatch):
+    directory = tmp_path / "node" / "accepted"
+    directory.mkdir(parents=True)
+    bad = directory / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+    agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
+                   max_iterations=1, sleep=lambda _s: None)
+    assert bad.exists()
+
+
+def test_completed_spool_suppresses_accepted_job_reexecution_when_post_retries(tmp_path):
+    agent._journal_job({"id": "j1", "kind": "run", "args": {}})
+    agent._spool_result("j1", {"status": "done", "result": {"ok": True}})
+    client = RaisingClient(post_error=_status_error(503))
+    agent.run_loop(_cfg(), client=client,
+                   runner=lambda k, a: pytest.fail("durably completed work must not rerun"),
+                   max_iterations=1, sleep=lambda _s: None)
+    assert _accepted_files(tmp_path) == [] and len(_spool_files(tmp_path)) == 1
 
 
 def test_worker_error_dict_is_reported_failed():
@@ -193,11 +327,13 @@ def test_heartbeat_and_status_fire_each_iteration_after_ready(monkeypatch):
 class RaisingClient:
     """get_work / post_result raise a scripted error (or behave) so the 401 path is exercisable."""
 
-    def __init__(self, *, get_work_error=None, job=None, post_error=None):
+    def __init__(self, *, get_work_error=None, job=None, post_error=None, ack_error=None):
         self._get_work_error = get_work_error
         self._job = job
         self._post_error = post_error
+        self._ack_error = ack_error
         self.posted = []
+        self.acked = []
 
     def get_work(self, wait):
         if self._get_work_error is not None:
@@ -208,6 +344,11 @@ class RaisingClient:
         if self._post_error is not None:
             raise self._post_error
         self.posted.append((job_id, payload))
+
+    def ack_work(self, job_id):
+        if self._ack_error is not None:
+            raise self._ack_error
+        self.acked.append(job_id)
 
 
 def test_get_work_401_invalidates_session_and_stops_for_explicit_reenrollment(monkeypatch):
@@ -270,6 +411,30 @@ def test_post_result_non_401_error_spools_and_does_not_crash(tmp_path):
     assert 5.0 in slept                                     # bounded backoff after the failure
 
 
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422])
+def test_permanent_result_rejection_is_quarantined_without_retry_loop(tmp_path, status):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=_status_error(status))
+    slept = []
+    assert agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1},
+                          max_iterations=1, sleep=slept.append) == 1
+    assert _spool_files(tmp_path) == []
+    quarantined = list((tmp_path / "node" / "results" / "quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert json.loads(quarantined[0].read_text(encoding="utf-8"))["job_id"] == "j1"
+    assert slept == []
+
+
+@pytest.mark.parametrize("status", [408, 429])
+def test_retryable_result_status_keeps_live_spool_and_backs_off(tmp_path, status):
+    client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                           post_error=_status_error(status))
+    slept = []
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1},
+                   max_iterations=1, sleep=slept.append, reauth_backoff=3.0)
+    assert len(_spool_files(tmp_path)) == 1 and slept == [3.0]
+
+
 def test_finished_result_spool_is_cleaned_up_on_successful_post(tmp_path):
     client = FakeClient([{"id": "j1", "kind": "run", "args": {}}, None])
     agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": 1}, max_iterations=2,
@@ -319,6 +484,38 @@ def test_flush_keeps_result_when_post_still_fails(tmp_path):
     agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
                    sleep=lambda s: None)
     assert len(_spool_files(tmp_path)) == 1                 # still spooled
+
+
+def test_flush_quarantines_permanently_rejected_result_and_continues(tmp_path):
+    d = tmp_path / "node" / "results"
+    d.mkdir(parents=True)
+    (d / "old.json").write_text(json.dumps({"status": "done", "result": {"x": 1}}))
+    client = RaisingClient(post_error=_status_error(404))
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
+                   sleep=lambda s: None)
+    assert _spool_files(tmp_path) == []
+    assert len(list((d / "quarantine").iterdir())) == 1
+
+
+@pytest.mark.parametrize("phase", ["flush", "ack", "post"])
+def test_terminal_rejection_preserves_live_evidence_when_quarantine_fails(
+        tmp_path, monkeypatch, phase):
+    if phase == "flush":
+        d = tmp_path / "node" / "results"
+        d.mkdir(parents=True)
+        (d / "old.json").write_text(json.dumps({"status": "done"}), encoding="utf-8")
+        client = RaisingClient(post_error=_status_error(404))
+    elif phase == "ack":
+        client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                               ack_error=_status_error(404))
+    else:
+        client = RaisingClient(job={"id": "j1", "kind": "run", "args": {}},
+                               post_error=_status_error(404))
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+    agent.run_loop(_cfg(), client=client, runner=lambda k, a: {"ok": True},
+                   max_iterations=1, sleep=lambda _s: None)
+    assert _spool_files(tmp_path) or _accepted_files(tmp_path)
 
 
 def test_flush_quarantines_and_preserves_corrupt_spool_file(tmp_path):

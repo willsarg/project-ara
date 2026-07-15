@@ -6,11 +6,14 @@ httpx is mocked with an injected stub client, so the whole surface is exercised 
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import httpx
 import pytest
 
 from ara.node import client as client_mod
-from ara.node.client import NodeClient
+from ara.node.client import NodeClient, WIRE_JOB_KINDS
 
 
 class FakeResponse:
@@ -49,6 +52,12 @@ class FakeHTTPClient:
 def _client(response=None):
     fake = FakeHTTPClient(response)
     return NodeClient("https://c.example/", "TOK", client=fake), fake
+
+
+def test_wire_job_allowlist_matches_pinned_contract():
+    schema = json.loads((Path(__file__).parents[1] /
+                         "contracts/wire/schema/work.response.schema.json").read_text())
+    assert WIRE_JOB_KINDS == frozenset(schema["properties"]["job"]["properties"]["kind"]["enum"])
 
 
 def test_default_client_is_httpx_and_base_is_trimmed(monkeypatch):
@@ -134,6 +143,15 @@ def test_post_result_percent_encodes_wire_job_id():
     nc.post_result("../../outside job", {"status": "done"})
     assert fake.calls[0][1] == (
         "https://c.example/api/work/..%2F..%2Foutside%20job/result")
+
+
+def test_ack_work_posts_to_percent_encoded_job_endpoint():
+    nc, fake = _client()
+    nc.ack_work("../../outside job")
+    method, url, body, headers = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://c.example/api/work/..%2F..%2Foutside%20job/ack"
+    assert body is None and headers == {"Authorization": "Bearer TOK"}
 
 
 def test_close_releases_the_pool():

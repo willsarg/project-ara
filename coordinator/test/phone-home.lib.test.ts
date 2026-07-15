@@ -67,6 +67,35 @@ describe("enrollment tokens", () => {
     expect(auth.verifyEnrollmentToken(token, { allowUsed: true })).toBeTruthy();
   });
 
+  it("binds concurrent uses of one enrollment token to exactly one enrollment", async () => {
+    const { token } = enroll.issueEnrollmentToken();
+    const attempts = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        Promise.resolve().then(() => enroll.enroll(token, selfDesc("box-token-race"))),
+      ),
+    );
+
+    expect(new Set(attempts.map((attempt) => attempt?.enrollment_id)).size).toBe(1);
+    const matching = db.listAgents().filter((agent) => agent.machine_key === "box-token-race");
+    expect(matching).toHaveLength(1);
+    expect(matching[0].enrollment_token_id).toBe(
+      db.getEnrollmentTokenByHash(auth.hashToken(token))!.id,
+    );
+  });
+
+  it("serializes concurrent fresh-token enrollment for one machine onto its stable row", async () => {
+    const tokens = Array.from({ length: 8 }, () => enroll.issueEnrollmentToken().token);
+    await Promise.all(
+      tokens.map((token) =>
+        Promise.resolve().then(() => enroll.enroll(token, selfDesc("box-machine-race"))),
+      ),
+    );
+
+    const matching = db.listAgents().filter((agent) => agent.machine_key === "box-machine-race");
+    expect(matching).toHaveLength(1);
+    expect(matching[0].status).toBe("pending");
+  });
+
   it("stores only the hash, never the plaintext", () => {
     const { token } = enroll.issueEnrollmentToken();
     const row = db.getEnrollmentTokenByHash(auth.hashToken(token));
@@ -81,6 +110,19 @@ describe("enrollment tokens", () => {
     const row = db.getEnrollmentTokenByHash(auth.hashToken(token))!;
     db.markEnrollmentTokenUsed(row.id);
     expect(enroll.enroll(token, selfDesc("box-orphan-token"))).toBeNull();
+  });
+
+  it("returns null when the atomic DB enrollment is given an unknown token row", () => {
+    expect(
+      db.enrollAgentAtomically({
+        token_id: -1,
+        machine_key: "missing-token",
+        enrollment_id: "enr_missing_token",
+        identity_json: null,
+        caps_json: null,
+        environment_json: null,
+      }),
+    ).toBeNull();
   });
 });
 
@@ -455,7 +497,7 @@ describe("work queue", () => {
     return agent.id;
   }
 
-  it("enqueue → nextForAgent returns the job once, then it is dispatched", async () => {
+  it("offers once, then becomes dispatched only after durable acknowledgement", async () => {
     const agentId = await activeAgent("box-w1");
     const jobId = work.enqueue(agentId, "run", { model: "qwen", prompt: "hi" });
     expect(jobId).toMatch(/^job_/);
@@ -463,17 +505,37 @@ describe("work queue", () => {
     const job = await work.nextForAgent(agentId, 0);
     expect(job).toEqual({ id: jobId, kind: "run", args: { model: "qwen", prompt: "hi" } });
 
-    // already dispatched → nothing left to hand out on an immediate re-poll
+    // A live unacknowledged offer is not duplicated by an immediate re-poll.
     expect(await work.nextForAgent(agentId, 0)).toBeNull();
+    expect(db.getWorkById(jobId)!.status).toBe("offered");
+    expect(work.acknowledge(jobId, agentId)).toBe("ok");
     expect(db.getWorkById(jobId)!.status).toBe("dispatched");
+    expect(work.acknowledge(jobId, agentId)).toBe("ok"); // idempotent after response loss
   });
 
-  it("claims a job exactly once under two back-to-back polls (atomic dispatch)", async () => {
+  it("accepts exactly the four coordinator job kinds", async () => {
+    const agentId = await activeAgent("box-job-kinds");
+    for (const kind of ["run", "characterize", "detect", "benchmark"]) {
+      const jobId = work.enqueue(agentId, kind, {});
+      expect(db.getWorkById(jobId)!.kind).toBe(kind);
+    }
+  });
+
+  it("rejects an invalid job kind before insertion and at the DB boundary", async () => {
+    const agentId = await activeAgent("box-invalid-kind");
+    expect(() => work.enqueue(agentId, "shell", {})).toThrow(/invalid job kind/i);
+    expect(() => db.insertWork("job_invalid_kind", agentId, "shell", "{}")).toThrow(
+      /invalid job kind/i,
+    );
+    expect(db.getWorkById("job_invalid_kind")).toBeNull();
+  });
+
+  it("offers a job exactly once under two back-to-back polls", async () => {
     const agentId = await activeAgent("box-race");
     const jobId = work.enqueue(agentId, "run", { model: "qwen", prompt: "hi" });
 
     // Two polls fired back-to-back (no await between them) race for the single queued job. The
-    // atomic queued→dispatched claim must hand it to exactly one; the other sees nothing → null.
+    // atomic queued→offered claim must hand it to exactly one; the other sees nothing → null.
     const [a, b] = await Promise.all([
       work.nextForAgent(agentId, 0),
       work.nextForAgent(agentId, 0),
@@ -482,7 +544,25 @@ describe("work queue", () => {
     const claimed = [a, b].filter((j) => j !== null);
     expect(claimed).toHaveLength(1);
     expect(claimed[0]!.id).toBe(jobId);
-    expect(db.getWorkById(jobId)!.status).toBe("dispatched");
+    expect(db.getWorkById(jobId)!.status).toBe("offered");
+  });
+
+  it("reoffers an expired unacknowledged offer but never an acknowledged long job", async () => {
+    const agentId = await activeAgent("box-offer-recovery");
+    const jobId = work.enqueue(agentId, "benchmark", {});
+    expect(await work.nextForAgent(agentId, 0)).toMatchObject({ id: jobId });
+    expect(db.claimNextWorkForAgent(agentId, 0)).toMatchObject({ id: jobId });
+    expect(work.acknowledge(jobId, agentId)).toBe("ok");
+    expect(db.claimNextWorkForAgent(agentId, 0)).toBeNull();
+  });
+
+  it("acknowledgement hides foreign jobs and rejects jobs that were never offered", async () => {
+    const owner = await activeAgent("box-ack-owner");
+    const other = await activeAgent("box-ack-other");
+    const jobId = work.enqueue(owner, "run", {});
+    expect(work.acknowledge("job_missing", owner)).toBe("unknown");
+    expect(work.acknowledge(jobId, other)).toBe("unknown");
+    expect(work.acknowledge(jobId, owner)).toBe("conflict");
   });
 
   it("nextForAgent long-poll resolves null after the wait window (fake timers)", async () => {

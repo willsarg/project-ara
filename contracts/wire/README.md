@@ -24,6 +24,7 @@ and the plan `2026-07-01-ara-phone-home-migration-plan` (in the vault).
 | `POST /api/enroll` | enrollment token | `enroll.request` → `enroll.response` |
 | `GET /api/enroll/{id}` | enrollment token | `enroll-poll.response` |
 | `GET /api/work?wait=N` | session token | `work.response` (200; 204 has no body) |
+| `POST /api/work/{id}/ack` | session token | Node durably accepted the offer; execution may begin |
 | `POST /api/work/{id}/result` | session token | `result.request` |
 
 Shared: `environment` (on every measurement), `capability` (advertised at enroll). Capability

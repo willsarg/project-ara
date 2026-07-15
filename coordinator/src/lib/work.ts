@@ -4,7 +4,11 @@
 // cheap sync read, and if there's nothing yet it AWAITS a short timer before the next read. SERVER-ONLY.
 import "server-only";
 import { randomBytes } from "node:crypto";
-import { claimNextWorkForAgent, getWorkById, insertWork, recordWorkResult } from "./db";
+import {
+  acknowledgeWorkForAgent, claimNextWorkForAgent, getWorkById, insertWork, recordWorkResult,
+  type WorkAckResult,
+} from "./db";
+import { assertAllowedJobKind } from "./job-kinds";
 
 /** The dispatched job as it goes on the wire (work.response `job`). */
 export interface DispatchedJob {
@@ -17,6 +21,7 @@ const POLL_STEP_MS = 250; // re-check cadence between sync reads during a long-p
 
 /** Queue a job for an agent. Returns the job id (also the wire `job.id`). */
 export function enqueue(agentId: number, kind: string, args: Record<string, unknown>): string {
+  assertAllowedJobKind(kind);
   const id = `job_${randomBytes(12).toString("hex")}`;
   insertWork(id, agentId, kind, JSON.stringify(args ?? {}));
   return id;
@@ -24,10 +29,8 @@ export function enqueue(agentId: number, kind: string, args: Record<string, unkn
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** Long-poll for the next queued job, up to `waitMs`. Returns the job (atomically claiming it —
- *  queued→dispatched in one statement) as soon as one is available, or null once the window elapses.
- *  The atomic claim guarantees a job is handed out exactly once even under concurrent polls. Awaits
- *  between cheap sync claims so the synchronous DB never blocks the loop. */
+/** Long-poll for the next queued/expired-offer job, up to `waitMs`. The returned offer remains
+ * unexecutable until the node journals it and calls acknowledge(). */
 export async function nextForAgent(agentId: number, waitMs: number): Promise<DispatchedJob | null> {
   const deadline = Date.now() + Math.max(0, waitMs);
   for (;;) {
@@ -43,6 +46,10 @@ export async function nextForAgent(agentId: number, waitMs: number): Promise<Dis
     if (remaining <= 0) return null;
     await sleep(Math.min(POLL_STEP_MS, remaining));
   }
+}
+
+export function acknowledge(jobId: string, agentId: number): WorkAckResult {
+  return acknowledgeWorkForAgent(jobId, agentId);
 }
 
 /** Record a job's result. Returns false if the job id is unknown (→ the route answers 404). */

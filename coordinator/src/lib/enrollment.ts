@@ -7,16 +7,12 @@ import { randomBytes } from "node:crypto";
 import { hashToken, verifyEnrollmentToken } from "./node-auth";
 import {
   activateAgent,
-  createPendingAgent,
+  enrollAgentAtomically,
   getAgentByEnrollmentId,
-  getAgentByEnrollmentTokenId,
-  getAgentByMachineKey,
   getPendingSessionToken,
   insertEnrollmentToken,
   listAgents,
   listAgentsByStatus,
-  markEnrollmentTokenUsed,
-  reenrollAgent,
   revokeAgent,
   setAgentStatus,
   type AgentRow,
@@ -50,25 +46,16 @@ export function enroll(
   const tokRow = verifyEnrollmentToken(token, { allowUsed: true });
   if (!tokRow) return null;
 
-  if (tokRow.used) {
-    const existing = getAgentByEnrollmentTokenId(tokRow.id);
-    return existing ? { enrollment_id: existing.enrollment_id, status: "pending" } : null;
-  }
-
   const enrollment_id = newId("enr");
   const machine_key = typeof self?.machine_key === "string" ? self.machine_key : "";
   const stored = {
     enrollment_id,
-    enrollment_token_id: tokRow.id, // bind: only this token may poll this agent (IDOR guard)
     identity_json: self?.identity != null ? JSON.stringify(self.identity) : null,
     caps_json: self?.capabilities != null ? JSON.stringify(self.capabilities) : null,
     environment_json: self?.environment != null ? JSON.stringify(self.environment) : null,
   };
-  const existing = machine_key ? getAgentByMachineKey(machine_key) : null;
-  if (existing) reenrollAgent(existing.id, stored);
-  else createPendingAgent({ machine_key, ...stored });
-  markEnrollmentTokenUsed(tokRow.id); // single-use for enroll; the token can still poll (allowUsed)
-  return { enrollment_id, status: "pending" };
+  const agent = enrollAgentAtomically({ token_id: tokRow.id, machine_key, ...stored });
+  return agent ? { enrollment_id: agent.enrollment_id, status: "pending" } : null;
 }
 
 /** Result of an enrollment poll. The route maps each to an HTTP response / wire body. */

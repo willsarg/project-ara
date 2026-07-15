@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -66,6 +67,36 @@ def _config_path():
 
 def _pending_path():
     return node_dir() / "pending-enrollment.json"
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+@contextmanager
+def _credential_lock():
+    """Serialize credential read/compare/write sequences across node processes."""
+    path = node_dir() / "credentials.lock"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if _is_windows():
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if _is_windows():
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _fsync_parent(path: Path) -> None:
@@ -151,17 +182,43 @@ def save(config: NodeConfig) -> None:
     The session token is a credential, so a same-directory temporary file is created 0600 up front
     and replaces the destination only after its contents are durable. This leaves an existing valid
     config intact if writing or replacement fails. On Windows the mode is advisory (ACLs govern)."""
-    _write_json_atomic(_config_path(), dataclasses.asdict(config))
+    with _credential_lock():
+        _write_json_atomic(_config_path(), dataclasses.asdict(config))
 
 
 def save_pending(pending: PendingEnrollment) -> None:
     """Durably persist a one-shot handshake without replacing an active node config."""
-    _write_json_atomic(_pending_path(), dataclasses.asdict(pending))
+    with _credential_lock():
+        _write_json_atomic(_pending_path(), dataclasses.asdict(pending))
 
 
 def clear_pending() -> None:
     """Remove completed enrollment state and durably record its absence."""
-    path = _pending_path()
-    if path.exists() or path.is_symlink():
-        path.unlink()
-        _fsync_parent(path)
+    with _credential_lock():
+        path = _pending_path()
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            _fsync_parent(path)
+
+
+def clear_session_if_current(server_url: str, session_token: str | None) -> bool:
+    """Clear rejected authority only if disk still contains that exact authority.
+
+    The comparison and atomic replacement share the credential lock with every config writer, so a
+    late 401 from an old daemon cannot overwrite a newly enrolled session.
+    """
+    with _credential_lock():
+        current = load()
+        if current is None:
+            _write_json_atomic(
+                _config_path(),
+                dataclasses.asdict(NodeConfig(server_url=server_url)),
+            )
+            return True
+        if (current.server_url == server_url
+                and current.session_token == session_token):
+            current.session_token = None
+            current.enrollment_token = None
+            _write_json_atomic(_config_path(), dataclasses.asdict(current))
+            return True
+        return False

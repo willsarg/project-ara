@@ -118,11 +118,11 @@ def test_phone_home_enroll_approve_work_result(coordinator):
         f".run({json.dumps(job_id)}, {agent_id});"
     )
 
-    # 6) The node (now session-authed) claims the job over HTTP (real /api/work: session auth +
-    #    atomic UPDATE...RETURNING claim).
+    # 6) The node receives an atomic offer, journals it durably, then acknowledges before execution.
     authed = NodeClient(coordinator, session_token)
     job = authed.get_work(wait=5)
     assert job is not None and job["id"] == job_id and job["kind"] == "detect"
+    authed.ack_work(job_id)  # durable local acceptance authorizes execution
 
     # 7) The node posts a result (real /api/work/[id]/result: session auth + record). Shape matches
     #    result.request; environment is the real node-produced shape.

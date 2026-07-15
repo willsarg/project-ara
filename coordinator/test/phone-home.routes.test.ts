@@ -9,6 +9,7 @@ process.env.ARA_COORDINATOR_DB = ":memory:";
 let enrollRoute: typeof import("@/app/api/enroll/route");
 let pollRoute: typeof import("@/app/api/enroll/[id]/route");
 let workRoute: typeof import("@/app/api/work/route");
+let ackRoute: typeof import("@/app/api/work/[id]/ack/route");
 let resultRoute: typeof import("@/app/api/work/[id]/result/route");
 let db: typeof import("@/lib/db");
 let enroll: typeof import("@/lib/enrollment");
@@ -41,6 +42,7 @@ beforeAll(async () => {
   enrollRoute = await import("@/app/api/enroll/route");
   pollRoute = await import("@/app/api/enroll/[id]/route");
   workRoute = await import("@/app/api/work/route");
+  ackRoute = await import("@/app/api/work/[id]/ack/route");
   resultRoute = await import("@/app/api/work/[id]/result/route");
 });
 
@@ -160,6 +162,12 @@ describe("full enroll → approve → poll → work → result flow", () => {
     expect(await workRes.json()).toEqual({
       job: { id: jobId, kind: "run", args: { model: "qwen", prompt: "hi" } },
     });
+    expect(db.getWorkById(jobId)!.status).toBe("offered");
+    const ack = await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: sessionToken }),
+      params(jobId),
+    );
+    expect(ack.status).toBe(200);
     expect(db.getWorkById(jobId)!.status).toBe("dispatched");
 
     // report a result → 200, recorded; bad session → 401; unknown/foreign job → 404
@@ -196,6 +204,52 @@ describe("full enroll → approve → poll → work → result flow", () => {
     const row = db.getWorkById(jobId)!;
     expect(row.status).toBe("done");
     expect(JSON.parse(row.result_json!)).toEqual({ output: "Paris." });
+
+    // Result and acknowledgement response loss are both idempotent/terminal-safe.
+    const repeatedResult = await resultRoute.POST(
+      req(`http://x/api/work/${jobId}/result`, {
+        method: "POST", bearer: sessionToken,
+        body: JSON.stringify({ status: "done", result: { different: true }, environment: ENV }),
+      }),
+      params(jobId),
+    );
+    expect(repeatedResult.status).toBe(200);
+    expect(JSON.parse(db.getWorkById(jobId)!.result_json!)).toEqual({ output: "Paris." });
+    const lateAck = await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: sessionToken }),
+      params(jobId),
+    );
+    expect(lateAck.status).toBe(409);
+  });
+});
+
+describe("POST /api/work/[id]/ack", () => {
+  it("authenticates, hides foreign/unknown jobs, and acknowledges an offer idempotently", async () => {
+    const owner = await activate("box-ack-route-owner");
+    const other = await activate("box-ack-route-other");
+    const { enqueue } = await import("@/lib/work");
+    const jobId = enqueue(owner.agentId, "run", {});
+
+    expect((await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST" }), params(jobId))).status).toBe(401);
+    expect((await ackRoute.POST(
+      req("http://x/api/work/missing/ack", { method: "POST", bearer: owner.sessionToken }),
+      params("missing"))).status).toBe(404);
+    expect((await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: other.sessionToken }),
+      params(jobId))).status).toBe(404);
+    expect((await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: owner.sessionToken }),
+      params(jobId))).status).toBe(409); // queued, not yet offered
+
+    expect((await workRoute.GET(
+      req("http://x/api/work?wait=0", { bearer: owner.sessionToken }))).status).toBe(200);
+    expect((await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: owner.sessionToken }),
+      params(jobId))).status).toBe(200);
+    expect((await ackRoute.POST(
+      req(`http://x/api/work/${jobId}/ack`, { method: "POST", bearer: owner.sessionToken }),
+      params(jobId))).status).toBe(200);
   });
 });
 
@@ -273,6 +327,20 @@ describe("POST /api/enroll boundary validation", () => {
 });
 
 describe("POST /api/work/[id]/result boundary + error paths", () => {
+  it("409s a valid result for work that was never offered and acknowledged", async () => {
+    const { agentId, sessionToken } = await activate("box-result-unacked");
+    const jobId = (await import("@/lib/work")).enqueue(agentId, "run", {});
+    const res = await resultRoute.POST(
+      req(`http://x/api/work/${jobId}/result`, {
+        method: "POST", bearer: sessionToken,
+        body: JSON.stringify({ status: "done", result: {}, environment: ENV }),
+      }),
+      params(jobId),
+    );
+    expect(res.status).toBe(409);
+    expect(db.getWorkById(jobId)!.status).toBe("queued");
+  });
+
   it("404 on an unknown job id (no leak of existence)", async () => {
     const { sessionToken } = await activate("box-r1");
     const res = await resultRoute.POST(
@@ -330,6 +398,85 @@ describe("POST /api/work/[id]/result boundary + error paths", () => {
       params(jobId2),
     );
     expect(noEnv.status).toBe(400);
+  });
+
+  it("validates the complete pinned result.request shape before mutating the job", async () => {
+    const { agentId, sessionToken } = await activate("box-result-schema");
+    const { enqueue } = await import("@/lib/work");
+    const jobId = enqueue(agentId, "benchmark", {});
+    const invalidBodies: unknown[] = [
+      null,
+      [],
+      { status: "done", environment: ENV },
+      { status: "failed", environment: ENV },
+      { status: "done", result: [], environment: ENV },
+      { status: "failed", error: {}, environment: ENV },
+      { status: "done", result: {}, measurement: [], environment: ENV },
+      { status: "done", result: {}, environment: { ...ENV, platform: "plan9" } },
+      { status: "done", result: {}, environment: { ...ENV, accel: "tpu" } },
+      { status: "done", result: {}, environment: { ...ENV, containerized: "false" } },
+      { status: "done", result: {}, environment: { ...ENV, virtualization_layer: 7 } },
+      { status: "done", result: {}, environment: { ...ENV, wall_source: "guessed" } },
+      { status: "done", result: {}, environment: { ...ENV, surprise: true } },
+      { status: "done", result: {}, environment: { ...ENV, platform: undefined } },
+      { status: "done", result: {}, environment: { ...ENV, accel: undefined } },
+      { status: "done", result: {}, environment: { ...ENV, containerized: undefined } },
+      { status: "done", result: {}, environment: { ...ENV, wall_source: undefined } },
+      { status: "done", result: {}, environment: ENV, surprise: true },
+    ];
+
+    for (const body of invalidBodies) {
+      const res = await resultRoute.POST(
+        req(`http://x/api/work/${jobId}/result`, {
+          method: "POST",
+          bearer: sessionToken,
+          body: JSON.stringify(body),
+        }),
+        params(jobId),
+      );
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      const row = db.getWorkById(jobId)!;
+      expect(row.status).toBe("queued");
+      expect(row.result_json).toBeNull();
+      expect(row.error).toBeNull();
+      expect(row.measurement_json).toBeNull();
+    }
+  });
+
+  it("accepts nullable schema fields when the status-required property is present", async () => {
+    const { agentId, sessionToken } = await activate("box-result-schema-nullable");
+    const { enqueue } = await import("@/lib/work");
+    const doneId = enqueue(agentId, "detect", {});
+    const failedId = enqueue(agentId, "run", {});
+    expect(db.claimNextWorkForAgent(agentId)!.id).toBe(doneId);
+    expect(db.acknowledgeWorkForAgent(doneId, agentId)).toBe("ok");
+    expect(db.claimNextWorkForAgent(agentId)!.id).toBe(failedId);
+    expect(db.acknowledgeWorkForAgent(failedId, agentId)).toBe("ok");
+
+    const done = await resultRoute.POST(
+      req(`http://x/api/work/${doneId}/result`, {
+        method: "POST",
+        bearer: sessionToken,
+        body: JSON.stringify({
+          status: "done",
+          result: null,
+          measurement: null,
+          environment: ENV,
+        }),
+      }),
+      params(doneId),
+    );
+    const failed = await resultRoute.POST(
+      req(`http://x/api/work/${failedId}/result`, {
+        method: "POST",
+        bearer: sessionToken,
+        body: JSON.stringify({ status: "failed", error: null, environment: ENV }),
+      }),
+      params(failedId),
+    );
+
+    expect(done.status).toBe(200);
+    expect(failed.status).toBe(200);
   });
 
   it("400 on malformed JSON body (not 500)", async () => {

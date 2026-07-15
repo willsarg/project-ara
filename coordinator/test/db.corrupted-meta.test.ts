@@ -32,6 +32,9 @@ vi.mock("better-sqlite3", () => {
     prepare(sql: string) {
       return new FakeStatement(sql);
     }
+    transaction(fn: () => void) {
+      return { immediate: fn };
+    }
   }
   return { default: FakeDatabase };
 });
