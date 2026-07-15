@@ -410,6 +410,40 @@ def test_windows_existing_serving_directory_and_failed_replace_cleanup(tmp_path,
     assert list(serving_path.iterdir()) == []
 
 
+def test_posix_failed_replace_tolerates_already_removed_temporary(monkeypatch, tmp_path):
+    """Exercise the descriptor-relative cleanup race without requiring POSIX host semantics."""
+    _supply_posix_open_flags(monkeypatch)
+
+    class Stream:
+        def write(self, _value):
+            return None
+
+        def flush(self):
+            return None
+
+        def fileno(self):
+            return 72
+
+        def close(self):
+            return None
+
+    guard = activity._DirectoryGuard(tmp_path, "posix", 71)
+    monkeypatch.setattr(activity.os, "open", lambda *_a, **_k: 72)
+    monkeypatch.setattr(activity.os, "fdopen", lambda *_a, **_k: Stream())
+    monkeypatch.setattr(activity.os, "fsync", lambda _fd: None)
+    monkeypatch.setattr(
+        activity, "_replace_record",
+        lambda *_a, **_k: (_ for _ in ()).throw(PermissionError("replace denied")),
+    )
+    monkeypatch.setattr(
+        activity.os, "unlink",
+        lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+
+    with pytest.raises(PermissionError, match="replace denied"):
+        activity._atomic_write(tmp_path / "record.json", {"value": 1}, guard=guard)
+
+
 def test_windows_open_existing_serving_without_create(tmp_path, monkeypatch):
     root_path = tmp_path / "activity"
     serving_path = root_path / "serving"
@@ -433,6 +467,18 @@ def test_windows_record_handle_transfers_to_fd_and_reads_json(tmp_path, monkeypa
         lambda _handle: pytest.fail("transferred record handle closed twice"),
     )
     assert activity._json_record(record, guard=guard) == {"value": 1}
+
+
+def test_windows_record_open_suppresses_non_regular_handle(monkeypatch, tmp_path):
+    guard = activity._DirectoryGuard(tmp_path, "windows", 70)
+    closed = []
+    monkeypatch.setattr(activity, "_win_open_record", lambda _path: 71)
+    monkeypatch.setattr(activity, "_win_handle_to_fd", lambda _handle: 72)
+    monkeypatch.setattr(activity.os, "fstat", lambda _fd: types.SimpleNamespace(st_mode=0o040000))
+    monkeypatch.setattr(activity.os, "close", lambda descriptor: closed.append(descriptor))
+
+    assert activity._open_record_fd(tmp_path / "record.json", guard) is None
+    assert closed == [72]
 
 
 def test_windows_record_conversion_failure_closes_handle(monkeypatch, tmp_path):

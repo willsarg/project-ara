@@ -208,6 +208,18 @@ def test_agent_lease_supports_platform_without_optional_open_features(monkeypatc
         pass
 
 
+def test_atomic_json_write_uses_optional_owner_only_permissions(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent.os, "fchmod", lambda fd, mode: calls.append((fd, mode)),
+                        raising=False)
+
+    target = tmp_path / "state" / "record.json"
+    agent._write_json_atomic(target, {"value": 1})
+
+    assert target.read_text(encoding="utf-8") == '{"value": 1}'
+    assert len(calls) == 1 and calls[0][1] == 0o600
+
+
 def test_job_is_durable_and_acknowledged_before_runner(tmp_path):
     fake = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
     def runner(_kind, _args):
@@ -311,6 +323,24 @@ def test_accepted_job_symlink_is_quarantined(tmp_path):
     agent.run_loop(_cfg(), client=FakeClient([None]), runner=lambda k, a: {},
                    max_iterations=1, sleep=lambda _s: None)
     assert (directory / "quarantine" / "link.json").is_symlink()
+
+
+def test_accepted_job_symlink_policy_is_portably_exercised(monkeypatch):
+    entry = types.SimpleNamespace(
+        name="link.json",
+        lstat=lambda: types.SimpleNamespace(st_mtime_ns=1),
+        is_symlink=lambda: True,
+    )
+    directory = types.SimpleNamespace(
+        exists=lambda: True,
+        glob=lambda _pattern: [entry],
+    )
+    quarantined = []
+    monkeypatch.setattr(agent, "_accepted_dir", lambda: directory)
+    monkeypatch.setattr(agent, "_quarantine_spool", lambda path: quarantined.append(path))
+
+    assert agent._next_accepted_job() is None
+    assert quarantined == [entry]
 
 
 def test_invalid_accepted_job_survives_quarantine_failure(tmp_path, monkeypatch):
@@ -730,6 +760,33 @@ def test_spool_order_advances_past_durable_state_after_clock_rollback(tmp_path, 
     assert [job_id for job_id, _payload in client.posted] == ["older", "newer"]
 
 
+def test_persisted_order_portably_filters_symlinks_and_non_objects(monkeypatch):
+    class Entry:
+        def __init__(self, value, *, symlink=False):
+            self.value = value
+            self.symlink = symlink
+
+        def is_symlink(self):
+            return self.symlink
+
+        def read_text(self, *, encoding):
+            assert encoding == "utf-8"
+            return self.value
+
+    results = types.SimpleNamespace(glob=lambda _pattern: [
+        Entry("{}", symlink=True),
+        Entry("[]"),
+        Entry("{}"),
+    ])
+    accepted = types.SimpleNamespace(glob=lambda _pattern: [Entry(json.dumps({
+        "completion": {"order": 9_000},
+    }))])
+    monkeypatch.setattr(agent, "_results_dir", lambda: results)
+    monkeypatch.setattr(agent, "_accepted_dir", lambda: accepted)
+
+    assert agent._persisted_spool_order() == 9_000
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
 def test_persisted_order_ignores_unusable_state_and_reads_completion_wal(tmp_path):
     results = tmp_path / "node" / "results"
@@ -932,6 +989,30 @@ def test_flush_quarantines_dangling_symlink_before_ordering(tmp_path):
     assert (d / "quarantine" / "dangling.json").is_symlink()
 
 
+def test_flush_portably_rejects_symlink_root_and_entry(monkeypatch):
+    client = FakeClient([])
+    symlink_root = types.SimpleNamespace(is_symlink=lambda: True)
+    monkeypatch.setattr(agent, "_results_dir", lambda: symlink_root)
+    assert agent._flush_spool(client, _cfg()) is client
+
+    entry = types.SimpleNamespace(
+        name="link.json",
+        lstat=lambda: types.SimpleNamespace(st_mtime_ns=1),
+        is_symlink=lambda: True,
+    )
+    directory = types.SimpleNamespace(
+        is_symlink=lambda: False,
+        exists=lambda: True,
+        glob=lambda _pattern: [entry],
+    )
+    quarantined = []
+    monkeypatch.setattr(agent, "_results_dir", lambda: directory)
+    monkeypatch.setattr(agent, "_quarantine_spool", lambda path: quarantined.append(path))
+
+    assert agent._flush_spool(client, _cfg()) is client
+    assert quarantined == [entry]
+
+
 def test_flush_quarantines_permanently_rejected_result_and_continues(tmp_path):
     d = tmp_path / "node" / "results"
     d.mkdir(parents=True)
@@ -1125,6 +1206,56 @@ def test_flush_quarantines_symlink_without_chmodding_its_target(tmp_path):
     assert os.stat(target).st_mode & 0o777 == mode
 
 
+def test_quarantine_portably_avoids_chmod_after_symlink_move(monkeypatch):
+    state = {"moved": False}
+
+    class FakePath:
+        def __init__(self, kind):
+            self.kind = kind
+
+        @property
+        def parent(self):
+            return parent
+
+        @property
+        def name(self):
+            return "bad.json"
+
+        def __truediv__(self, child):
+            if self.kind == "parent" and child == "quarantine":
+                return quarantine
+            if self.kind == "quarantine":
+                return destination
+            raise AssertionError((self.kind, child))
+
+        def mkdir(self, **_kwargs):
+            return None
+
+        def exists(self):
+            return False
+
+        def is_symlink(self):
+            return self.kind == "destination" and state["moved"]
+
+        def chmod(self, _mode):
+            pytest.fail("a symlink destination must not be chmodded")
+
+    parent = FakePath("parent")
+    quarantine = FakePath("quarantine")
+    destination = FakePath("destination")
+    source = FakePath("source")
+
+    def replace(old, new):
+        assert old is source and new is destination
+        state["moved"] = True
+
+    monkeypatch.setattr(agent.os, "replace", replace)
+    monkeypatch.setattr(agent, "_fsync_parent", lambda path: None)
+
+    agent._quarantine_spool(source)
+    assert state["moved"] is True
+
+
 def test_flush_survives_quarantine_filesystem_failure(tmp_path, monkeypatch):
     d = tmp_path / "node" / "results"
     d.mkdir(parents=True)
@@ -1272,6 +1403,17 @@ def test_spool_parent_sync_uses_posix_directory_descriptor(tmp_path, monkeypatch
     target = tmp_path / "result.json"
     assert agent._fsync_parent(target) is None
     assert calls == [("open", target.parent, os.O_RDONLY), ("fsync", 71), ("close", 71)]
+
+
+def test_private_directory_portably_rejects_symlink():
+    fake_path = types.SimpleNamespace(
+        mkdir=lambda **_kwargs: None,
+        is_symlink=lambda: True,
+        is_dir=lambda: True,
+    )
+
+    with pytest.raises(OSError, match="must not be a symlink"):
+        agent._ensure_private_directory(fake_path)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
