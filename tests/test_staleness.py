@@ -366,6 +366,31 @@ def test_artifact_identity_can_authorize_prepared_revision_without_main_ref(
     assert staleness.artifact_matches("org/model", identity) is False
 
 
+def test_artifact_fallback_refuses_changed_main_without_cached_snapshot(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    root = tmp_path / ".cache" / "huggingface" / "hub" / "models--org--model"
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    identity = staleness.artifact_identity("org/model", revision=revision)
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text("c" * 40)
+
+    assert staleness.artifact_matches("org/model", identity) is False
+
+
+def test_validated_snapshot_refuses_windows_junction(tmp_path, monkeypatch):
+    root = tmp_path / "models--org--model"
+    revision = "a" * 40
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    monkeypatch.setattr(Path, "is_junction", lambda path: path == root)
+
+    assert staleness._validated_snapshot(root, revision) is None
+
+
 def test_validated_snapshot_refuses_resolution_race(tmp_path, monkeypatch):
     root = tmp_path / "models--org--model"
     snapshot = root / "snapshots" / ("a" * 40)

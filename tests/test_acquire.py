@@ -370,6 +370,31 @@ def test_prepare_download_refuses_unknown_payload_sizes(monkeypatch):
     with pytest.raises(RuntimeError, match="size"):
         acquire.prepare_download("org/repo", gguf=True)
 
+    class ZeroTransformerApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 40,
+                siblings=[types.SimpleNamespace(rfilename="config.json", size=0)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: ZeroTransformerApi())
+    with pytest.raises(RuntimeError, match="empty download"):
+        acquire.prepare_download("org/repo", gguf=False)
+
+    class EmptyApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(sha="a" * 40, siblings=[])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: EmptyApi())
+    with pytest.raises(RuntimeError, match="files"):
+        acquire.prepare_download("org/repo", gguf=False)
+
+    class EmptyGgufApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                sha="a" * 40,
+                siblings=[types.SimpleNamespace(rfilename="model.gguf", size=0)])
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: EmptyGgufApi())
+    with pytest.raises(RuntimeError, match="size"):
+        acquire.prepare_download("org/repo", gguf=True)
+
 
 def test_valid_model_id_accepts_well_formed_repo_ids():
     # org/name and bare name, with the chars HF allows in a segment.

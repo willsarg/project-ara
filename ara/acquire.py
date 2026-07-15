@@ -231,14 +231,18 @@ def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
         if selected is None:
             raise FileNotFoundError(f"no loadable .gguf in {repo}")
         size = selected.size
-        if not isinstance(size, int) or size < 0:
+        if not isinstance(size, int) or size <= 0:
             raise RuntimeError(f"the Hub did not return a trustworthy size for {selected.rfilename}")
         return AcquisitionPlan(model, repo, revision, selected.rfilename,
                                round(size / 1e9, 3))
+    if not siblings:
+        raise RuntimeError(f"the Hub did not report any files for {repo}")
     if any(not isinstance(item.size, int) or item.size < 0 for item in siblings):
         raise RuntimeError(f"the Hub did not return trustworthy sizes for every file in {repo}")
     total = sum(item.size for item in siblings)
-    return AcquisitionPlan(model, repo, revision, None, round(total / 1e9, 3) if total else None)
+    if total <= 0:
+        raise RuntimeError(f"the Hub reported an empty download for {repo}")
+    return AcquisitionPlan(model, repo, revision, None, round(total / 1e9, 3))
 
 
 def download_prepared(plan: AcquisitionPlan, *, progress: bool = False) -> str:

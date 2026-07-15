@@ -57,9 +57,13 @@ def _validated_snapshot(root: Path, revision: str) -> Path | None:
     snapshots = root / "snapshots"
     snapshot = snapshots / revision
     try:
-        if root.is_symlink() or snapshots.is_symlink() or snapshot.is_symlink() or not snapshot.is_dir():
+        linklike = lambda path: path.is_symlink() or path.is_junction()
+        if (linklike(root) or linklike(snapshots) or linklike(snapshot)
+                or not snapshot.is_dir()):
             return None
-        if (root.resolve(strict=True).parent != root.parent.resolve(strict=True)
+        resolved_root = root.resolve(strict=True)
+        if (resolved_root.name != root.name
+                or resolved_root.parent != root.parent.resolve(strict=True)
                 or snapshots.resolve(strict=True).parent != root.resolve(strict=True)
                 or snapshot.resolve(strict=True).parent != snapshots.resolve(strict=True)):
             return None
@@ -307,9 +311,13 @@ def artifact_matches(model: str, expected_artifact_id: str | None, *,
     if current is None and revision is None and isinstance(expected_artifact_id, str):
         prefix = ("hf:", "hf-gguf:")
         if expected_artifact_id.startswith(prefix):
+            repo, separator, filename = model.partition(":")
+            repo_id = repo if separator and filename.lower().endswith(".gguf") else model
             authority = expected_artifact_id.split(":", 2)[1]
             _, separator, encoded_revision = authority.rpartition("@")
-            if separator and _REVISION_RE.fullmatch(encoded_revision):
+            main_ref = _cache_dir(repo_id) / "refs" / "main"
+            if (not main_ref.exists() and not main_ref.is_symlink() and separator
+                    and _REVISION_RE.fullmatch(encoded_revision)):
                 current = artifact_identity(model, revision=encoded_revision)
     return (isinstance(expected_artifact_id, str) and bool(expected_artifact_id)
             and current == expected_artifact_id)
