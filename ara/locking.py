@@ -14,7 +14,9 @@ Spec 2026-07-04-measurement-flock-lock.
 from __future__ import annotations
 
 import hashlib
+import getpass
 import os
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -32,6 +34,10 @@ class OllamaSetupBusy(RuntimeError):
     """Raised when another ARA process is setting up the same Ollama identity."""
 
 
+class StagingBusy(RuntimeError):
+    """Raised when another ARA process owns the model-staging lease for this volume."""
+
+
 def _lock_path() -> Path:
     """The lock file, alongside ``ara.db`` — so the test ``ARA_DB_PATH`` override isolates it too."""
     return db._db_path().parent / "measurement.lock"
@@ -41,6 +47,15 @@ def _ollama_lock_path(endpoint: str, served_name: str) -> Path:
     identity = f"{endpoint}\0{served_name}".encode("utf-8")
     suffix = hashlib.sha256(identity).hexdigest()[:24]
     return db._db_path().parent / f"ollama-setup-{suffix}.lock"
+
+
+def _staging_lock_path(parent: Path) -> Path:
+    """One user-scoped lock per filesystem volume, independent of ARA's data-dir override."""
+    device = parent.stat().st_dev
+    uid = hashlib.sha256(getpass.getuser().encode("utf-8")).hexdigest()[:16]
+    root = Path(tempfile.gettempdir()) / f"ara-stage-locks-{uid}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root / f"volume-{device}.lock"
 
 
 def _is_windows() -> bool:
@@ -110,6 +125,29 @@ def ollama_setup_lock(endpoint: str, served_name: str):
             raise OllamaSetupBusy(
                 f"another ARA process is setting up Ollama model {served_name!r} — retry after "
                 "that setup finishes."
+            )
+        try:
+            yield
+        finally:
+            _release(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def staging_lock(parent: Path):
+    """Hold the cross-process lease for private model copies on *parent*'s volume.
+
+    The lease spans admission, copy, engine use, and cleanup. A crashed process releases the OS
+    lock automatically, allowing its marked stale stage to be reclaimed by the next operation.
+    """
+    path = _staging_lock_path(parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _acquire(fd):
+            raise StagingBusy(
+                "another ARA process is staging or using a governed model on this volume — retry "
+                "after it finishes."
             )
         try:
             yield

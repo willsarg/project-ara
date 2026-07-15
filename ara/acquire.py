@@ -207,7 +207,7 @@ def download_gguf(model: str, *, progress: bool = False) -> str:
         disable_progress_bars() if was_disabled else enable_progress_bars()
 
 
-def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
+def prepare_download(model: str, *, gguf: bool, revision: str | None = None) -> AcquisitionPlan:
     """Resolve one immutable Hub revision for both sizing and the later download."""
     if gguf and is_local_gguf(model):
         return AcquisitionPlan(model, None, None, os.path.realpath(model), gguf_size_gb(model))
@@ -216,9 +216,12 @@ def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
     from huggingface_hub import HfApi
 
     repo, separator, requested = model.partition(":")
-    info = HfApi().model_info(repo, files_metadata=True)
-    revision = getattr(info, "sha", None)
-    if not isinstance(revision, str) or not _REVISION_RE.fullmatch(revision):
+    if revision is not None and not _REVISION_RE.fullmatch(revision):
+        raise ValueError(f"invalid immutable revision for {repo}")
+    info = HfApi().model_info(repo, revision=revision, files_metadata=True)
+    resolved_revision = getattr(info, "sha", None)
+    if (not isinstance(resolved_revision, str) or not _REVISION_RE.fullmatch(resolved_revision)
+            or revision is not None and resolved_revision.lower() != revision.lower()):
         raise RuntimeError(f"the Hub did not return an immutable revision for {repo}")
     siblings = info.siblings or []
     if gguf:
@@ -233,7 +236,7 @@ def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
         size = selected.size
         if type(size) is not int or size <= 0:
             raise RuntimeError(f"the Hub did not return a trustworthy size for {selected.rfilename}")
-        return AcquisitionPlan(model, repo, revision, selected.rfilename,
+        return AcquisitionPlan(model, repo, resolved_revision, selected.rfilename,
                                round(size / 1e9, 3))
     if not siblings:
         raise RuntimeError(f"the Hub did not report any files for {repo}")
@@ -242,7 +245,7 @@ def prepare_download(model: str, *, gguf: bool) -> AcquisitionPlan:
     total = sum(item.size for item in siblings)
     if total <= 0:
         raise RuntimeError(f"the Hub reported an empty download for {repo}")
-    return AcquisitionPlan(model, repo, revision, None, round(total / 1e9, 3))
+    return AcquisitionPlan(model, repo, resolved_revision, None, round(total / 1e9, 3))
 
 
 def download_prepared(plan: AcquisitionPlan, *, progress: bool = False) -> str:

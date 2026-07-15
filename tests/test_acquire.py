@@ -321,6 +321,36 @@ def test_prepared_transformer_download_pins_probed_revision(monkeypatch):
     assert calls == [("org/repo", {"revision": "b" * 40})]
 
 
+def test_prepare_download_recovers_an_explicit_authorized_revision(monkeypatch):
+    revision = "a" * 40
+    seen = []
+
+    class Api:
+        def model_info(self, repo, **kwargs):
+            seen.append((repo, kwargs))
+            return types.SimpleNamespace(
+                sha=revision,
+                siblings=[types.SimpleNamespace(
+                    rfilename="model-q4.gguf", size=4_000_000_000)])
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: Api())
+    plan = acquire.prepare_download(
+        "org/repo:model-q4.gguf", gguf=True, revision=revision)
+    assert plan.revision == revision and plan.filename == "model-q4.gguf"
+    assert seen == [("org/repo", {"revision": revision, "files_metadata": True})]
+
+    with pytest.raises(ValueError, match="invalid immutable revision"):
+        acquire.prepare_download("org/repo", gguf=False, revision="main")
+
+    class WrongApi:
+        def model_info(self, *_args, **_kwargs):
+            return types.SimpleNamespace(sha="b" * 40, siblings=[])
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: WrongApi())
+    with pytest.raises(RuntimeError, match="immutable revision"):
+        acquire.prepare_download("org/repo", gguf=False, revision=revision)
+
+
 def test_prepare_download_covers_local_invalid_revision_and_missing_selection(
         tmp_path, monkeypatch):
     local = tmp_path / "model.gguf"

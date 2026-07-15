@@ -22,25 +22,32 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from ara import locking
+
 _HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _BLOB_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
 _STAGE_DISK_BUFFER_BYTES = 2_000_000_000
+_STAGE_OWNER = ".ara-stage-owner"
 
 
 class StagedModel:
     """A verified operation-private model path with deterministic cleanup."""
 
-    def __init__(self, path: Path, temporary: tempfile.TemporaryDirectory):
+    def __init__(self, path: Path, temporary: tempfile.TemporaryDirectory, lease):
         self.path = str(path)
         self._temporary = temporary
+        self._lease = lease
 
     def __enter__(self) -> str:
         return self.path
 
     def __exit__(self, *_exc) -> None:
-        self._temporary.cleanup()
+        try:
+            self._temporary.cleanup()
+        finally:
+            self._lease.__exit__(*_exc)
 
 
 def _cache_dir(model_id: str) -> Path:
@@ -375,6 +382,30 @@ def _authority_manifest(expected_artifact_id: str) -> dict[str | None, tuple[int
     return manifest if len(manifest) == len(entries) else None
 
 
+def authorized_download_ref(model: str, expected_artifact_id: str) -> tuple[str, str] | None:
+    """Return the exact Hub selector and commit SHA encoded by stored artifact authority."""
+    if not isinstance(model, str) or not isinstance(expected_artifact_id, str):
+        return None
+    if not expected_artifact_id.startswith(("hf:", "hf-gguf:")):
+        return None
+    authority = expected_artifact_id.split(":", 2)[1]
+    encoded_repo, separator, revision = authority.rpartition("@")
+    repo, model_separator, requested = model.partition(":")
+    if (not separator or encoded_repo != repo or not _REVISION_RE.fullmatch(revision)):
+        return None
+    manifest = _authority_manifest(expected_artifact_id)
+    if manifest is None or None in manifest:
+        return None
+    ggufs = [relative for relative in manifest if relative.lower().endswith(".gguf")]
+    if expected_artifact_id.startswith("hf-gguf:") or ggufs:
+        if len(ggufs) != 1 or (model_separator and requested != ggufs[0]):
+            return None
+        return f"{repo}:{ggufs[0]}", revision
+    if model_separator:
+        return None
+    return repo, revision
+
+
 def _stage_file(source: Path, destination: Path, expected: tuple[int, str]) -> None:
     """Copy one source privately, then prove it is the exact authorized content."""
     resolved = source.resolve(strict=True)
@@ -382,6 +413,21 @@ def _stage_file(source: Path, destination: Path, expected: tuple[int, str]) -> N
     shutil.copy2(resolved, destination)
     if _content_digest(destination) != expected:
         raise RuntimeError(f"{source} did not match its authorized digest while staging")
+
+
+def _reclaim_stale_stages(parent: Path) -> None:
+    """Remove only ARA-marked crash remnants while the volume-wide lease is held."""
+    try:
+        candidates = list(parent.glob(".ara-stage-*"))
+        for candidate in candidates:
+            marker = candidate / _STAGE_OWNER
+            if (candidate.is_symlink() or not candidate.is_dir()
+                    or marker.is_symlink() or not marker.is_file()):
+                continue
+            if marker.read_text(encoding="utf-8") == "ara-stage-v1\n":
+                shutil.rmtree(candidate)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"cannot safely reclaim stale model stages under {parent}") from exc
 
 
 def stage_model_ref(model: str, expected_artifact_id: str, *,
@@ -402,17 +448,22 @@ def stage_model_ref(model: str, expected_artifact_id: str, *,
         stage_parent = stage_parent.resolve(strict=True)
     except OSError as exc:
         raise RuntimeError(f"cannot resolve the staging volume for {model}") from exc
-    required = sum(size for size, _digest in manifest.values()) + _STAGE_DISK_BUFFER_BYTES
+    lease = locking.staging_lock(stage_parent)
+    lease.__enter__()
+    temporary = None
     try:
-        free = shutil.disk_usage(stage_parent).free
-    except OSError as exc:
-        raise RuntimeError(f"cannot verify free disk space for staging {model}") from exc
-    if free < required:
-        raise RuntimeError(
-            f"not enough disk to stage {model}: needs the artifact size plus 2 GB headroom")
-    temporary = tempfile.TemporaryDirectory(prefix=".ara-stage-", dir=stage_parent)
-    root = Path(temporary.name)
-    try:
+        _reclaim_stale_stages(stage_parent)
+        required = sum(size for size, _digest in manifest.values()) + _STAGE_DISK_BUFFER_BYTES
+        try:
+            free = shutil.disk_usage(stage_parent).free
+        except OSError as exc:
+            raise RuntimeError(f"cannot verify free disk space for staging {model}") from exc
+        if free < required:
+            raise RuntimeError(
+                f"not enough disk to stage {model}: needs the artifact size plus 2 GB headroom")
+        temporary = tempfile.TemporaryDirectory(prefix=".ara-stage-", dir=stage_parent)
+        root = Path(temporary.name)
+        (root / _STAGE_OWNER).write_text("ara-stage-v1\n", encoding="utf-8")
         if source.is_file():
             if len(manifest) != 1:
                 raise RuntimeError(f"authorized manifest does not describe one file for {model}")
@@ -430,9 +481,11 @@ def stage_model_ref(model: str, expected_artifact_id: str, *,
                    if revision is not None else artifact_matches(model, expected_artifact_id))
         if not matches:
             raise RuntimeError(f"artifact changed while staging: {model}")
-        return StagedModel(staged_path, temporary)
+        return StagedModel(staged_path, temporary, lease)
     except BaseException:
-        temporary.cleanup()
+        if temporary is not None:
+            temporary.cleanup()
+        lease.__exit__(None, None, None)
         raise
 
 

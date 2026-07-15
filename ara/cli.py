@@ -1210,18 +1210,36 @@ def _prefetch_plan(c: Console, model: str, bk, engine_key: str | None,
                    authorized_artifact_id: str | None = None) -> tuple[bool, object | None, int | None]:
     """Run deterministic cache/compatibility/disk gates before live work is claimed."""
     incompatible = engines.engine_for_model(model) not in (None, engine_key)
-    if (authorized_artifact_id is not None
-            and staleness.artifact_matches(model, authorized_artifact_id)):
+    if incompatible:
         return False, None, None
+    authorized_ref = None
+    if authorized_artifact_id is not None:
+        if staleness.artifact_matches(model, authorized_artifact_id):
+            return False, None, None
+        authorized_ref = staleness.authorized_download_ref(model, authorized_artifact_id)
+        if authorized_ref is None:
+            msg = f"cannot recover the exact authorized artifact for {model}"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return False, None, 1
+        if not callable(getattr(bk, "download_prepared_model", None)):
+            msg = f"the {engine_key} engine cannot recover an exact authorized artifact"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return False, None, 1
     cached = getattr(bk, "calibration_model_cached", None)
-    if incompatible or cached is None or cached(model):
+    if authorized_ref is None and (cached is None or cached(model)):
         return False, None, None
     prepare = getattr(bk, "prepare_download", None)
     try:
-        payload = (prepare(model) if prepare is not None else
-                   acquire.gguf_size_gb(model)
-                   if engine_key in {"cpu", "vulkan", "cuda-gguf"}
-                   else acquire.repo_size_gb(model))
+        if authorized_ref is not None:
+            selector, revision = authorized_ref
+            payload = acquire.prepare_download(
+                selector, gguf=engine_key in {"cpu", "vulkan", "cuda-gguf"},
+                revision=revision)
+        else:
+            payload = (prepare(model) if prepare is not None else
+                       acquire.gguf_size_gb(model)
+                       if engine_key in {"cpu", "vulkan", "cuda-gguf"}
+                       else acquire.repo_size_gb(model))
     except Exception as exc:
         msg = _fetch_error_msg(model, acquire.classify_repo_error(exc))
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))

@@ -8294,8 +8294,15 @@ def test_render_benchmark_prefetches_uncached_and_errors_cleanly(make_console, m
     _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
     bk = cli.get_backend("apple")
     bk.calibration_model_cached = lambda m: False        # uncached -> pre-fetch fires
+    bk.download_prepared_model = lambda *_a, **_k: pytest.fail("download called")
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 999.0)
+    revision = "a" * 40
+    monkeypatch.setattr(cli.staleness, "authorized_download_ref",
+                        lambda *_a: ("org/m", revision))
+    monkeypatch.setattr(
+        cli.acquire, "prepare_download",
+        lambda *_a, **_k: cli.acquire.AcquisitionPlan(
+            "org/m", "org/m", revision, None, 999.0))
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
     c, buf = make_console()
     rc = cli.render_benchmark(

@@ -101,3 +101,20 @@ def test_ollama_setup_lock_uses_stable_nonidentity_filename(tmp_path, monkeypatc
         locks = list(tmp_path.glob("ollama-setup-*.lock"))
         assert len(locks) == 1
         assert "host" not in locks[0].name and "private" not in locks[0].name
+
+
+def test_staging_lock_serializes_the_whole_volume(tmp_path, monkeypatch):
+    monkeypatch.setattr(locking.tempfile, "gettempdir", lambda: str(tmp_path / "locks"))
+    first = tmp_path / "models-a"
+    second = tmp_path / "models-b"
+    first.mkdir()
+    second.mkdir()
+
+    with locking.staging_lock(first):
+        with pytest.raises(locking.StagingBusy, match="this volume"):
+            with locking.staging_lock(second):
+                pass
+    with locking.staging_lock(second):
+        pass
+    locks = list((tmp_path / "locks").glob("ara-stage-locks-*/*.lock"))
+    assert len(locks) == 1

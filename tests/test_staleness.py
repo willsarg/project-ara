@@ -169,6 +169,48 @@ def test_artifact_identity_accepts_valid_cache_through_symlinked_ancestor(
     assert not staged_path.exists()
 
 
+def test_authorized_download_ref_recovers_exact_transformer_and_gguf_revision(
+        tmp_path, monkeypatch):
+    _point_hub_at(tmp_path, monkeypatch)
+    revision = "a" * 40
+    _revision_cache(tmp_path, revision, filename="model.safetensors")
+    transformer = staleness.artifact_identity("org/model")
+    assert staleness.authorized_download_ref("org/model", transformer) == \
+        ("org/model", revision)
+
+    _revision_cache(tmp_path, "c" * 40, filename="Model-Q4.gguf")
+    gguf = staleness.artifact_identity("org/model")
+    assert staleness.authorized_download_ref("org/model", gguf) == \
+        ("org/model:Model-Q4.gguf", "c" * 40)
+    exact = staleness.artifact_identity("org/model:Model-Q4.gguf")
+    assert staleness.authorized_download_ref("org/model:Model-Q4.gguf", exact) == \
+        ("org/model:Model-Q4.gguf", "c" * 40)
+
+
+@pytest.mark.parametrize(("model", "authority"), [
+    (1, "hf:org/model@" + "a" * 40 + ":x"),
+    ("org/model", "local-gguf:/m:1:sha256:" + "a" * 64),
+    ("org/model", "hf:other/model@" + "a" * 40
+     + ":model.safetensors:direct:1:sha256:" + "a" * 64),
+    ("org/model", "hf:org/model@" + "a" * 40 + ":bad"),
+    ("org/model", "hf-gguf:org/model@" + "a" * 40
+     + ":config.json:direct:1:sha256:" + "a" * 64),
+    ("org/model:file", "hf:org/model@" + "a" * 40
+     + ":model.safetensors:direct:1:sha256:" + "a" * 64),
+])
+def test_authorized_download_ref_rejects_malformed_or_mismatched_authority(
+        model, authority):
+    assert staleness.authorized_download_ref(model, authority) is None
+
+
+def test_authorized_download_ref_rejects_ambiguous_gguf_manifest():
+    revision = "a" * 40
+    first = "one.gguf:direct:1:sha256:" + "a" * 64
+    second = "two.gguf:direct:1:sha256:" + "b" * 64
+    authority = f"hf:org/model@{revision}:{first}|{second}"
+    assert staleness.authorized_download_ref("org/model", authority) is None
+
+
 def test_bare_hf_identity_rejects_empty_snapshot_and_binds_weight_blob(tmp_path, monkeypatch):
     _point_hub_at(tmp_path, monkeypatch)
     revision = "a" * 40
@@ -313,6 +355,38 @@ def test_stage_model_ref_copies_blob_and_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(staleness, "artifact_matches", lambda *_a, **_k: False)
     with pytest.raises(RuntimeError, match="cannot pin"):
         staleness.stage_model_ref("org/model", identity)
+
+
+def test_stage_model_ref_reclaims_only_marked_crash_remnants(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+    identity = staleness.artifact_identity(str(model))
+    stale = tmp_path / ".ara-stage-stale"
+    stale.mkdir()
+    (stale / staleness._STAGE_OWNER).write_text("ara-stage-v1\n")
+    (stale / "stranded-model").write_bytes(b"large")
+    unowned = tmp_path / ".ara-stage-unowned"
+    unowned.mkdir()
+    foreign_marker = tmp_path / ".ara-stage-foreign-marker"
+    foreign_marker.mkdir()
+    (foreign_marker / staleness._STAGE_OWNER).write_text("not-ara\n")
+
+    with staleness.stage_model_ref(str(model), identity) as staged:
+        assert Path(staged).read_bytes() == b"weights"
+        assert not stale.exists()
+        assert unowned.exists()
+        assert foreign_marker.exists()
+        with pytest.raises(staleness.locking.StagingBusy):
+            staleness.stage_model_ref(str(model), identity)
+    with staleness.stage_model_ref(str(model), identity) as staged:
+        assert Path(staged).read_bytes() == b"weights"
+
+
+def test_stale_stage_reclamation_fails_closed_on_scan_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        Path, "glob", lambda *_a, **_k: (_ for _ in ()).throw(OSError("scan failed")))
+    with pytest.raises(RuntimeError, match="cannot safely reclaim"):
+        staleness._reclaim_stale_stages(tmp_path)
 
 
 def test_stage_model_ref_cleans_up_when_authority_changes_during_staging(

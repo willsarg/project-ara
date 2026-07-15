@@ -111,9 +111,10 @@ def _wire_characterize(monkeypatch, backend):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.catalog, "remember", lambda *_a: None)
-    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "artifact_identity",
+                        lambda _model, **_kwargs: "artifact:test")
     monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact:
+    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact, **_kwargs:
                         contextlib.nullcontext(cli.staleness.pinned_model_ref(model, artifact)))
 
 
@@ -235,6 +236,26 @@ def test_prefetch_skips_network_for_existing_authorized_snapshot(make_console, m
     assert cli._prefetch_weights(
         c, "org/model", backend, "cpu", as_json=False, progress=False,
         authorized_artifact_id="hf:authority") is None
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("recoverable", [False, True])
+def test_prefetch_refuses_unrecoverable_authority_or_legacy_downloader(
+        make_console, monkeypatch, capsys, as_json, recoverable):
+    revision = "a" * 40
+    backend = types.SimpleNamespace(calibration_model_cached=lambda _model: False)
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    monkeypatch.setattr(
+        cli.staleness, "authorized_download_ref",
+        lambda *_a: ("org/model", revision) if recoverable else None)
+    c, buf = make_console()
+
+    needed, payload, rc = cli._prefetch_plan(
+        c, "org/model", backend, "cpu", as_json=as_json,
+        authorized_artifact_id="hf:authority")
+    assert (needed, payload, rc) == (False, None, 1)
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert ("cannot recover" if not recoverable else "cannot recover an exact") in output
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -411,9 +432,10 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda *_a: 1.0)
     monkeypatch.setattr(cli.db, "get_model", lambda *_a: None)
     monkeypatch.setattr(cli.db, "save_benchmark_result", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "artifact_identity",
+                        lambda _model, **_kwargs: "artifact:test")
     monkeypatch.setattr(cli.staleness, "pinned_model_ref", lambda model, _artifact: model)
-    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact:
+    monkeypatch.setattr(cli.staleness, "stage_model_ref", lambda model, artifact, **_kwargs:
                         contextlib.nullcontext(cli.staleness.pinned_model_ref(model, artifact)))
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
@@ -433,13 +455,17 @@ def test_benchmark_one_activity_covers_prefetch_and_every_repeat(
 
     backend = types.SimpleNamespace(
         calibration_model_cached=lambda _m: False,
-        download_calibration_model=download,
+        download_prepared_model=download,
         benchmark=run,
     )
     _wire_benchmark(monkeypatch, backend)
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: None)
-    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    revision = "a" * 40
+    plan = cli.acquire.AcquisitionPlan("org/model", "org/model", revision, None, 1.0)
+    monkeypatch.setattr(cli.staleness, "authorized_download_ref",
+                        lambda *_a: ("org/model", revision))
+    monkeypatch.setattr(cli.acquire, "prepare_download", lambda *_a, **_k: plan)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 50.0)
     c, _ = make_console()
     assert cli.render_benchmark(c, "org/model", use_case="reasoning",
                                 engine="cpu", repeat=2) == 0
@@ -456,13 +482,16 @@ def test_benchmark_cache_check_and_disk_refusal_happen_before_tracking(
 
     backend = types.SimpleNamespace(
         calibration_model_cached=cached,
-        download_calibration_model=lambda *_a, **_k: pytest.fail("download called"),
+        download_prepared_model=lambda *_a, **_k: pytest.fail("download called"),
         benchmark=lambda *_a, **_k: pytest.fail("benchmark called"),
     )
     _wire_benchmark(monkeypatch, backend)
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: 10.0)
-    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda _m: 10.0)
+    revision = "a" * 40
+    plan = cli.acquire.AcquisitionPlan("org/model", "org/model", revision, None, 10.0)
+    monkeypatch.setattr(cli.staleness, "authorized_download_ref",
+                        lambda *_a: ("org/model", revision))
+    monkeypatch.setattr(cli.acquire, "prepare_download", lambda *_a, **_k: plan)
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 1.0)
     monkeypatch.setattr(cli.activity, "track", lambda *_a, **_k: pytest.fail("track called"))
     c, _ = make_console()
@@ -478,13 +507,17 @@ def test_benchmark_download_failure_is_tracked_then_cleaned_without_backend_call
 
     backend = types.SimpleNamespace(
         calibration_model_cached=lambda _m: False,
-        download_calibration_model=download,
+        download_prepared_model=download,
         benchmark=lambda *_a, **_k: pytest.fail("benchmark called"),
     )
     _wire_benchmark(monkeypatch, backend)
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _m: None)
-    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: None)
+    revision = "a" * 40
+    plan = cli.acquire.AcquisitionPlan("org/model", "org/model", revision, None, 1.0)
+    monkeypatch.setattr(cli.staleness, "authorized_download_ref",
+                        lambda *_a: ("org/model", revision))
+    monkeypatch.setattr(cli.acquire, "prepare_download", lambda *_a, **_k: plan)
+    monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: 50.0)
     c, _ = make_console()
     assert cli.render_benchmark(c, "org/model", use_case="reasoning", engine="cpu") == 1
     assert activity.snapshot() == []
