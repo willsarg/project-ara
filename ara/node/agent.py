@@ -334,7 +334,10 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
     d = _results_dir()
     if not d.exists():
         return client
-    for f in sorted(d.glob("*.json")):
+    # Filenames are privacy-preserving hashes, not sequence keys. The durable file write time is
+    # the only ordering evidence retained by both current and legacy spool formats.
+    files = sorted(d.glob("*.json"), key=lambda path: (path.stat().st_mtime_ns, path.name))
+    for f in files:
         try:
             if f.is_symlink():
                 raise ValueError("spool path is a symlink")
@@ -345,6 +348,9 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
             except OSError:
                 pass
             continue
+        # The completion spool is durable proof that execution already finished. Its older
+        # accepted-job journal is now redundant even if result delivery remains unavailable.
+        _accepted_path(job_id).unlink(missing_ok=True)
         try:
             delivered, client = _try_post(client, config, job_id, payload)
         except _TerminalResultRejection as exc:
@@ -355,8 +361,11 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
                 pass
             continue
         if delivered:
-            _accepted_path(job_id).unlink(missing_ok=True)
             f.unlink(missing_ok=True)
+        else:
+            # Do not report a later completion ahead of the oldest transient failure. Leaving the
+            # remaining files untouched also lets the loop recognize that it must not accept work.
+            break
     return client
 
 
@@ -399,6 +408,10 @@ def _run_loop(config, *, client: NodeClient | None = None,
         except _ReenrollmentRequired:
             health.status("re-enrollment required — session rejected while reporting a result")
             return count
+        if any(_results_dir().glob("*.json")):
+            health.status("waiting to deliver a completed result before accepting more work")
+            sleep(reauth_backoff)
+            continue
         accepted = _next_accepted_job()
         if accepted is None:
             try:

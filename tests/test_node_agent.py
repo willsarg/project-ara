@@ -298,6 +298,14 @@ def test_completed_spool_suppresses_accepted_job_reexecution_when_post_retries(t
     assert _accepted_files(tmp_path) == [] and len(_spool_files(tmp_path)) == 1
 
 
+def test_accepted_recovery_skips_job_with_durable_completion(tmp_path):
+    agent._journal_job({"id": "j1", "kind": "run", "args": {}})
+    agent._spool_result("j1", {"status": "done", "result": {"ok": True}})
+
+    assert agent._next_accepted_job() is None
+    assert _accepted_files(tmp_path) == []
+
+
 def test_worker_error_dict_is_reported_failed():
     fake = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
     agent.run_loop(_cfg(), client=fake, runner=lambda k, a: {"error": "nope"}, max_iterations=1)
@@ -547,6 +555,51 @@ def test_flush_keeps_result_when_post_still_fails(tmp_path):
     agent.run_loop(_cfg(), client=client, runner=lambda k, a: {}, max_iterations=1,
                    sleep=lambda s: None)
     assert len(_spool_files(tmp_path)) == 1                 # still spooled
+
+
+def test_undelivered_result_blocks_polling_and_execution_of_later_work(tmp_path):
+    """A completed job must remain the node's only responsibility until its result is delivered.
+
+    Otherwise a coordinator outage can let a later job execute and finish before the earlier
+    result reaches the coordinator, breaking the end-to-end FIFO contract.
+    """
+    class ResultOutageClient(FakeClient):
+        def post_result(self, job_id, payload):
+            raise _status_error(503)
+
+    jobs = [
+        {"id": "j1", "kind": "run", "args": {}},
+        {"id": "j2", "kind": "run", "args": {}},
+    ]
+    client = ResultOutageClient(jobs)
+    executed = []
+
+    agent.run_loop(
+        _cfg(), client=client,
+        runner=lambda kind, args: executed.append((kind, args)) or {"ok": True},
+        max_iterations=2, sleep=lambda _seconds: None,
+    )
+
+    assert executed == [("run", {})]
+    assert client.acked == ["j1"]
+    assert client._jobs == [jobs[1]]
+    assert len(_spool_files(tmp_path)) == 1
+
+
+def test_flush_replays_results_in_persisted_write_order(tmp_path):
+    """Opaque hash filenames must not decide FIFO replay order after a restart."""
+    job_ids = ["first candidate", "second candidate"]
+    by_filename = sorted(job_ids, key=lambda job_id: agent._spool_path(job_id).name)
+    older, newer = reversed(by_filename)  # make filename order intentionally contradict age
+    agent._spool_result(older, {"status": "done", "result": {"order": 1}})
+    agent._spool_result(newer, {"status": "done", "result": {"order": 2}})
+    os.utime(agent._spool_path(older), ns=(1_000_000_000, 1_000_000_000))
+    os.utime(agent._spool_path(newer), ns=(2_000_000_000, 2_000_000_000))
+    client = FakeClient([])
+
+    agent._flush_spool(client, _cfg())
+
+    assert [job_id for job_id, _payload in client.posted] == [older, newer]
 
 
 def test_flush_quarantines_permanently_rejected_result_and_continues(tmp_path):
