@@ -1009,6 +1009,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         else:
             c.emit(c.style("warn", f"  couldn't describe {model_id} — is it downloaded / a valid repo?"))
         return 1
+    evidence_model = scoring.durable_model_id(model_id)
     mk = profile.machine_key()
     # Per-engine: a model can be characterized under several engines on one machine (GPU + CPU).
     per_engine = {}              # engine_key -> (safe_context, decode_context, measured_at, config)
@@ -1020,7 +1021,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
         con = (stack.enter_context(db.connected_readonly())
                if db._db_path().is_file() else scratch)
         for key in engines.ENGINES:
-            row = db.get_characterization(con, mk, key, model_id)
+            row = db.get_characterization(con, mk, key, evidence_model)
             if row is not None:
                 per_engine[key] = (row["safe_context"], row.get("decode_context"),
                                    row.get("measured_at"), row.get("config"))
@@ -1032,7 +1033,8 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
     best_decode = best_triple[1] if best_triple else None
     # Rule #3: a stored ceiling whose cache changed since it was measured isn't authoritative —
     # flag it here just as serve/run do, so no command shows a stale number unqualified.
-    best_stale = best_triple is not None and staleness.ceiling_is_stale(model_id, best_triple[2])
+    best_stale = (best_triple is not None
+                  and staleness.ceiling_is_stale(evidence_model, best_triple[2]))
     if as_json:
         print(json.dumps({"model_id": model_id, **meta, "safe_context": best,
                           "decode_context": best_decode, "stale_ceiling": best_stale,
@@ -1053,7 +1055,7 @@ def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> 
             ceiling_str = f"~{sc} tokens" if sc else "no safe ceiling"
             if sc and dc and dc > sc:
                 ceiling_str += f"  · ~{dc} stream-only (est.)"
-            if sc and staleness.ceiling_is_stale(model_id, at):
+            if sc and staleness.ceiling_is_stale(evidence_model, at):
                 ceiling_str += "  · ⚠ stale — re-characterize"
             if config is None:
                 ceiling_str += "  · settings unknown — re-characterize"
@@ -1298,6 +1300,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                f"or a local .gguf file path")
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
+    evidence_model = scoring.durable_model_id(model)
     lever_err = _unsupported_lever_error(sel.backend, kv_quant=kv_quant, flash_attn=flash_attn,
                                          flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
                                          prefill_chunk=prefill_chunk)
@@ -1375,6 +1378,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                               kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
         _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
+        artifact_id_before = staleness.artifact_identity(evidence_model)
+        if artifact_id_before is None:
+            msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return 1
         try:
             result = bk.characterize(model, progress=progress, **fa_kw)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
@@ -1407,23 +1415,23 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 1
 
     ceiling = result["safe_context"]
-    artifact_id = staleness.artifact_identity(model)
-    if ceiling is not None and artifact_id is None:
-        msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
+    artifact_id = staleness.artifact_identity(evidence_model)
+    if artifact_id != artifact_id_before:
+        msg = f"the artifact for {model} changed during characterization — result not stored"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
-                                 model, safe_context=ceiling, points=result["points"],
+                                 evidence_model, safe_context=ceiling, points=result["points"],
                                  decode_context=result.get("decode_context"),
                                  config=measured_config, artifact_id=artifact_id)
-        canonical_model_id = scoring.canonical_model_id(model)
-        if model != canonical_model_id:
+        canonical_model_id = scoring.canonical_model_id(evidence_model)
+        if evidence_model != canonical_model_id:
             catalog.remember_variant(
-                con, model, canonical_model_id, quant=scoring.quant_key(model),
-                weights_gb=staleness.artifact_size_gb(model))
+                con, evidence_model, canonical_model_id, quant=scoring.quant_key(evidence_model),
+                weights_gb=staleness.artifact_size_gb(evidence_model))
         else:
-            catalog.remember(con, model)
+            catalog.remember(con, evidence_model)
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
@@ -1789,7 +1797,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         return err("the coding benchmark executes model-generated Python on this machine "
                    "(NOT a security sandbox) — re-run with --exec-consent to allow it")
 
-    if engine is None or engine == "auto":
+    auto_engine = engine is None or engine == "auto"
+    if auto_engine:
         key = engines.for_backend(detect.backend_name()) or engines.for_hardware()
     else:
         key = engines.resolve(engine)
@@ -1798,20 +1807,69 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             return err(f"benchmark doesn't support --engine {engine!r} — choose one of: "
                        "auto, mlx, cuda, cpu, vulkan, cuda-gguf")
         return err("no benchmark-capable engine matches this machine")
-    backend = engines.ENGINES.get(key, {}).get("backend") if key else None
-    bk = get_backend(backend) if backend else None
-    if bk is None or not hasattr(bk, "benchmark"):
-        be_name = backend or "none"
+    default_backend = engines.ENGINES.get(key, {}).get("backend") if key else None
+    default_bk = get_backend(default_backend) if default_backend else None
+    if default_bk is None or not hasattr(default_bk, "benchmark"):
+        be_name = default_backend or "none"
         return err(f"benchmark isn't supported on the {be_name} engine")
 
     mk = profile.machine_key()
-    expected_config = _measurement_config(backend)
+    evidence_model = scoring.durable_model_id(model)
+    current_artifact_id = (staleness.artifact_identity(evidence_model)
+                           if auto_engine else None)
     with db.connected() as con:
-        row = db.get_characterization(con, mk, key, model)  # keyed by engine key, not backend
-        if not row or row.get("safe_context") is None:
-            return err(f"no measured ceiling for {model} — run: ara characterize {model}")
-        if msg := _measurement_config_error(row, expected_config, backend, model):
-            return err(msg)
+        if auto_engine:
+            # Auto is evidence-led: prefer the detected engine on a tie, but fall back to any
+            # benchmark-capable engine on which this exact artifact has a compatible measured
+            # ceiling.  A CPU-characterized GGUF therefore remains usable on a CUDA host.
+            candidates = []
+            config_errors = []
+            artifact_mismatch = False
+            missing_artifact_authority = False
+            for candidate_key in dict.fromkeys([key, *engines.ENGINES]):
+                candidate_backend = engines.ENGINES[candidate_key]["backend"]
+                candidate_bk = get_backend(candidate_backend)
+                if not hasattr(candidate_bk, "benchmark"):
+                    continue
+                candidate_row = db.get_characterization(
+                    con, mk, candidate_key, evidence_model)
+                if not candidate_row or candidate_row.get("safe_context") is None:
+                    continue
+                config_error = _measurement_config_error(
+                    candidate_row, _measurement_config(candidate_backend),
+                    candidate_backend, model)
+                if config_error:
+                    config_errors.append(config_error)
+                    continue
+                if not candidate_row.get("artifact_id"):
+                    missing_artifact_authority = True
+                    continue
+                if (not current_artifact_id
+                        or candidate_row["artifact_id"] != current_artifact_id):
+                    artifact_mismatch = True
+                    continue
+                candidates.append((candidate_row["safe_context"], candidate_key,
+                                   candidate_backend, candidate_bk, candidate_row))
+            if not candidates:
+                if config_errors:
+                    return err(config_errors[0])
+                if missing_artifact_authority:
+                    return err(f"the measured ceiling for {model} is not bound to an exact "
+                               f"artifact — re-run: ara characterize {model}")
+                if artifact_mismatch:
+                    return err(f"the cached artifact for {model} differs from its measured "
+                               f"ceiling — re-run: ara characterize {model}")
+                return err(f"no measured ceiling for {model} — run: ara characterize {model}")
+            _, key, backend, bk, row = max(candidates, key=lambda candidate: candidate[0])
+        else:
+            backend, bk = default_backend, default_bk
+            row = db.get_characterization(
+                con, mk, key, evidence_model)  # keyed by engine key, not backend
+            if not row or row.get("safe_context") is None:
+                return err(f"no measured ceiling for {model} — run: ara characterize {model}")
+            if msg := _measurement_config_error(
+                    row, _measurement_config(backend), backend, model):
+                return err(msg)
         characterized_artifact_id = row.get("artifact_id")
         if not characterized_artifact_id:
             return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
@@ -1829,11 +1887,13 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             safe = row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
 
-    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
+    stale_ceiling = _stale_ceiling_note(
+        c, evidence_model, ceiling_measured_at, as_json=as_json)
     items = benchmark.load_probe(use_case)
     n = len(items)
     if n == 0:
         return err(f"the {use_case} probe set is empty — no measurement taken")
+    methodology_id = benchmark.methodology_id(use_case, items)
     if not as_json and not assume_yes and sys.stdin.isatty():
         if use_case == "coding":
             c.emit(c.style("warn", "  warning: the coding benchmark EXECUTES model-generated "
@@ -1861,7 +1921,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 c, model, bk, prefetch_size,
                 as_json=as_json, progress=progress)) is not None:
             return rc
-        artifact_id = staleness.artifact_identity(model)
+        artifact_id = staleness.artifact_identity(evidence_model)
         if artifact_id != characterized_artifact_id:
             return err(f"the cached artifact for {model} differs from its measured ceiling — "
                        f"re-run: ara characterize {model}")
@@ -1915,7 +1975,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                         return err("invalid benchmark result: error must be text")
                     errored_n += 1
             run_scores.append(benchmark.score_probe_set(use_case, items, completions))
-            current_artifact_id = staleness.artifact_identity(model)
+            current_artifact_id = staleness.artifact_identity(evidence_model)
             if current_artifact_id != artifact_id:
                 return err(f"the cached artifact for {model} changed during the benchmark — "
                            "no measurement taken")
@@ -1944,17 +2004,18 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
     with db.connected() as con:
-        canonical_model_id = scoring.canonical_model_id(model)
-        mrow = db.get_model(con, model) or db.get_model(con, canonical_model_id)
-        quant = scoring.quant_key(model) or (mrow.get("quant") if mrow else None)
-        if model != canonical_model_id:
+        canonical_model_id = scoring.canonical_model_id(evidence_model)
+        mrow = db.get_model(con, evidence_model) or db.get_model(con, canonical_model_id)
+        quant = scoring.quant_key(evidence_model) or (mrow.get("quant") if mrow else None)
+        if evidence_model != canonical_model_id:
             catalog.remember_variant(
-                con, model, canonical_model_id, quant=quant,
-                weights_gb=staleness.artifact_size_gb(model))
-        db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
+                con, evidence_model, canonical_model_id, quant=quant,
+                weights_gb=staleness.artifact_size_gb(evidence_model))
+        db.save_benchmark_result(con, mk, evidence_model, use_case, score=score, source=source,
                                  engine_key=key, backend=backend,
                                  base_model=scoring.base_key(canonical_model_id), quant=quant,
                                  benchmark_id=use_case, max_score=1.0, sample_size=n,
+                                 methodology_id=methodology_id,
                                  refused_n=refused_n, errored_n=errored_n,
                                  probe_context=safe, generation_cap=effective_generation_cap,
                                  repeat_count=repeat, total_generations=total,
@@ -2056,6 +2117,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     if not acquire.valid_model_ref(model):
         return err(f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                    f"or a local .gguf file path")
+    evidence_model = scoring.durable_model_id(model)
     if kv_quant not in _KV_QUANT_CHOICES:
         return err(_kv_quant_error(kv_quant))
     if weight_quant not in _WEIGHT_QUANT_CHOICES:
@@ -2072,7 +2134,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     with db.connected() as con:
         if engine is not None:
             # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
-            row = db.get_characterization(con, mk, sel.engine_key, model)
+            row = db.get_characterization(con, mk, sel.engine_key, evidence_model)
             if row is None:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
                            f"ara characterize {model}{suffix}")
@@ -2093,7 +2155,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             default = engines.for_backend(detect.backend_name())
             per_engine = {}                  # engine_key -> (safe_context, backend, can_run, time, row)
             for key in dict.fromkeys([default, *engines.ENGINES]):
-                row = db.get_characterization(con, mk, key, model)
+                row = db.get_characterization(con, mk, key, evidence_model)
                 if row is None:
                     continue
                 backend = engines.ENGINES[key]["backend"]
@@ -2153,7 +2215,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             engine_key = max(runnable, key=lambda k: runnable[k][0])
             safe, backend, _, ceiling_measured_at, _ = runnable[engine_key]
 
-    stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
+    stale_ceiling = _stale_ceiling_note(
+        c, evidence_model, ceiling_measured_at, as_json=as_json)
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
                                          flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
                                          prefill_chunk=prefill_chunk)

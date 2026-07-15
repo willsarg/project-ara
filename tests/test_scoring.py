@@ -10,10 +10,11 @@ separate benchmark step measured (tier="measured"), or an imported published sco
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 
 import pytest
 
-from ara import scoring
+from ara import benchmark, scoring
 
 
 def test_score_for_imported_returns_labelled_score():
@@ -43,19 +44,50 @@ def test_gguf_selector_has_canonical_repo_and_exact_quant():
     assert scoring.quant_key("org/repo:Model.Q4_K_M.gguf") == "q4_k_m"
 
 
+def test_durable_model_id_resolves_existing_local_selector(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    model = Path("relative:Model-Q4_K_M.gguf")
+    model.write_bytes(b"weights")
+    assert scoring.durable_model_id(str(model)) == str(model.resolve())
+    assert scoring.durable_model_id("org/repo:Model-Q4_K_M.gguf") == \
+        "org/repo:Model-Q4_K_M.gguf"
+
+
 def test_measured_evidence_rejects_selector_quant_mismatch():
     selector = "org/repo:Model-Q4_K_M.gguf"
     row = {
         "model_id": selector, "use_case": "coding", "tier": "measured",
         "benchmark_id": "coding", "canonical_model_id": "org/repo",
+        "methodology_id": benchmark.methodology_id("coding"),
         "base_model": scoring.base_key("org/repo"), "artifact_id": "artifact",
         "engine_key": "cpu", "backend": "cpu", "quant": "q8_0",
         "score": 0.5, "source": "probe", "max_score": 1.0,
+        "sample_size": len(benchmark.load_probe("coding")),
         "refused_n": 0, "errored_n": 0, "measured_at": None,
     }
     assert scoring.validate_measured_evidence(row)[0] is None
     row["quant"] = "q4_k_m"
     assert scoring.validate_measured_evidence(row)[0]["score"] == 0.5
+
+
+def test_measured_evidence_rejects_stale_methodology_or_partial_probe():
+    n = len(benchmark.load_probe("reasoning"))
+    row = {
+        "model_id": "org/model", "use_case": "reasoning", "tier": "measured",
+        "benchmark_id": "reasoning", "methodology_id": benchmark.methodology_id("reasoning"),
+        "canonical_model_id": "org/model", "base_model": scoring.base_key("org/model"),
+        "artifact_id": "artifact", "engine_key": "cpu", "backend": "cpu",
+        "quant": None, "score": 0.5, "source": "probe", "max_score": 1.0,
+        "sample_size": n, "refused_n": 0, "errored_n": 0, "measured_at": None,
+    }
+    assert scoring.validate_measured_evidence(row)[0] is not None
+    row["methodology_id"] = "sha256:old"
+    assert scoring.validate_measured_evidence(row)[0] is None
+    row["methodology_id"] = benchmark.methodology_id("reasoning")
+    row["sample_size"] = 1
+    assert scoring.validate_measured_evidence(row)[0] is None
+    row["use_case"] = row["benchmark_id"] = "chat"
+    assert scoring.validate_measured_evidence(row)[0] is None
 
 
 def test_measured_score_beats_imported():

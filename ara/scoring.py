@@ -54,6 +54,18 @@ def canonical_model_id(model_id: str) -> str:
     return model_id.partition(":")[0] if acquire.valid_repo_gguf_ref(model_id) else model_id
 
 
+def durable_model_id(model_id: str) -> str:
+    """Stable persistence key for *model_id*.
+
+    Existing local GGUF paths are resolved now, while the caller's working directory is known.
+    Repo ids and repo:file selectors retain their public spelling.  The original CLI spelling is
+    still used for display and engine invocation; only durable evidence keys use this value.
+    """
+    if acquire.is_local_gguf(model_id):
+        return str(Path(model_id).expanduser().resolve())
+    return model_id
+
+
 # Genuine quantization tokens only — bit-widths, llama.cpp quant classes (Q/IQ/TQ), and the
 # awq/gptq/float classes. The container FORMATS `gguf`/`mlx` (present in _QUANT_RE for base_key
 # stripping) are deliberately excluded: they describe packaging, not precision, so they're never
@@ -191,6 +203,8 @@ def decode_run_scores(raw: str | None, repeat_count: int | None
 
 def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
     """Validate a local benchmark row before it can influence recommendation ranking."""
+    from ara import benchmark
+
     warning = "invalid stored benchmark evidence"
     model_id = row.get("model_id")
     use_case = row.get("use_case")
@@ -200,6 +214,12 @@ def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
             or row.get("canonical_model_id") != canonical
             or row.get("base_model") != (base_key(canonical) if canonical else None)
             or not isinstance(row.get("artifact_id"), str) or not row["artifact_id"]):
+        return None, warning
+    if use_case not in benchmark.USE_CASES:
+        return None, warning
+    expected_probe = benchmark.load_probe(use_case)
+    if (row.get("methodology_id") != benchmark.methodology_id(use_case, expected_probe)
+            or row.get("sample_size") != len(expected_probe)):
         return None, warning
     if (not isinstance(row.get("engine_key"), str) or not row["engine_key"]
             or not isinstance(row.get("backend"), str) or not row["backend"]):
@@ -252,8 +272,6 @@ def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
     if row.get("refused_n") is None or row.get("errored_n") is None:
         return None, warning
     if any(value is not None for value in structured) and any(value is None for value in structured):
-        return None, warning
-    if all(value is not None for value in structured) and sample_size is None:
         return None, warning
     if (total is not None and sample_size is not None and repeat_count is not None
             and total != sample_size * repeat_count):

@@ -2507,12 +2507,30 @@ def _measured_row(model_id, use_case="coding", score=0.6, source="mlx probe", **
         "tier": "measured", "engine_key": "mlx", "backend": "apple",
         "base_model": cli.scoring.base_key(canonical),
         "quant": cli.scoring.quant_key(model_id), "benchmark_id": use_case,
+        "methodology_id": cli.benchmark.methodology_id(use_case),
+        "sample_size": len(cli.benchmark.load_probe(use_case)),
         "max_score": 1.0, "refused_n": 0, "errored_n": 0,
         "artifact_id": f"artifact:{model_id}",
         "canonical_model_id": canonical, "measured_at": "2026-07-15T12:00:00+00:00",
     }
     row.update(over)
     return row
+
+
+def _accept_render_test_evidence(monkeypatch):
+    """Keep presentation-only tests focused on rendering synthetic evidence shapes."""
+    def validate(row):
+        return ({
+            "score": float(row["score"]), "source": row["source"],
+            "sample_size": row.get("sample_size"),
+            "refused_n": row.get("refused_n"), "errored_n": row.get("errored_n"),
+            "probe_context": row.get("probe_context"),
+            "generation_cap": row.get("generation_cap"),
+            "repeat_count": row.get("repeat_count"),
+            "total_generations": row.get("total_generations"),
+            "run_scores": None,
+        }, None)
+    monkeypatch.setattr(cli.scoring, "validate_measured_evidence", validate)
 
 
 def test_recommend_ranks_fits_by_context(make_console, monkeypatch, set_platform):
@@ -2697,8 +2715,9 @@ def test_recommend_rejects_unknown_use_case(make_console, monkeypatch, set_platf
     assert "cooking" in buf.getvalue()
 
 
-def _wire_inversion_bench(monkeypatch, four_bit=0.098, eight_bit=0.061, n=50):
+def _wire_inversion_bench(monkeypatch, four_bit=0.098, eight_bit=0.061, n=None):
     # Same base model, two quants, both measured here — a lower-precision upset.
+    n = len(cli.benchmark.load_probe("coding")) if n is None else n
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda con, mk: [
         _measured_row("org/Model-4bit", score=four_bit, sample_size=n,
@@ -4278,6 +4297,23 @@ def test_model_detail_full(make_console, monkeypatch):
     assert "8192" in out and "mlx-4bit" in out and "16000" in out
 
 
+def test_model_detail_looks_up_local_evidence_by_absolute_key(
+        make_console, monkeypatch, tmp_path):
+    model = tmp_path / "relative:Model-Q4_K_M.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.catalog, "describe", lambda _mid: _meta())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    seen = []
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, _engine, model_id:
+                        seen.append(model_id) or None)
+    c, _ = make_console()
+
+    assert cli.render_model_detail(c, model.name) == 0
+    assert set(seen) == {str(model.resolve())}
+
+
 def test_model_detail_verbose_discloses_measurement_time(make_console, monkeypatch):
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
@@ -4521,6 +4557,37 @@ def test_render_characterize_refuses_to_store_unidentified_artifact(
     c, buf = make_console()
     assert cli.render_characterize(c, "org/Model") == 1
     assert "result not stored" in buf.getvalue()
+
+
+def test_render_characterize_refuses_artifact_changed_during_measurement(
+        make_console, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                                "decode_context": None, "points": []})
+    identities = iter(("artifact:before", "artifact:after"))
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
+    monkeypatch.setattr(cli.db, "save_characterization",
+                        lambda *_a, **_k: pytest.fail("changed evidence must not be stored"))
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 1
+    assert "changed during characterization" in buf.getvalue()
+
+
+def test_render_characterize_persists_absolute_local_evidence_key(
+        make_console, monkeypatch, tmp_path):
+    model = tmp_path / "local:Model-Q4_K_M.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.chdir(tmp_path)
+    _wire_characterize(monkeypatch, backend="cpu",
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                                "decode_context": None, "points": []})
+    saved = {}
+    monkeypatch.setattr(cli.db, "save_characterization",
+                        lambda _con, _mk, _engine, model_id, **_kw:
+                        saved.update(model_id=model_id))
+    c, _ = make_console()
+    assert cli.render_characterize(c, model.name, engine="cpu") == 0
+    assert saved["model_id"] == str(model.resolve())
 
 
 def test_render_characterize_catalogs_exact_gguf_variant(make_console, monkeypatch):
@@ -6165,6 +6232,21 @@ def test_run_accepts_local_gguf_path(make_console, monkeypatch, tmp_path):
     out = buf.getvalue()
     assert "invalid model" not in out          # guard accepted the local path
     assert "isn't characterized" in out
+
+
+def test_run_looks_up_local_evidence_by_absolute_key(make_console, monkeypatch, tmp_path):
+    model = tmp_path / "relative:Model-Q4_K_M.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.chdir(tmp_path)
+    _wire_run(monkeypatch, characterization=None)
+    seen = []
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, _engine, model_id:
+                        seen.append(model_id) or None)
+    c, _ = make_console()
+
+    assert cli.render_run(c, model.name, prompt="hi", engine="cpu") == 1
+    assert seen == [str(model.resolve())]
 
 
 def test_characterize_rejects_malformed_model_id(make_console, monkeypatch):
@@ -7893,6 +7975,7 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     assert saved["use_case"] == "coding"
     assert saved["score"] == 0.75
     assert saved["engine_key"] == "mlx"
+    assert saved["methodology_id"].startswith("sha256:")
     assert saved["sample_size"] == 2
     out = buf.getvalue()
     assert "coding" in out and "75%" in out and "stored" in out
@@ -7996,7 +8079,7 @@ def test_render_benchmark_explicit_ctx_still_refuses_mismatched_measurement_conf
         "safe_context": 8000, "config": {"kv_quant": "q4_0"}
     })
     c, buf = make_console()
-    assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="mlx", ctx=4000,
                                 assume_yes=True) == 1
     assert "different engine settings" in buf.getvalue()
 
@@ -8069,6 +8152,92 @@ def test_render_benchmark_auto_uses_detected_cpu_backend(
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine=engine,
                                 assume_yes=True) == 0
     assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_auto_reuses_cpu_ceiling_on_cuda_host(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    catalog = dict(cli.engines.ENGINES)
+    catalog["cuda"] = {**catalog["cuda"], "backend": "cuda"}
+    catalog["cpu"] = {**catalog["cpu"], "backend": "cpu"}
+    monkeypatch.setattr(cli.engines, "ENGINES", catalog)
+    monkeypatch.setattr(cli.engines, "for_backend",
+                        lambda backend: "cuda" if backend == "cuda" else None)
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_auto_skips_higher_stale_engine_ceiling(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    catalog = dict(cli.engines.ENGINES)
+    catalog["cuda"] = {**catalog["cuda"], "backend": "cuda"}
+    catalog["cpu"] = {**catalog["cpu"], "backend": "cpu"}
+    monkeypatch.setattr(cli.engines, "ENGINES", catalog)
+    monkeypatch.setattr(cli.engines, "for_backend",
+                        lambda backend: "cuda" if backend == "cuda" else None)
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, engine, _model: {
+                            "safe_context": 16000 if engine == "cuda" else 8000,
+                            "artifact_id": ("artifact:stale" if engine == "cuda"
+                                            else "artifact:test"),
+                        } if engine in {"cuda", "cpu"} else None)
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_auto_ignores_nonbenchmark_candidate_backend(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    working_backend = cli.get_backend("cpu")
+    catalog = dict(cli.engines.ENGINES)
+    catalog["faux"] = {"backend": "faux"}
+    monkeypatch.setattr(cli.engines, "ENGINES", catalog)
+    monkeypatch.setattr(cli, "get_backend",
+                        lambda backend: (types.SimpleNamespace()
+                                         if backend == "faux" else working_backend))
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 0
+    assert saved["engine_key"] == "cpu"
+
+
+def test_render_benchmark_explicit_engine_requires_its_own_ceiling(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, engine_key="cpu")
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="cpu",
+                                assume_yes=True) == 1
+    assert "no measured ceiling" in buf.getvalue()
+
+
+def test_render_benchmark_persists_absolute_local_evidence_key(
+        make_console, monkeypatch, tmp_path):
+    model = tmp_path / "relative:Model-Q4_K_M.gguf"
+    model.write_bytes(b"weights")
+    monkeypatch.chdir(tmp_path)
+    saved = _wire_benchmark(monkeypatch, engine_key="cpu")
+    absolute = str(model.resolve())
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda _con, _mk, engine, model_id: {
+                            "safe_context": 8000, "artifact_id": "artifact:test"
+                        } if engine == "cpu" and model_id == absolute else None)
+    c, _ = make_console()
+
+    assert cli.render_benchmark(c, model.name, use_case="reasoning", engine="cpu",
+                                assume_yes=True) == 0
+    assert saved["model"] == absolute
 
 
 def test_render_benchmark_verbose_discloses_execution_and_evidence(
@@ -8488,6 +8657,7 @@ def test_recommend_measured_partial_refusal_and_low_confidence_annotated(make_co
                             "org/Partial", score=0.4, sample_size=30,
                             refused_n=2, errored_n=0)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    _accept_render_test_evidence(monkeypatch)
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
     out = buf.getvalue()
@@ -8504,6 +8674,7 @@ def test_recommend_measured_errored_partial_no_low_confidence_at_threshold(make_
                             "org/Err", score=0.6, source="cuda probe", sample_size=100,
                             refused_n=0, errored_n=3)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    _accept_render_test_evidence(monkeypatch)
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
     out = buf.getvalue()
@@ -8520,6 +8691,7 @@ def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platfor
                             "org/Partial", score=0.4, sample_size=30,
                             refused_n=2, errored_n=1)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    _accept_render_test_evidence(monkeypatch)
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_recommend(c, as_json=True, use_case="coding") == 0
     payload = json.loads(capsys.readouterr().out)
@@ -8529,21 +8701,23 @@ def test_recommend_use_case_json_carries_partial_fields(monkeypatch, set_platfor
 
 def test_recommend_carries_repeat_wide_benchmark_provenance(
         make_console, monkeypatch, set_platform, capsys):
+    probe_n = len(cli.benchmark.load_probe("coding"))
+    total_n = probe_n * 3
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Repeated", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
-        "org/Repeated", score=0.6, source="mlx probe=100", sample_size=100,
+        "org/Repeated", score=0.6, source=f"mlx probe={probe_n}", sample_size=probe_n,
         refused_n=5, errored_n=2,
         probe_context=4096, generation_cap=512, repeat_count=3,
-        total_generations=300, run_scores_json="[0.55, 0.6, 0.65]",
+        total_generations=total_n, run_scores_json="[0.55, 0.6, 0.65]",
     )])
 
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c, use_case="coding") == 0
     out = buf.getvalue()
-    assert "[partial: 5/300 refused, 2/300 errored]" in out
-    assert "[evidence: 100 prompts × 3 runs; ctx 4096; max 512]" in out
+    assert f"[partial: 5/{total_n} refused, 2/{total_n} errored]" in out
+    assert f"[evidence: {probe_n} prompts × 3 runs; ctx 4096; max 512]" in out
 
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_recommend(c, use_case="coding", as_json=True) == 0
@@ -8551,7 +8725,7 @@ def test_recommend_carries_repeat_wide_benchmark_provenance(
     assert score["probe_context"] == 4096
     assert score["generation_cap"] == 512
     assert score["repeat_count"] == 3
-    assert score["total_generations"] == 300
+    assert score["total_generations"] == total_n
     assert score["run_scores"] == [0.55, 0.6, 0.65]
 
 
@@ -8562,7 +8736,9 @@ def test_recommend_joins_exact_gguf_variant_evidence(
                     [_model_row(selector, weights_gb=4.0, quant="q4_k_m")])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [
-        _measured_row(selector, score=0.7, sample_size=100, refused_n=0, errored_n=0)
+        _measured_row(selector, score=0.7,
+                      sample_size=len(cli.benchmark.load_probe("coding")),
+                      refused_n=0, errored_n=0)
     ])
     c, buf = make_console()
 
@@ -8572,11 +8748,12 @@ def test_recommend_joins_exact_gguf_variant_evidence(
 
 def test_recommend_verbose_handles_legacy_benchmark_provenance(
         make_console, monkeypatch, set_platform):
+    probe_n = len(cli.benchmark.load_probe("coding"))
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Legacy", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
-        "org/Legacy", score=0.6, source="mlx probe=100", sample_size=100,
+        "org/Legacy", score=0.6, source=f"mlx probe={probe_n}", sample_size=probe_n,
         refused_n=0, errored_n=0,
         probe_context=None, generation_cap=None, repeat_count=None,
         total_generations=None, run_scores_json=None,
@@ -8584,20 +8761,21 @@ def test_recommend_verbose_handles_legacy_benchmark_provenance(
 
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c, use_case="coding") == 0
-    assert "[evidence: 100 prompts]" in buf.getvalue()
+    assert f"[evidence: {probe_n} prompts]" in buf.getvalue()
 
 
 @pytest.mark.parametrize("stored", ["not-json", "{}", "[0.5, true]", "[1.5, 0.5]",
                                      "[0.5]", "[NaN, 0.5]", "[0.1, 0.1]"])
 def test_recommend_discloses_invalid_stored_run_scores(
         make_console, monkeypatch, set_platform, capsys, stored):
+    probe_n = len(cli.benchmark.load_probe("coding"))
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
-        "org/Corrupt", score=0.6, source="mlx probe=100", sample_size=100,
+        "org/Corrupt", score=0.6, source=f"mlx probe={probe_n}", sample_size=probe_n,
         refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
-        repeat_count=2, total_generations=200, run_scores_json=stored)])
+        repeat_count=2, total_generations=probe_n * 2, run_scores_json=stored)])
 
     c, buf = make_console()
     assert cli.render_recommend(c, use_case="coding") == 0
@@ -8614,11 +8792,11 @@ def test_recommend_discloses_invalid_stored_run_scores(
 @pytest.mark.parametrize("field,value", [
     ("score", "bad"), ("score", float("nan")), ("score", 1.1),
     ("sample_size", 0), ("sample_size", None), ("refused_n", None), ("refused_n", -1),
-    ("refused_n", 201), ("errored_n", True),
+    ("refused_n", 329), ("errored_n", True),
     ("errored_n", None),
     ("probe_context", 0), ("probe_context", None),
     ("generation_cap", -1), ("repeat_count", 0),
-    ("total_generations", 199), ("source", ""), ("measured_at", "not-a-date"),
+    ("total_generations", 327), ("source", ""), ("measured_at", "not-a-date"),
     ("measured_at", 123), ("tier", "imported"), ("benchmark_id", "rag"),
     ("engine_key", "bogus"), ("engine_key", None),
     ("backend", "bogus"), ("backend", None), ("base_model", "bogus"),
@@ -8628,13 +8806,14 @@ def test_recommend_discloses_invalid_stored_run_scores(
 ])
 def test_recommend_downgrades_other_invalid_stored_evidence(
         make_console, monkeypatch, set_platform, field, value):
+    probe_n = len(cli.benchmark.load_probe("coding"))
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Corrupt", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     row = _measured_row(
-        "org/Corrupt", score=0.6, source="mlx probe=100", sample_size=100,
+        "org/Corrupt", score=0.6, source=f"mlx probe={probe_n}", sample_size=probe_n,
         refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
-        repeat_count=2, total_generations=200, run_scores_json="[0.6, 0.6]")
+        repeat_count=2, total_generations=probe_n * 2, run_scores_json="[0.6, 0.6]")
     row[field] = value
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [row])
     monkeypatch.setattr(cli.staleness, "fit_is_stale", lambda *_a: False)
@@ -8647,13 +8826,14 @@ def test_recommend_downgrades_other_invalid_stored_evidence(
 
 def test_recommend_downgrades_stale_benchmark_for_changed_cached_artifact(
         make_console, monkeypatch, set_platform, capsys):
+    probe_n = len(cli.benchmark.load_probe("coding"))
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Changed", weights_gb=4.0, max_context=131072)])
     monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
     monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [_measured_row(
-        "org/Changed", score=0.9, source="mlx probe=100", sample_size=100,
+        "org/Changed", score=0.9, source=f"mlx probe={probe_n}", sample_size=probe_n,
         refused_n=0, errored_n=0, probe_context=4096, generation_cap=512,
-        repeat_count=1, total_generations=100, run_scores_json="[0.9]")])
+        repeat_count=1, total_generations=probe_n, run_scores_json="[0.9]")])
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:changed")
 
     c, buf = make_console()
@@ -8863,7 +9043,7 @@ def test_render_benchmark_refuses_unknown_or_changing_artifact(
     assert "differs from its measured ceiling" in buf.getvalue()
     assert "model" not in saved
 
-    identities = iter(["artifact:test", "artifact:b"])
+    identities = iter(["artifact:test", "artifact:test", "artifact:b"])
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
@@ -8871,14 +9051,29 @@ def test_render_benchmark_refuses_unknown_or_changing_artifact(
     assert "model" not in saved
 
 
+@pytest.mark.parametrize("engine", [None, "mlx"])
 def test_render_benchmark_refuses_ceiling_without_artifact_authority(
-        make_console, monkeypatch):
+        make_console, monkeypatch, engine):
     _wire_benchmark(monkeypatch)
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda *_a: {"safe_context": 8000, "artifact_id": None})
     c, buf = make_console()
-    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine=engine,
+                                assume_yes=True) == 1
     assert "not bound to an exact artifact" in buf.getvalue()
+
+
+def test_render_benchmark_refuses_artifact_changed_after_auto_selection(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+    identities = iter(["artifact:test", "artifact:changed"])
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
+    c, buf = make_console()
+
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning",
+                                assume_yes=True) == 1
+    assert "differs from its measured ceiling" in buf.getvalue()
+    assert "model" not in saved
 
 
 def test_render_benchmark_catalogs_exact_gguf_variant(make_console, monkeypatch):

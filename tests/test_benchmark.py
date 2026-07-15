@@ -519,8 +519,38 @@ def test_agentic_parses_json_after_preamble():
     assert _bm.score("agentic", item, 'Sure, here you go: {"name":"f","arguments":{"x":1}}') == 1.0
 
 
+def test_agentic_scores_first_json_object_when_another_follows():
+    item = {"expected": {"name": "f", "arguments": {"x": 1}}}
+    completion = (
+        '{"name":"f","arguments":{"x":1}}\n'
+        '{"name":"different","arguments":{"x":2}}'
+    )
+    assert _bm.score("agentic", item, completion) == 1.0
+
+
+def test_agentic_skips_malformed_braced_text_before_first_decodable_object():
+    item = {"expected": {"name": "f", "arguments": {"x": 1}}}
+    completion = (
+        'Analysis {not valid JSON}: use the requested call.\n'
+        '```json\n{"name":"f","arguments":{"x":1}}\n```\n'
+        'Trailing note with {more prose}.'
+    )
+    assert _bm.score("agentic", item, completion) == 1.0
+
+
 def test_score_probe_set_empty_returns_zero_not_crash():
     assert _bm.score_probe_set("coding", [], []) == 0.0
+
+
+def test_methodology_id_binds_probe_prompt_and_scorer_contract(monkeypatch):
+    items = [{"question": "2 + 2?", "answer": "#### 4"}]
+    baseline = _bm.methodology_id("reasoning", items)
+    assert baseline == _bm.methodology_id("reasoning", items)
+    assert baseline.startswith("sha256:")
+    assert baseline != _bm.methodology_id(
+        "reasoning", [{"question": "3 + 3?", "answer": "#### 6"}])
+    monkeypatch.setitem(_bm._SCORER_VERSIONS, "reasoning", "2")
+    assert baseline != _bm.methodology_id("reasoning", items)
 
 
 def test_token_f1_counts_repeated_tokens():

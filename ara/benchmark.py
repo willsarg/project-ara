@@ -14,6 +14,7 @@ containment (bubblewrap) is a tracked follow-up.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -57,11 +58,30 @@ _PROBE_FILES: dict[str, str] = {
     "rag":        "rag.json",
 }
 
+# Scorer semantics are part of persisted evidence. Prompt text and probe contents are hashed
+# automatically; bump only the affected scorer version when its grading rules change.
+_SCORER_VERSIONS: dict[str, str] = {use_case: "1" for use_case in USE_CASES}
+
 
 def load_probe(use_case: str) -> list[dict]:
     """Return the shipped probe list for *use_case*."""
     path = _DATA_DIR / _PROBE_FILES[use_case]
     return json.loads(path.read_text())
+
+
+def methodology_id(use_case: str, items: list[dict] | None = None) -> str:
+    """Immutable identity of the exact probes, prompts, and scoring contract in use."""
+    probe = load_probe(use_case) if items is None else items
+    payload = {
+        "contract": "ara-benchmark-methodology-v1",
+        "use_case": use_case,
+        "scorer_version": _SCORER_VERSIONS[use_case],
+        "probes": probe,
+        "prompts": [prompt_for(use_case, item) for item in probe],
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def prompt_for(use_case: str, item: dict) -> str:
@@ -216,7 +236,6 @@ def _score_reasoning(item: dict, completion: str) -> float:
 def _extract_json(text: str):
     """Parse the first JSON object found anywhere in *text* (tolerates prose + fences).
 
-    Unlike code, JSON is whitespace-insensitive, so a greedy ``{...}`` scan is safe.
     Returns the parsed object, or ``None`` if nothing parses.
     """
     text = text.strip()
@@ -224,13 +243,15 @@ def _extract_json(text: str):
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group())
-    except (json.JSONDecodeError, ValueError):
-        return None
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            parsed, _ = decoder.raw_decode(text, start)
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            start = text.find("{", start + 1)
+    return None
 
 
 def _agentic_value_matches(expected, predicted) -> bool:
