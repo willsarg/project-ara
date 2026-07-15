@@ -58,7 +58,7 @@ def test_search_activity_cleans_up_on_every_exit(
 def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None})
+        "safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"})
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
@@ -107,6 +107,7 @@ def _wire_characterize(monkeypatch, backend):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.catalog, "remember", lambda *_a: None)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
 
 
 @pytest.mark.parametrize("cached,expected_downloads", [(True, []), (False, ["org/model"])])
@@ -276,7 +277,7 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None})
+        "safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"})
     monkeypatch.setattr(cli.benchmark, "load_probe", lambda _use_case: [{"answer": "a"}])
     monkeypatch.setattr(cli.benchmark, "prompt_for", lambda *_a: "prompt")
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda *_a: 1.0)

@@ -45,7 +45,8 @@ def test_measured_evidence_rejects_selector_quant_mismatch():
         "benchmark_id": "coding", "canonical_model_id": "org/repo",
         "base_model": scoring.base_key("org/repo"), "artifact_id": "artifact",
         "engine_key": "cpu", "backend": "cpu", "quant": "q8_0",
-        "score": 0.5, "source": "probe", "max_score": None, "measured_at": None,
+        "score": 0.5, "source": "probe", "max_score": 1.0,
+        "refused_n": 0, "errored_n": 0, "measured_at": None,
     }
     assert scoring.validate_measured_evidence(row)[0] is None
     row["quant"] = "q4_k_m"

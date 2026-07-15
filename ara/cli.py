@@ -1407,12 +1407,23 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         return 1
 
     ceiling = result["safe_context"]
+    artifact_id = staleness.artifact_identity(model)
+    if ceiling is not None and artifact_id is None:
+        msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  model, safe_context=ceiling, points=result["points"],
                                  decode_context=result.get("decode_context"),
-                                 config=measured_config)
-        catalog.remember(con, model)
+                                 config=measured_config, artifact_id=artifact_id)
+        canonical_model_id = scoring.canonical_model_id(model)
+        if model != canonical_model_id:
+            catalog.remember_variant(
+                con, model, canonical_model_id, quant=scoring.quant_key(model),
+                weights_gb=staleness.artifact_size_gb(model))
+        else:
+            catalog.remember(con, model)
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
@@ -1582,6 +1593,13 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         catalog.scan(cache_con)            # ephemeral snapshot of the local cache
         evidence_con = (stack.enter_context(db.connected_readonly())
                         if db._db_path().is_file() else cache_con)
+        for durable in catalog.all_models(evidence_con):
+            model_id = durable["model_id"]
+            if ((":" in model_id or model_id.lower().endswith(".gguf"))
+                    and staleness.artifact_identity(model_id) is not None):
+                db.upsert_model(
+                    cache_con, model_id,
+                    **{name: durable.get(name) for name in db._MODEL_COLS})
         # Prefer the measured wall for the detected engine (anti-silo: same grounding as profile).
         default_engine = engines.for_backend(detect.backend_name())
         measured = (calibration.get_calibration(evidence_con, default_engine)
@@ -1794,6 +1812,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             return err(f"no measured ceiling for {model} — run: ara characterize {model}")
         if msg := _measurement_config_error(row, expected_config, backend, model):
             return err(msg)
+        characterized_artifact_id = row.get("artifact_id")
+        if not characterized_artifact_id:
+            return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
+                       f"re-run: ara characterize {model}")
         if ctx is not None:
             if ctx <= 0:
                 return err("--ctx must be a positive integer")
@@ -1840,6 +1862,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                 as_json=as_json, progress=progress)) is not None:
             return rc
         artifact_id = staleness.artifact_identity(model)
+        if artifact_id != characterized_artifact_id:
+            return err(f"the cached artifact for {model} differs from its measured ceiling — "
+                       f"re-run: ara characterize {model}")
         # --repeat N: run the probe set N times (N separate model loads — acceptable v1). Never let a
         # single lucky roll stand in as THE number: score each run independently, store the MEAN as the
         # point estimate, and surface the LO–HI band so a wide spread is visible (pass^k spirit).
@@ -1891,11 +1916,6 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                     errored_n += 1
             run_scores.append(benchmark.score_probe_set(use_case, items, completions))
             current_artifact_id = staleness.artifact_identity(model)
-            if artifact_id is None:
-                artifact_id = current_artifact_id
-            if artifact_id is None:
-                return err(f"cannot identify the exact cached artifact for {model} — "
-                           "no measurement taken")
             if current_artifact_id != artifact_id:
                 return err(f"the cached artifact for {model} changed during the benchmark — "
                            "no measurement taken")
@@ -1926,8 +1946,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     with db.connected() as con:
         canonical_model_id = scoring.canonical_model_id(model)
         mrow = db.get_model(con, model) or db.get_model(con, canonical_model_id)
-        quant = mrow.get("quant") if mrow else None
-        quant = quant or scoring.quant_key(model)
+        quant = scoring.quant_key(model) or (mrow.get("quant") if mrow else None)
         if model != canonical_model_id:
             catalog.remember_variant(
                 con, model, canonical_model_id, quant=quant,
@@ -1935,7 +1954,7 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         db.save_benchmark_result(con, mk, model, use_case, score=score, source=source,
                                  engine_key=key, backend=backend,
                                  base_model=scoring.base_key(canonical_model_id), quant=quant,
-                                 benchmark_id=use_case, sample_size=n,
+                                 benchmark_id=use_case, max_score=1.0, sample_size=n,
                                  refused_n=refused_n, errored_n=errored_n,
                                  probe_context=safe, generation_cap=effective_generation_cap,
                                  repeat_count=repeat, total_generations=total,

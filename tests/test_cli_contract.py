@@ -77,6 +77,7 @@ def mocked_world(monkeypatch, store):
                         lambda con: [{"model_id": "org/m", "modality": "text"}])
     monkeypatch.setattr(cli.catalog, "describe", lambda model_id: {"modality": "text"})
     monkeypatch.setattr(cli.catalog, "remember", lambda con, model: None)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda model: f"artifact:{model}")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key: None)
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])

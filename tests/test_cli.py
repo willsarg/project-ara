@@ -17,6 +17,12 @@ from ara.detect import Accelerator, Machine, ModelStore, Runtime
 from ara.hardware import (BoardInfo, CpuInfo, Drive, MemoryInfo, MemoryModule, StorageInfo)
 
 
+@pytest.fixture(autouse=True)
+def _stable_test_artifact(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
+
+
 def _raise_input(exc):
     """A fake builtins.input that raises — for EOF/Ctrl-C at the prompt."""
     def _f(prompt=""):
@@ -2501,7 +2507,8 @@ def _measured_row(model_id, use_case="coding", score=0.6, source="mlx probe", **
         "tier": "measured", "engine_key": "mlx", "backend": "apple",
         "base_model": cli.scoring.base_key(canonical),
         "quant": cli.scoring.quant_key(model_id), "benchmark_id": use_case,
-        "max_score": None, "artifact_id": f"artifact:{model_id}",
+        "max_score": 1.0, "refused_n": 0, "errored_n": 0,
+        "artifact_id": f"artifact:{model_id}",
         "canonical_model_id": canonical, "measured_at": "2026-07-15T12:00:00+00:00",
     }
     row.update(over)
@@ -4478,6 +4485,8 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
+    monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     if characterize is not None:
         # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
         _char = characterize
@@ -4500,6 +4509,33 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     assert "20000" in buf.getvalue() and "mlx" in buf.getvalue()
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
+    assert row["artifact_id"] == "artifact:test"
+
+
+def test_render_characterize_refuses_to_store_unidentified_artifact(
+        make_console, monkeypatch):
+    _wire_characterize(monkeypatch,
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                                "decode_context": None, "points": []})
+    monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: None)
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/Model") == 1
+    assert "result not stored" in buf.getvalue()
+
+
+def test_render_characterize_catalogs_exact_gguf_variant(make_console, monkeypatch):
+    _wire_characterize(monkeypatch, backend="cpu",
+                       characterize=lambda m: {"model": m, "safe_context": 20000,
+                                                "decode_context": None, "points": []})
+    captured = {}
+    monkeypatch.setattr(cli.catalog, "remember_variant",
+                        lambda con, model, canonical, **kw:
+                        captured.update(model=model, canonical=canonical, **kw))
+    selector = "org/repo:Model-Q4_K_M.gguf"
+    c, _ = make_console()
+    assert cli.render_characterize(c, selector, engine="cpu") == 0
+    assert captured == {"model": selector, "canonical": "org/repo",
+                        "quant": "q4_k_m", "weights_gb": 1.0}
 
 
 def test_characterize_verbose_discloses_engine_and_effective_kv_cache(
@@ -7816,7 +7852,9 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     monkeypatch.setattr(cli.engines, "ENGINES", orig)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": ceiling} if e == engine_key else None)
+                        lambda con, mk, e, m: {
+                            "safe_context": ceiling, "artifact_id": "artifact:test"
+                        } if e == engine_key else None)
 
     saved = {}
 
@@ -7906,7 +7944,8 @@ def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
 def test_render_benchmark_lower_ctx_preserves_ceiling_staleness(monkeypatch, capsys):
     _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 8000, "measured_at": "2026-01-02T03:04:05+00:00"})
+        "safe_context": 8000, "measured_at": "2026-01-02T03:04:05+00:00",
+        "artifact_id": "artifact:test"})
     seen = {}
     monkeypatch.setattr(
         cli.staleness, "ceiling_is_stale",
@@ -8574,15 +8613,17 @@ def test_recommend_discloses_invalid_stored_run_scores(
 
 @pytest.mark.parametrize("field,value", [
     ("score", "bad"), ("score", float("nan")), ("score", 1.1),
-    ("sample_size", 0), ("sample_size", None), ("refused_n", -1),
+    ("sample_size", 0), ("sample_size", None), ("refused_n", None), ("refused_n", -1),
     ("refused_n", 201), ("errored_n", True),
+    ("errored_n", None),
     ("probe_context", 0), ("probe_context", None),
     ("generation_cap", -1), ("repeat_count", 0),
     ("total_generations", 199), ("source", ""), ("measured_at", "not-a-date"),
     ("measured_at", 123), ("tier", "imported"), ("benchmark_id", "rag"),
     ("engine_key", "bogus"), ("engine_key", None),
     ("backend", "bogus"), ("backend", None), ("base_model", "bogus"),
-    ("canonical_model_id", "other/model"), ("artifact_id", ""), ("max_score", 0.5),
+    ("canonical_model_id", "other/model"), ("artifact_id", ""),
+    ("max_score", None), ("max_score", 2.0),
     ("quant", "q8_0"),
 ])
 def test_recommend_downgrades_other_invalid_stored_evidence(
@@ -8808,6 +8849,7 @@ def test_render_benchmark_persists_structured_execution_provenance(
     assert saved["repeat_count"] == 2
     assert saved["total_generations"] == 4
     assert saved["run_scores"] == [0.4, 0.8]
+    assert saved["max_score"] == 1.0
     assert saved["artifact_id"] == "artifact:test"
     assert saved["canonical_model_id"] == "org/m"
 
@@ -8818,15 +8860,25 @@ def test_render_benchmark_refuses_unknown_or_changing_artifact(
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: None)
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
-    assert "cannot identify the exact cached artifact" in buf.getvalue()
+    assert "differs from its measured ceiling" in buf.getvalue()
     assert "model" not in saved
 
-    identities = iter(["artifact:a", "artifact:b"])
+    identities = iter(["artifact:test", "artifact:b"])
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: next(identities))
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
     assert "changed during the benchmark" in buf.getvalue()
     assert "model" not in saved
+
+
+def test_render_benchmark_refuses_ceiling_without_artifact_authority(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(cli.db, "get_characterization",
+                        lambda *_a: {"safe_context": 8000, "artifact_id": None})
+    c, buf = make_console()
+    assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "not bound to an exact artifact" in buf.getvalue()
 
 
 def test_render_benchmark_catalogs_exact_gguf_variant(make_console, monkeypatch):

@@ -210,9 +210,8 @@ def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
     if not isinstance(row.get("source"), str) or not row["source"]:
         return None, warning
     max_score = row.get("max_score")
-    if (max_score is not None and (isinstance(max_score, bool)
-            or not isinstance(max_score, (int, float)) or not math.isfinite(max_score)
-            or max_score <= 0 or score > max_score)):
+    if (isinstance(max_score, bool) or not isinstance(max_score, (int, float))
+            or not math.isfinite(max_score) or max_score != 1.0):
         return None, warning
     measured_at = row.get("measured_at")
     if measured_at is not None:
@@ -246,6 +245,8 @@ def validate_measured_evidence(row: dict) -> tuple[dict | None, str | None]:
     total = row.get("total_generations")
     structured = (row.get("probe_context"), row.get("generation_cap"), repeat_count,
                   total, row.get("run_scores_json"))
+    if row.get("refused_n") is None or row.get("errored_n") is None:
+        return None, warning
     if any(value is not None for value in structured) and any(value is None for value in structured):
         return None, warning
     if all(value is not None for value in structured) and sample_size is None:
