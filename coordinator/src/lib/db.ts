@@ -505,8 +505,9 @@ export function acknowledgeWorkForAgent(id: string, agentId: number): WorkAckRes
   const db = open();
   const changed = db.prepare(
     `UPDATE work SET status = 'dispatched', dispatched_at = datetime('now')
-     WHERE id = ? AND agent_id = ? AND status = 'offered'`,
-  ).run(id, agentId);
+     WHERE id = ? AND agent_id = ? AND status = 'offered'
+       AND EXISTS (SELECT 1 FROM agents WHERE agents.id = ? AND agents.status = 'active')`,
+  ).run(id, agentId, agentId);
   if (changed.changes === 1) return "ok";
   const row = db.prepare("SELECT agent_id, status FROM work WHERE id = ?").get(id) as
     | { agent_id: number; status: string }
@@ -554,6 +555,9 @@ export function recordWorkResult(
            result_environment_json = @result_environment_json,
            finished_at = datetime('now')
        WHERE id = @id AND agent_id = @agent_id AND status = 'dispatched'
+         AND EXISTS (
+           SELECT 1 FROM agents WHERE agents.id = @agent_id AND agents.status = 'active'
+         )
          AND @status IN ('done', 'failed')`,
     )
     .run({ id, agent_id: agentId, ...p });

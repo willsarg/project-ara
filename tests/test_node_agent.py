@@ -644,24 +644,86 @@ def test_completed_journal_prevents_reexecution_when_results_disappear_during_ru
         results.write_text("storage replaced", encoding="utf-8")
         return {"ok": True}
 
-    agent.run_loop(_cfg(), client=first, runner=runner, max_iterations=1,
-                   sleep=lambda _seconds: None)
-    assert first.acked == ["j1"] and first.posted == []
-    completion = json.loads(_accepted_files(tmp_path)[0].read_text(encoding="utf-8"))
-    assert completion["version"] == 2 and completion["completion"]["job_id"] == "j1"
+    def restore_storage(_seconds):
+        if results.is_file():
+            results.unlink()
+            results.mkdir()
 
-    results.unlink()
-    results.mkdir()
-    restarted = FakeClient([None])
-    agent.run_loop(
-        _cfg(), client=restarted,
-        runner=lambda _kind, _args: pytest.fail("completed work must not execute after restart"),
-        max_iterations=1, sleep=lambda _seconds: None,
-    )
+    agent.run_loop(_cfg(), client=first, runner=runner, max_iterations=1, sleep=restore_storage)
 
-    assert executions == ["first-completed"]
-    assert restarted.posted and restarted.posted[0][0] == "j1"
+    assert executions == ["first-completed"] and first.acked == ["j1"]
+    assert first.posted and first.posted[0][0] == "j1"
     assert _accepted_files(tmp_path) == [] and _spool_files(tmp_path) == []
+
+
+def test_spool_order_advances_past_durable_state_after_clock_rollback(tmp_path, monkeypatch):
+    older = {"version": 2, "order": 2_000, "job_id": "older", "payload": {"status": "done"}}
+    agent._write_result_envelope(older)
+    monkeypatch.setattr(agent, "_last_spool_order", 0)
+    monkeypatch.setattr(agent.time, "time_ns", lambda: 1_000)
+
+    newer = agent._new_result_envelope("newer", {"status": "done"})
+    agent._write_result_envelope(newer)
+    client = FakeClient([])
+    agent._flush_spool(client, _cfg())
+
+    assert newer["order"] == 2_001
+    assert [job_id for job_id, _payload in client.posted] == ["older", "newer"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics differ on Windows")
+def test_persisted_order_ignores_unusable_state_and_reads_completion_wal(tmp_path):
+    results = tmp_path / "node" / "results"
+    results.mkdir(parents=True)
+    (results / "link.json").symlink_to(tmp_path / "missing")
+    (results / "broken.json").write_text("{broken", encoding="utf-8")
+    (results / "list.json").write_text("[]", encoding="utf-8")
+    job = {"id": "j1", "kind": "run", "args": {}}
+    completion = {"version": 2, "order": 9_000, "job_id": "j1",
+                  "payload": {"status": "done"}}
+    agent._journal_completion(agent._accepted_path("j1"), job, completion)
+
+    assert agent._persisted_spool_order() == 9_000
+
+
+def test_completed_journal_recovery_refuses_conflicting_result_spool(tmp_path):
+    job = {"id": "j1", "kind": "run", "args": {}}
+    completion = agent._new_result_envelope("j1", {"status": "done", "result": {"value": 1}})
+    agent._journal_completion(agent._accepted_path("j1"), job, completion)
+    conflicting = {**completion, "payload": {"status": "done", "result": {"value": 2}}}
+    agent._write_result_envelope(conflicting)
+
+    with pytest.raises(agent._AcceptedJournalBlocked, match="conflicts"):
+        agent._recover_completed_journals()
+
+    assert json.loads(agent._spool_path("j1").read_text(encoding="utf-8")) == conflicting
+    assert agent._accepted_path("j1").exists()
+
+
+def test_completed_journal_recovery_accepts_identical_existing_spool(tmp_path):
+    job = {"id": "j1", "kind": "run", "args": {}}
+    completion = agent._new_result_envelope("j1", {"status": "done"})
+    agent._journal_completion(agent._accepted_path("j1"), job, completion)
+    agent._write_result_envelope(completion)
+
+    agent._recover_completed_journals()
+
+    assert not agent._accepted_path("j1").exists()
+    assert json.loads(agent._spool_path("j1").read_text(encoding="utf-8")) == completion
+
+
+def test_completed_journal_recovery_refuses_unreadable_existing_spool(tmp_path):
+    job = {"id": "j1", "kind": "run", "args": {}}
+    completion = agent._new_result_envelope("j1", {"status": "done"})
+    agent._journal_completion(agent._accepted_path("j1"), job, completion)
+    spool = agent._spool_path("j1")
+    spool.parent.mkdir(parents=True, exist_ok=True)
+    spool.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(agent._AcceptedJournalBlocked, match="unreadable"):
+        agent._recover_completed_journals()
+
+    assert agent._accepted_path("j1").exists() and spool.exists()
 
 
 def test_completed_journal_recovery_blocks_when_journal_cannot_be_retired(
@@ -882,6 +944,18 @@ def test_permanent_flush_rejection_retains_spool_when_accepted_cleanup_is_imposs
     agent._flush_spool(RaisingClient(post_error=_status_error(404)), _cfg())
 
     assert len(_spool_files(tmp_path)) == 1
+
+
+def test_permanent_rejection_quarantine_failure_blocks_later_results(tmp_path, monkeypatch):
+    agent._spool_result("old", {"status": "done"})
+    agent._spool_result("later", {"status": "done"})
+    monkeypatch.setattr(agent, "_quarantine_spool",
+                        lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
+    client = RaisingClient(post_error=_status_error(404))
+
+    agent._flush_spool(client, _cfg())
+
+    assert len(_spool_files(tmp_path)) == 2
 
 
 def test_permanent_immediate_rejection_retains_spool_when_accepted_cleanup_is_impossible(

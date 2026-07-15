@@ -223,10 +223,31 @@ def _verify_result_storage() -> None:
 _last_spool_order = 0
 
 
+def _persisted_spool_order() -> int:
+    highest = 0
+    paths = list(_results_dir().glob("*.json")) + list(_accepted_dir().glob("*.json"))
+    for path in paths:
+        try:
+            if path.is_symlink():
+                continue
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        order = value.get("order")
+        completion = value.get("completion")
+        if isinstance(completion, dict):
+            order = completion.get("order")
+        if isinstance(order, int) and not isinstance(order, bool) and order > highest:
+            highest = order
+    return highest
+
+
 def _next_spool_order() -> int:
     """Return a process-monotonic completion order suitable for durable spool replay."""
     global _last_spool_order  # noqa: PLW0603 — the single leased agent owns this sequence
-    _last_spool_order = max(time.time_ns(), _last_spool_order + 1)
+    _last_spool_order = max(time.time_ns(), _last_spool_order + 1, _persisted_spool_order() + 1)
     return _last_spool_order
 
 
@@ -381,7 +402,20 @@ def _recover_completed_journals() -> None:
                 or isinstance(completion["order"], bool) or completion["order"] < 1
                 or not isinstance(completion["payload"], dict)):
             continue
-        _write_result_envelope(completion)
+        spool_path = _spool_path(job["id"])
+        if spool_path.exists() or spool_path.is_symlink():
+            try:
+                existing = json.loads(spool_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise _AcceptedJournalBlocked(
+                    f"completion WAL conflicts with unreadable result spool {spool_path.name}"
+                ) from exc
+            if existing != completion:
+                raise _AcceptedJournalBlocked(
+                    f"completion WAL conflicts with existing result spool {spool_path.name}"
+                )
+        else:
+            _write_result_envelope(completion)
         if not _retire_accepted(path):
             raise _AcceptedJournalBlocked(
                 f"could not retire completed accepted-job journal {path.name}"
@@ -477,8 +511,10 @@ def _flush_spool(client: NodeClient, config) -> NodeClient:
             if accepted_retired:
                 try:
                     _quarantine_spool(f)
-                except OSError:
-                    pass
+                except OSError as quarantine_exc:
+                    health.status(
+                        f"could not quarantine rejected result spool {f.name}: {quarantine_exc}")
+                    return client
                 continue
             break
         if delivered and accepted_retired:
@@ -622,14 +658,14 @@ def _run_loop(config, *, client: NodeClient | None = None,
                 except OSError as exc:
                     health.status(f"all completion storage unavailable after execution: {exc}")
                     sleep(reauth_backoff)
-        if not result_spooled:
+        while not result_spooled:
             try:
                 _write_result_envelope(result_envelope)
+                result_spooled = True
             except OSError as exc:
                 health.status(
                     f"result spool unavailable after completion; preserving journal: {exc}")
                 sleep(reauth_backoff)
-                continue
         accepted_retired = _retire_accepted(accepted_path)
         try:
             delivered, client = _try_post(client, config, job["id"], payload)

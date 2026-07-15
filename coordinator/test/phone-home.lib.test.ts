@@ -566,6 +566,24 @@ describe("work queue", () => {
     expect(db.getWorkById(jobId)).toMatchObject({ status: "queued", offered_at: null });
   });
 
+  it("does not acknowledge or record results after the owning agent is revoked", async () => {
+    const agentId = await activeAgent("box-revoked-transitions");
+    const ackId = work.enqueue(agentId, "run", {});
+    expect(db.claimNextWorkForAgent(agentId)).not.toBeNull();
+    enroll.revoke(agentId);
+    expect(db.acknowledgeWorkForAgent(ackId, agentId)).toBe("conflict");
+
+    const resultAgent = await activeAgent("box-revoked-result");
+    const resultId = work.enqueue(resultAgent, "run", {});
+    expect(db.claimNextWorkForAgent(resultAgent)).not.toBeNull();
+    expect(db.acknowledgeWorkForAgent(resultId, resultAgent)).toBe("ok");
+    enroll.revoke(resultAgent);
+    expect(db.recordWorkResult(resultId, resultAgent, {
+      status: "done", result_json: "{}", error: null, measurement_json: null,
+      result_environment_json: JSON.stringify(VALID_ENV),
+    })).toBe("conflict");
+  });
+
   it("accepts exactly the four coordinator job kinds", async () => {
     const agentId = await activeAgent("box-job-kinds");
     for (const kind of ["run", "characterize", "detect", "benchmark"]) {
