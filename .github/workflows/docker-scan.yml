@@ -56,7 +56,7 @@ jobs:
         run: |
           docker run -d --name ara-smoke \
             -e ARA_COORDINATOR_SECRET=ci-boot-smoke -p 3000:3000 ara-coordinator:scan
-          for i in $(seq 1 15); do
+          for _ in $(seq 1 15); do
             sleep 2
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/health || true)
             [ "$code" = "200" ] && break

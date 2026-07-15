@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import time
 
 import pytest
 
@@ -648,8 +649,18 @@ def test_artifact_identity_tracks_same_size_local_gguf_with_restored_mtime(tmp_p
     original = model.stat()
     identity = staleness.artifact_identity(str(model))
 
-    model.write_bytes(b"mutated!")
-    os.utime(model, ns=(original.st_atime_ns, original.st_mtime_ns))
+    # Some filesystems (notably Docker overlayfs) coalesce ctime updates within one timestamp
+    # tick. Wait for an observable metadata change so this exercises the stat-based contract
+    # instead of assuming a filesystem resolution that ARA does not control.
+    deadline = time.monotonic() + 2.0
+    while True:
+        model.write_bytes(b"mutated!")
+        os.utime(model, ns=(original.st_atime_ns, original.st_mtime_ns))
+        if model.stat().st_ctime_ns != original.st_ctime_ns:
+            break
+        if time.monotonic() >= deadline:
+            pytest.skip("filesystem does not expose ctime changes at test resolution")
+        time.sleep(0.001)
 
     assert staleness.artifact_identity(str(model)) != identity
 

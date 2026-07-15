@@ -59,14 +59,16 @@ jobs:
       - name: Surface survivors clearly in the job log
         if: always()
         run: |
-          echo "## Mutation probe results" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          uv run mutmut results >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "A surviving mutant (🙁) is a finding to triage — a place the test suite wouldn't" >> "$GITHUB_STEP_SUMMARY"
-          echo "catch that specific code change — not a build failure. This job does not fail the" >> "$GITHUB_STEP_SUMMARY"
-          echo "build on survivors." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Mutation probe results"
+            echo '```'
+            uv run mutmut results || true
+            echo '```'
+            echo ""
+            echo "A surviving mutant (🙁) is a finding to triage — a place the test suite wouldn't"
+            echo "catch that specific code change — not a build failure. This job does not fail the"
+            echo "build on survivors."
+          } >> "$GITHUB_STEP_SUMMARY" 2>&1
       - name: Upload mutmut cache (survivor/killed detail, for local triage via `mutmut show <id>`)
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 — same pin as publish.yml
