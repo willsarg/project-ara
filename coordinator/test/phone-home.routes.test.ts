@@ -610,7 +610,7 @@ describe("POST /api/work/[id]/result boundary + error paths", () => {
     }
   });
 
-  it("accepts nullable schema fields when the status-required property is present", async () => {
+  it("accepts nullable success fields but rejects a failed result without an error reason", async () => {
     const { agentId, sessionToken } = await activate("box-result-schema-nullable");
     const { enqueue } = await import("@/lib/work");
     const doneId = enqueue(agentId, "detect", {});
@@ -643,7 +643,8 @@ describe("POST /api/work/[id]/result boundary + error paths", () => {
     );
 
     expect(done.status).toBe(200);
-    expect(failed.status).toBe(200);
+    expect(failed.status).toBe(400);
+    expect(db.getWorkById(failedId)!.status).toBe("dispatched");
   });
 
   it("400 on malformed JSON body (not 500)", async () => {

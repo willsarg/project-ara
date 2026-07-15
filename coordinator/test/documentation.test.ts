@@ -42,6 +42,7 @@ describe("coordinator operator documentation", () => {
     expect(nodes).toContain("dispatch time unknown");
     expect(nodes).toContain("Job was not queued: the selected node is no longer active.");
     expect(nodes).toContain("Job was not queued: node, model, and prompt are required.");
+    expect(nodes).toContain("Node was not denied: it is no longer pending.");
     expect(nodes).toContain('<input name="prompt" placeholder="prompt" required />');
     expect(nodes).toContain("jobId");
   });

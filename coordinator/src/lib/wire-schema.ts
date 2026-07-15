@@ -80,7 +80,10 @@ export const RESULT_REQUEST_SCHEMA = {
     },
     {
       if: { properties: { status: { const: "failed" } } },
-      then: { required: ["error"], properties: { result: { type: "null" } } },
+      then: {
+        required: ["error"],
+        properties: { error: { type: "string", minLength: 1 }, result: { type: "null" } },
+      },
     },
   ],
 } as const;
@@ -105,7 +108,7 @@ interface ResultRequestBase {
 
 export type ResultRequest = ResultRequestBase & (
   | { status: "done"; result: Record<string, unknown> | null; error?: null }
-  | { status: "failed"; error: string | null; result?: null }
+  | { status: "failed"; error: string; result?: null }
 );
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });

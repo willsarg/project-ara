@@ -15,7 +15,7 @@ import { listRecentWork } from "@/lib/work";
 export const dynamic = "force-dynamic";
 
 interface NodesPageProps {
-  searchParams: Promise<{ job?: string; jobId?: string }>;
+  searchParams: Promise<{ agent?: string; job?: string; jobId?: string }>;
 }
 
 export default async function NodesPage({ searchParams }: NodesPageProps) {
@@ -40,7 +40,9 @@ export default async function NodesPage({ searchParams }: NodesPageProps) {
       </header>
 
       <main className="wrap">
-        {receipt.job === "invalid" ? (
+        {receipt.agent === "not-pending" ? (
+          <p className="notice error">Node was not denied: it is no longer pending.</p>
+        ) : receipt.job === "invalid" ? (
           <p className="notice error">Job was not queued: node, model, and prompt are required.</p>
         ) : receipt.job === "not-active" ? (
           <p className="notice error">Job was not queued: the selected node is no longer active.</p>

@@ -229,6 +229,25 @@ describe("denyAgentAction", () => {
   it("no-ops when id is missing/falsy", async () => {
     await expect(actions.denyAgentAction(new FormData())).rejects.toThrow("NEXT_REDIRECT:/nodes");
   });
+
+  it("rejects a stale pending-page denial after the node was approved", async () => {
+    const agent = await pendingAgent("box-stale-deny");
+    enroll.approveAgent(agent.id);
+    const approved = db.getAgentById(agent.id)!;
+    expect(approved.pending_session_token).toEqual(expect.any(String));
+
+    const form = new FormData();
+    form.set("id", String(agent.id));
+    await expect(actions.denyAgentAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?agent=not-pending",
+    );
+
+    expect(db.getAgentById(agent.id)).toMatchObject({
+      status: "active",
+      session_token_hash: approved.session_token_hash,
+      pending_session_token: approved.pending_session_token,
+    });
+  });
 });
 
 describe("revokeAgentAction", () => {

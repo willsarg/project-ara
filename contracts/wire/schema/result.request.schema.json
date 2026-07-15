@@ -28,7 +28,10 @@
       "if": { "properties": { "status": { "const": "failed" } } },
       "then": {
         "required": ["error"],
-        "properties": { "result": { "type": "null" } }
+        "properties": {
+          "error": { "type": "string", "minLength": 1 },
+          "result": { "type": "null" }
+        }
       }
     }
   ]

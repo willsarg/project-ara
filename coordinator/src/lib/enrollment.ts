@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { hashToken, verifyEnrollmentToken } from "./node-auth";
 import {
   activateAgent,
+  denyPendingAgent,
   enrollAgentAtomically,
   getAgentByEnrollmentId,
   getPendingSessionToken,
@@ -14,7 +15,6 @@ import {
   listAgents,
   listAgentsByStatus,
   revokeAgent,
-  setAgentStatus,
   type AgentRow,
 } from "./db";
 
@@ -37,8 +37,8 @@ export function issueEnrollmentToken(): { token: string } {
   return { token };
 }
 
-/** Enroll a node. A used token retries its original enrollment idempotently. A fresh token for a
- *  known nonempty machine rotates that agent back to pending, preserving its stable id and jobs. */
+/** Enroll a node. A used token retries its original enrollment idempotently. Every fresh generic
+ * token creates a distinct pending owner; it cannot rotate or inherit an existing node's work. */
 export function enroll(
   token: string,
   self: SelfDescription,
@@ -92,8 +92,8 @@ export function approveAgent(id: number): void {
   activateAgent(id, hashToken(token), token);
 }
 
-export function denyAgent(id: number): void {
-  setAgentStatus(id, "denied");
+export function denyAgent(id: number): boolean {
+  return denyPendingAgent(id);
 }
 
 /** Revoke an approved agent: deny it and invalidate its session token (see db.revokeAgent). */

@@ -14,6 +14,8 @@
     { "fixture": "result.request.invalid-failed-missing-error.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
     { "fixture": "result.request.invalid-done-with-error.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
     { "fixture": "result.request.invalid-failed-with-result.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "result.request.invalid-failed-null-error.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
+    { "fixture": "result.request.invalid-failed-empty-error.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
     { "fixture": "result.request.invalid-bad-environment-enum.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },
     { "fixture": "enroll-poll.invalid-active-missing-token.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": false },
     { "fixture": "enroll.request.invalid-extra-property.json", "schema": "https://ara.dev/wire/enroll.request.json", "valid": false }

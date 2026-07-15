@@ -71,7 +71,10 @@ export async function approveAgentAction(form: FormData) {
 
 export async function denyAgentAction(form: FormData) {
   const id = Number(form.get("id"));
-  if (id) denyAgent(id);
+  if (id && !denyAgent(id)) {
+    revalidatePath("/nodes");
+    redirect("/nodes?agent=not-pending");
+  }
   revalidatePath("/nodes");
   redirect("/nodes");
 }

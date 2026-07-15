@@ -381,8 +381,17 @@ export function activateAgent(id: number, sessionTokenHash: string, plaintext: s
     .run(sessionTokenHash, plaintext, id);
 }
 
-export function setAgentStatus(id: number, status: string): void {
-  open().prepare("UPDATE agents SET status = ? WHERE id = ?").run(status, id);
+/** Deny only a still-pending enrollment. A stale pending-page action must never demote an active
+ * node or strand its transient session credential. */
+export function denyPendingAgent(id: number): boolean {
+  const changed = open()
+    .prepare(
+      `UPDATE agents
+       SET status = 'denied', session_token_hash = NULL, pending_session_token = NULL
+       WHERE id = ? AND status = 'pending'`,
+    )
+    .run(id);
+  return changed.changes === 1;
 }
 
 /** Revoke an agent: deny it and erase both the live hash and any unacknowledged plaintext, so no
