@@ -391,7 +391,7 @@ export function claimNextWorkForAgent(
            status = 'queued'
            OR (status = 'offered' AND dispatched_at <= datetime('now', ?))
          )
-         ORDER BY CASE status WHEN 'offered' THEN 0 ELSE 1 END, created_at, id LIMIT 1
+         ORDER BY CASE status WHEN 'offered' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1
        )
        RETURNING id, kind, args_json`,
     )

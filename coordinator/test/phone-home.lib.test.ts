@@ -547,6 +547,16 @@ describe("work queue", () => {
     expect(db.getWorkById(jobId)!.status).toBe("offered");
   });
 
+  it("preserves FIFO when multiple jobs share SQLite's one-second timestamp", async () => {
+    const agentId = await activeAgent("box-fifo-tie");
+    // Reverse lexical IDs prove the tie-breaker is insertion order, not the random public ID.
+    db.insertWork("job_z_first", agentId, "detect", "{}");
+    db.insertWork("job_a_second", agentId, "detect", "{}");
+    expect(db.claimNextWorkForAgent(agentId)!.id).toBe("job_z_first");
+    expect(db.acknowledgeWorkForAgent("job_z_first", agentId)).toBe("ok");
+    expect(db.claimNextWorkForAgent(agentId)!.id).toBe("job_a_second");
+  });
+
   it("reoffers an expired unacknowledged offer but never an acknowledged long job", async () => {
     const agentId = await activeAgent("box-offer-recovery");
     const jobId = work.enqueue(agentId, "benchmark", {});
