@@ -177,7 +177,7 @@ def test_cpu_features_x86_flags(set_platform, run_stub, monkeypatch):
     # Intel Mac (any host without /proc/cpuinfo): flags come from sysctl. Force the except branch
     # deterministically — on a real Linux host /proc/cpuinfo reads fine, so without this the test
     # silently exercises the proc branch instead and leaves the sysctl fallback uncovered (caught
-    # on rog-ubuntu, where the Z1's real cpuinfo happens to contain the same flags).
+    # on a live AMD test host whose cpuinfo happened to contain the same flags).
     set_platform("Darwin", "x86_64")
 
     def _no_proc(self):

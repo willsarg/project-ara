@@ -1,5 +1,5 @@
 {
-  "identity": { "hostname": "rog-ubuntu" },
+  "identity": { "hostname": "example-linux-node" },
   "capabilities": [],
   "environment": {
     "platform": "linux",

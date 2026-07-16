@@ -229,7 +229,8 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "ara node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))
     c.emit()
     if not accelerated:
-        c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
+        c.emit(c.style("dim", "  no accelerator auto-selected — using the portable CPU path "
+                              "(llama.cpp); "
                               "install with ") + c.style("accent", "ara install --engine cpu"))
     c.emit(c.style("dim", "  start with ") + c.style("accent", "ara detect"))
 
@@ -578,16 +579,22 @@ def _det_apps(c: Console, m) -> None:
 
 
 def _det_ara(c: Console, m) -> None:
+    backend_hint = "auto-picked for this hardware"
+    if not m.accelerated:
+        backend_hint = "portable CPU path — no accelerator auto-selected"
+        if any(g.usable_backend == "vulkan" for g in getattr(m, "gpus", [])):
+            backend_hint += (
+                "; Vulkan acceleration available — optional: ara install --engine vulkan")
+    install_key = _guidance_engine(m.backend)
     c.emit(c.section("  ARA"))
     c.emit(c.field(
         "backend", m.backend,
-        "auto-picked for this hardware" if m.accelerated
-        else "CPU fallback — no GPU backend detected",
+        backend_hint,
         value_role="good",
     ))
     c.emit(c.field(
         "engine", f"{m.engine} {'ready' if m.engine_ready else 'not installed'}",
-        None if m.engine_ready else "install: ara install",
+        None if m.engine_ready else f"install: {_install_guidance_command(install_key)}",
         value_role="good" if m.engine_ready else "warn",
     ))
     c.emit(c.field("hf cli",

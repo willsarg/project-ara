@@ -57,7 +57,7 @@ one-release compatibility aliases must not be used in new examples. Production s
 the same `python -m ara` main as the `ara` console script.
 
 Platform claims are evidence-based: macOS is verified with CPU + MLX, Windows with CPU + CUDA on
-an RTX 2070, and Linux with CPU. CUDA-on-Linux is not claimed until it is tested there.
+an 8 GB NVIDIA Turing GPU, and Linux with CPU. CUDA-on-Linux is not claimed until it is tested there.
 
 ## Landing a change
 

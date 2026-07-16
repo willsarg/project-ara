@@ -278,7 +278,7 @@ def test_public_docs_and_search_guidance_use_canonical_surface_and_uv_only():
     assert "`ara models search" in docs
     assert "`ara detect --runtime" in docs
     assert "macOS" in docs and "CPU + MLX" in docs
-    assert "Windows" in docs and "RTX 2070" in docs
+    assert "Windows" in docs and "8 GB NVIDIA Turing GPU" in docs
     assert "Linux" in docs and "CPU" in docs
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -337,7 +337,19 @@ def test_readme_scopes_nvidia_quick_start_to_verified_platform():
     prose = " ".join(readme.split())
     assert "### NVIDIA GPU (Windows verified)" in readme
     assert "NVIDIA on Linux is not yet claimed" in prose
-    assert "use the CPU fallback block" in prose
+    assert "use the CPU block" in prose
+
+
+def test_readme_treats_cpu_only_hosts_as_first_class_without_overclaiming():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    prose = " ".join(readme.split())
+    assert "### CPU (no GPU required)" in readme
+    assert "Windows or Linux without an NVIDIA GPU" in prose
+    assert "Intel Macs use this CPU path" in prose
+    assert "Intel Mac has not yet passed ARA's full verification suite" in prose
+    assert "C/C++ build tools" in prose
+    assert "reports Vulkan as usable" in prose
+    assert "ara install --engine vulkan" in prose
 
 
 def test_live_cli_guidance_never_points_to_hidden_aliases():

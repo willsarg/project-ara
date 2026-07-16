@@ -14,7 +14,8 @@ import pytest
 
 import ara.cli as cli
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
-from ara.hardware import (BoardInfo, CpuInfo, Drive, MemoryInfo, MemoryModule, StorageInfo)
+from ara.hardware import (BoardInfo, CpuInfo, Drive, GpuInfo, MemoryInfo, MemoryModule,
+                          StorageInfo)
 
 
 @pytest.fixture(autouse=True)
@@ -923,7 +924,8 @@ def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     cli.render_landing(c)
     out = buf.getvalue()
     assert "32 GB RAM" in out                  # plain 'RAM' label off Apple
-    assert "no GPU backend detected" in out and "ara install --engine cpu" in out
+    assert "no accelerator auto-selected" in out and "ara install --engine cpu" in out
+    assert "CPU fallback" not in out
     assert "bartowski/SmolLM2-135M-Instruct-GGUF" in out and "--engine cpu" in out
     assert "mlx" not in out                    # no stray internal jargon on a non-Apple box
 
@@ -1594,7 +1596,7 @@ def test_render_detect_verbose_and_cpu_fallback(monkeypatch, make_console, stub_
     # `accelerated` is a property — drive it via backend="cpu" (no GPU-class adapter).
     stub_pythons(count=1, discover=[])
     m = _machine(
-        backend="cpu", engine="llama.cpp", engine_ready=False,
+        backend="cpu", engine="cpu", engine_ready=False,
         cpu_logical=24, hf_token=False,
         accel=Accelerator("none", "none detected", None, None),
         runtimes=[Runtime("Ollama", False, None, kind="engine"),
@@ -1606,10 +1608,30 @@ def test_render_detect_verbose_and_cpu_fallback(monkeypatch, make_console, stub_
     cli.render_detect(c)
     out = buf.getvalue()
     assert "physical" in out and "logical" in out      # verbose cpu line
-    assert "CPU fallback — no GPU backend detected" in out   # _det_ara backend hint
-    assert "install: ara install" in out               # engine install hint (not gated)
+    assert "portable CPU path — no accelerator auto-selected" in out
+    assert "install: ara install --engine cpu" in out
+    assert "CPU fallback" not in out
     # verbose lists absent engine and absent store as "not found"
     assert out.count("not found") >= 2
+
+
+def test_render_detect_cpu_mentions_opt_in_vulkan_without_changing_default(
+        monkeypatch, make_console, stub_pythons):
+    stub_pythons(count=1, discover=[])
+    m = _machine(
+        system="Linux", arch="x86_64", backend="cpu", engine="cpu", engine_ready=False,
+        accel=Accelerator("none", "CPU", None, None),
+        gpus=[GpuInfo(vendor="amd", name="AMD Radeon 780M", integrated=True,
+                      compute_runtime="Vulkan 1.3 · RADV", usable_backend="vulkan")],
+    )
+    monkeypatch.setattr(cli.detect, "machine", lambda: m)
+    c, buf = make_console()
+    cli.render_detect(c)
+    out = buf.getvalue()
+    assert "Vulkan 1.3 · RADV — usable" in out
+    assert "Vulkan acceleration available — optional: ara install --engine vulkan" in out
+    assert "install: ara install --engine cpu" in out
+    assert "no GPU backend detected" not in out
 
 
 def test_gpu_line_shows_gtt_shared_pool_for_apu(make_console):

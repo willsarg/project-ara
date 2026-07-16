@@ -139,7 +139,7 @@ These are how **Rule #1 (Safety)** and **Rule #3 (Accuracy)** are enforced in th
   paths) must be OS-agnostic — use `pathlib`/`os.path`, branch interpreter/venv layout on
   `os.name` (`Scripts\python.exe` vs `bin/python`), keep OS-specific recon (sysctl, Homebrew
   paths) behind a platform guard. ARA is developed on macOS (Apple Silicon) and tested green on
-  macOS (CPU + MLX), Windows (CPU + CUDA, RTX 2070), and Linux (CPU); **claim a platform only once
+  macOS (CPU + MLX), Windows (CPU + CUDA, 8 GB NVIDIA Turing GPU), and Linux (CPU); **claim a platform only once
   the suite is green there** — CUDA-on-Linux shares the Windows code path but isn't claimed yet
   (no NVIDIA-on-Linux box has run it).
 

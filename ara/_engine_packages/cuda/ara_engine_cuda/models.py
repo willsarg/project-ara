@@ -96,7 +96,7 @@ def kv_cache_kwargs(kv_bits: int | None) -> dict:
 
     Uses transformers' public generate-time cache API (``cache_implementation="quantized"`` + a
     ``cache_config`` dict) rather than constructing a cache class. The backend string is the
-    lowercase ``"hqq"`` transformers expects (verified live against transformers 5.x on willw11)."""
+    lowercase ``"hqq"`` transformers expects (verified live against transformers 5.x on Windows)."""
     if kv_bits is None:
         return {}
     return {"cache_implementation": "quantized",

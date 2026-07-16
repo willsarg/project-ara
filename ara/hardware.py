@@ -1272,7 +1272,10 @@ def _with_runtime(g: "GpuInfo") -> "GpuInfo":
             bits = f"Vulkan {vk['api']} · {vk['driver']}"
             if vk["coopmat"]:
                 bits += " · coopmat"
-            runtime, backend = bits, "vulkan"
+            runtime = bits
+            if (platform.system() in ("Linux", "Windows")
+                    and platform.machine().lower() in ("x86_64", "amd64")):
+                backend = "vulkan"
         else:
             rv = _rocm_version()           # noted only; not a usable_backend on RDNA3/APU
             runtime = f"ROCm {rv}" if rv is not None else None

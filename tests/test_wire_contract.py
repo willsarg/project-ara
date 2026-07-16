@@ -62,3 +62,13 @@ def test_every_schema_is_valid_metaschema() -> None:
     """Each schema is itself a well-formed 2020-12 schema (catches typos in the contract)."""
     for path in _SCHEMA_DIR.glob("*.schema.json"):
         Draft202012Validator.check_schema(_load(path))
+
+
+def test_enrollment_fixtures_use_an_obviously_synthetic_identity() -> None:
+    """Public wire examples must not identify a maintainer's real fleet hosts."""
+    paths = _FIXTURE_DIR.glob("enroll.request.*.json")
+    for path in paths:
+        fixture = _load(path)
+        assert fixture["identity"]["hostname"].startswith("example-")
+        machine_key = fixture.get("machine_key")
+        assert machine_key is None or machine_key.startswith("example-")

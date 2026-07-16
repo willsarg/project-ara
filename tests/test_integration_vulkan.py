@@ -14,7 +14,7 @@ Opt-in and kept out of the fast unit loop:
 
 **Hardware-gated.** It skips unless an amdgpu Vulkan GPU is present (the amdgpu GTT sysfs exists),
 so it's a clean skip on the macOS/CI dev machines — and never triggers a CPU-only source build off
-the target hardware. Validated on rog-ubuntu (Ryzen Z1 Extreme / Radeon 780M, RADV).
+the target hardware. Validated on an x86_64 Linux host (Ryzen Z1 Extreme / Radeon 780M, RADV).
 
 Slug: 2026-06-25-vulkan-amd-engine-lane
 """

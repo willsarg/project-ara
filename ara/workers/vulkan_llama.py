@@ -60,7 +60,7 @@ _KV_GGML_TYPE = {"f16": 1, "q8_0": 8, "q4_0": 2}
 
 # Effective bytes per KV element by quant type, for the a-priori memory slope. The L1/L4 gate must
 # predict the SAME memory the quantized cache actually uses — otherwise it refuses contexts that
-# fit and KV-quant buys no extra ceiling (caught on rog-ubuntu). f16=2; q8_0=34B/32 (int8 + one
+# fit and KV-quant buys no extra ceiling (caught on a live Vulkan host). f16=2; q8_0=34B/32 (int8 + one
 # f16 scale per 32-block); q4_0=18B/32 (int4 + one f16 scale). Measurement (L2/L5) still backstops
 # these against the real wall, so a small inaccuracy can't breach safety.
 _KV_BYTES = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}

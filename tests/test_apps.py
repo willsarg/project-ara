@@ -374,7 +374,8 @@ def test_windows_installed_programs_no_winreg_returns_empty(monkeypatch):
     # Force `import winreg` to fail on EVERY platform (a None in sys.modules raises ImportError) —
     # otherwise this passes trivially off-Windows but FAILS on real Windows, where winreg imports
     # and reads the actual registry. Deterministically exercises the ImportError branch. Caught by
-    # live validation on willw11 (the test assumed winreg is always absent). Keep-branches-mockable.
+    # Live Windows validation caught this (the test assumed winreg is always absent).
+    # Keep branches mockable.
     monkeypatch.setitem(sys.modules, "winreg", None)
     assert apps._windows_installed_programs() == {}
 

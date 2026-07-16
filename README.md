@@ -66,7 +66,7 @@ ara run mlx-community/SmolLM-135M-Instruct-4bit "Explain local AI simply"
 
 ### NVIDIA GPU (Windows verified)
 
-This CUDA path is verified on Windows. NVIDIA on Linux is not yet claimed; use the CPU fallback
+This CUDA path is verified on Windows. NVIDIA on Linux is not yet claimed; use the CPU
 block below on Linux until that lane has passed ARA's full verification suite.
 
 ```bash
@@ -76,7 +76,11 @@ ara characterize HuggingFaceTB/SmolLM-135M-Instruct --engine cuda
 ara run HuggingFaceTB/SmolLM-135M-Instruct "Explain local AI simply"
 ```
 
-### CPU fallback
+### CPU (no GPU required)
+
+This is the portable path for Windows or Linux without an NVIDIA GPU, and Intel Macs use this CPU
+path too. Windows and Linux CPU execution are verified. Intel Mac has not yet passed ARA's full
+verification suite, so that route is available but not currently claimed as verified.
 
 ```bash
 ara detect
@@ -84,6 +88,14 @@ ara install --engine cpu
 ara characterize bartowski/SmolLM2-135M-Instruct-GGUF --engine cpu
 ara run bartowski/SmolLM2-135M-Instruct-GGUF "Explain local AI simply"
 ```
+
+Windows uses a prebuilt CPU engine wheel. On Linux and macOS, the engine may compile llama.cpp
+locally; when it does, the machine needs working C/C++ build tools. ARA reports a build failure
+instead of changing system tooling on your behalf.
+
+If `ara detect` reports Vulkan as usable on an x86_64 Windows or Linux machine, GPU offload is an
+optional next step through `ara install --engine vulkan`. The CPU path above remains the simplest
+starting point and is selected explicitly.
 
 These are deliberately tiny workflow demonstration models, not quality recommendations. The
 `characterize` step downloads missing model weights, then measures the largest context this
@@ -144,7 +156,7 @@ same production entrypoint. In a checkout, prefix either with `uv run`.
 |---|---|
 | `ara detect` | Read-only machine recon: chip, memory, accelerator, storage, engines, frameworks, cached models, and installed AI/ML apps. Facets: `--python`, `--apps`, `--runtime`, and `--models`. Runtime inventory is cross-platform; MLX ecosystem detail is added only on Apple Silicon. Never stresses the machine or loads an engine. |
 | `ara status` | What ARA itself is doing right now: idle, searching, characterizing, benchmarking, running, serving, or hosting the fleet coordinator. It is not a generic process monitor. |
-| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on an AMD iGPU's shared memory), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
+| `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in portable CPU path); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on a compatible x86_64 Windows/Linux GPU, including integrated GPUs), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
 | `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
 | `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
@@ -176,10 +188,10 @@ hardware-specific engine; it picks a backend for the machine and loads only that
 - **Apple Silicon** → ARA's native **MLX engine**,
   which finds each model's safe context ceiling *without crashing the machine*.
 - **NVIDIA / CUDA** → ARA's native **CUDA engine** (torch).
-- **Everything else** → the built-in **CPU engine** (llama.cpp on system RAM) — the universal
-  fallback, so any machine with enough RAM can run models, just not GPU-accelerated.
-- **AMD iGPU** → the built-in **Vulkan engine** (llama.cpp GGUF on the integrated GPU's shared
-  memory) — one wall, since the iGPU and CPU share RAM.
+- **Everything else** → the built-in **CPU engine** (llama.cpp on system RAM) — the portable
+  path, so any machine with enough RAM can run models without GPU acceleration.
+- **Vulkan-capable GPU on x86_64 Windows/Linux** → the opt-in **Vulkan engine** (llama.cpp
+  GGUF with GPU offload), including integrated GPUs that use shared system memory.
 - **NVIDIA, oversized for VRAM** → the built-in **cuda-gguf** engine (llama.cpp GGUF, partial
   offload `n_gpu_layers=K`) — ARA's first **two-wall** engine, governing discrete VRAM *and*
   system RAM at once so a model too big for VRAM runs K layers on the GPU and the rest on CPU.
@@ -198,11 +210,14 @@ The catalog of engines and the install logic live in [`ara/engines.py`](./ara/en
 | OS | Engines verified |
 |---|---|
 | **macOS (Apple Silicon)** | CPU + MLX — the primary development machine |
-| **Windows** | CPU + CUDA — full test suite green, inference verified on an RTX 2070 |
+| **Windows** | CPU + CUDA — full test suite green, inference verified on an 8 GB NVIDIA Turing GPU |
 | **Linux** | CPU — full suite and CPU integration tests green |
 
 CUDA on Linux shares the same native CUDA engine path as Windows, but isn't claimed here until the
 full suite is green on an NVIDIA-on-Linux box.
+
+Intel Macs route to the portable CPU engine by design, but are not listed in the verified table
+until that path has passed ARA's full suite and live CPU integration on Intel macOS.
 
 ---
 

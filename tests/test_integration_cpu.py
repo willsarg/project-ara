@@ -52,7 +52,7 @@ def test_safe_limits_reads_a_real_ram_wall(cpu_engine):
     m = cpu_engine.safe_limits()
     assert m["total_gb"] > 0 and m["wall_gb"] > 0
     # safe_budget = wall - the EFFECTIVE margin, which is min(cap, max(0.5, 0.1*RAM)) — not the raw
-    # cap. On a small-RAM box (~11 GB, caught on rog-ubuntu) 10% < the 2 GB cap, so asserting against
+    # cap. On a small-RAM box (~11 GB) 10% < the 2 GB cap, so asserting against
     # DEFAULT_MARGIN_GB is wrong; assert against the margin the limits dict actually reports.
     assert 0.5 <= m["margin_gb"] <= cpu_engine.DEFAULT_MARGIN_GB
     assert m["safe_budget_gb"] == pytest.approx(m["wall_gb"] - m["margin_gb"])

@@ -115,7 +115,7 @@ ENGINES: dict[str, dict] = {
         #   max_version: 0.3.19 is the last Windows CPU wheel that actually RUNS via this binding.
         #   The post-0.3.19 /whl/cpu Windows wheels (py3-none-win_amd64) ship a split/runtime-loaded
         #   ggml backend that llama-cpp-python doesn't initialize (upstream #2069, "no backends
-        #   loaded"). Verified 2026-06-30 on willw11 (Zen-3, cp312): 0.3.21 imports but fails to
+        #   loaded"). Verified 2026-06-30 on a Windows CUDA host (Zen-3, cp312): 0.3.21 imports but fails to
         #   load ANY model (SmolLM2 and gemma-4 both "Failed to load model from file"); 0.3.32's
         #   llama.dll fails to load outright (WinError 127). (Historically these were also flagged
         #   as AVX-512 builds that fault on non-AVX-512 CPUs — 0xc000001d.) Native builds elsewhere
@@ -123,7 +123,7 @@ ENGINES: dict[str, dict] = {
         #   llama-cpp-python (verified Mac cpu engine ships 0.3.31, runs gemma-4).
         #   RE-CERTIFY before raising this cap — don't guess. `scripts/certify_llama_cpp_cpu.py`
         #   installs a candidate version the same way (--only-binary + this index), loads a tiny
-        #   GGUF, and generates a token; exit 0 = safe to bump. Re-run 2026-07-02 on willw11
+        #   GGUF, and generates a token; exit 0 = safe to bump. Re-run 2026-07-02 on the Windows host
         #   re-confirmed 0.3.32 still fails at llama.dll load (WinError 127 → cap stays).
         "wheel_only": {
             "llama-cpp-python": {

@@ -617,7 +617,7 @@ def test_cpu_info_returns_empty_on_internal_exception(monkeypatch):
 # Task 3: Memory detail
 # ---------------------------------------------------------------------------
 
-# Fixtures from the plan (real winbox output)
+# Representative redacted Windows fixture values.
 _WIN_MEM_MODULES = [
     {"DeviceLocator": "DIMM_A1", "Capacity": 8589934592, "ConfiguredClockSpeed": 3400,
      "SMBIOSMemoryType": 26, "Manufacturer": "G-Skill", "PartNumber": "F4-3200C14-8GFX"},
@@ -633,7 +633,7 @@ _WIN_MEM_ARRAY = {"MemoryDevices": 4, "MaxCapacity": 134217728}
 
 _WIN_TOTALS = (32.0, 28.0, 0.0)   # (total_gb, available_gb, swap_gb)
 
-# macOS SPMemoryDataType text fixture (real Apple M4 Pro output shape)
+# Representative redacted macOS SPMemoryDataType output shape.
 _MACOS_SPMEMORY = """\
 Hardware Overview:
 
@@ -1407,9 +1407,9 @@ def test_disk_free_gb_uses_gib_not_decimal_gb(monkeypatch):
 # Task 5: Board / firmware (board_info)
 # ---------------------------------------------------------------------------
 
-# --- Fixtures from the plan (REAL captured output) ---
+# --- Representative redacted platform fixtures ---
 
-# macOS SPHardwareDataType text fixture (real Apple M4 Pro / MacBook Pro)
+# macOS SPHardwareDataType text fixture with unique identifiers redacted.
 _MACOS_SPHARDWARE = """\
 Hardware Overview:
 
@@ -1427,7 +1427,7 @@ Hardware Overview:
       Activation Lock Status: Disabled
 """
 
-# Windows WMI fixture objects (real winbox)
+# Representative Windows WMI fixture objects.
 _WIN_BASEBOARD = {"Manufacturer": "ASUSTeK COMPUTER INC.", "Product": "ROG STRIX X470-F GAMING"}
 _WIN_BIOS = {"SMBIOSBIOSVersion": "6042", "ReleaseDate": "\\/Date(1651104000000)\\/"}
 _WIN_SYSTEM = {"Manufacturer": "System manufacturer", "Model": "System Product Name"}
@@ -1474,8 +1474,8 @@ def test_board_macos_no_model_name_leaves_vendor_none():
 
 # --- _board_windows parser ---
 
-def test_board_windows_asus_rog_winbox():
-    """Real winbox fixture: board=ASUS ROG STRIX X470-F, bios=6042@2022-04-28,
+def test_board_windows_asus_rog_fixture():
+    """Representative fixture: board=ASUS ROG STRIX X470-F, bios=6042@2022-04-28,
     system=None/None (placeholders stripped by _clean)."""
     b = hw._board_windows(_WIN_BASEBOARD, _WIN_BIOS, _WIN_SYSTEM)
     assert b.board_vendor == "ASUSTeK COMPUTER INC."
@@ -1746,7 +1746,7 @@ def test_gpus_linux_reads_sysfs(tmp_path, monkeypatch):
     monkeypatch.setattr(hw, "cpu_info", lambda: hw.CpuInfo(vendor="AuthenticAMD"))
     # Stub the live Vulkan probe: the name priority is marketing-map → vulkaninfo → lspci, so on a
     # real Linux host with a Vulkan GPU the actual device name would win and mask the lspci fallback
-    # this test exercises (caught on rog-ubuntu: real RADV name beat the mocked "Phoenix1").
+    # this test exercises (a live RADV name once beat the mocked "Phoenix1").
     monkeypatch.setattr(hw, "_vulkan_devices", lambda: [])
     gpus = hw._gpus_linux()
     assert len(gpus) == 1 and gpus[0].name == "Phoenix1" and gpus[0].vendor == "amd"
@@ -2207,6 +2207,8 @@ def test_vulkan_devices_single_gpu_no_llvmpipe(monkeypatch):
 
 def test_with_runtime_amd_vulkan_usable(monkeypatch):
     from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hw.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(hw, "_vulkan_devices",
         lambda: [{"vendor": "amd", "api": "1.4.318", "driver": "radv", "coopmat": True}])
     monkeypatch.setattr(hw, "_rocm_version", lambda: None)
@@ -2253,12 +2255,29 @@ def test_with_runtime_nvidia_no_cuda(monkeypatch):
 
 def test_with_runtime_intel_vulkan_usable(monkeypatch):
     from ara import hardware as hw
+    monkeypatch.setattr(hw.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hw.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(hw, "_vulkan_devices",
         lambda: [{"vendor": "intel", "api": "1.3.290", "driver": "anv", "coopmat": False}])
     monkeypatch.setattr(hw, "_rocm_version", lambda: None)
     g = hw._with_runtime(hw.GpuInfo(vendor="intel", name="Intel Arc A770"))
     assert g.usable_backend == "vulkan"
     assert g.compute_runtime == "Vulkan 1.3.290 · anv"
+
+
+def test_with_runtime_vulkan_present_but_not_usable_on_unsupported_hosts(monkeypatch):
+    from ara import hardware as hw
+    monkeypatch.setattr(hw, "_vulkan_devices",
+        lambda: [{"vendor": "intel", "api": "1.3.290", "driver": "moltenvk",
+                  "coopmat": False}])
+    monkeypatch.setattr(hw, "_rocm_version", lambda: None)
+    for system, machine in (("Darwin", "x86_64"), ("Linux", "aarch64"),
+                            ("Windows", "ARM64")):
+        monkeypatch.setattr(hw.platform, "system", lambda value=system: value)
+        monkeypatch.setattr(hw.platform, "machine", lambda value=machine: value)
+        g = hw._with_runtime(hw.GpuInfo(vendor="intel", name="Integrated GPU"))
+        assert g.compute_runtime == "Vulkan 1.3.290 · moltenvk"
+        assert g.usable_backend is None
 
 
 def test_with_runtime_unknown_vendor_none(monkeypatch):

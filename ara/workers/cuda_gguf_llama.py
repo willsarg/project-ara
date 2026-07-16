@@ -61,7 +61,7 @@ def _add_cuda_dll_dirs() -> list[str]:
             # PATH prepend is the RELIABLE lever: ctypes/LoadLibraryEx load the bundled llama.dll
             # with LOAD_WITH_ALTERED_SEARCH_PATH, which resolves that DLL's own dependencies
             # (cudart64/cublas64) via PATH — NOT the os.add_dll_directory user dirs. Verified on
-            # willw11: add_dll_directory(v12.6\bin) alone did NOT fix the load; PATH prepend does.
+            # On Windows, add_dll_directory(v12.6\bin) alone did NOT fix the load; PATH prepend does.
             if d not in os.environ.get("PATH", "").split(os.pathsep):
                 os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
             added.append(d)
@@ -266,7 +266,7 @@ def offload_ok_partial(device: dict | None, offloaded: tuple[int, int] | None) -
 
 # --------------------------------------------------------------------------- #
 # Engine-touching helpers (import llama_cpp / psutil / nvidia-smi inside).
-# Not unit-covered here (workers are omitted from the gate); validated LIVE on willw11.
+# Not unit-covered here (workers are omitted from the gate); validated live on Windows.
 # --------------------------------------------------------------------------- #
 def _used_ram_gb() -> float:
     """Live system RAM in use (GB) — MAX of a few reads (Rule #1: never under-report the base)."""
