@@ -140,7 +140,11 @@ def test_models_group_bare_and_help_show_generated_help(mocked_world, capsys):
         assert cli.main(argv) == 0
         captured = capsys.readouterr()
         assert captured.err == ""
-        assert "Usage: ara models [OPTIONS] COMMAND [ARGS]..." in captured.out
+        usage = captured.out.splitlines()[0]
+        assert usage in {
+            "Usage: ara models [OPTIONS] COMMAND [ARGS]...",
+            "Usage: ara models [OPTIONS] [COMMAND] [ARGS]...",
+        }
         assert "search" in captured.out
         assert "recommend" in captured.out
         assert "show" in captured.out

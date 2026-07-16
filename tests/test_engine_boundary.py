@@ -171,5 +171,13 @@ def test_coverage_and_mutation_only_exclude_native_engine_packages():
     mutation_probe = (_ROOT / "scripts" / "mutation_probe.sh").read_text(encoding="utf-8")
     assert "ara/_engine_packages/" in mutation_probe
     assert "ara/_vendor/" not in mutation_probe
+    assert "mapfile" not in mutation_probe
+    assert 'rm -rf "$MUTANTS_DIR"' in mutation_probe
     assert 'uv run mutmut run --max-children "${MUTMUT_MAX_CHILDREN:-1}" || true' \
         not in mutation_probe
+
+    mutation_workflow = (_ROOT / ".github" / "workflows" / "mutation.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "path: mutants" in mutation_workflow
+    assert "path: .mutmut-cache" not in mutation_workflow

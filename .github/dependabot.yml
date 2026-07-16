@@ -30,6 +30,12 @@ updates:
     groups:
       coordinator:
         patterns: ["*"]      # one combined PR for all Node dep bumps
+    ignore:
+      # Next.js 16's build-time TypeScript detection does not recognize the platform-split
+      # TypeScript 7 package yet. Keep patch/minor updates flowing on the supported line, but do
+      # not let a major compiler bump poison the otherwise-safe coordinator update group.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /coordinator   # the multi-stage Dockerfile's base image
