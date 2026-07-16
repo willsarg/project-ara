@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ara import cli, mlx, pythons
+from ara import cli, engines, mlx, pythons
 from ara.detect import Accelerator, Machine, Runtime
 from ara.mlx import MlxInterpreter
 
@@ -244,7 +244,7 @@ def test_generated_help_matches_frozen_visible_tree_and_examples(capsys):
     examples = {
         ("detect",): ("Usage: ara detect [OPTIONS]", "ara detect --runtime --json"),
         ("models", "search"): (
-            "Usage: ara models search [OPTIONS] QUERY...", 'ara models search "small vision model" --json'),
+            "Usage: ara models search [OPTIONS] QUERY...", 'ara models search "small instruct model" --json'),
         ("node", "enroll"): (
             "Usage: ara node enroll [OPTIONS] [SERVER_URL]", "ara node enroll https://ara.example --token TOKEN"),
         ("run",): ("Usage: ara run [OPTIONS] MODEL PROMPT...", 'ara run org/model "Explain this" --json'),
@@ -292,6 +292,52 @@ def test_public_docs_and_search_guidance_use_canonical_surface_and_uv_only():
     source = (ROOT / "ara" / "cli.py").read_text(encoding="utf-8")
     assert "pip install " not in source
     assert "uv run ara" in source
+
+
+def test_readme_has_exact_engine_specific_first_completion_paths():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    paths = {
+        "mlx": "\n".join([
+            "ara detect",
+            "ara install",
+            "ara characterize mlx-community/SmolLM-135M-Instruct-4bit --engine mlx",
+            'ara run mlx-community/SmolLM-135M-Instruct-4bit "Explain local AI simply"',
+        ]),
+        "cuda": "\n".join([
+            "ara detect",
+            "ara install",
+            "ara characterize HuggingFaceTB/SmolLM-135M-Instruct --engine cuda",
+            'ara run HuggingFaceTB/SmolLM-135M-Instruct "Explain local AI simply"',
+        ]),
+        "cpu": "\n".join([
+            "ara detect",
+            "ara install --engine cpu",
+            "ara characterize bartowski/SmolLM2-135M-Instruct-GGUF --engine cpu",
+            'ara run bartowski/SmolLM2-135M-Instruct-GGUF "Explain local AI simply"',
+        ]),
+    }
+    for engine_key, snippet in paths.items():
+        assert engines.ENGINES[engine_key]["smoke_model"] in readme
+        assert snippet in readme
+    assert {spec["smoke_model"] for spec in engines.ENGINES.values()} <= set(readme.split())
+
+
+def test_readme_teaches_the_first_ten_minutes_without_hiding_costs():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "pipx-style" in readme and "https://docs.astral.sh/uv/getting-started/installation/" in readme
+    assert "tiny workflow demonstration" in readme
+    assert "downloads" in readme and "network" in readme and "disk" in readme and "time" in readme
+    assert "Optional preflight" in readme and "ara profile" in readme
+    for term in ("model", "engine", "Transformers", "GGUF", "quantization", "token", "context", "characterization"):
+        assert f"**{term}" in readme
+
+
+def test_readme_scopes_nvidia_quick_start_to_verified_platform():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    prose = " ".join(readme.split())
+    assert "### NVIDIA GPU (Windows verified)" in readme
+    assert "NVIDIA on Linux is not yet claimed" in prose
+    assert "use the CPU fallback block" in prose
 
 
 def test_live_cli_guidance_never_points_to_hidden_aliases():

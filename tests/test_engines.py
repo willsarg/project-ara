@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ara.engines as engines
+from ara import acquire
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +636,21 @@ def test_uninstall_removes_present_env_with_missing_schema_stamp(monkeypatch):
 def test_every_shipping_engine_has_model_kinds():
     for key in ("mlx", "cuda", "cpu", "vulkan", "cuda-gguf"):
         assert "model_kinds" in engines.ENGINES[key], f"{key!r} missing model_kinds"
+
+
+def test_every_shipping_engine_has_an_approved_smoke_model_for_its_lane():
+    expected = {
+        "mlx": ("mlx-community/SmolLM-135M-Instruct-4bit", "transformers"),
+        "cuda": ("HuggingFaceTB/SmolLM-135M-Instruct", "transformers"),
+        "cpu": ("bartowski/SmolLM2-135M-Instruct-GGUF", "gguf"),
+        "vulkan": ("bartowski/SmolLM2-135M-Instruct-GGUF", "gguf"),
+        "cuda-gguf": ("bartowski/SmolLM2-135M-Instruct-GGUF", "gguf"),
+    }
+
+    for key, (model, kind) in expected.items():
+        assert engines.ENGINES[key]["smoke_model"] == model
+        assert acquire.valid_model_ref(model)
+        assert kind in engines.ENGINES[key]["model_kinds"]
 
 
 def test_vulkan_is_gguf_capable_but_cpu_stays_the_gguf_default():

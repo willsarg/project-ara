@@ -154,10 +154,41 @@ def _landing_hardware(chip: str, backend: str, mem_gb: float | None,
     return tokens
 
 
+def _guidance_engine(backend: str | None = None) -> str:
+    """Choose the concrete engine shown in human first-run guidance.
+
+    Automatic install intentionally covers only detected Apple/NVIDIA acceleration. When no
+    supported accelerated lane is detected, guidance names the portable CPU lane explicitly.
+    """
+    return engines.for_backend(backend or detect.backend_name()) or "cpu"
+
+
+def _install_guidance_command(engine_key: str) -> str:
+    """The install command a newcomer should copy for *engine_key*."""
+    return "ara install" if engine_key in ("mlx", "cuda") else f"ara install --engine {engine_key}"
+
+
+def _emit_first_model_path(c: Console, engine_key: str | None = None) -> None:
+    """Explain how an empty catalog becomes one measured, runnable smoke model."""
+    key = engine_key or _guidance_engine()
+    model = engines.ENGINES[key]["smoke_model"]
+    c.emit(c.style("dim", "  no models cached yet"))
+    c.emit(c.style("dim", "  start: ") + c.style("accent", _install_guidance_command(key)))
+    c.emit(c.style("dim", "  then:  ")
+           + c.style("accent", f"ara characterize {model} --engine {key}"))
+    c.emit(c.style("dim", "         downloads a tiny demo model if needed, then measures its "
+                           "safe context ceiling"))
+    c.emit(c.style("dim", "  run:   ")
+           + c.style("accent", f'ara run {model} "Explain local AI simply"'))
+    c.emit(c.style("dim", "         after characterization succeeds"))
+
+
 def render_landing(c: Console) -> None:
     chip = detect.chip_name()
     backend = detect.backend_name()
     accelerated = backend in ("apple", "cuda")
+    engine_key = _guidance_engine(backend)
+    smoke_model = engines.ENGINES[engine_key]["smoke_model"]
 
     acc = detect.accelerator(chip)
     tokens = _landing_hardware(
@@ -176,29 +207,31 @@ def render_landing(c: Console) -> None:
         line += c.style("dim", " · ") + c.style("metric", tok)
     c.emit(line)
     c.emit()
-    c.emit(c.section("  GETTING STARTED") + c.style("dim", "  (the planned v1 path)"))
-    c.emit(_cmd(c, "detect", "inspect this machine — read-only recon"))
+    c.emit(c.section("  FIRST RUN"))
+    c.emit(_cmd(c, "ara detect", "inspect this machine — read-only recon"))
     c.emit(c.style("dim", "                  --python · --apps · --runtime · --models · --json"))
-    c.emit(_cmd(c, "status", "show what ARA is doing right now"))
-    c.emit(_cmd(c, "models search", "find models on the Hugging Face Hub"))
-    c.emit(_cmd(c, "detect --models", "catalog models physically cached on this machine"))
-    c.emit(_cmd(c, "characterize <model>", "measure a model's safe context ceiling here"))
-    c.emit(_cmd(c, "install", "install the engine matched to this machine"))
-    c.emit(_cmd(c, "profile", "estimate this machine's capability (analytic — no engine)"))
-    c.emit(_cmd(c, "models recommend", "catalog models that fit, ranked by usable context"))
-    c.emit(_cmd(c, "run <model>", "launch it safely — right up to the edge, never over"))
-    c.emit(_cmd(c, "serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
-    c.emit(_cmd(c, "benchmark <model>", "run a capability probe and store the measured score"))
-    c.emit(_cmd(c, "hub", "host the coordinator that ARA nodes phone home to"))
-    c.emit(_cmd(c, "node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))
+    install_command = _install_guidance_command(engine_key).removeprefix("ara ")
+    c.emit(_cmd(c, f"ara {install_command}", "install the engine for this machine"))
+    c.emit(_cmd(c, f"ara characterize {smoke_model} --engine {engine_key}",
+                "download a tiny demo model and measure its safe context ceiling"))
+    c.emit(_cmd(c, f'ara run {smoke_model} "Explain local AI simply"',
+                "generate one completion under that measured ceiling"))
+    c.emit()
+    c.emit(c.section("  EXPLORE"))
+    c.emit(_cmd(c, "ara status", "show what ARA is doing right now"))
+    c.emit(_cmd(c, "ara models search", "find models on the Hugging Face Hub"))
+    c.emit(_cmd(c, "ara detect --models", "catalog models physically cached on this machine"))
+    c.emit(_cmd(c, "ara profile", "estimate this machine's capability (analytic — no engine)"))
+    c.emit(_cmd(c, "ara models recommend", "catalog models that fit, ranked by usable context"))
+    c.emit(_cmd(c, "ara serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
+    c.emit(_cmd(c, "ara benchmark <model>", "run a capability probe and store the measured score"))
+    c.emit(_cmd(c, "ara hub", "host the coordinator that ARA nodes phone home to"))
+    c.emit(_cmd(c, "ara node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))
     c.emit()
     if not accelerated:
         c.emit(c.style("dim", "  no GPU backend detected — using the CPU fallback (llama.cpp); "
                               "install with ") + c.style("accent", "ara install --engine cpu"))
-    c.emit(
-        c.style("dim", "  try ") + c.style("accent", "ara detect")
-        + c.style("dim", "  ·  run is next")
-    )
+    c.emit(c.style("dim", "  start with ") + c.style("accent", "ara detect"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1543,6 +1576,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         if dc and dc > ceiling:
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
                    + c.style("dim", "  · grow-by-streaming, not a prompt size"))
+        c.emit(c.style("dim", "  next: ")
+               + c.style("accent", f'ara run {model} "Explain local AI simply"'))
     else:
         base = result.get("base_gb")
         budget = result.get("budget_gb")
@@ -1678,7 +1713,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
                + c.style("dim", f"  {m['modality'] or '?'}  →  ")
                + c.style(role, tail))
     if not models:
-        c.emit(c.style("dim", "  empty — download a model and it'll be cataloged here"))
+        _emit_first_model_path(c)
     c.emit()
     n_char = sum(1 for m in models if m["model_id"] in best)
     c.emit(c.style("dim", f"  {len(models)} cataloged · {n_char} characterized on this machine"))
@@ -1807,8 +1842,11 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         noun = "model" if len(models) == 1 else "models"
         c.emit(c.field("catalog", f"{len(models)} cached {noun} · ephemeral read-only scan"))
     if not recs:
-        c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
-                              "try a smaller / more-quantized model"))
+        if not models:
+            _emit_first_model_path(c, default_engine or "cpu")
+        else:
+            c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
+                                  "try a smaller / more-quantized model"))
         _unrankable_note()
         c.emit()
         return 0
@@ -3217,6 +3255,12 @@ def render_install(c: Console, *, engine: str = "auto", refresh: bool = False,
     else:  # failed
         c.emit(c.style("bad", f"  installing {pkg} failed:"))
         c.emit(c.style("dim", f"  {result.detail}"))
+    if result.status in _INSTALL_OK:
+        model = engines.ENGINES[key]["smoke_model"]
+        c.emit(c.style("dim", "  next: ")
+               + c.style("accent", f"ara characterize {model} --engine {key}"))
+        c.emit(c.style("dim", "        downloads a tiny demo model if needed, then measures its "
+                               "safe context ceiling"))
     return 0 if result.status in _INSTALL_OK else 1
 
 
@@ -3962,7 +4006,7 @@ def _click_models(ctx: click.Context) -> int:
 
 
 @_click_models.command("search", context_settings=_HELP_SETTINGS,
-                       epilog='Example:\n  ara models search "small vision model" --json')
+                       epilog='Example:\n  ara models search "small instruct model" --json')
 @click.argument("query", nargs=-1, required=True)
 @_json_verbose_options
 @click.pass_context
@@ -4016,7 +4060,8 @@ def _click_characterize(ctx: click.Context, model: str, engine: str | None, kv_q
     """Safely measure MODEL's real context ceiling by loading it on an engine.
 
     ARA ramps context within the selected engine's safety boundary, then stores the measured
-    ceiling as evidence for later governed operations.
+    ceiling as evidence for later governed operations. Omit tuning options to use ARA's safe
+    defaults.
     """
     c = _mark_json(ctx, as_json)
     with locking.measurement_lock():
@@ -4067,7 +4112,8 @@ def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: 
     """Generate one governed completion under MODEL's characterized safe ceiling.
 
     ARA selects a compatible characterized engine unless --engine pins one, and refuses before
-    loading when the requested settings do not match the measurement.
+    loading when the requested settings do not match the measurement. Omit tuning options to use
+    ARA's safe defaults.
     """
     return render_run(
         _mark_json(ctx, as_json), model, prompt=" ".join(prompt) or None, engine=engine,

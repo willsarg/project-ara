@@ -16,6 +16,7 @@ CI. It skips cleanly when uv or the network/model aren't available.
 """
 from __future__ import annotations
 
+import json
 import shutil
 
 import pytest
@@ -30,17 +31,20 @@ SMOKE_MODEL = "bartowski/SmolLM2-135M-Instruct-GGUF"
 
 
 @pytest.fixture
-def cpu_engine(tmp_path, monkeypatch):
+def cpu_engine(tmp_path, monkeypatch, capsys):
     """Install the cpu engine into a throwaway env; yield the cpu backend. Skips if it can't."""
     monkeypatch.setenv("ARA_ENGINES_DIR", str(tmp_path / "engines"))
     if shutil.which("uv") is None:
         pytest.skip("uv not on PATH")
-    from ara import engines
+    from ara import cli
     from ara.backends import cpu
 
-    result = engines.install("cpu")
-    if result.status not in ("installed", "already"):
-        pytest.skip(f"cpu engine install unavailable: {result.status} {result.detail}".strip())
+    rc = cli.main(["install", "--engine", "cpu", "--json"])
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    if rc != 0:
+        pytest.skip(f"cpu engine install unavailable: {result}")
+    assert result["key"] == "cpu" and result["status"] in ("installed", "already", "refreshed")
     return cpu
 
 
@@ -89,3 +93,55 @@ def test_generate_produces_a_real_completion(cpu_engine):
     assert "refused" not in out, f"governed generate was refused: {out.get('reason')}"
     assert out["context"] == 2048                       # KV capped at the governed ceiling
     assert isinstance(out["completion"], str) and out["completion"].strip()
+
+
+def test_public_cli_reaches_a_governed_first_cpu_completion(
+        tmp_path, monkeypatch, capsys):
+    """The README's CPU path works through public commands and persists authoritative evidence."""
+    if shutil.which("uv") is None:
+        pytest.skip("uv not on PATH")
+
+    # Fetch independently before invoking the workflow. A network/model failure is environmental
+    # and may skip; after this succeeds, every CLI or evidence failure is an ARA regression.
+    from ara.workers import cpu_llama
+    try:
+        cpu_llama._resolve_gguf(SMOKE_MODEL)
+    except Exception as exc:
+        pytest.skip(f"{SMOKE_MODEL} unavailable (offline?): {exc}")
+
+    monkeypatch.setenv("ARA_ENGINES_DIR", str(tmp_path / "engines"))
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "ara.db"))
+
+    from ara import cli, db, profile, scoring
+
+    assert cli.main(["install", "--engine", "cpu", "--json"]) == 0
+    install_payload = json.loads(capsys.readouterr().out)
+    assert install_payload["key"] == "cpu"
+    assert install_payload["status"] in ("installed", "already", "refreshed")
+
+    assert cli.main([
+        "characterize", SMOKE_MODEL, "--engine", "cpu", "--json",
+    ]) == 0
+    characterize_payload = json.loads(capsys.readouterr().out)
+    safe_context = characterize_payload["safe_context"]
+    assert characterize_payload["engine"] == "cpu"
+    assert isinstance(safe_context, int) and not isinstance(safe_context, bool)
+    assert safe_context > 0
+
+    with db.connected_readonly() as con:
+        row = db.get_characterization(
+            con, profile.machine_key(), "cpu", scoring.durable_model_id(SMOKE_MODEL),
+        )
+    assert row is not None
+    assert row["engine"] == "cpu"
+    assert row["safe_context"] == safe_context
+    assert isinstance(row["artifact_id"], str) and row["artifact_id"]
+
+    assert cli.main([
+        "run", SMOKE_MODEL, "Reply with one word", "--engine", "cpu", "--yes",
+        "--max-tokens", "8", "--json",
+    ]) == 0
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_payload["engine"] == "cpu"
+    assert run_payload["safe_context"] == safe_context
+    assert isinstance(run_payload["completion"], str) and run_payload["completion"].strip()

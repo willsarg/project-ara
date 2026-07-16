@@ -476,6 +476,7 @@ def test_run_help_explains_governance_and_generation_controls(capsys):
     assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf" in out
     assert "--max-tokens N" in out and "Maximum new tokens" in out
     assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
+    assert "Omit tuning options to use ARA's safe defaults" in out
 
 
 @contextlib.contextmanager
@@ -518,6 +519,14 @@ def test_characterize_help_explains_measurement_and_engine_specific_choices(caps
     assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
     assert "CUDA weight format: none, int8, int4, or fp8" in out
     assert "selected engine's safety boundary" in out
+    assert "Omit tuning options to use ARA's safe defaults" in out
+
+
+def test_models_search_help_starts_with_a_text_model_example(capsys):
+    assert cli.main(["models", "search", "--help"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert 'ara models search "small instruct model" --json' in out
+    assert "small vision model" not in out
 
 
 # --kv-quant flag threading (default f16). Slug: 2026-06-25-vulkan-kv-cache-quant
@@ -893,9 +902,14 @@ def test_render_landing_supported(make_console, monkeypatch):
     assert "ara" in out and "Apple M4 Pro" in out
     assert "24 GB unified memory" in out and "16-core GPU" in out   # hardware, in plain terms
     assert "ara-engine-mlx" not in out and "backend apple" not in out    # no internal jargon on the line
-    assert "GETTING STARTED" in out
+    assert "FIRST RUN" in out
     assert "detect" in out and "status" in out and "profile" in out
     assert "--python" in out and "--runtime" in out   # detect facet hint (python/apps/mlx collapsed in)
+    assert "ara install" in out
+    assert "mlx-community/SmolLM-135M-Instruct-4bit" in out
+    assert "--engine mlx" in out
+    assert out.index("detect") < out.index("ara install") < out.index("characterize") < out.index("run mlx-community")
+    assert "planned v1 path" not in out and "run is next" not in out
     assert "CPU fallback" not in out
 
 
@@ -910,7 +924,25 @@ def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     out = buf.getvalue()
     assert "32 GB RAM" in out                  # plain 'RAM' label off Apple
     assert "no GPU backend detected" in out and "ara install --engine cpu" in out
+    assert "bartowski/SmolLM2-135M-Instruct-GGUF" in out and "--engine cpu" in out
     assert "mlx" not in out                    # no stray internal jargon on a non-Apple box
+
+
+def test_render_landing_cuda_uses_cuda_first_run(make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "chip_name", lambda: "Ryzen 9")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli.detect, "_memory_gb", lambda: (64.0, 20.0))
+    monkeypatch.setattr(
+        cli.detect, "accelerator",
+        lambda chip: cli.detect.Accelerator("cuda", "NVIDIA RTX 4090", 24.0, "CUDA"),
+    )
+    c, buf = make_console()
+    cli.render_landing(c)
+    out = buf.getvalue()
+    assert "NVIDIA RTX 4090" in out
+    assert "HuggingFaceTB/SmolLM-135M-Instruct" in out
+    assert "--engine cuda" in out
+    assert out.index("detect") < out.index("ara install") < out.index("characterize") < out.index("run HuggingFaceTB")
 
 
 def test_cmd_long_name_keeps_gap_before_gloss(make_console):
@@ -2123,6 +2155,25 @@ def test_render_install_refreshed_is_success(make_console, monkeypatch):
     assert "refreshed" in buf.getvalue().lower()
 
 
+@pytest.mark.parametrize("key,model", [
+    ("mlx", "mlx-community/SmolLM-135M-Instruct-4bit"),
+    ("cuda", "HuggingFaceTB/SmolLM-135M-Instruct"),
+    ("cpu", "bartowski/SmolLM2-135M-Instruct-GGUF"),
+    ("vulkan", "bartowski/SmolLM2-135M-Instruct-GGUF"),
+    ("cuda-gguf", "bartowski/SmolLM2-135M-Instruct-GGUF"),
+])
+@pytest.mark.parametrize("status", ["installed", "refreshed", "already"])
+def test_render_install_success_points_at_approved_smoke_model(
+        make_console, monkeypatch, key, model, status):
+    _stub_install(monkeypatch, key, status)
+    c, buf = make_console()
+    assert cli.render_install(c, engine=key) == 0
+    out = buf.getvalue()
+    assert f"ara characterize {model} --engine {key}" in out
+    assert "tiny demo model" in out
+    assert "downloads" in out and "safe context ceiling" in out
+
+
 def test_render_install_threads_refresh_to_engines(make_console, monkeypatch):
     seen = {}
     monkeypatch.setattr(cli.engines, "resolve", lambda v: "mlx")
@@ -2459,7 +2510,21 @@ def test_render_models_empty_and_no_engine(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "unsupported")  # engine_key None
     c, buf = make_console()
     cli.render_models(c)
-    assert "empty" in buf.getvalue()
+    out = buf.getvalue()
+    assert "no models cached" in out
+    assert "ara install --engine cpu" in out
+    assert "ara characterize bartowski/SmolLM2-135M-Instruct-GGUF --engine cpu" in out
+    assert ('ara run bartowski/SmolLM2-135M-Instruct-GGUF '
+            '"Explain local AI simply"') in out
+    assert "downloads a tiny demo model" in out
+
+
+def test_render_models_empty_json_remains_empty_list(monkeypatch, capsys, store):
+    monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "all_models", lambda con: [])
+    c = cli.Console(color=False, stream=sys.stderr)
+    cli.render_models(c, as_json=True)
+    assert json.loads(capsys.readouterr().out) == []
 
 
 def test_render_models_json(monkeypatch, capsys, store):
@@ -2639,6 +2704,28 @@ def test_recommend_none_fit(make_console, monkeypatch, set_platform):
     c, buf = make_console()
     assert cli.render_recommend(c) == 0
     assert "nothing in the catalog fits" in buf.getvalue()
+
+
+def test_recommend_empty_catalog_shows_first_model_path(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [])
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    out = buf.getvalue()
+    assert "no models cached" in out
+    assert "nothing in the catalog fits" not in out
+    assert "ara install" in out
+    assert "ara characterize mlx-community/SmolLM-135M-Instruct-4bit --engine mlx" in out
+    assert ('ara run mlx-community/SmolLM-135M-Instruct-4bit '
+            '"Explain local AI simply"') in out
+
+
+def test_recommend_empty_catalog_json_remains_empty_list(
+        monkeypatch, capsys, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [])
+    c = cli.Console(color=False, stream=sys.stderr)
+    assert cli.render_recommend(c, as_json=True) == 0
+    assert json.loads(capsys.readouterr().out) == []
 
 
 def test_recommend_notes_fitting_but_unrankable(make_console, monkeypatch, set_platform):
@@ -5020,7 +5107,20 @@ def test_render_characterize_no_ceiling(make_console, store, monkeypatch):
     out = buf.getvalue()
     assert "couldn't fit" in out and "pre-quantized MLX model" in out
     assert "--weight-quant" not in out
+    assert "ara run org/Big" not in out
     assert cli.db.get_characterization(store, "mkey", "mlx", "org/Big")["safe_context"] is None
+
+
+def test_render_characterize_positive_ceiling_points_to_concrete_run(
+        make_console, store, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda m: {"model": m, "safe_context": 9000,
+                                 "decode_context": None, "points": []},
+    )
+    c, buf = make_console()
+    assert cli.render_characterize(c, "org/M") == 0
+    assert 'next: ara run org/M "Explain local AI simply"' in buf.getvalue()
 
 
 def test_render_characterize_no_ceiling_explains_with_budget(make_console, store, monkeypatch):

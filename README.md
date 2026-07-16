@@ -14,13 +14,9 @@
 </div>
 
 > [!NOTE]
-> ARA is the tool you reach for to **honestly assess any machine with a Python runtime for
-> AI work** — what hardware it has, what's installed, where your models and interpreters
-> actually live — and then run local models right up to the hardware's safe edge, never
-> over. Recon is read-only and runs anywhere. ARA has execution lanes for CPU, Apple
-> Silicon (MLX), NVIDIA (CUDA — full-GPU, or a two-wall GGUF partial-offload hybrid), AMD
-> iGPUs (Vulkan), and an existing Ollama installation; the live-verified platform matrix is
-> documented below.
+> ARA tells you what local AI work this computer can safely handle, then governs a model while
+> it runs. Start with read-only machine inspection, measure one model's safe limit, and generate
+> a first answer without having to learn the local-AI toolchain up front.
 
 ---
 
@@ -44,19 +40,78 @@ knows your machine's real limits. The design values, in order:
 
 ---
 
-## 🚀 Quick start
+## 🚀 Your first ten minutes
 
-Install the released command with `uv`:
+Install the released command with [`uv`](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
 uv tool install project-ara
-ara                              # landing screen + getting-started path
-ara detect                       # read-only recon of this machine
-ara profile                      # engine-free safe-budget estimate
-ara install                      # add the engine matched to this machine
-ara characterize <model>         # measure that model's safe context ceiling here
-ara run <model> "Explain this"   # governed one-shot inference under that ceiling
 ```
+
+`uv tool install` is the **pipx-style** option: it puts the `ara` command in its own isolated
+Python environment instead of adding packages to the Python environment for your application.
+
+Now choose the block that matches what `ara detect` reports. Bare `ara install` automatically
+selects only Apple Silicon or NVIDIA acceleration. A CPU installation is explicit because it may
+compile llama.cpp locally and can take longer.
+
+### Apple Silicon
+
+```bash
+ara detect
+ara install
+ara characterize mlx-community/SmolLM-135M-Instruct-4bit --engine mlx
+ara run mlx-community/SmolLM-135M-Instruct-4bit "Explain local AI simply"
+```
+
+### NVIDIA GPU (Windows verified)
+
+This CUDA path is verified on Windows. NVIDIA on Linux is not yet claimed; use the CPU fallback
+block below on Linux until that lane has passed ARA's full verification suite.
+
+```bash
+ara detect
+ara install
+ara characterize HuggingFaceTB/SmolLM-135M-Instruct --engine cuda
+ara run HuggingFaceTB/SmolLM-135M-Instruct "Explain local AI simply"
+```
+
+### CPU fallback
+
+```bash
+ara detect
+ara install --engine cpu
+ara characterize bartowski/SmolLM2-135M-Instruct-GGUF --engine cpu
+ara run bartowski/SmolLM2-135M-Instruct-GGUF "Explain local AI simply"
+```
+
+These are deliberately tiny workflow demonstration models, not quality recommendations. The
+`characterize` step downloads missing model weights, then measures the largest context this
+machine can run safely. Expect it to use network bandwidth, disk space, and time; the exact cost
+depends on the model and machine. The later `run` refuses to exceed the ceiling that was measured.
+
+**Optional preflight:** `ara profile` estimates the machine's safe memory budget without loading
+an engine or model. It is useful for orientation, but it is not required before `characterize`.
+
+No arguments shows the same machine-specific first-run path:
+
+```bash
+ara
+```
+
+### The local-AI words used above
+
+- **model:** the learned weights and configuration that produce an answer.
+- **engine:** the software that loads those weights and performs the computation on CPU or GPU.
+- **Transformers format:** the common Hugging Face model layout used by ARA's MLX and CUDA engines.
+- **GGUF format:** a file format designed for efficient local inference, used by the CPU and
+  GPU-offload llama.cpp lanes.
+- **quantization:** storing weights with fewer bits to reduce memory and disk use, usually with a
+  quality tradeoff.
+- **token:** a piece of text processed by a model; it may be a word, part of a word, or punctuation.
+- **context:** the tokens a model can consider at once, including the prompt and generated answer.
+- **characterization:** ARA's measurement of a particular model artifact and engine on this
+  machine, producing the safe context ceiling used to govern later runs.
 
 For fleet nodes, install the outbound HTTP client too:
 
@@ -72,9 +127,8 @@ uv run ara detect
 uv run pytest                    # 100% statement + branch coverage gate
 ```
 
-No arguments shows what ARA can do for this machine. Everything below is a subcommand.
-The hardware engine isn't a dependency — `ara install` adds it on demand, so `uv sync`
-stays lean and works the same on every platform.
+Everything below is a subcommand. The hardware engine isn't a core dependency — the install step
+adds the selected engine on demand, so `uv sync` stays lean and works the same on every platform.
 
 Use `ara detect --runtime` for cross-platform runtime/backend readiness and
 `ara detect --runtime --json` for its machine-readable form.

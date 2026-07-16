@@ -66,6 +66,7 @@ ENGINES: dict[str, dict] = {
         # transformers stay engine-env-only — never ARA dependencies.
         "python": "3.12",          # ara-engine-mlx requires >=3.12
         "model_kinds": ("transformers",),
+        "smoke_model": "mlx-community/SmolLM-135M-Instruct-4bit",
     },
     "cuda": {
         "backend": "cuda",
@@ -91,6 +92,7 @@ ENGINES: dict[str, dict] = {
         "pip_args": ["--torch-backend=auto"],
         "python": "3.12",
         "model_kinds": ("transformers",),
+        "smoke_model": "HuggingFaceTB/SmolLM-135M-Instruct",
     },
     "cpu": {
         "backend": "cpu",
@@ -104,6 +106,7 @@ ENGINES: dict[str, dict] = {
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
         "model_kinds": ("gguf",),
+        "smoke_model": "bartowski/SmolLM2-135M-Instruct-GGUF",
         # llama-cpp-python ships NO PyPI wheels, so a stock Windows box (no MSVC) can't build
         # it from source. On Windows pull a prebuilt CPU wheel from the project's own index;
         # `--only-binary` (added in _install_targets) makes that deterministic. Scoped to
@@ -143,6 +146,7 @@ ENGINES: dict[str, dict] = {
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
         "model_kinds": ("gguf",),
+        "smoke_model": "bartowski/SmolLM2-135M-Instruct-GGUF",
         # GPU-offload GGUF via llama.cpp's Vulkan backend (opt-in, --engine vulkan). Prebuilt
         # Vulkan wheels exist for x86_64 Linux + Windows on the project's own index (default PyPI
         # ships no llama-cpp-python wheel at all). We MUST force the prebuilt Vulkan wheel from
@@ -171,6 +175,7 @@ ENGINES: dict[str, dict] = {
         "builtin": True,           # worker ships in ARA; only its deps install into the env
         "packages": ["llama-cpp-python>=0.3", "psutil", "huggingface_hub"],
         "model_kinds": ("gguf",),
+        "smoke_model": "bartowski/SmolLM2-135M-Instruct-GGUF",
         # CUDA-offload GGUF via llama.cpp's CUDA build (opt-in, --engine cuda-gguf). Enables the
         # two-wall hybrid path: K layers on NVIDIA VRAM, N-K on CPU RAM, auto-fitted each run.
         # NOT a hardware auto-pick — NVIDIA still auto-picks ``cuda`` (the full-GPU transformers
