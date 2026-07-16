@@ -27,6 +27,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 PYPROJECT="pyproject.toml"
+MUTANTS_DIR="mutants"
 BACKUP="$(mktemp)"
 cp "$PYPROJECT" "$BACKUP"
 restore() {
@@ -42,7 +43,10 @@ else
     # excluding native engine package code. `git log --name-only` over that window, deduped,
     # filtered to
     # files that still exist (a file renamed/deleted since shouldn't be probed).
-    mapfile -t FILES < <(
+    FILES=()
+    while IFS= read -r f; do
+        FILES+=("$f")
+    done < <(
         git log --since="7 days ago" --name-only --pretty=format: -- 'ara/*.py' \
             | sort -u \
             | grep -E '^ara/' \
@@ -68,6 +72,12 @@ printf '  %s\n' "${FILES[@]}"
     done
     printf ']\n'
 } >>"$PYPROJECT"
+
+# mutmut's generated tree records whether each source file was mutated or merely copied. Reusing
+# it after changing only_mutate can therefore make a newly selected file look current even though
+# it contains no mutation trampolines. A scoped probe is a fresh measurement, so always rebuild
+# the ignored generated tree before running it.
+rm -rf "$MUTANTS_DIR"
 
 # mutmut's own exit code reflects infra failures (e.g. the clean test run itself failing), not
 # survivor counts — survivors are a finding, not a probe failure, but infra failures must fail the
