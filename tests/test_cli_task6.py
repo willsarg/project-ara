@@ -281,6 +281,14 @@ def test_public_docs_and_search_guidance_use_canonical_surface_and_uv_only():
     assert "Windows" in docs and "RTX 2070" in docs
     assert "Linux" in docs and "CPU" in docs
 
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "uv tool install project-ara" in readme
+    assert "project-ara[node]" in readme
+    assert "--exec-consent" in readme
+    assert "Linux systemd user service" in readme
+    assert "first-class, optional adapter" in readme
+    assert "immutable\nartifact" in readme
+
     source = (ROOT / "ara" / "cli.py").read_text(encoding="utf-8")
     assert "pip install " not in source
     assert "uv run ara" in source

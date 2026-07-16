@@ -17,9 +17,10 @@
 > ARA is the tool you reach for to **honestly assess any machine with a Python runtime for
 > AI work** — what hardware it has, what's installed, where your models and interpreters
 > actually live — and then run local models right up to the hardware's safe edge, never
-> over. Recon is read-only and runs anywhere; running models works today on CPU, Apple
-> Silicon (MLX), NVIDIA (CUDA — full-GPU, or a two-wall GGUF partial-offload hybrid), and
-> AMD iGPUs (Vulkan).
+> over. Recon is read-only and runs anywhere. ARA has execution lanes for CPU, Apple
+> Silicon (MLX), NVIDIA (CUDA — full-GPU, or a two-wall GGUF partial-offload hybrid), AMD
+> iGPUs (Vulkan), and an existing Ollama installation; the live-verified platform matrix is
+> documented below.
 
 ---
 
@@ -45,13 +46,30 @@ knows your machine's real limits. The design values, in order:
 
 ## 🚀 Quick start
 
+Install the released command with `uv`:
+
 ```bash
-uv sync                          # install the pure-Python core into .venv (works on any OS)
-uv run ara                       # the landing screen + getting-started path
-uv run ara detect                # read-only recon of this machine
-uv run ara install               # add the engine matched to this machine (MLX / CUDA / CPU)
-uv run ara characterize <model>  # measure that model's safe context ceiling on this machine
-uv run ara run <model> "..."     # one-shot inference, governed under the measured ceiling
+uv tool install project-ara
+ara                              # landing screen + getting-started path
+ara detect                       # read-only recon of this machine
+ara profile                      # engine-free safe-budget estimate
+ara install                      # add the engine matched to this machine
+ara characterize <model>         # measure that model's safe context ceiling here
+ara run <model> "Explain this"   # governed one-shot inference under that ceiling
+```
+
+For fleet nodes, install the outbound HTTP client too:
+
+```bash
+uv tool install 'project-ara[node]'
+```
+
+From a source checkout, use the same commands through `uv run`:
+
+```bash
+uv sync --frozen --group dev
+uv run ara detect
+uv run pytest                    # 100% statement + branch coverage gate
 ```
 
 No arguments shows what ARA can do for this machine. Everything below is a subcommand.
@@ -74,16 +92,17 @@ same production entrypoint. In a checkout, prefix either with `uv run`.
 | `ara status` | What ARA itself is doing right now: idle, searching, characterizing, benchmarking, running, serving, or hosting the fleet coordinator. It is not a generic process monitor. |
 | `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in CPU fallback); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on an AMD iGPU's shared memory), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
-| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under the engine that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into the engine. |
+| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
 | `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 | `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
 | `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. |
 | `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on every engine (CPU, MLX, CUDA, Vulkan, cuda-gguf). |
-| `ara benchmark <model> --use-case <coding\|reasoning\|agentic\|extraction\|rag>` | **Governed capability benchmark**: run a probe set for that use-case under the engine (capped at the safe ceiling, like `run`) and store the measured score. The model's own chat template is applied, so template-strict instruct models score honestly. |
-| `ara serve <model>` | Stand the model up as a **governed OpenAI-compatible endpoint** — on Ollama, or the MLX server with `--engine mlx` — capped at the model's safe context ceiling, and return the endpoint. |
+| `ara benchmark <model> --use-case <coding\|reasoning\|agentic\|extraction\|rag>` | **Governed capability benchmark**: run a judge-free probe set against the model's actual quant, under its characterized ceiling, and store the measured score. `--max-tokens N` lifts the generation cap for thinking models. Coding output executes only with `--exec-consent`; ARA uses macOS Seatbelt and skips coding execution on hosts where it cannot provide a sandbox. |
+| `ara serve [model]` | Stand up a **governed OpenAI-compatible endpoint** through an existing Ollama installation or the native MLX server. With no model, ARA selects the best-fitting model already in Ollama; an uncharacterized Ollama model starts under a conservatively estimated bound that is explicitly labeled estimated. `--ctx` can lower but never exceed the safe bound. |
 | `ara hub` | Build and run ARA's version-matched **fleet coordinator** in Docker, attached in the foreground. SQLite state persists in ARA's host data directory; `--bind`, `--port`, `--data-dir`, and `--rebuild` control the host deployment. The default bind is loopback; put HTTPS/TLS termination in front before enrolling remote nodes. |
 | `ara hf login` / `logout` / `status` | Manage your Hugging Face token (needed for gated models). `login` reads it from a hidden prompt, piped stdin, or `--token`, verifies it against the Hub, and stores it in the **standard HF token file** — so every fetch and engine worker picks it up. `status` shows who you're logged in as (never the token); `logout` removes it. |
-| `ara node enroll` / `install` / `run` / `start` / `status` / `stop` / `uninstall` | Enroll and operate ARA's push-only node daemon. |
+| `ara node enroll` / `run` | Enroll with a coordinator and run ARA's push-only node loop. Nodes dial out; the coordinator never opens SSH or connects back into them. Install the `project-ara[node]` extra for the HTTP client. |
+| `ara node install` / `start` / `status` / `stop` / `uninstall` | Manage the node as a Linux systemd user service. ARA does not silently enable lingering or any other administrator policy. |
 | `ara doctor` | Inspect ARA's stored machine identity and local record counts. |
 
 Commands that support structured output expose command-level `--json`; Click owns invalid syntax
@@ -110,6 +129,8 @@ hardware-specific engine; it picks a backend for the machine and loads only that
 - **NVIDIA, oversized for VRAM** → the built-in **cuda-gguf** engine (llama.cpp GGUF, partial
   offload `n_gpu_layers=K`) — ARA's first **two-wall** engine, governing discrete VRAM *and*
   system RAM at once so a model too big for VRAM runs K layers on the GPU and the rest on CPU.
+- **Existing Ollama installation** → a first-class, optional adapter for governed
+  characterization and serving. Ollama is never required for recon or for ARA's native engines.
 
 The engine is **not a core dependency**. ARA ships the native MLX and CUDA package sources under
 `ara/_engine_packages/{mlx,cuda}` and installs only the matched package and its heavy dependencies
@@ -139,9 +160,16 @@ full suite is green on an NVIDIA-on-Linux box.
 context ceiling by **refusing before it ever loads past the memory wall** and aborting a probe
 the moment usage approaches the limit. Each engine governs against the right wall — physical RAM
 (CPU; swap is reported but never counted), the MLX unified-memory wall (Apple), or VRAM (CUDA) —
-and `ara run` stays capped under that measured ceiling. Model ids are validated before they're
-ever passed to an engine subprocess. ARA stays **advisory** — it surfaces what's true and what to
-consider; it never runs destructive or system-mutating commands on your behalf.
+and `ara run` stays capped under that measured ceiling. ARA resolves model weights to an immutable
+artifact, records that identity with the measurement, and verifies it again before loading; changed
+or ambiguous weights are refused instead of being presented as the characterized model. ARA stays
+**advisory** — it surfaces what's true and what to consider; it never runs destructive or
+system-mutating commands on your behalf.
+
+Fleet control follows the same boundary. `ara hub` binds to loopback by default and runs the
+version-matched coordinator in Docker with host-persisted SQLite state. Nodes phone home, work is
+ownership-bound and journaled across restarts, and incomplete or failed work is never reported as a
+successful model result. Put a trusted TLS reverse proxy in front before enrolling remote nodes.
 
 ---
 
