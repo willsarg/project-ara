@@ -11,6 +11,7 @@ See vault specs 2026-06-26-detect-ollama-liveness and 2026-06-26-ara-serve-gover
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -19,6 +20,67 @@ import urllib.request
 
 DEFAULT_HOST = "127.0.0.1:11434"
 _MANIFEST_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class OllamaModel:
+    """One installed model from a coherent ``GET /api/tags`` snapshot.
+
+    Optional fields stay ``None`` (or an empty tuple) when an Ollama version omits them or
+    returns a malformed value. ``digest`` is accepted only when it is a canonical manifest
+    SHA-256, so callers never mistake unverified identity data for evidence.
+    """
+
+    name: str
+    model: str | None = None
+    digest: str | None = None
+    size_bytes: int | None = None
+    parent_model: str | None = None
+    format: str | None = None
+    family: str | None = None
+    families: tuple[str, ...] = ()
+    parameter_size: str | None = None
+    quantization: str | None = None
+    context_length: int | None = None
+    embedding_length: int | None = None
+    capabilities: tuple[str, ...] = ()
+
+    @property
+    def aliases(self) -> tuple[str, ...]:
+        """Equivalent implicit-``latest`` spelling, when one exists."""
+        alias = _latest_alias(self.name)
+        return (alias,) if alias is not None else ()
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _nonnegative_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _positive_int(value: object) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _latest_alias(name: str) -> str | None:
+    """Return the other spelling in an implicit-``latest`` pair.
+
+    Only the final path component is inspected, so a registry port is not mistaken for a tag.
+    """
+    leaf = name.rsplit("/", 1)[-1]
+    if leaf.endswith(":latest"):
+        return name[:-len(":latest")]
+    if ":" not in leaf:
+        return name + ":latest"
+    return None
 
 
 def base_url() -> str:
@@ -68,17 +130,63 @@ def version(timeout: float = 0.5) -> str | None:
     return v if isinstance(v, str) else None
 
 
-def tags(timeout: float = 2.0) -> list[str] | None:
-    """Installed model names via ``GET /api/tags`` (e.g. ``["qwen3:0.6b", ...]``), or ``None``
-    when the server is unreachable / the payload is malformed. Malformed entries are skipped."""
+def inventory(timeout: float = 2.0) -> list[OllamaModel] | None:
+    """Parse one coherent ``GET /api/tags`` snapshot into typed model records.
+
+    ``None`` means the server or root payload could not be trusted. Individual rows without a
+    usable name are skipped; malformed optional fields remain explicitly unknown.
+    """
     data = _get_json("/api/tags", timeout)
-    if not data:
+    rows = data.get("models") if data else None
+    if not isinstance(rows, list):
         return None
-    models = data.get("models")
-    if not isinstance(models, list):
-        return None
-    return [m["name"] for m in models
-            if isinstance(m, dict) and isinstance(m.get("name"), str)]
+    result: list[OllamaModel] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        details = row.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        digest = row.get("digest")
+        result.append(OllamaModel(
+            name=name,
+            model=_optional_string(row.get("model")),
+            digest=(digest if isinstance(digest, str)
+                    and _MANIFEST_DIGEST.fullmatch(digest) else None),
+            size_bytes=_nonnegative_int(row.get("size")),
+            parent_model=_optional_string(details.get("parent_model")),
+            format=_optional_string(details.get("format")),
+            family=_optional_string(details.get("family")),
+            families=_string_tuple(details.get("families")),
+            parameter_size=_optional_string(details.get("parameter_size")),
+            quantization=_optional_string(details.get("quantization_level")),
+            context_length=_positive_int(details.get("context_length")),
+            embedding_length=_positive_int(details.get("embedding_length")),
+            capabilities=_string_tuple(row.get("capabilities")),
+        ))
+    return result
+
+
+def find_model(models: list[OllamaModel], name: str) -> OllamaModel | None:
+    """Resolve *name* in an inventory, accepting only the implicit ``:latest`` alias."""
+    for model in models:
+        if model.name == name:
+            return model
+    alias = _latest_alias(name)
+    if alias is not None:
+        for model in models:
+            if model.name == alias:
+                return model
+    return None
+
+
+def tags(timeout: float = 2.0) -> list[str] | None:
+    """Installed model names, retained as a compatibility view over :func:`inventory`."""
+    models = inventory(timeout)
+    return [model.name for model in models] if models is not None else None
 
 
 def manifest_digest(name: str, timeout: float = 2.0) -> str | None:
@@ -87,18 +195,9 @@ def manifest_digest(name: str, timeout: float = 2.0) -> str | None:
     The structured ``digest`` from ``/api/tags`` identifies the complete Ollama manifest (weights
     references, template, and parameters). It is intentionally not described as a weights digest.
     """
-    data = _get_json("/api/tags", timeout)
-    models = data.get("models") if data else None
-    if not isinstance(models, list):
-        return None
-    leaf = name.rsplit("/", 1)[-1]
-    accepted = {name, name + ":latest"} if ":" not in leaf else {name}
-    for model in models:
-        if not isinstance(model, dict) or model.get("name") not in accepted:
-            continue
-        digest = model.get("digest")
-        return digest if isinstance(digest, str) and _MANIFEST_DIGEST.fullmatch(digest) else None
-    return None
+    models = inventory(timeout)
+    model = find_model(models, name) if models is not None else None
+    return model.digest if model is not None else None
 
 
 def ps(timeout: float = 2.0) -> list[dict] | None:
@@ -134,14 +233,9 @@ def size_bytes(name: str, timeout: float = 2.0) -> int | None:
     """On-disk size (bytes) of installed model *name* from ``GET /api/tags``, or ``None`` when the
     server is unreachable / the model isn't listed / the size is malformed. The weights-footprint
     proxy for the analytic estimate (decimal bytes — what the estimator expects)."""
-    data = _get_json("/api/tags", timeout)
-    if not data or not isinstance(data.get("models"), list):
-        return None
-    for m in data["models"]:
-        if isinstance(m, dict) and m.get("name") == name:
-            s = m.get("size")
-            return s if isinstance(s, int) else None
-    return None
+    models = inventory(timeout)
+    model = find_model(models, name) if models is not None else None
+    return model.size_bytes if model is not None else None
 
 
 def create(name: str, from_model: str, num_ctx: int, timeout: float = 300.0) -> bool:

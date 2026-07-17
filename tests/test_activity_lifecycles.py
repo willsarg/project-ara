@@ -690,6 +690,10 @@ def test_mlx_serve_sigterm_unwind_cleans_activity(
 def _wire_ollama_serve(monkeypatch, *, isatty=False):
     monkeypatch.setattr(cli.ollama, "version", lambda: "1.0")
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model"])
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda: [cli.ollama.OllamaModel(name="base:model", digest="a" * 64)],
+    )
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
@@ -844,6 +848,13 @@ def test_ollama_refuses_takeover_of_served_identity_owned_by_another_base(
     monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
 
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model", "shared:latest"])
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda: [
+            cli.ollama.OllamaModel(name="base:model", digest="a" * 64),
+            cli.ollama.OllamaModel(name="shared:latest", digest="b" * 64),
+        ],
+    )
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("existing identity overwritten"))
     c, buf = make_console()

@@ -126,8 +126,120 @@ def test_post_json_none_on_non_object(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# tags — installed model names
+# inventory / tags — one structured /api/tags snapshot
 # --------------------------------------------------------------------------- #
+def test_inventory_parses_current_model_shape(monkeypatch):
+    digest = "a" * 64
+    row = {
+        "name": "custom:latest",
+        "model": "custom:latest",
+        "size": 522_653_783,
+        "digest": digest,
+        "details": {
+            "parent_model": "qwen3:0.6b",
+            "format": "gguf",
+            "family": "qwen3",
+            "families": ["qwen3"],
+            "parameter_size": "751.63M",
+            "quantization_level": "Q4_K_M",
+            "context_length": 40_960,
+            "embedding_length": 1_024,
+        },
+        "capabilities": ["completion", "tools", "thinking"],
+    }
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [row]})
+
+    models = ollama.inventory()
+
+    assert models == [ollama.OllamaModel(
+        name="custom:latest",
+        model="custom:latest",
+        digest=digest,
+        size_bytes=522_653_783,
+        parent_model="qwen3:0.6b",
+        format="gguf",
+        family="qwen3",
+        families=("qwen3",),
+        parameter_size="751.63M",
+        quantization="Q4_K_M",
+        context_length=40_960,
+        embedding_length=1_024,
+        capabilities=("completion", "tools", "thinking"),
+    )]
+    assert ollama.OllamaModel.__dataclass_params__.frozen is True
+
+
+def test_inventory_accepts_older_sparse_model_shape(monkeypatch):
+    digest = "b" * 64
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [{
+        "name": "qwen3:0.6b",
+        "size": 522_653_767,
+        "digest": digest,
+        "details": {
+            "format": "gguf",
+            "family": "qwen3",
+            "families": ["qwen3"],
+            "parameter_size": "751.63M",
+            "quantization_level": "Q4_K_M",
+        },
+    }]})
+
+    model = ollama.inventory()[0]
+
+    assert model.name == "qwen3:0.6b"
+    assert model.model is None
+    assert model.context_length is None
+    assert model.embedding_length is None
+    assert model.capabilities == ()
+
+
+def test_inventory_treats_malformed_optional_fields_as_unknown(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [
+        {"name": "valid", "model": 7, "size": True, "digest": "bad",
+         "details": {"family": 2, "families": ["qwen", 3],
+                     "context_length": True, "embedding_length": -1},
+         "capabilities": ["completion", 4]},
+        {},
+        {"name": 5},
+        "bad",
+    ]})
+
+    models = ollama.inventory()
+
+    assert len(models) == 1
+    model = models[0]
+    assert model.model is None
+    assert model.digest is None
+    assert model.size_bytes is None
+    assert model.family is None
+    assert model.families == ("qwen",)
+    assert model.context_length is None
+    assert model.embedding_length is None
+    assert model.capabilities == ("completion",)
+
+
+def test_inventory_none_when_unreachable_or_models_not_list(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: None)
+    assert ollama.inventory() is None
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": "nope"})
+    assert ollama.inventory() is None
+
+
+def test_find_model_matches_exact_and_implicit_latest():
+    model = ollama.OllamaModel(name="base:latest")
+    tagged = ollama.OllamaModel(name="base:other")
+    assert model.aliases == ("base",)
+    assert tagged.aliases == ()
+    assert ollama.find_model([model], "base") is model
+    assert ollama.find_model([model], "base:latest") is model
+    assert ollama.find_model([model], "base:other") is None
+
+
+def test_find_model_treats_registry_port_as_part_of_name():
+    model = ollama.OllamaModel(name="registry.local:5000/org/base:latest")
+    assert ollama.find_model([model], "registry.local:5000/org/base") is model
+
+
 def test_tags_returns_names(monkeypatch):
     monkeypatch.setattr(ollama, "_get_json",
                         lambda p, t: {"models": [{"name": "a:1"}, {"name": "b:2"}]})

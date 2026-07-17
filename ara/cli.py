@@ -2508,8 +2508,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 
 
-def _ollama_artifact_id(model: str) -> str | None:
-    digest = ollama.manifest_digest(model)
+def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None) -> str | None:
+    """Manifest identity from a supplied inventory record, or a fresh snapshot when omitted."""
+    digest = record.digest if record is not None else ollama.manifest_digest(model)
     return _OLLAMA_ARTIFACT_PREFIX + digest if digest else None
 
 
@@ -2528,7 +2529,7 @@ def _ollama_safe_ceiling(con, mk: str, model: str, artifact_id: str):
     return row["safe_context"], "measured", row.get("measured_at")
 
 
-def _ollama_estimated_ceiling(model: str):
+def _ollama_estimated_ceiling(model: str, *, record: ollama.OllamaModel | None = None):
     """The engine-free *estimated* safe ceiling for *model*, as ``(est_context, "estimated", None)``,
     or ``None`` when the architecture can't be read or the model doesn't fit.
 
@@ -2551,7 +2552,7 @@ def _ollama_estimated_ceiling(model: str):
         "head_dim": info.get(f"{arch}.attention.key_length"),
         "max_context": info.get(f"{arch}.context_length"),
     }
-    size = ollama.size_bytes(model)
+    size = record.size_bytes if record is not None else ollama.size_bytes(model)
     weights_gb = size / 1e9 if size else None            # decimal GB — the estimator's unit
     lim = estimate.limits(detect.machine())              # heuristic wall: an estimate stays an estimate
     fit = estimate.model_fit(lim, meta, weights_gb)
@@ -2685,12 +2686,13 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
 
     if ollama.version() is None:
         return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
-    names = ollama.tags()
-    if names is None:
+    models = ollama.inventory()
+    if models is None:
         return err("couldn't list Ollama models — is the server reachable?")
-    if model not in names:
+    record = ollama.find_model(models, model)
+    if record is None:
         return err(f"{model} isn't in Ollama — pull it first: ollama pull {model}")
-    artifact_id = _ollama_artifact_id(model)
+    artifact_id = _ollama_artifact_id(model, record=record)
     if artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to measure mutable "
                    "weights without artifact provenance.")
@@ -2708,11 +2710,11 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     provenance: dict = {}
     try:
         with locking.ollama_setup_lock(ollama.base_url(), probe):
-            latest_names = ollama.tags()
-            if latest_names is None:
+            latest_models = ollama.inventory()
+            if latest_models is None:
                 return err("couldn't recheck Ollama model names before characterization — "
                            "refusing to risk a probe collision.")
-            if probe in latest_names or probe + ":latest" in latest_names:
+            if ollama.find_model(latest_models, probe) is not None:
                 return err(f"Ollama characterization probe {probe!r} already exists — refusing "
                            "to overwrite or delete it.")
             with activity.track("characterizing", model):
@@ -2757,7 +2759,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     return 0
 
 
-def _ollama_pick_best(names: list[str]) -> str | None:
+def _ollama_pick_best(models: list[ollama.OllamaModel]) -> str | None:
     """Zero-arg ``ara serve`` selection: of the models already in the Ollama store, the one whose
     safe ceiling is largest — measured if we have it, else the conservative estimate — so a bare
     ``ara serve`` stands up the model that gives this machine the most usable context. ``None`` when
@@ -2765,10 +2767,11 @@ def _ollama_pick_best(names: list[str]) -> str | None:
     mk = profile.machine_key()
     best_name, best_ceiling = None, -1
     with db.connected() as con:
-        for n in names:
-            artifact_id = _ollama_artifact_id(n)
+        for record in models:
+            n = record.name
+            artifact_id = _ollama_artifact_id(n, record=record)
             found = (_ollama_safe_ceiling(con, mk, n, artifact_id) if artifact_id else None)
-            found = found or _ollama_estimated_ceiling(n)
+            found = found or _ollama_estimated_ceiling(n, record=record)
             if found and found[0] is not None and found[0] > best_ceiling:
                 best_name, best_ceiling = n, found[0]
     return best_name
@@ -2983,16 +2986,16 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     if ollama.version() is None:
         return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
 
-    names = ollama.tags()
-    if names is None:
+    models = ollama.inventory()
+    if models is None:
         return err("couldn't list Ollama models — is the server reachable?")
 
     # 2a. zero-arg: recommend among what's already pulled, then serve the best fit
     if model is None:
-        if not names:
+        if not models:
             return err("no models in Ollama — pull one (`ollama pull <model>`), or name one: "
                        "`ara serve <model>`.")
-        model = _ollama_pick_best(names)
+        model = _ollama_pick_best(models)
         if model is None:
             return err("no model in Ollama fits this machine — pull a smaller / more-quantized "
                        "one, or name one explicitly.")
@@ -3003,7 +3006,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                    + c.style("dim", " (best fit in your Ollama store)"))
 
     # 2b. named model: ensure it's in the store — pull it if missing (get out of the way)
-    if model not in names:
+    record = ollama.find_model(models, model)
+    if record is None:
         if name is not None:
             return err("a new custom --name cannot be created safely because Ollama has no atomic "
                        "create-if-absent operation; omit --name to use ARA's content-addressed "
@@ -3012,11 +3016,17 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", f"  pulling {model} …"))
         if not ollama.pull(model):
             return err(f"couldn't pull {model} into Ollama — check the model name.")
-        names.append(model)
+        models = ollama.inventory()
+        if models is None:
+            return err(f"pulled {model}, but couldn't re-read Ollama's model inventory.")
+        record = ollama.find_model(models, model)
+        if record is None:
+            return err(f"Ollama reported a successful pull for {model}, but the model isn't in "
+                       "its inventory — refusing ambiguous identity.")
         if not as_json:
             c.emit(c.style("dim", "  pulled."))
 
-    base_artifact_id = _ollama_artifact_id(model)
+    base_artifact_id = _ollama_artifact_id(model, record=record)
     if base_artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to serve mutable "
                    "weights without artifact provenance.")
@@ -3067,7 +3077,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     # verification succeeds; only then can ARA hand off to a persistent Ollama ownership claim.
     served = name or _governed_name(
         model, artifact_id=base_artifact_id, context=safe)
-    served_preexisting = served in names or served + ":latest" in names
+    served_preexisting = ollama.find_model(models, served) is not None
     endpoint_base = ollama.base_url()
     live_activity = activity.snapshot()
     legacy_item = next((item for item in live_activity
@@ -3115,11 +3125,11 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     try:
         with locking.ollama_setup_lock(endpoint_base, served), setup_activity:
             if not already_owned:
-                latest_names = ollama.tags()
-                if latest_names is None:
+                latest_models = ollama.inventory()
+                if latest_models is None:
                     return err("couldn't recheck Ollama model names before creating the governed "
                                "model — refusing to risk a collision.")
-                if served in latest_names or served + ":latest" in latest_names:
+                if ollama.find_model(latest_models, served) is not None:
                     return err(f"Ollama model {served!r} appeared before ARA could create it — "
                                "refusing to overwrite or unload it.")
                 if not ollama.create(served, model, safe):

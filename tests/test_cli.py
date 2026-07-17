@@ -4002,6 +4002,12 @@ def test_cleanup_ollama_probe_reports_delete_failure_after_verified_unload(monke
 def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda t=2.0: ([cli.ollama.OllamaModel(
+            name="qwen3:0.6b", digest="a" * 64,
+        )] if in_store else []),
+    )
     monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda model: "a" * 64)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
@@ -4036,12 +4042,27 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
         assert row["artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
 
 
+def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, capsys):
+    _wire_char_ollama(monkeypatch)
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda t=2.0: [cli.ollama.OllamaModel(name="qwen3:latest", digest="a" * 64)],
+    )
+    monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:latest"])
+    monkeypatch.setattr(
+        cli, "_ollama_measure_ceiling",
+        _fake_ollama_measure((4096, [{"context": 4096, "fit": True}])),
+    )
+    c = cli.Console.from_env()
+    assert cli.render_characterize(c, "qwen3", engine="ollama", as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["safe_context"] == 4096
+
+
 def test_characterize_ollama_refuses_if_manifest_changes_during_measurement(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    base_digests = iter(["a" * 64, "b" * 64])
     monkeypatch.setattr(cli.ollama, "manifest_digest",
-                        lambda name: next(base_digests) if name == "qwen3:0.6b" else "a" * 64)
+                        lambda name: "b" * 64 if name == "qwen3:0.6b" else "a" * 64)
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
                         _fake_ollama_measure((4096, [])))
     c, buf = make_console()
@@ -4054,7 +4075,10 @@ def test_characterize_ollama_refuses_if_manifest_changes_during_measurement(
 def test_characterize_ollama_refuses_unidentified_manifest(
         store, monkeypatch, make_console):
     _wire_char_ollama(monkeypatch)
-    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _model: None)
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda t=2.0: [cli.ollama.OllamaModel(name="qwen3:0.6b")],
+    )
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
                         lambda *_a: pytest.fail("measured unidentified manifest"))
     c, buf = make_console()
@@ -4069,6 +4093,13 @@ def test_characterize_ollama_refuses_preexisting_content_addressed_probe(
     probe = cli._governed_name(
         "qwen3:0.6b", artifact_id=artifact, context=8192) + "-probe"
     monkeypatch.setattr(cli.ollama, "tags", lambda _t=2.0: ["qwen3:0.6b", probe])
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda _t=2.0: [
+            cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64),
+            cli.ollama.OllamaModel(name=probe, digest="b" * 64),
+        ],
+    )
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
                         lambda *_a, **_k: pytest.fail("overwrote preexisting probe"))
     monkeypatch.setattr(cli.ollama, "delete",
@@ -4083,12 +4114,13 @@ def test_characterize_ollama_refuses_when_final_probe_inventory_is_unavailable(
     _wire_char_ollama(monkeypatch)
     calls = 0
 
-    def tags(_timeout=2.0):
+    def inventory(_timeout=2.0):
         nonlocal calls
         calls += 1
-        return ["qwen3:0.6b"] if calls == 1 else None
+        return ([cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+                if calls == 1 else None)
 
-    monkeypatch.setattr(cli.ollama, "tags", tags)
+    monkeypatch.setattr(cli.ollama, "inventory", inventory)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "recheck" in buf.getvalue() and "probe collision" in buf.getvalue()
@@ -4248,6 +4280,7 @@ def test_characterize_ollama_not_serving(make_console, monkeypatch):
 def test_characterize_ollama_tags_unreachable(make_console, monkeypatch):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: None)
+    monkeypatch.setattr(cli.ollama, "inventory", lambda t=2.0: None)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "couldn't list Ollama models" in buf.getvalue()
@@ -7298,13 +7331,31 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     """Wire render_serve's Ollama + db seams. ``names=None`` ⇒ tags() unreachable;
     ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches).
     ``pull_ok`` is ollama.pull's result; ``show``/``size`` feed the estimated-ceiling fallback."""
-    monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pull_ok)
+    pulled = set()
+
+    def pull(n, timeout=600.0):
+        if pull_ok:
+            pulled.add(n)
+        return pull_ok
+
+    monkeypatch.setattr(cli.ollama, "pull", pull)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: show)
     monkeypatch.setattr(cli.ollama, "size_bytes", lambda n, timeout=2.0: size)
     monkeypatch.setattr(cli.ollama, "version", lambda timeout=0.5: version)
     monkeypatch.setattr(cli.ollama, "tags",
                         lambda timeout=2.0: (None if names is None else list(names)))
+
+    def inventory(timeout=2.0):
+        if names is None:
+            return None
+        return [cli.ollama.OllamaModel(
+            name=n,
+            digest=("a" * 64 if n == "qwen3:0.6b" or n in pulled else "b" * 64),
+            size_bytes=size,
+        ) for n in (*names, *pulled)]
+
+    monkeypatch.setattr(cli.ollama, "inventory", inventory)
     state = {"served": None}
 
     def create(n, f, ctx, timeout=300.0):
@@ -7360,15 +7411,59 @@ def test_serve_refuses_when_tags_unreachable(make_console, monkeypatch):
     assert "couldn't list Ollama models" in buf.getvalue()
 
 
+def test_serve_treats_implicit_latest_as_installed(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("qwen3:latest",), ps_rows=[])
+    monkeypatch.setattr(
+        cli.ollama, "pull",
+        lambda *_a, **_k: pytest.fail("pulled a model already installed as implicit :latest"),
+    )
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3") == 1
+    assert "didn't load" in buf.getvalue()
+
+
 def test_serve_pulls_missing_model_then_serves(make_console, monkeypatch):
     pulled = []
     _wire_serve(monkeypatch, names=("other:1",), characterization={"safe_context": 8192},
                 ps_rows=_SERVE_LOADED)
     monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pulled.append(n) or True)
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda timeout=2.0: [cli.ollama.OllamaModel(
+            name=n, digest="a" * 64,
+        ) for n in ("other:1", *pulled)],
+    )
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0     # no --ctx: serves at the measured ceiling
     assert pulled == ["qwen3:0.6b"]
     assert "pulling qwen3:0.6b" in buf.getvalue()
+
+
+def test_serve_refuses_when_inventory_unavailable_after_pull(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    calls = 0
+
+    def inventory(timeout=2.0):
+        nonlocal calls
+        calls += 1
+        return ([cli.ollama.OllamaModel(name="other:1", digest="b" * 64)]
+                if calls == 1 else None)
+
+    monkeypatch.setattr(cli.ollama, "inventory", inventory)
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 1
+    assert "couldn't re-read" in buf.getvalue()
+
+
+def test_serve_refuses_when_successful_pull_is_absent_from_inventory(make_console, monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda timeout=2.0: [cli.ollama.OllamaModel(name="other:1", digest="b" * 64)],
+    )
+    c, buf = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 1
+    assert "successful pull" in buf.getvalue() and "ambiguous identity" in buf.getvalue()
 
 
 def test_serve_pulls_missing_model_json_is_quiet(make_console, monkeypatch, capsys):
@@ -7412,7 +7507,10 @@ def test_serve_refuses_new_custom_name_before_pulling_missing_model(
 
 def test_serve_refuses_unidentified_base_manifest(make_console, monkeypatch):
     _wire_serve(monkeypatch)
-    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: None)
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda timeout=2.0: [cli.ollama.OllamaModel(name="qwen3:0.6b")],
+    )
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("created unidentified base"))
     c, buf = make_console()
@@ -7666,10 +7764,9 @@ def test_serve_does_not_cleanup_when_manifest_becomes_unverifiable_after_load_fa
 
 def test_serve_refuses_if_base_manifest_retargets_during_setup(make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
-    base_reads = iter(["a" * 64, "c" * 64])
     monkeypatch.setattr(
         cli.ollama, "manifest_digest",
-        lambda name: next(base_reads) if name == "qwen3:0.6b" else "b" * 64,
+        lambda name: "c" * 64 if name == "qwen3:0.6b" else "b" * 64,
     )
     monkeypatch.setattr(
         cli.ollama, "load",
@@ -7683,7 +7780,7 @@ def test_serve_refuses_if_base_manifest_retargets_during_setup(make_console, mon
 
 def test_serve_refuses_if_base_manifest_retargets_during_load(make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
-    base_reads = iter(["a" * 64, "a" * 64, "c" * 64])
+    base_reads = iter(["a" * 64, "c" * 64])
     monkeypatch.setattr(
         cli.ollama, "manifest_digest",
         lambda name: next(base_reads) if name == "qwen3:0.6b" else "b" * 64,
@@ -7726,12 +7823,15 @@ def test_serve_refuses_name_appearing_at_final_collision_check(make_console, mon
     calls = 0
     served = _serve_name()
 
-    def tags(*_a, **_k):
+    def inventory(*_a, **_k):
         nonlocal calls
         calls += 1
-        return ["qwen3:0.6b"] if calls == 1 else ["qwen3:0.6b", f"{served}:latest"]
+        rows = [cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+        if calls > 1:
+            rows.append(cli.ollama.OllamaModel(name=f"{served}:latest", digest="b" * 64))
+        return rows
 
-    monkeypatch.setattr(cli.ollama, "tags", tags)
+    monkeypatch.setattr(cli.ollama, "inventory", inventory)
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("late collision overwritten"))
     c, buf = make_console()
@@ -7743,12 +7843,13 @@ def test_serve_refuses_when_final_collision_check_is_unavailable(make_console, m
     _wire_serve(monkeypatch)
     calls = 0
 
-    def tags(*_a, **_k):
+    def inventory(*_a, **_k):
         nonlocal calls
         calls += 1
-        return ["qwen3:0.6b"] if calls == 1 else None
+        return ([cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+                if calls == 1 else None)
 
-    monkeypatch.setattr(cli.ollama, "tags", tags)
+    monkeypatch.setattr(cli.ollama, "inventory", inventory)
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("created without collision check"))
     c, buf = make_console()
@@ -8021,6 +8122,16 @@ def test_find_loaded_matches_exact_tagged_and_none():
     assert cli._find_loaded([{"name": "other"}], "srv") is None
 
 
+def test_ollama_artifact_id_uses_inventory_record_without_refetch(monkeypatch):
+    record = cli.ollama.OllamaModel(name="base:latest", digest="a" * 64)
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda _name: pytest.fail("refetched a digest already present in the snapshot"),
+    )
+    assert cli._ollama_artifact_id("base", record=record) == (
+        "ollama-manifest-sha256:" + "a" * 64)
+
+
 def test_ollama_safe_ceiling_requires_matching_manifest_artifact(monkeypatch):
     artifact = "ollama-manifest-sha256:" + "a" * 64
     chars = {"ollama": {"safe_context": 8000,
@@ -8110,6 +8221,25 @@ def test_ollama_estimated_ceiling_maps_meta_and_delegates(monkeypatch):
     assert captured["lim"] == {"safe_budget_gb": 10.0}
 
 
+def test_ollama_estimated_ceiling_uses_inventory_size_without_refetch(monkeypatch):
+    record = cli.ollama.OllamaModel(name="qwen3:0.6b", size_bytes=500_000_000)
+    captured = {}
+    monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: _SHOW_QWEN3)
+    monkeypatch.setattr(
+        cli.ollama, "size_bytes",
+        lambda _n, timeout=2.0: pytest.fail("refetched a size already present in the snapshot"),
+    )
+    monkeypatch.setattr(cli.detect, "machine", lambda: object())
+    monkeypatch.setattr(cli.estimate, "limits", lambda m: {})
+    monkeypatch.setattr(
+        cli.estimate, "model_fit",
+        lambda _lim, _meta, weights: captured.update(weights=weights) or {"est_context": 8192},
+    )
+    assert cli._ollama_estimated_ceiling("qwen3:0.6b", record=record) == (
+        8192, "estimated", None)
+    assert captured["weights"] == 0.5
+
+
 def test_ollama_estimated_ceiling_none_when_show_unavailable(monkeypatch):
     monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: None)
     assert cli._ollama_estimated_ceiling("m") is None
@@ -8140,27 +8270,38 @@ def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
     _wire_pick(monkeypatch)
     ceils = {"a:1": (4000, "estimated", None), "b:1": (9000, "estimated", None),
              "c:1": (6000, "estimated", None)}
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m: None)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: ceils.get(m))
-    assert cli._ollama_pick_best(["a:1", "b:1", "c:1"]) == "b:1"
+    models = [cli.ollama.OllamaModel(name=n, digest=ch * 64)
+              for n, ch in zip(ceils, "abc", strict=True)]
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m, *, record=None: ceils.get(m))
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda _n: pytest.fail("refetched inventory identity while ranking"),
+    )
+    assert cli._ollama_pick_best(models) == "b:1"
 
 
 def test_ollama_pick_best_uses_measured_when_present(monkeypatch):
     _wire_pick(monkeypatch)
     # a has a measured ceiling; b only an estimate — each model uses its own best source, then
     # we rank by value (b's 9000 estimate legitimately beats a's 5000 measured).
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling",
-                        lambda con, mk, m: (5000, "measured", None) if m == "a:1" else None)
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact:
+                        (5000, "measured", None) if m == "a:1" else None)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
-                        lambda m: (9000, "estimated", None) if m == "b:1" else None)
-    assert cli._ollama_pick_best(["a:1", "b:1"]) == "b:1"
+                        lambda m, *, record=None:
+                        (9000, "estimated", None) if m == "b:1" else None)
+    models = [cli.ollama.OllamaModel(name=n, digest=ch * 64)
+              for n, ch in (("a:1", "a"), ("b:1", "b"))]
+    assert cli._ollama_pick_best(models) == "b:1"
 
 
 def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
     _wire_pick(monkeypatch)
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m: None)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: None)
-    assert cli._ollama_pick_best(["a:1", "b:1"]) is None
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m, *, record=None: None)
+    models = [cli.ollama.OllamaModel(name=n) for n in ("a:1", "b:1")]
+    assert cli._ollama_pick_best(models) is None
 
 
 def test_serve_zero_arg_selects_and_serves_json(make_console, monkeypatch, capsys):
