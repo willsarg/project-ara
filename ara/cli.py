@@ -2238,19 +2238,21 @@ def _native_benchmark_plan(model: str, engine: str | None,
                 candidate_bk = get_backend(candidate_backend)
                 if not hasattr(candidate_bk, "benchmark"):
                     continue
-                candidate_row = db.get_characterization(
+                expected_config = _measurement_config(candidate_backend)
+                candidate_row = db.get_reusable_characterization_for_engine(
+                    con, mk, candidate_key, evidence_model, config=expected_config)
+                display_row = db.get_characterization(
                     con, mk, candidate_key, evidence_model)
-                if not candidate_row or candidate_row.get("safe_context") is None:
+                if candidate_row is None:
+                    if display_row and (config_error := _measurement_config_error(
+                            display_row, expected_config, candidate_backend, model)):
+                        config_errors.append(config_error)
+                    continue
+                if candidate_row.get("safe_context") is None:
                     continue
                 installed, label = engine_status(candidate_backend)
                 if not installed:
                     unavailable.append((candidate_key, label))
-                    continue
-                config_error = _measurement_config_error(
-                    candidate_row, _measurement_config(candidate_backend),
-                    candidate_backend, model)
-                if config_error:
-                    config_errors.append(config_error)
                     continue
                 if not candidate_row.get("artifact_id"):
                     missing_artifact_authority = True
@@ -2283,12 +2285,21 @@ def _native_benchmark_plan(model: str, engine: str | None,
             installed, label = engine_status(backend)
             if not installed:
                 return None, f"the {label} isn't installed — run: ara install --engine {key}"
-            row = db.get_characterization(con, mk, key, evidence_model)
-            if not row or row.get("safe_context") is None:
+            expected_config = _measurement_config(backend)
+            row = db.get_reusable_characterization_for_engine(
+                con, mk, key, evidence_model, config=expected_config)
+            display_row = db.get_characterization(con, mk, key, evidence_model)
+            if row is None:
+                if display_row is None:
+                    return None, (f"no measured ceiling for {model} — run: "
+                                  f"ara characterize {model}")
+                if display_row and (msg := _measurement_config_error(
+                        display_row, expected_config, backend, model)):
+                    return None, msg
+                return None, (f"no reusable measured ceiling for {model} — run: "
+                              f"ara characterize {model}")
+            if row.get("safe_context") is None:
                 return None, f"no measured ceiling for {model} — run: ara characterize {model}"
-            if msg := _measurement_config_error(
-                    row, _measurement_config(backend), backend, model):
-                return None, msg
         characterized_artifact_id = row.get("artifact_id")
         if not characterized_artifact_id:
             return None, (f"the measured ceiling for {model} is not bound to an exact artifact — "
@@ -2982,15 +2993,21 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     with db.connected() as con:
         if engine is not None:
             # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
-            row = db.get_characterization(con, mk, sel.engine_key, evidence_model)
-            if row is None:
+            row = db.get_reusable_characterization_for_engine(
+                con, mk, sel.engine_key, evidence_model, config=requested_config)
+            display_row = db.get_characterization(con, mk, sel.engine_key, evidence_model)
+            if row is None and display_row is None:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
+                           f"ara characterize {model}{suffix}")
+            if row is None:
+                if msg := _measurement_config_error(
+                        display_row, requested_config, sel.backend, model):
+                    return err(msg)
+                return err(f"the measured ceiling for {model} is not reusable — re-run: "
                            f"ara characterize {model}{suffix}")
             if row.get("safe_context") is None:
                 return err(f"{model} was characterized but didn't fit on {sel.engine_key} — "
                            f"too big for this machine")
-            if msg := _measurement_config_error(row, requested_config, sel.backend, model):
-                return err(msg)
             engine_key, backend, safe = sel.engine_key, sel.backend, row["safe_context"]
             ceiling_measured_at = row.get("measured_at")
             characterized_artifact_id = row.get("artifact_id")
@@ -3004,13 +3021,21 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             default = engines.for_backend(detect.backend_name())
             per_engine = {}                  # engine_key -> (safe_context, backend, can_run, time, row)
             for key in dict.fromkeys([default, *engines.ENGINES]):
-                row = db.get_characterization(con, mk, key, evidence_model)
-                if row is None:
-                    continue
                 backend = engines.ENGINES[key]["backend"]
-                per_engine[key] = (row.get("safe_context"), backend,
+                candidate_config = _effective_measurement_config(
+                    get_backend(backend), backend, flash_attn=flash_attn,
+                    flash_attn_optin=flash_attn_optin, kv_quant=kv_quant,
+                    weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+                row = db.get_reusable_characterization_for_engine(
+                    con, mk, key, evidence_model, config=candidate_config)
+                display_row = db.get_characterization(con, mk, key, evidence_model)
+                if row is None and display_row is None:
+                    continue
+                selected = row if row is not None else display_row
+                per_engine[key] = (selected.get("safe_context"), backend,
                                    hasattr(get_backend(backend), "generate"),
-                                   row.get("measured_at"), row)
+                                   selected.get("measured_at"), selected,
+                                   row is not None)
             if not per_engine:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
                            f"ara characterize {model}")
@@ -3027,7 +3052,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             }
             config_runnable = {
                 k: v for k, v in lever_supported.items()
-                if _measurement_config_error(
+                if v[5] and _measurement_config_error(
                     v[4], _effective_measurement_config(
                         get_backend(v[1]), v[1], flash_attn=flash_attn,
                         flash_attn_optin=flash_attn_optin,
@@ -3046,6 +3071,9 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 ]
                 if any(mismatches):
                     return err(next(msg for msg in mismatches if msg is not None))
+                if any(not v[5] for v in lever_supported.values()):
+                    return err(f"the measured ceiling for {model} is not reusable — re-run: "
+                               f"ara characterize {model}")
                 lever_errors = [
                     _unsupported_lever_error(
                         v[1], kv_quant=kv_quant, flash_attn=flash_attn,
@@ -3089,7 +3117,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                            f"--engine {unavailable_key}")
             # Largest ceiling wins; the dict is detected-first, so a strict `>` lets ties favour it.
             engine_key = max(runnable, key=lambda k: runnable[k][0])
-            safe, backend, _, ceiling_measured_at, selected_row = runnable[engine_key]
+            safe, backend, _, ceiling_measured_at, selected_row, _reusable = runnable[engine_key]
             characterized_artifact_id = selected_row.get("artifact_id")
 
     stale_ceiling = _stale_ceiling_note(
@@ -3893,23 +3921,27 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     mk = profile.machine_key()
     expected_config = _measurement_config("apple", kv_quant=kv_quant)
     with db.connected() as con:
+        reusable_row = db.get_reusable_characterization_for_engine(
+            con, mk, engine_key, model, config=expected_config)
+        display_row = db.get_characterization(con, mk, engine_key, model)
         if ctx is not None:
-            _row = db.get_characterization(con, mk, engine_key, model)
-            if _row and (msg := _measurement_config_error(
-                    _row, expected_config, "apple", model)):
+            if display_row and (msg := _measurement_config_error(
+                    display_row, expected_config, "apple", model)):
                 return err(msg)
-            if (msg := _ctx_gate_msg(ctx, _row.get("safe_context") if _row else None, model)):
+            if (msg := _ctx_gate_msg(
+                    ctx, reusable_row.get("safe_context") if reusable_row else None, model)):
                 return err(msg)
             safe, source = ctx, "requested"
             ceiling_measured_at = None       # explicit --ctx, not a stored ceiling
             measured_slope = None            # a-priori gate for an unmeasured override (Rule #1)
         else:
-            row = db.get_characterization(con, mk, engine_key, model)  # keyed by engine key, not backend
+            row = reusable_row
             if not row or row.get("safe_context") is None:
-                return err(f"no measured MLX ceiling for {model} — run: ara characterize {model} "
+                if display_row and (msg := _measurement_config_error(
+                        display_row, expected_config, "apple", model)):
+                    return err(msg)
+                return err(f"no reusable measured MLX ceiling for {model} — run: ara characterize {model} "
                            f"(or pass --ctx N).")
-            if msg := _measurement_config_error(row, expected_config, "apple", model):
-                return err(msg)
             safe, source = row["safe_context"], "measured"
             ceiling_measured_at = row.get("measured_at")
             # Serving the model's OWN measured ceiling: fit the real ramp slope so the pre-load gate

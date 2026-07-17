@@ -109,16 +109,31 @@ def assess_characterization(
 ) -> CharacterizationAssessment:
     """Read Ollama history without allowing display-only evidence into governed decisions."""
 
-    row = db.get_characterization(con, machine_key, "ollama", model.name)
-    if row is None:
+    rows = db.list_characterizations_for_display(
+        con, machine_key, runtime="ollama", logical_model_id=model.name)
+    if not rows:
         return CharacterizationAssessment(None, None, "missing")
+    expected_artifact = (
+        _OLLAMA_ARTIFACT_PREFIX + model.digest if model.digest is not None else None)
+    artifact_rows = [row for row in rows if row.get("artifact_id") == expected_artifact]
+    candidates = artifact_rows or rows
+
+    def current_authority(row: dict[str, Any]) -> bool:
+        config = row.get("config")
+        return (isinstance(config, dict)
+                and config.get("endpoint_authority") == authority.endpoint.url
+                and config.get("runtime_version") == authority.server_version
+                and config.get("server_instance_id") == authority.server_instance_id
+                and config.get("configured_inputs") == dict(authority.configured_inputs))
+
+    row = max(candidates, key=lambda item: (
+        current_authority(item), item.get("measured_at") or "",
+        item.get("config_key") or ""))
     config = row.get("config")
     if not isinstance(config, dict) or config.get("methodology") != "ollama-physical-walls-v1":
         return _display_only(row, "methodology_missing_or_unsupported")
     if ollama.initial_governed_model_error(model) is not None:
         return _display_only(row, "unsupported_model_cell")
-    expected_artifact = (
-        _OLLAMA_ARTIFACT_PREFIX + model.digest if model.digest is not None else None)
     if expected_artifact is None or row.get("artifact_id") != expected_artifact:
         return _display_only(row, "artifact_mismatch")
     safe_context = row.get("safe_context")
@@ -192,6 +207,8 @@ def assess_characterization(
         return _display_only(row, "placement_unsupported")
     if not _wall_evidence_complete(config, point):
         return _display_only(row, "wall_evidence_incomplete")
+    if not row.get("reusable"):
+        return _display_only(row, "storage_evidence_not_reusable")
     return CharacterizationAssessment(row, row, None)
 
 

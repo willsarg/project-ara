@@ -93,7 +93,7 @@ def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
     assert db.get_calibration(con, _NEW, "cpu") is not None
     assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
     assert db.get_latest_profile(con, _NEW) is not None
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 5
     assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
 
 
@@ -162,7 +162,13 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     path = tmp_path / "legacy.db"
     monkeypatch.setenv("ARA_DB_PATH", str(path))
     raw = sqlite3.connect(path)                      # a pre-migration store: user_version == 0
-    raw.executescript(db.SCHEMA)
+    raw.executescript("""
+    CREATE TABLE calibrations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+        calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+        PRIMARY KEY (machine_key, engine)
+    );
+    """)
     raw.execute("INSERT INTO calibrations (machine_key, engine, fixed_overhead_gb, "
                 "calibrated_at, wall_gb, safe_budget_gb) VALUES "
                 "('m', 'wmx', 1.1, 't0', 25.8, 22.8)")     # decimal-era apple row
@@ -175,8 +181,8 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     con = db.connect()
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
-    # The migration chain now ends at v4; the single-field key 'm' is not a legacy machine key.
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 4
+    # The migration chain now ends at v5; the single-field key 'm' is not a legacy machine key.
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 5
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
@@ -343,8 +349,9 @@ def test_legacy_characterization_migrates_with_unknown_artifact_id(tmp_path, mon
     monkeypatch.setenv("ARA_DB_PATH", str(path))
     migrated = db.connect()
     try:
-        assert db.get_characterization(
-            migrated, "m", "ollama", "org/model")["artifact_id"] is None
+        row = db.get_characterization(migrated, "m", "ollama", "org/model")
+        assert row["artifact_id"].startswith("legacy-unverified:v1:")
+        assert row["reusable"] is False
     finally:
         migrated.close()
 
@@ -372,6 +379,264 @@ def test_characterization_defaults_to_default_measurement_config(store):
     db.save_characterization(store, "m", "cpu", "org/model",
                              safe_context=8192, points=[])
     assert db.get_characterization(store, "m", "cpu", "org/model")["config"] == {}
+
+
+def test_characterizations_preserve_artifact_and_config_cells_with_exact_reusable_reads(store):
+    first_artifact = "hf:org/model@aaa"
+    second_artifact = "hf:org/model@bbb"
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=4096, points=[],
+        artifact_id=first_artifact, config={"kv_quant": "f16"},
+    )
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=8192, points=[],
+        artifact_id=second_artifact, config={"kv_quant": "q8_0"},
+    )
+
+    rows = db.list_characterizations_for_display(
+        store, "m", runtime="torch", backend="cuda", logical_model_id="org/model")
+    assert len(rows) == 2
+    assert {row["artifact_id"] for row in rows} == {first_artifact, second_artifact}
+    assert all(row["reusable"] is True for row in rows)
+    first = db.get_reusable_characterization(
+        store, "m", runtime="torch", backend="cuda", artifact_id=first_artifact,
+        config_key=rows[0]["config_key"] if rows[0]["artifact_id"] == first_artifact
+        else rows[1]["config_key"],
+    )
+    second = db.get_reusable_characterization(
+        store, "m", runtime="torch", backend="cuda", artifact_id=second_artifact,
+        config_key=rows[0]["config_key"] if rows[0]["artifact_id"] == second_artifact
+        else rows[1]["config_key"],
+    )
+    assert first["safe_context"] == 4096
+    assert second["safe_context"] == 8192
+    assert first["config_key"] != second["config_key"]
+
+
+def test_engine_reusable_read_selects_matching_config_history(store):
+    artifact = "hf:org/model@abcdef0:manifest"
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=4096, points=[],
+        artifact_id=artifact, config={"kv_quant": "f16"},
+        measured_at="2026-01-01T00:00:00+00:00",
+    )
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=8192, points=[],
+        artifact_id=artifact, config={"kv_quant": "q8_0"},
+        measured_at="2026-02-01T00:00:00+00:00",
+    )
+
+    selected = db.get_reusable_characterization_for_engine(
+        store, "m", "cuda", "org/model", config={"kv_quant": "f16"})
+
+    assert selected["safe_context"] == 4096
+    assert selected["config"]["kv_quant"] == "f16"
+
+
+def test_exact_display_read_can_return_nonreusable_history(store):
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=4096, points=[],
+        artifact_id="label-only", config={},
+    )
+    row = db.list_characterizations_for_display(
+        store, "m", runtime="torch", backend="cuda")[0]
+
+    selected = db.get_characterization_for_display(
+        store, "m", runtime="torch", backend="cuda",
+        artifact_id=row["artifact_id"], config_key=row["config_key"])
+
+    assert selected["logical_model_id"] == "org/model"
+    assert selected["reusable"] is False
+
+
+def test_characterization_records_artifact_provenance(store):
+    artifact_id = "ollama-manifest-sha256:" + "a" * 64
+    db.save_characterization(
+        store, "m", "ollama", "org/model", safe_context=4096, points=[],
+        artifact_id=artifact_id, config={"placement": "cpu"},
+        evidence={"digest_source": "api"},
+    )
+
+    artifact = db.get_model_artifact(store, artifact_id)
+    assert artifact["logical_model_id"] == "org/model"
+    assert artifact["artifact_source"] == "ollama"
+    assert artifact["artifact_confidence"] == "observed_digest"
+    assert artifact["evidence"] == {"digest_source": "api"}
+
+
+def test_model_artifact_api_round_trips_all_facts_and_missing(store):
+    assert db.get_model_artifact(store, "missing") is None
+    db.upsert_model_artifact(
+        store, "local-gguf:/models/m.gguf:stat:1", "local/m", artifact_source="local",
+        artifact_confidence="strong", resolved_revision="rev", manifest_hash="hash",
+        size_bytes=42, format="gguf", quantization="q4_k_m",
+        facts={"path": "/models/m.gguf"}, evidence={"source": "stat"},
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    artifact = db.get_model_artifact(store, "local-gguf:/models/m.gguf:stat:1")
+    assert artifact["resolved_revision"] == "rev"
+    assert artifact["manifest_hash"] == "hash"
+    assert artifact["size_bytes"] == 42
+    assert artifact["facts"] == {"path": "/models/m.gguf"}
+
+
+def test_artifact_classification_covers_weak_and_local_identities():
+    assert db._artifact_classification(None) == ("legacy", "legacy_unverified")
+    assert db._artifact_classification("local-gguf:/m:stat:1") == ("local", "strong")
+    assert db._artifact_classification("ollama-manifest-sha256:nope") == (
+        "ollama", "unknown")
+
+
+def test_unrecognized_artifact_identity_is_display_only(store):
+    db.save_characterization(
+        store, "m", "cuda", "org/model", safe_context=4096, points=[],
+        artifact_id="label-only", config={},
+    )
+
+    row = db.get_characterization(store, "m", "cuda", "org/model")
+    assert row["artifact_confidence"] == "unknown"
+    assert row["reusable"] is False
+    assert db.list_reusable_characterizations(
+        store, "m", runtime="torch", backend="cuda") == []
+    assert db.get_reusable_characterization(
+        store, "m", runtime="torch", backend="cuda",
+        artifact_id=row["artifact_id"], config_key=row["config_key"]) is None
+
+
+def test_exact_reusable_read_supports_old_readonly_schema():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    INSERT INTO characterizations VALUES
+        ('m', 'cuda', 'org/model', 4096, NULL, 'hf:org/model@abcdef0:manifest',
+         '{}', '[]', '2026-01-01T00:00:00+00:00');
+    """)
+    row = db.list_reusable_characterizations(
+        con, "m", runtime="torch", backend="cuda")[0]
+
+    selected = db.get_reusable_characterization(
+        con, "m", runtime="torch", backend="cuda", artifact_id=row["artifact_id"],
+        config_key=row["config_key"])
+
+    assert selected["safe_context"] == 4096
+    con.close()
+
+
+def test_old_readonly_calibration_missing_row_returns_none():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute("""
+        CREATE TABLE calibrations (
+            machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+            calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+            PRIMARY KEY (machine_key, engine))
+    """)
+    assert db.get_calibration(con, "missing", "cpu") is None
+    con.close()
+
+
+def test_v5_migrates_unknown_target_rows_as_display_only_and_reopens(
+        tmp_path, monkeypatch):
+    path = tmp_path / "target-schema.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    INSERT INTO characterizations VALUES
+        ('m', 'mystery-runtime', 'org/model', 4096, NULL, NULL, NULL, '[]',
+         '2026-01-01T00:00:00+00:00');
+    CREATE TABLE calibrations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+        calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+        PRIMARY KEY (machine_key, engine)
+    );
+    INSERT INTO calibrations VALUES
+        ('m', 'mystery-runtime', 1.0, '2026-01-01T00:00:00+00:00', 8.0, 6.0);
+    PRAGMA user_version = 4;
+    """)
+    con.close()
+
+    first = db.connect()
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 5
+    rows = db.list_characterizations_for_display(
+        first, "m", runtime="mystery-runtime", backend="unknown")
+    assert len(rows) == 1
+    assert rows[0]["artifact_confidence"] == "legacy_unverified"
+    assert rows[0]["reusable"] is False
+    assert rows[0]["artifact_id"].startswith("legacy-unverified:v1:")
+    artifact = db.get_model_artifact(first, rows[0]["artifact_id"])
+    assert artifact["artifact_confidence"] == "legacy_unverified"
+    assert db.list_reusable_characterizations(
+        first, "m", runtime="mystery-runtime", backend="unknown") == []
+    calibration = db.get_calibration(first, "m", "mystery-runtime")
+    assert calibration["runtime"] == "mystery-runtime"
+    assert calibration["backend"] == "unknown"
+    assert calibration["config_key"] == "cal:v1:default"
+    first.close()
+
+    second = db.connect()
+    assert second.execute("SELECT COUNT(*) FROM characterizations").fetchone()[0] == 1
+    assert second.execute("SELECT COUNT(*) FROM calibrations").fetchone()[0] == 1
+    second.close()
+    backup = path.with_name(path.name + ".pre-target-schema-v5.bak")
+    assert backup.exists()
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert saved.execute("SELECT engine FROM characterizations").fetchone()[0] == (
+        "mystery-runtime")
+    saved.close()
+
+
+def test_v5_target_rebuild_failure_rolls_back_and_keeps_v4_store(
+        tmp_path, monkeypatch):
+    path = tmp_path / "target-schema-rollback.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    INSERT INTO characterizations VALUES
+        ('m', 'cpu', 'org/model', 4096, NULL, NULL, NULL, '[]', 't');
+    CREATE TABLE calibrations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+        calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+        PRIMARY KEY (machine_key, engine)
+    );
+    INSERT INTO calibrations VALUES ('m', 'cpu', 1.0, 't', 8.0, 6.0);
+    PRAGMA user_version = 4;
+    """)
+    con.close()
+    monkeypatch.setattr(
+        db, "_migrate_target_schema_v5",
+        lambda _con: (_ for _ in ()).throw(RuntimeError("forced v5 failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="forced v5 failure"):
+        db.connect()
+
+    saved = sqlite3.connect(path)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert "engine" in {
+        row[1] for row in saved.execute("PRAGMA table_info(characterizations)")}
+    assert saved.execute("SELECT safe_context FROM characterizations").fetchone()[0] == 4096
+    assert saved.execute("SELECT fixed_overhead_gb FROM calibrations").fetchone()[0] == 1.0
+    saved.close()
 
 
 def test_legacy_characterization_config_remains_unknown(tmp_path, monkeypatch):
@@ -594,7 +859,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     first = db.connect()
     row = db.get_benchmark_result(first, "m", "org/model", "coding")
-    assert first.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 5
     assert row is not None
     assert row["runtime"] == "mystery-runtime"
     assert row["backend"] == "unknown"
@@ -606,7 +871,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     second = db.connect()
     assert second.execute("SELECT COUNT(*) FROM benchmark_results").fetchone()[0] == 1
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 5
     second.close()
     backup = path.with_name(path.name + ".pre-target-cells-v4.bak")
     assert backup.exists()
@@ -768,6 +1033,19 @@ def _v2_engine_identity_db(tmp_path, monkeypatch, name="identity.db"):
     con = sqlite3.connect(path)
     con.executescript(db.SCHEMA)
     con.executescript("""
+    DROP TABLE calibrations;
+    CREATE TABLE calibrations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+        calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+        PRIMARY KEY (machine_key, engine)
+    );
+    DROP TABLE characterizations;
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
     DROP TABLE benchmark_results;
     CREATE TABLE benchmark_results (
         machine_key TEXT NOT NULL, model_id TEXT NOT NULL, use_case TEXT NOT NULL,
@@ -800,15 +1078,15 @@ def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monk
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert [tuple(row) for row in migrated.execute(
-        "SELECT machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, "
-        "safe_budget_gb FROM calibrations ORDER BY machine_key"
-    )] == sorted(calibrations)
-    assert [tuple(row) for row in migrated.execute(
-        "SELECT machine_key, engine, model_id, safe_context, decode_context, points_json, "
-        "measured_at FROM characterizations ORDER BY machine_key"
-    )] == sorted(characterizations)
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 5
+    for machine_key, engine, overhead, calibrated_at, wall, budget in calibrations:
+        row = db.get_calibration(migrated, machine_key, engine)
+        assert (row["fixed_overhead_gb"], row["calibrated_at"], row["wall_gb"],
+                row["safe_budget_gb"]) == (overhead, calibrated_at, wall, budget)
+    for machine_key, engine, model_id, safe, decode, points, measured_at in characterizations:
+        row = db.get_characterization(migrated, machine_key, engine, model_id)
+        assert (row["safe_context"], row["decode_context"], row["points_json"],
+                row["measured_at"]) == (safe, decode, points, measured_at)
 
 
 def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_path, monkeypatch):
@@ -845,17 +1123,17 @@ def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_pa
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert migrated.execute("SELECT engine FROM calibrations WHERE machine_key='old'").fetchone()[0] == "mlx"
-    tie = dict(migrated.execute("SELECT * FROM calibrations WHERE machine_key='tie'").fetchone())
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.get_calibration(migrated, "old", "mlx")["legacy_engine"] == "mlx"
+    tie = db.get_calibration(migrated, "tie", "mlx")
     assert tie["engine"] == "mlx" and tie["fixed_overhead_gb"] == 2.0 and tie["wall_gb"] == 22.0
-    null_ts = dict(migrated.execute("SELECT * FROM calibrations WHERE machine_key='null-ts'").fetchone())
+    null_ts = db.get_calibration(migrated, "null-ts", "cuda")
     assert null_ts["engine"] == "cuda" and null_ts["fixed_overhead_gb"] == 2.0
-    char = dict(migrated.execute("SELECT * FROM characterizations WHERE machine_key='collision'").fetchone())
+    char = db.get_characterization(migrated, "collision", "cuda", "b")
     assert char["engine"] == "cuda" and char["safe_context"] == 200
     assert char["decode_context"] == 202 and char["points_json"] == '["complete-winner"]'
-    old_char = migrated.execute("SELECT engine FROM characterizations WHERE machine_key='old'").fetchone()
-    assert old_char[0] == "cuda"
+    old_char = db.get_characterization(migrated, "old", "cuda", "a")
+    assert old_char["engine"] == "cuda"
     bench = dict(migrated.execute("SELECT engine_key, source FROM benchmark_results").fetchone())
     assert bench == {"engine_key": "cuda", "source": "wcx probe"}
     migrated_profile = json.loads(migrated.execute("SELECT profile_json FROM profiles").fetchone()[0])
@@ -895,8 +1173,8 @@ def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monke
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
     before = backup.read_bytes()
     second = db.connect()
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert second.execute("SELECT engine FROM calibrations").fetchone()[0] == "mlx"
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.get_calibration(second, "m", "mlx")["legacy_engine"] == "mlx"
     second.close()
     assert backup.read_bytes() == before
 

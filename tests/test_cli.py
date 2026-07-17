@@ -318,13 +318,13 @@ def test_render_doctor_verbose_reports_store_details(
 
     out = buf.getvalue()
     assert f"database             {db._db_path()}" in out
-    assert "schema version       4" in out
+    assert "schema version       5" in out
 
     c = cli.Console.from_env(verbose=True)
     assert cli.render_doctor(c, as_json=True) == 0
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
-    assert out_json["schema_version"] == 4
+    assert out_json["schema_version"] == 5
 
 
 def test_render_doctor_text_reports_ollama_findings(
@@ -1507,6 +1507,14 @@ def test_profile_reads_legacy_calibration_without_migrating(
 
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    store.executescript("""
+    DROP TABLE calibrations;
+    CREATE TABLE calibrations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, fixed_overhead_gb REAL,
+        calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL,
+        PRIMARY KEY (machine_key, engine)
+    );
+    """)
     store.execute(
         "INSERT INTO calibrations "
         "(machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, safe_budget_gb) "
@@ -2639,6 +2647,15 @@ def test_detect_models_reads_existing_database_without_migrating(
 
     path = db._db_path()
     backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+    store.executescript("""
+    DROP TABLE characterizations;
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    """)
     store.execute(
         "INSERT INTO characterizations "
         "(machine_key, engine, model_id, safe_context, points_json) VALUES (?, ?, ?, ?, ?)",
@@ -3207,14 +3224,32 @@ def test_main_recommend_use_case_dispatch(monkeypatch):
 # ara serve --engine mlx — governed MLX endpoint (this Mac)
 # Spec 2026-06-28-recommend-use-case-and-serve-selection
 # --------------------------------------------------------------------------- #
+def _patch_native_characterization(monkeypatch, row):
+    def reusable_row(*_args, config, **_kwargs):
+        if row is None:
+            return None
+        return row if row.get("config", {}) == config else None
+
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", reusable_row)
+
+
+def _patch_native_characterization_lookup(monkeypatch, lookup):
+    monkeypatch.setattr(cli.db, "get_characterization", lookup)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda con, mk, engine, model, **_kwargs: lookup(con, mk, engine, model),
+    )
+
+
 def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_platform):
     # `serve --engine mlx` stands the model up on the governed MLX server at the MEASURED apple
     # ceiling, hands back an OpenAI-compatible /v1 endpoint, and stays foreground (proc.wait).
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     # Characterizations are keyed by ENGINE KEY ("mlx"), not backend name ("apple").
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
+    _patch_native_characterization(monkeypatch, {"safe_context": 8000})
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     captured = {}
 
@@ -3240,10 +3275,9 @@ def test_serve_mlx_json_carries_stale_ceiling_flag(make_console, monkeypatch, se
     """MLX serve --json must also carry the stale flag (mirrors the Ollama path) — Fix #4."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: ({"safe_context": 8000,
-                                                "measured_at": "2026-01-01T00:00:00+00:00"}
-                                               if e == "mlx" else None))
+    _patch_native_characterization(
+        monkeypatch, {"safe_context": 8000,
+                      "measured_at": "2026-01-01T00:00:00+00:00"})
     monkeypatch.setattr(cli.staleness, "ceiling_is_stale", lambda mid, at: True)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
 
@@ -3260,7 +3294,7 @@ def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, s
     # No measured MLX ceiling + no --ctx → refuse, point at characterize (never a guessed ceiling).
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: None)
+    _patch_native_characterization(monkeypatch, None)
     c, buf = make_console()
     assert cli.render_serve(c, "org/Uncharacterized", engine="mlx", assume_yes=True) == 1
     assert "characterize" in buf.getvalue()
@@ -3270,9 +3304,8 @@ def test_serve_mlx_refuses_ceiling_measured_with_nondefault_config(
         make_console, monkeypatch, set_platform):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
-        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
-    })
+    _patch_native_characterization(
+        monkeypatch, {"safe_context": 8000, "config": {"kv_quant": "q4_0"}})
     c, buf = make_console()
     assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
     assert "different engine settings" in buf.getvalue()
@@ -3282,9 +3315,8 @@ def test_serve_mlx_explicit_ctx_still_refuses_mismatched_measurement_config(
         make_console, monkeypatch, set_platform):
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
-        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
-    })
+    _patch_native_characterization(
+        monkeypatch, {"safe_context": 8000, "config": {"kv_quant": "q4_0"}})
     c, buf = make_console()
     assert cli.render_serve(c, "org/m", engine="mlx", ctx=4000, assume_yes=True) == 1
     assert "different engine settings" in buf.getvalue()
@@ -3318,8 +3350,7 @@ def test_serve_mlx_passes_measured_slope_from_points(make_console, monkeypatch, 
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     row = {"safe_context": 40960,
            "points": [{"context": 2000, "mem_gb": 1.535}, {"context": 16000, "mem_gb": 4.48}]}
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: row if e == "mlx" else None)
+    _patch_native_characterization(monkeypatch, row)
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     captured = {}
 
@@ -3355,8 +3386,7 @@ def _wire_run(monkeypatch, *, engine_ok=True, generate=_ok_generate, characteriz
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     if characterization is not None and "artifact_id" not in characterization:
         characterization = {**characterization, "artifact_id": "artifact:test"}
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: characterization)
+    _patch_native_characterization(monkeypatch, characterization)
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
     bk = types.SimpleNamespace()
@@ -3477,12 +3507,25 @@ def test_run_pinned_refuses_missing_artifact_authority(make_console, monkeypatch
     assert "not bound to an exact artifact" in buf.getvalue()
 
 
+def test_run_pinned_refuses_display_only_ceiling(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "not reusable" in buf.getvalue()
+
+
 def test_run_refuses_when_artifact_changes_after_auto_selection_before_load(
         make_console, monkeypatch):
     _wire_run(monkeypatch, characterization=_CHAR)
     monkeypatch.setattr(
         cli.db, "get_characterization",
         lambda _con, _mk, engine, _model: _CHAR if engine == "cpu" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda _con, _mk, engine, _model, **_kwargs: _CHAR if engine == "cpu" else None)
     matches = iter((True, False))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: next(matches))
     c, buf = make_console()
@@ -3498,6 +3541,9 @@ def test_run_refuses_result_when_artifact_changes_during_generation(
     monkeypatch.setattr(
         cli.db, "get_characterization",
         lambda _con, _mk, engine, _model: _CHAR if engine == "cpu" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda _con, _mk, engine, _model, **_kwargs: _CHAR if engine == "cpu" else None)
     matches = iter((True, True, False))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: next(matches))
     c, buf = make_console()
@@ -3632,6 +3678,10 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.db, "get_characterization",
                         lambda con, mk, e, m: chars.get(e))
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda _con, _mk, engine, _model, **_kwargs: chars.get(engine),
+    )
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
 
     def backend(b=None):
@@ -3654,6 +3704,19 @@ def test_run_picks_characterized_engine_across_backends(make_console, monkeypatc
     c, buf = make_console()
     assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
     assert "ran on cpu" in buf.getvalue()
+
+
+def test_run_auto_refuses_display_only_ceiling(make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cpu",
+        chars={"cpu": {"model_id": "org/m", "safe_context": 4096}},
+        supports={"cpu": True})
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "not reusable" in buf.getvalue()
 
 
 def test_run_picks_largest_safe_context_engine(monkeypatch, capsys):
@@ -5275,6 +5338,15 @@ def test_model_detail_reads_legacy_characterization_without_migrating(
 
     monkeypatch.setattr(cli.catalog, "describe", lambda mid: _meta())
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    store.executescript("""
+    DROP TABLE characterizations;
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, engine TEXT NOT NULL, model_id TEXT NOT NULL,
+        safe_context INTEGER, decode_context INTEGER, artifact_id TEXT, config_json TEXT,
+        points_json TEXT, measured_at TEXT,
+        PRIMARY KEY (machine_key, engine, model_id)
+    );
+    """)
     store.execute(
         "INSERT INTO characterizations "
         "(machine_key, engine, model_id, safe_context, decode_context, points_json) "
@@ -7311,12 +7383,12 @@ def test_run_threads_flash_attn_to_vulkan_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "cpu")
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "llama.cpp (Vulkan)"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {
-                                "safe_context": 8000,
-                                "config": {"kv_quant": "q4_0", "flash_attn": False},
-                                "artifact_id": "artifact:test",
-                            })
+    _patch_native_characterization(
+        monkeypatch, {
+            "safe_context": 8000,
+            "config": {"kv_quant": "q4_0", "flash_attn": False},
+            "artifact_id": "artifact:test",
+        })
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
@@ -7371,11 +7443,11 @@ def test_run_threads_kv_quant_to_apple_backend(make_console, monkeypatch):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {
-                                "safe_context": 8000, "config": {"kv_quant": "q4_0"},
-                                "artifact_id": "artifact:test",
-                            })
+    _patch_native_characterization(
+        monkeypatch, {
+            "safe_context": 8000, "config": {"kv_quant": "q4_0"},
+            "artifact_id": "artifact:test",
+        })
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
@@ -7902,6 +7974,8 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     if characterization is not None and "artifact_id" not in characterization:
         characterization = {**characterization,
                             "artifact_id": "ollama-manifest-sha256:" + "a" * 64}
+    if characterization is not None and "reusable" not in characterization:
+        characterization = {**characterization, "reusable": True}
     if (characterization is not None
             and characterization.get("safe_context") is not None
             and "config" not in characterization):
@@ -7956,7 +8030,10 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
                 "accelerator_margin_bytes": None,
             },
         }
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
+    monkeypatch.setattr(
+        cli.db, "list_characterizations_for_display",
+        lambda *_a, **_k: [] if characterization is None else [characterization],
+    )
     monkeypatch.setattr(cli.db, "save_characterization", lambda *a, **k: None)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
 
@@ -10441,10 +10518,13 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     monkeypatch.setattr(cli.engines, "ENGINES", orig)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "test engine"))
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {
-                            "safe_context": ceiling, "artifact_id": "artifact:test"
-                        } if e == engine_key else None)
+    row = {"safe_context": ceiling, "artifact_id": "artifact:test"}
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: row if engine == engine_key else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda _con, _mk, engine, _model, **_kwargs: row if engine == engine_key else None)
 
     saved = {}
 
@@ -10798,9 +10878,10 @@ def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
 
 def test_render_benchmark_lower_ctx_preserves_ceiling_staleness(monkeypatch, capsys):
     _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
+    row = {
         "safe_context": 8000, "measured_at": "2026-01-02T03:04:05+00:00",
-        "artifact_id": "artifact:test"})
+        "artifact_id": "artifact:test"}
+    _patch_native_characterization(monkeypatch, row)
     seen = {}
     monkeypatch.setattr(
         cli.staleness, "ceiling_is_stale",
@@ -10826,19 +10907,45 @@ def test_render_benchmark_rejects_unknown_use_case(make_console, monkeypatch):
 def test_render_benchmark_refuses_no_ceiling(make_console, monkeypatch):
     _wire_benchmark(monkeypatch, ceiling=8000)
     # Override get_characterization to return None (no ceiling stored).
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: None)
+    _patch_native_characterization(monkeypatch, None)
     c, buf = make_console()
     rc = cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True)
     assert rc == 1
     assert "no measured ceiling" in buf.getvalue() and "ara characterize" in buf.getvalue()
 
 
+@pytest.mark.parametrize("engine", [None, "mlx"])
+def test_render_benchmark_refuses_reusable_row_without_safe_ceiling(
+        make_console, monkeypatch, engine):
+    _wire_benchmark(monkeypatch)
+    row = {"safe_context": None, "artifact_id": "artifact:test"}
+    _patch_native_characterization(monkeypatch, row)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(
+        c, "org/m", use_case="reasoning", engine=engine, assume_yes=True) == 1
+    assert "no measured ceiling" in buf.getvalue()
+
+
+def test_render_benchmark_explicit_refuses_display_only_ceiling(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    row = {"safe_context": 8000, "artifact_id": "artifact:test"}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(
+        c, "org/m", use_case="reasoning", engine="mlx", assume_yes=True) == 1
+    assert "no reusable measured ceiling" in buf.getvalue()
+
+
 def test_render_benchmark_refuses_ceiling_measured_with_nondefault_config(
         make_console, monkeypatch):
     _wire_benchmark(monkeypatch, ceiling=8000)
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
-        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
-    })
+    _patch_native_characterization(
+        monkeypatch, {"safe_context": 8000, "config": {"kv_quant": "q4_0"}})
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True) == 1
     assert "different engine settings" in buf.getvalue()
@@ -10847,9 +10954,8 @@ def test_render_benchmark_refuses_ceiling_measured_with_nondefault_config(
 def test_render_benchmark_explicit_ctx_still_refuses_mismatched_measurement_config(
         make_console, monkeypatch):
     _wire_benchmark(monkeypatch, ceiling=8000)
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: {
-        "safe_context": 8000, "config": {"kv_quant": "q4_0"}
-    })
+    _patch_native_characterization(
+        monkeypatch, {"safe_context": 8000, "config": {"kv_quant": "q4_0"}})
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="mlx", ctx=4000,
                                 assume_yes=True) == 1
@@ -10859,7 +10965,7 @@ def test_render_benchmark_explicit_ctx_still_refuses_mismatched_measurement_conf
 def test_render_benchmark_explicit_ctx_cannot_replace_characterization(
         make_console, monkeypatch):
     _wire_benchmark(monkeypatch, ceiling=8000)
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: None)
+    _patch_native_characterization(monkeypatch, None)
     c, buf = make_console()
 
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", ctx=4000,
@@ -10953,11 +11059,11 @@ def test_render_benchmark_auto_skips_uninstalled_engine_for_installed_fallback(
     monkeypatch.setattr(cli.engines, "ENGINES", catalog)
     monkeypatch.setattr(cli.engines, "for_backend",
                         lambda backend: "cuda" if backend == "cuda" else None)
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda _con, _mk, engine, _model: {
-                            "safe_context": 16000 if engine == "cuda" else 8000,
-                            "artifact_id": "artifact:test",
-                        } if engine in {"cuda", "cpu"} else None)
+    _patch_native_characterization_lookup(
+        monkeypatch, lambda _con, _mk, engine, _model: {
+            "safe_context": 16000 if engine == "cuda" else 8000,
+            "artifact_id": "artifact:test",
+        } if engine in {"cuda", "cpu"} else None)
     monkeypatch.setattr(cli, "engine_status",
                         lambda backend=None: (backend == "cpu", f"{backend} engine"))
     c, _ = make_console()
@@ -11010,12 +11116,12 @@ def test_render_benchmark_auto_skips_higher_stale_engine_ceiling(
     monkeypatch.setattr(cli.engines, "ENGINES", catalog)
     monkeypatch.setattr(cli.engines, "for_backend",
                         lambda backend: "cuda" if backend == "cuda" else None)
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda _con, _mk, engine, _model: {
-                            "safe_context": 16000 if engine == "cuda" else 8000,
-                            "artifact_id": ("artifact:stale" if engine == "cuda"
-                                            else "artifact:test"),
-                        } if engine in {"cuda", "cpu"} else None)
+    _patch_native_characterization_lookup(
+        monkeypatch, lambda _con, _mk, engine, _model: {
+            "safe_context": 16000 if engine == "cuda" else 8000,
+            "artifact_id": ("artifact:stale" if engine == "cuda"
+                            else "artifact:test"),
+        } if engine in {"cuda", "cpu"} else None)
     c, _ = make_console()
 
     assert cli.render_benchmark(c, "org/m", use_case="reasoning",
@@ -11065,7 +11171,7 @@ def test_render_benchmark_auto_ignores_nonbenchmark_candidate_backend(
 def test_render_benchmark_explicit_engine_requires_its_own_ceiling(
         make_console, monkeypatch):
     _wire_benchmark(monkeypatch, engine_key="cpu")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: None)
+    _patch_native_characterization(monkeypatch, None)
     c, buf = make_console()
 
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine="cpu",
@@ -11080,10 +11186,10 @@ def test_render_benchmark_persists_absolute_local_evidence_key(
     monkeypatch.chdir(tmp_path)
     saved = _wire_benchmark(monkeypatch, engine_key="cpu")
     absolute = str(model.resolve())
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda _con, _mk, engine, model_id: {
-                            "safe_context": 8000, "artifact_id": "artifact:test"
-                        } if engine == "cpu" and model_id == absolute else None)
+    _patch_native_characterization_lookup(
+        monkeypatch, lambda _con, _mk, engine, model_id: {
+            "safe_context": 8000, "artifact_id": "artifact:test"
+        } if engine == "cpu" and model_id == absolute else None)
     c, _ = make_console()
 
     assert cli.render_benchmark(c, model.name, use_case="reasoning", engine="cpu",
@@ -11395,8 +11501,7 @@ def test_serve_mlx_refuses_ctx_above_measured_ceiling(make_console, monkeypatch,
     Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
+    _patch_native_characterization(monkeypatch, {"safe_context": 8000})
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     c, buf = make_console()
     rc = cli.render_serve(c, "org/m", engine="mlx", ctx=16000, assume_yes=True)
@@ -11411,8 +11516,7 @@ def test_serve_mlx_allows_ctx_under_measured_ceiling(make_console, monkeypatch, 
     Slug: 2026-07-02-rule1-ctx-gate"""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": 8000} if e == "mlx" else None)
+    _patch_native_characterization(monkeypatch, {"safe_context": 8000})
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
 
     class _Proc:
@@ -11927,8 +12031,10 @@ def test_render_benchmark_refuses_unknown_or_changing_artifact(
 def test_render_benchmark_refuses_ceiling_without_artifact_authority(
         make_console, monkeypatch, engine):
     _wire_benchmark(monkeypatch)
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda *_a: {"safe_context": 8000, "artifact_id": None})
+    row = {"safe_context": 8000, "artifact_id": None}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)
     c, buf = make_console()
     assert cli.render_benchmark(c, "org/m", use_case="reasoning", engine=engine,
                                 assume_yes=True) == 1
@@ -12305,8 +12411,7 @@ def _wire_serve_mlx(monkeypatch, set_platform, *, ceiling=8000, serve=None):
     """Route `serve --engine mlx` to the MLX path with the db + port + apple.serve seams stubbed."""
     set_platform("Darwin", "arm64")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, e, m: {"safe_context": ceiling} if e == "mlx" else None)
+    _patch_native_characterization(monkeypatch, {"safe_context": ceiling})
     monkeypatch.setattr(cli, "_free_port", lambda: 12399)
     if serve is not None:
         monkeypatch.setattr("ara.backends.apple.serve", serve)

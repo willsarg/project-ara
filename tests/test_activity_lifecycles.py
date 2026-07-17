@@ -57,8 +57,10 @@ def test_search_activity_cleans_up_on_every_exit(
 
 def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"})
+    row = {"safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
@@ -424,8 +426,10 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "CPU engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"})
+    row = {"safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)
     monkeypatch.setattr(cli.benchmark, "load_probe", lambda _use_case: [{"answer": "a"}])
     monkeypatch.setattr(cli.benchmark, "prompt_for", lambda *_a: "prompt")
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda *_a: 1.0)
@@ -596,11 +600,17 @@ def test_benchmark_click_acquires_measurement_lock_before_tracking(monkeypatch):
     assert order == ["lock-enter", "track-enter", "render", "track-exit", "lock-exit"]
 
 
+def _wire_mlx_serve_characterization(monkeypatch):
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
+    row = {"safe_context": 4096, "measured_at": None, "points": []}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)
+
+
 def test_mlx_serve_tracks_after_ready_handshake_through_wait(
         make_console, monkeypatch, activity_registry):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "points": []})
+    _wire_mlx_serve_characterization(monkeypatch)
     monkeypatch.setattr(cli, "_free_port", lambda: 1234)
 
     class Proc:
@@ -618,9 +628,7 @@ def test_mlx_serve_tracks_after_ready_handshake_through_wait(
 
 
 def test_mlx_backend_startup_failure_never_starts_tracking(make_console, monkeypatch):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "points": []})
+    _wire_mlx_serve_characterization(monkeypatch)
     monkeypatch.setattr(cli, "_free_port", lambda: 1234)
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         serve=lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("not ready"))))
@@ -632,9 +640,7 @@ def test_mlx_backend_startup_failure_never_starts_tracking(make_console, monkeyp
 @pytest.mark.parametrize("raised", [RuntimeError("boom"), KeyboardInterrupt(), SystemExit(3)])
 def test_mlx_serve_wait_cleanup_covers_all_exit_paths(
         make_console, monkeypatch, activity_registry, raised):
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "points": []})
+    _wire_mlx_serve_characterization(monkeypatch)
     monkeypatch.setattr(cli, "_free_port", lambda: 1234)
 
     class Proc:
@@ -658,9 +664,7 @@ def test_mlx_serve_sigterm_unwind_cleans_activity(
         make_console, monkeypatch, activity_registry):
     import signal
 
-    monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None, "points": []})
+    _wire_mlx_serve_characterization(monkeypatch)
     monkeypatch.setattr(cli, "_free_port", lambda: 1234)
     installed = {}
 
@@ -730,10 +734,11 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
         "refusal_reasons": [],
         **wall_evidence,
     }
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
+    characterization = {
         "safe_context": 4096,
         "measured_at": None,
         "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "reusable": True,
         "points": [point],
         "config": {
             "methodology": "ollama-physical-walls-v1",
@@ -758,7 +763,9 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
             "effective_scheduler_spread": "unknown",
             **wall_evidence,
         },
-    })
+    }
+    monkeypatch.setattr(
+        cli.db, "list_characterizations_for_display", lambda *_a, **_k: [characterization])
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base:model" else "b" * 64)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))

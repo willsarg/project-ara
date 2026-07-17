@@ -171,6 +171,38 @@ def test_assessment_separates_display_row_from_strict_reusable_row(store):
     assert assessment.reason is None
 
 
+def test_assessment_rejects_storage_row_marked_nonreusable(store):
+    model, authority = _complete_characterization(store)
+    store.execute(
+        "UPDATE characterizations SET reusable=0 WHERE machine_key='machine'")
+    store.commit()
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == "storage_evidence_not_reusable"
+
+
+def test_assessment_selects_exact_artifact_when_newer_history_coexists(store):
+    model, authority = _complete_characterization(store)
+    current = db.get_characterization(store, "machine", "ollama", model.name)
+    db.save_characterization(
+        store, "machine", "ollama", model.name, safe_context=2048,
+        points=current["points"],
+        artifact_id="ollama-manifest-sha256:" + "b" * 64,
+        config=current["config"], measured_at="9999-01-01T00:00:00+00:00",
+    )
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is not None
+    assert assessment.reusable["artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
+    assert assessment.reusable["safe_context"] == 4096
+
+
 def test_legacy_characterization_stays_displayable_but_is_not_reusable(store):
     model = _model()
     db.save_characterization(
