@@ -487,7 +487,12 @@ def _det_engines(c: Console, m, *, show_absent: bool = False) -> None:
                 c.emit(c.field("·", val, "installed · not serving — run `ollama serve`",
                                value_role="warn"))
             elif rt.serving is True:
-                c.emit(c.field("·", val, "serving", value_role="good"))
+                detail = "serving"
+                if rt.endpoint_scope is not None:
+                    detail += f" · {rt.endpoint_scope}"
+                if rt.endpoint is not None:
+                    detail += f" · {rt.endpoint}"
+                c.emit(c.field("·", val, detail, value_role="good"))
             else:
                 c.emit(c.field("·", val, "found", value_role="good"))
         elif c.verbose or show_absent:
@@ -2508,6 +2513,17 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 
 
+def _ollama_governed_endpoint() -> tuple[ollama.OllamaEndpoint, str | None]:
+    """Return configured endpoint authority and any initial local-governance refusal."""
+    endpoint = ollama.endpoint_authority()
+    if endpoint.scope == "loopback":
+        return endpoint, None
+    if endpoint.scope == "unknown":
+        return endpoint, "Ollama's configured endpoint is invalid or ambiguous"
+    return endpoint, ("governed Ollama operations require a local loopback endpoint; "
+                      f"the configured endpoint is {endpoint.scope}")
+
+
 def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None) -> str | None:
     """Manifest identity from a supplied inventory record, or a fresh snapshot when omitted."""
     digest = record.digest if record is not None else ollama.manifest_digest(model)
@@ -2679,6 +2695,9 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
+    endpoint, endpoint_error = _ollama_governed_endpoint()
+    if endpoint_error is not None:
+        return err(endpoint_error)
     if ollama.version() is None:
         return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
     models = ollama.inventory()
@@ -2688,6 +2707,8 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     if record is None:
         return err(f"{model} isn't in Ollama — pull it first: ollama pull {model}")
     model = record.name
+    if (support_error := ollama.initial_governed_model_error(record)) is not None:
+        return err(support_error)
     artifact_id = _ollama_artifact_id(model, record=record)
     if artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to measure mutable "
@@ -2705,7 +2726,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     measurement_error = None
     provenance: dict = {}
     try:
-        with locking.ollama_setup_lock(ollama.base_url(), probe):
+        with locking.ollama_setup_lock(endpoint.url, probe):
             residency_error = _ollama_residency_error(ollama.processes())
             if residency_error is not None:
                 return err(residency_error)
@@ -2767,6 +2788,8 @@ def _ollama_pick_best(models: list[ollama.OllamaModel]) -> str | None:
     best_name, best_ceiling = None, -1
     with db.connected() as con:
         for record in models:
+            if ollama.initial_governed_model_error(record) is not None:
+                continue
             n = record.name
             artifact_id = _ollama_artifact_id(n, record=record)
             found = (_ollama_safe_ceiling(con, mk, n, artifact_id) if artifact_id else None)
@@ -3007,6 +3030,10 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         # Auto uses native MLX on Apple Silicon (handled above), otherwise Ollama. Ollama owns its
         # own CPU/GPU routing, so claiming a CUDA/CPU engine pin here would be dishonest.
 
+    endpoint_authority, endpoint_error = _ollama_governed_endpoint()
+    if endpoint_error is not None:
+        return err(endpoint_error)
+
     # Reject unsafe persistent activity fields before touching Ollama or pulling model data. A
     # placeholder positive context is sufficient here because the real ceiling is separately
     # validated before setup; this pass keeps malformed user input side-effect free.
@@ -3014,7 +3041,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         try:
             activity.validate_ollama_serving_fields(
                 served_name=name or _governed_name(candidate), model=candidate,
-                context=ctx or 1, endpoint=ollama.base_url())
+                context=ctx or 1, endpoint=endpoint_authority.url or ollama.base_url())
         except ValueError as exc:
             return err(f"invalid serving identity: {exc}")
         return None
@@ -3067,6 +3094,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", "  pulled."))
 
     model = record.name
+    if (support_error := ollama.initial_governed_model_error(record)) is not None:
+        return err(support_error)
     base_artifact_id = _ollama_artifact_id(model, record=record)
     if base_artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to serve mutable "
@@ -3119,7 +3148,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     served = name or _governed_name(
         model, artifact_id=base_artifact_id, context=safe)
     served_preexisting = ollama.find_model(models, served) is not None
-    endpoint_base = ollama.base_url()
+    endpoint_base = endpoint_authority.url
     live_activity = activity.snapshot()
     legacy_item = next((item for item in live_activity
                         if item.runtime == "ollama" and item.model == model

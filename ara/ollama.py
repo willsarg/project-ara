@@ -12,14 +12,24 @@ See vault specs 2026-06-26-detect-ollama-liveness and 2026-06-26-ara-serve-gover
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_HOST = "127.0.0.1:11434"
 _MANIFEST_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class OllamaEndpoint:
+    """Normalized Ollama endpoint identity and its execution scope."""
+
+    url: str | None
+    scope: str
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,9 @@ class OllamaModel:
     context_length: int | None = None
     embedding_length: int | None = None
     capabilities: tuple[str, ...] = ()
+    remote_model: str | None = None
+    remote_host: str | None = None
+    scope: str = "local"
 
     @property
     def aliases(self) -> tuple[str, ...]:
@@ -83,6 +96,14 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     return tuple(item for item in value if isinstance(item, str) and item)
 
 
+def _model_scope(row: dict) -> str:
+    remote_keys = ("remote_model", "remote_host")
+    remote_values = tuple(row.get(key) for key in remote_keys)
+    if any(isinstance(value, str) and value for value in remote_values):
+        return "cloud"
+    return "unknown" if any(key in row for key in remote_keys) else "local"
+
+
 def _latest_alias(name: str) -> str | None:
     """Return the other spelling in an implicit-``latest`` pair.
 
@@ -104,6 +125,39 @@ def base_url() -> str:
     if not host.startswith(("http://", "https://")):
         host = "http://" + host
     return host.rstrip("/")
+
+
+def endpoint_authority(url: str | None = None) -> OllamaEndpoint:
+    """Normalize an Ollama URL and classify it without contacting the endpoint."""
+    raw = base_url() if url is None else url.strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return OllamaEndpoint(None, "unknown")
+    if (parts.scheme.lower() not in ("http", "https") or not host
+            or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment):
+        return OllamaEndpoint(None, "unknown")
+    host = host.lower()
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host == "localhost"
+    if is_loopback:
+        scope = "loopback"
+    elif host == "ollama.com" or host.endswith(".ollama.com"):
+        scope = "cloud"
+    else:
+        scope = "remote"
+    rendered_host = f"[{host}]" if ":" in host else host
+    netloc = rendered_host + (f":{port}" if port is not None else "")
+    path = parts.path.rstrip("/")
+    normalized = urllib.parse.urlunsplit((parts.scheme.lower(), netloc, path, "", ""))
+    return OllamaEndpoint(normalized, scope)
 
 
 def _get_json(path: str, timeout: float) -> dict | None:
@@ -179,6 +233,9 @@ def inventory(timeout: float = 2.0) -> list[OllamaModel] | None:
             context_length=_positive_int(details.get("context_length")),
             embedding_length=_positive_int(details.get("embedding_length")),
             capabilities=_string_tuple(row.get("capabilities")),
+            remote_model=_optional_string(row.get("remote_model")),
+            remote_host=_optional_string(row.get("remote_host")),
+            scope=_model_scope(row),
         ))
     return result
 
@@ -193,6 +250,20 @@ def find_model(models: list[OllamaModel], name: str) -> OllamaModel | None:
         for model in models:
             if model.name == alias:
                 return model
+    return None
+
+
+def initial_governed_model_error(model: OllamaModel) -> str | None:
+    """Return why *model* is outside ARA's first governed Ollama cell, if it is."""
+    if model.scope == "cloud":
+        return f"{model.name} is an Ollama cloud model; ARA's local governor will not execute it"
+    if model.scope != "local":
+        return f"{model.name} has ambiguous local/remote metadata; refusing local execution"
+    if not isinstance(model.format, str) or model.format.casefold() != "gguf":
+        found = repr(model.format) if model.format is not None else "unknown"
+        return f"{model.name}'s format is {found}; initial Ollama support requires local GGUF"
+    if "completion" not in model.capabilities:
+        return f"{model.name} does not advertise Ollama's completion capability"
     return None
 
 

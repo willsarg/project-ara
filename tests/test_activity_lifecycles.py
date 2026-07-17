@@ -692,7 +692,9 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model"])
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda: [cli.ollama.OllamaModel(name="base:model", digest="a" * 64)],
+        lambda: [cli.ollama.OllamaModel(
+            name="base:model", digest="a" * 64, format="gguf",
+            capabilities=("completion",))],
     )
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
@@ -856,7 +858,9 @@ def test_ollama_refuses_takeover_of_served_identity_owned_by_another_base(
     monkeypatch.setattr(
         cli.ollama, "inventory",
         lambda: [
-            cli.ollama.OllamaModel(name="base:model", digest="a" * 64),
+            cli.ollama.OllamaModel(
+                name="base:model", digest="a" * 64, format="gguf",
+                capabilities=("completion",)),
             cli.ollama.OllamaModel(name="shared:latest", digest="b" * 64),
         ],
     )

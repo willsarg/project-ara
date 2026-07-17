@@ -282,6 +282,8 @@ class Runtime:
     accels: tuple[str, ...] = ()     # accelerator kinds it's built for; () = cross-platform
     usable: bool | None = None       # resolved against this machine; None = not gated
     serving: bool | None = None      # server runtimes only: True=reachable, False=installed-but-down
+    endpoint: str | None = None      # normalized external-runtime endpoint, when applicable
+    endpoint_scope: str | None = None  # loopback | remote | cloud | unknown
 
     @property
     def requires(self) -> str | None:
@@ -344,8 +346,13 @@ def _with_ollama_liveness(rt: Runtime) -> Runtime:
     When serving, prefer the running version over the brew receipt. Spec 2026-06-26-detect-ollama-liveness."""
     if not rt.present:
         return rt
+    endpoint = ollama.endpoint_authority()
+    if endpoint.scope == "unknown":
+        return replace(rt, serving=False, endpoint=None, endpoint_scope="unknown")
     api_version = ollama.version()
-    return replace(rt, version=api_version or rt.version, serving=api_version is not None)
+    return replace(
+        rt, version=api_version or rt.version, serving=api_version is not None,
+        endpoint=endpoint.url, endpoint_scope=endpoint.scope)
 
 
 # --------------------------------------------------------------------------- #

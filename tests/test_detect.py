@@ -416,6 +416,31 @@ def test_ollama_liveness_serving_prefers_api_version(monkeypatch):
     assert out.version == "0.30.10"      # running version wins over the brew receipt
 
 
+def test_ollama_liveness_records_normalized_endpoint_scope(monkeypatch):
+    monkeypatch.setattr(ollama, "base_url", lambda: "HTTP://BOX.LOCAL:11434/")
+    monkeypatch.setattr(ollama, "version", lambda *a, **k: "0.30.10")
+    rt = Runtime("Ollama", present=True)
+
+    out = detect._with_ollama_liveness(rt)
+
+    assert out.endpoint == "http://box.local:11434"
+    assert out.endpoint_scope == "remote"
+
+
+def test_ollama_liveness_does_not_contact_ambiguous_endpoint(monkeypatch):
+    monkeypatch.setattr(ollama, "base_url", lambda: "http://user:secret@localhost:11434")
+    monkeypatch.setattr(
+        ollama, "version", lambda *a, **k: pytest.fail("contacted ambiguous endpoint"))
+    rt = Runtime("Ollama", present=True, version="0.30.9-brew")
+
+    out = detect._with_ollama_liveness(rt)
+
+    assert out.endpoint is None
+    assert out.endpoint_scope == "unknown"
+    assert out.serving is False
+    assert out.version == "0.30.9-brew"
+
+
 def test_ollama_liveness_installed_not_serving_keeps_brew_version(monkeypatch):
     monkeypatch.setattr(ollama, "version", lambda *a, **k: None)
     rt = Runtime("Ollama", present=True, version="0.30.9-brew")

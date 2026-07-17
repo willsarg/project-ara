@@ -27,6 +27,40 @@ def test_base_url_bare_host(monkeypatch):
     assert ollama.base_url() == "http://myhost"
 
 
+def test_endpoint_authority_normalizes_and_classifies_loopback():
+    assert ollama.endpoint_authority("HTTP://LOCALHOST:11434/") == ollama.OllamaEndpoint(
+        url="http://localhost:11434", scope="loopback")
+
+
+def test_endpoint_authority_distinguishes_remote_and_cloud():
+    assert ollama.endpoint_authority("http://192.168.1.20:11434").scope == "remote"
+    assert ollama.endpoint_authority("https://ollama.com/api/") == ollama.OllamaEndpoint(
+        url="https://ollama.com/api", scope="cloud")
+
+
+def test_endpoint_authority_handles_mixed_case_scheme_and_ipv6_loopback():
+    assert ollama.endpoint_authority("Http://[::1]:11434/") == ollama.OllamaEndpoint(
+        url="http://[::1]:11434", scope="loopback")
+
+
+def test_endpoint_authority_fails_closed_on_ambiguous_urls():
+    for value in (
+        "ftp://localhost:11434",
+        "http://user:secret@localhost:11434",
+        "http://localhost:bad-port",
+        "http://localhost:11434?target=remote",
+        "http://localhost:11434#fragment",
+        "",
+    ):
+        assert ollama.endpoint_authority(value) == ollama.OllamaEndpoint(
+            url=None, scope="unknown")
+
+
+def test_endpoint_authority_does_not_trust_loopback_lookalikes():
+    assert ollama.endpoint_authority("http://127.0.0.2:11434").scope == "loopback"
+    assert ollama.endpoint_authority("http://localhost.example:11434").scope == "remote"
+
+
 # --------------------------------------------------------------------------- #
 # _get_json — the single urllib seam
 # --------------------------------------------------------------------------- #
@@ -193,6 +227,33 @@ def test_inventory_accepts_older_sparse_model_shape(monkeypatch):
     assert model.capabilities == ()
 
 
+def test_inventory_parses_remote_model_identity_as_cloud(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [{
+        "name": "qwen3.5:cloud",
+        "remote_model": "qwen3.5",
+        "remote_host": "https://ollama.com",
+        "capabilities": ["completion"],
+    }]})
+
+    model = ollama.inventory()[0]
+
+    assert model.remote_model == "qwen3.5"
+    assert model.remote_host == "https://ollama.com"
+    assert model.scope == "cloud"
+
+
+def test_inventory_does_not_misclassify_malformed_remote_metadata_as_local(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [{
+        "name": "ambiguous",
+        "remote_model": 7,
+    }]})
+
+    model = ollama.inventory()[0]
+
+    assert model.remote_model is None
+    assert model.scope == "unknown"
+
+
 def test_inventory_treats_malformed_optional_fields_as_unknown(monkeypatch):
     monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [
         {"name": "valid", "model": 7, "size": True, "digest": "bad",
@@ -238,6 +299,27 @@ def test_find_model_matches_exact_and_implicit_latest():
 def test_find_model_treats_registry_port_as_part_of_name():
     model = ollama.OllamaModel(name="registry.local:5000/org/base:latest")
     assert ollama.find_model([model], "registry.local:5000/org/base") is model
+
+
+def test_initial_governed_model_support_requires_local_gguf_completion():
+    supported = ollama.OllamaModel(
+        name="local", format="gguf", capabilities=("completion",))
+    assert ollama.initial_governed_model_error(supported) is None
+
+    cloud = ollama.OllamaModel(
+        name="cloud", format="gguf", capabilities=("completion",), scope="cloud")
+    assert "cloud model" in ollama.initial_governed_model_error(cloud)
+
+    ambiguous = ollama.OllamaModel(
+        name="ambiguous", format="gguf", capabilities=("completion",), scope="unknown")
+    assert "ambiguous" in ollama.initial_governed_model_error(ambiguous)
+
+    non_gguf = ollama.OllamaModel(
+        name="native", format="safetensors", capabilities=("completion",))
+    assert "requires local GGUF" in ollama.initial_governed_model_error(non_gguf)
+
+    no_completion = ollama.OllamaModel(name="embed", format="gguf", capabilities=("embedding",))
+    assert "completion" in ollama.initial_governed_model_error(no_completion)
 
 
 def test_tags_returns_names(monkeypatch):

@@ -1015,6 +1015,19 @@ def test_det_engines_serving(make_console):
     assert "serving" in out
 
 
+def test_det_engines_shows_ollama_endpoint_scope(make_console):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime(
+        "Ollama", True, "0.30.10", kind="engine", serving=True,
+        endpoint="http://box.local:11434", endpoint_scope="remote")])
+
+    cli._det_engines(c, m)
+
+    out = buf.getvalue()
+    assert "remote" in out
+    assert "http://box.local:11434" in out
+
+
 def test_det_engines_installed_not_serving_guides_serve(make_console):
     c, buf = make_console()
     m = _machine(runtimes=[Runtime("Ollama", True, "0.30.10", kind="engine", serving=False)])
@@ -4018,14 +4031,18 @@ def test_cleanup_ollama_probe_reports_delete_failure_after_verified_unload(monke
     assert "delete probe model" in cli._cleanup_ollama_probe("probe")
 
 
+def _local_ollama_model(name, **fields):
+    return cli.ollama.OllamaModel(
+        name=name, format="gguf", capabilities=("completion",), **fields)
+
+
 def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda t=2.0: ([cli.ollama.OllamaModel(
-            name="qwen3:0.6b", digest="a" * 64,
-        )] if in_store else []),
+        lambda t=2.0: ([_local_ollama_model(
+            "qwen3:0.6b", digest="a" * 64)] if in_store else []),
     )
     monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda model: "a" * 64)
@@ -4066,7 +4083,7 @@ def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, c
     artifact = "ollama-manifest-sha256:" + "a" * 64
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda t=2.0: [cli.ollama.OllamaModel(name="qwen3:latest", digest="a" * 64)],
+        lambda t=2.0: [_local_ollama_model("qwen3:latest", digest="a" * 64)],
     )
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:latest"])
     measured = {}
@@ -4111,7 +4128,7 @@ def test_characterize_ollama_refuses_unidentified_manifest(
     _wire_char_ollama(monkeypatch)
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda t=2.0: [cli.ollama.OllamaModel(name="qwen3:0.6b")],
+        lambda t=2.0: [_local_ollama_model("qwen3:0.6b")],
     )
     monkeypatch.setattr(cli, "_ollama_measure_ceiling",
                         lambda *_a: pytest.fail("measured unidentified manifest"))
@@ -4130,7 +4147,7 @@ def test_characterize_ollama_refuses_preexisting_content_addressed_probe(
     monkeypatch.setattr(
         cli.ollama, "inventory",
         lambda _t=2.0: [
-            cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64),
+            _local_ollama_model("qwen3:0.6b", digest="a" * 64),
             cli.ollama.OllamaModel(name=probe, digest="b" * 64),
         ],
     )
@@ -4151,7 +4168,7 @@ def test_characterize_ollama_refuses_when_final_probe_inventory_is_unavailable(
     def inventory(_timeout=2.0):
         nonlocal calls
         calls += 1
-        return ([cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+        return ([_local_ollama_model("qwen3:0.6b", digest="a" * 64)]
                 if calls == 1 else None)
 
     monkeypatch.setattr(cli.ollama, "inventory", inventory)
@@ -4311,6 +4328,16 @@ def test_characterize_ollama_not_serving(make_console, monkeypatch):
     assert "Ollama isn't serving" in buf.getvalue()
 
 
+def test_characterize_ollama_refuses_non_loopback_before_contact(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://192.168.1.20:11434")
+    monkeypatch.setattr(
+        cli.ollama, "version", lambda *_a, **_k: pytest.fail("contacted remote Ollama"))
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "local loopback" in buf.getvalue()
+
+
 def test_characterize_ollama_tags_unreachable(make_console, monkeypatch):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: None)
@@ -4325,6 +4352,22 @@ def test_characterize_ollama_not_in_store(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "isn't in Ollama" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_cloud_model_before_load(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(cli.ollama, "version", lambda *_a, **_k: "1.0")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda *_a, **_k: [
+        cli.ollama.OllamaModel(
+            name="qwen3.5:cloud", digest="a" * 64, format="gguf",
+            capabilities=("completion",), remote_model="qwen3.5", scope="cloud"),
+    ])
+    monkeypatch.setattr(
+        cli, "_ollama_max_context", lambda *_a: pytest.fail("inspected cloud model"))
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "qwen3.5:cloud", engine="ollama") == 1
+    assert "cloud model" in buf.getvalue()
 
 
 def test_characterize_ollama_refuses_preexisting_residency(make_console, monkeypatch):
@@ -7398,8 +7441,8 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     def inventory(timeout=2.0):
         if names is None:
             return None
-        return [cli.ollama.OllamaModel(
-            name=n,
+        return [_local_ollama_model(
+            n,
             digest=("a" * 64 if n == "qwen3:0.6b" or n in pulled else "b" * 64),
             size_bytes=size,
         ) for n in (*names, *pulled)]
@@ -7464,11 +7507,37 @@ def test_serve_refuses_when_not_serving(make_console, monkeypatch):
     assert "isn't serving" in buf.getvalue()
 
 
+def test_serve_refuses_non_loopback_before_contact(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "https://ollama.com")
+    monkeypatch.setattr(
+        cli.ollama, "version", lambda *_a, **_k: pytest.fail("contacted cloud Ollama"))
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "local loopback" in buf.getvalue() and "cloud" in buf.getvalue()
+
+
 def test_serve_refuses_when_tags_unreachable(make_console, monkeypatch):
     _wire_serve(monkeypatch, names=None)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "couldn't list Ollama models" in buf.getvalue()
+
+
+def test_serve_refuses_cloud_model_before_artifact_or_load(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(cli.ollama, "version", lambda *_a, **_k: "1.0")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda *_a, **_k: [
+        cli.ollama.OllamaModel(
+            name="qwen3.5:cloud", digest="a" * 64, format="gguf",
+            capabilities=("completion",), remote_model="qwen3.5", scope="cloud"),
+    ])
+    monkeypatch.setattr(
+        cli, "_ollama_artifact_id", lambda *_a, **_k: pytest.fail("identified cloud artifact"))
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "qwen3.5:cloud", ctx=8192) == 1
+    assert "cloud model" in buf.getvalue()
 
 
 def test_serve_refuses_unrelated_preexisting_residency(make_console, monkeypatch):
@@ -7506,7 +7575,7 @@ def test_serve_canonicalizes_implicit_latest_before_lock_and_ownership(
         monkeypatch, names=(canonical,), ps_rows=rows,
         characterization={"safe_context": 8192, "artifact_id": artifact},
     )
-    record = cli.ollama.OllamaModel(name=canonical, digest="a" * 64)
+    record = _local_ollama_model(canonical, digest="a" * 64)
     monkeypatch.setattr(cli.ollama, "inventory", lambda timeout=2.0: [record])
     monkeypatch.setattr(
         cli.ollama, "manifest_digest",
@@ -7547,8 +7616,8 @@ def test_serve_pulls_missing_model_then_serves(make_console, monkeypatch):
     monkeypatch.setattr(cli.ollama, "pull", lambda n, timeout=600.0: pulled.append(n) or True)
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda timeout=2.0: [cli.ollama.OllamaModel(
-            name=n, digest="a" * 64,
+        lambda timeout=2.0: [_local_ollama_model(
+            n, digest="a" * 64,
         ) for n in ("other:1", *pulled)],
     )
     c, buf = make_console()
@@ -7627,7 +7696,7 @@ def test_serve_refuses_unidentified_base_manifest(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     monkeypatch.setattr(
         cli.ollama, "inventory",
-        lambda timeout=2.0: [cli.ollama.OllamaModel(name="qwen3:0.6b")],
+        lambda timeout=2.0: [_local_ollama_model("qwen3:0.6b")],
     )
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("created unidentified base"))
@@ -7946,7 +8015,7 @@ def test_serve_refuses_name_appearing_at_final_collision_check(make_console, mon
     def inventory(*_a, **_k):
         nonlocal calls
         calls += 1
-        rows = [cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+        rows = [_local_ollama_model("qwen3:0.6b", digest="a" * 64)]
         if calls > 1:
             rows.append(cli.ollama.OllamaModel(name=f"{served}:latest", digest="b" * 64))
         return rows
@@ -7966,7 +8035,7 @@ def test_serve_refuses_when_final_collision_check_is_unavailable(make_console, m
     def inventory(*_a, **_k):
         nonlocal calls
         calls += 1
-        return ([cli.ollama.OllamaModel(name="qwen3:0.6b", digest="a" * 64)]
+        return ([_local_ollama_model("qwen3:0.6b", digest="a" * 64)]
                 if calls == 1 else None)
 
     monkeypatch.setattr(cli.ollama, "inventory", inventory)
@@ -8326,6 +8395,15 @@ def test_ollama_artifact_id_uses_inventory_record_without_refetch(monkeypatch):
         "ollama-manifest-sha256:" + "a" * 64)
 
 
+def test_ollama_governed_endpoint_rejects_ambiguous_configuration(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://user:secret@localhost:11434")
+
+    endpoint, error = cli._ollama_governed_endpoint()
+
+    assert endpoint.scope == "unknown" and endpoint.url is None
+    assert "invalid or ambiguous" in error
+
+
 def test_ollama_safe_ceiling_requires_matching_manifest_artifact(monkeypatch):
     artifact = "ollama-manifest-sha256:" + "a" * 64
     chars = {"ollama": {"safe_context": 8000,
@@ -8435,8 +8513,8 @@ def test_ollama_estimated_ceiling_uses_inventory_size_without_refetch(monkeypatc
 
 
 def test_named_serve_passes_inventory_record_to_estimator(make_console, monkeypatch):
-    record = cli.ollama.OllamaModel(
-        name="qwen3:0.6b", digest="a" * 64, size_bytes=500_000_000)
+    record = _local_ollama_model(
+        "qwen3:0.6b", digest="a" * 64, size_bytes=500_000_000)
     _wire_serve(monkeypatch, characterization=None, ps_rows=_SERVE_LOADED)
     monkeypatch.setattr(cli.ollama, "inventory", lambda timeout=2.0: [record])
     seen = []
@@ -8479,7 +8557,7 @@ def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
     _wire_pick(monkeypatch)
     ceils = {"a:1": (4000, "estimated", None), "b:1": (9000, "estimated", None),
              "c:1": (6000, "estimated", None)}
-    models = [cli.ollama.OllamaModel(name=n, digest=ch * 64)
+    models = [_local_ollama_model(n, digest=ch * 64)
               for n, ch in zip(ceils, "abc", strict=True)]
     monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
@@ -8500,7 +8578,7 @@ def test_ollama_pick_best_uses_measured_when_present(monkeypatch):
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
                         lambda m, *, record=None:
                         (9000, "estimated", None) if m == "b:1" else None)
-    models = [cli.ollama.OllamaModel(name=n, digest=ch * 64)
+    models = [_local_ollama_model(n, digest=ch * 64)
               for n, ch in (("a:1", "a"), ("b:1", "b"))]
     assert cli._ollama_pick_best(models) == "b:1"
 
@@ -8509,8 +8587,25 @@ def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
     _wire_pick(monkeypatch)
     monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m, *, record=None: None)
-    models = [cli.ollama.OllamaModel(name=n) for n in ("a:1", "b:1")]
+    models = [_local_ollama_model(n) for n in ("a:1", "b:1")]
     assert cli._ollama_pick_best(models) is None
+
+
+def test_ollama_pick_best_skips_models_outside_initial_governed_cell(monkeypatch):
+    _wire_pick(monkeypatch)
+    local = _local_ollama_model("local:1", digest="a" * 64)
+    cloud = cli.ollama.OllamaModel(
+        name="cloud:1", digest="b" * 64, format="gguf",
+        capabilities=("completion",), remote_model="upstream", scope="cloud")
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda *_a, **_k: None)
+
+    def estimate(model, *, record=None):
+        if model == "cloud:1":
+            pytest.fail("ranked a cloud model for local serving")
+        return 4096, "estimated", None
+
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", estimate)
+    assert cli._ollama_pick_best([cloud, local]) == "local:1"
 
 
 def test_serve_zero_arg_selects_and_serves_json(make_console, monkeypatch, capsys):

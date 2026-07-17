@@ -65,12 +65,14 @@ def test_detect_runtime_json_reports_common_inventory_on_linux_without_mlx_detai
         },
         "user_environment": {
             "source": "user environment",
-            "runtimes": [
-                {"name": "llama.cpp", "present": True, "version": "b5200", "kind": "engine",
-                 "accels": [], "usable": None, "serving": None},
-                {"name": "PyTorch", "present": True, "version": "2.7.1", "kind": "framework",
-                 "accels": [], "usable": None, "serving": None},
-            ],
+                "runtimes": [
+                    {"name": "llama.cpp", "present": True, "version": "b5200", "kind": "engine",
+                     "accels": [], "usable": None, "serving": None,
+                     "endpoint": None, "endpoint_scope": None},
+                    {"name": "PyTorch", "present": True, "version": "2.7.1", "kind": "framework",
+                     "accels": [], "usable": None, "serving": None,
+                     "endpoint": None, "endpoint_scope": None},
+                ],
         },
     }
 
