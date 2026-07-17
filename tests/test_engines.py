@@ -140,6 +140,8 @@ def test_for_backend_cuda_still_returns_cuda_not_cuda_gguf():
 def test_is_installed_true_when_env_exists(monkeypatch):
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: name == "apple")
     monkeypatch.setattr(
+        engines.engine_env, "stamped_version", lambda name: engines._ara_version())
+    monkeypatch.setattr(
         engines.engine_env,
         "stamped_schema",
         lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
@@ -160,6 +162,8 @@ def test_is_installed_false_when_declared_schema_stamp_is_missing(monkeypatch):
     monkeypatch.setitem(
         engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        engines.engine_env, "stamped_version", lambda name: engines._ara_version())
     monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: None)
     assert engines.is_installed("mlx") is False
 
@@ -168,6 +172,8 @@ def test_is_installed_false_when_declared_schema_stamp_is_wrong(monkeypatch):
     monkeypatch.setitem(
         engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        engines.engine_env, "stamped_version", lambda name: engines._ara_version())
     monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v1")
     assert engines.is_installed("mlx") is False
 
@@ -176,8 +182,23 @@ def test_is_installed_true_when_declared_schema_stamp_matches(monkeypatch):
     monkeypatch.setitem(
         engines.ENGINES, "mlx", {**engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"})
     monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        engines.engine_env, "stamped_version", lambda name: engines._ara_version())
     monkeypatch.setattr(engines.engine_env, "stamped_schema", lambda name: "mlx-worker-v2")
     assert engines.is_installed("mlx") is True
+
+
+def test_is_installed_false_when_engine_was_built_by_an_older_ara(monkeypatch):
+    monkeypatch.setattr(engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        engines.engine_env,
+        "stamped_schema",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+    )
+    monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0.1.1")
+    monkeypatch.setattr(engines, "_ara_version", lambda: "0.1.2")
+
+    assert engines.is_installed("mlx") is False
 
 
 # --------------------------------------------------------------------------- #

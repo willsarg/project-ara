@@ -714,6 +714,11 @@ def test_profile_cpu_fallback_engine_ready_when_env_present(set_platform, run_st
     set_platform("Linux", "x86_64")
     monkeypatch.setattr("shutil.which", lambda n, path=None: None)
     monkeypatch.setattr(detect._engines.engine_env, "exists", lambda name: name == "cpu")
+    monkeypatch.setattr(
+        detect._engines.engine_env,
+        "stamped_version",
+        lambda name: detect._engines._ara_version(),
+    )
     m = detect.machine()
     assert m.backend == "cpu" and m.engine_ready is True
 

@@ -57,6 +57,11 @@ def test_engine_status_does_not_import_native_mlx_package(set_platform, monkeypa
     set_platform("Darwin", "arm64")
     # presence is an env-existence check (no find_spec, no import of the engine)
     monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        registry.engines.engine_env,
+        "stamped_version",
+        lambda name: registry.engines._ara_version(),
+    )
     registry.engine_status()
     assert "ara_engine_mlx" not in sys.modules
 
@@ -70,6 +75,11 @@ def test_engine_status_reports_present_env_unready_when_schema_is_missing(
         {**registry.engines.ENGINES["mlx"], "env_schema": "mlx-worker-v2"},
     )
     monkeypatch.setattr(registry.engines.engine_env, "exists", lambda name: True)
+    monkeypatch.setattr(
+        registry.engines.engine_env,
+        "stamped_version",
+        lambda name: registry.engines._ara_version(),
+    )
     monkeypatch.setattr(registry.engines.engine_env, "stamped_schema", lambda name: None)
 
     installed, name = registry.engine_status()

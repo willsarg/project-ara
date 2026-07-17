@@ -258,11 +258,14 @@ def resolve(value: str) -> str | None:
 def is_installed(key: str) -> bool:
     """Is engine *key*'s isolated env ready? Cheap and engine-free.
 
-    An env is ready when its Python exists and, if the catalog declares an engine-package schema,
-    its schema stamp matches. Unknown keys and stale package layouts are not installed-ready.
+    An env is ready when its Python exists, its ARA release stamp is current, and, if the catalog
+    declares an engine-package schema, its schema stamp matches. Unknown keys, older bundled
+    engine code, and stale package layouts are not installed-ready.
     """
     engine = ENGINES.get(engine_identity.canonical_engine(key))
     if engine is None or not engine_env.exists(engine["backend"]):
+        return False
+    if engine_env.stamped_version(engine["backend"]) != _ara_version():
         return False
     schema = engine.get("env_schema")
     return schema is None or engine_env.stamped_schema(engine["backend"]) == schema
