@@ -4044,18 +4044,33 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
 
 def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, capsys):
     _wire_char_ollama(monkeypatch)
+    artifact = "ollama-manifest-sha256:" + "a" * 64
     monkeypatch.setattr(
         cli.ollama, "inventory",
         lambda t=2.0: [cli.ollama.OllamaModel(name="qwen3:latest", digest="a" * 64)],
     )
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:latest"])
-    monkeypatch.setattr(
-        cli, "_ollama_measure_ceiling",
-        _fake_ollama_measure((4096, [{"context": 4096, "fit": True}])),
-    )
+    measured = {}
+
+    def measure(model, _max_ctx, probe, **kwargs):
+        measured.update(model=model, probe=probe)
+        kwargs["provenance"].update(created=True, artifact_id=artifact)
+        return 4096, [{"context": 4096, "fit": True}]
+
+    monkeypatch.setattr(cli, "_ollama_measure_ceiling", measure)
     c = cli.Console.from_env()
     assert cli.render_characterize(c, "qwen3", engine="ollama", as_json=True) == 0
-    assert json.loads(capsys.readouterr().out)["safe_context"] == 4096
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_context"] == 4096 and payload["model"] == "qwen3:latest"
+    assert measured == {
+        "model": "qwen3:latest",
+        "probe": cli._governed_name(
+            "qwen3:latest", artifact_id=artifact, context=8192) + "-probe",
+    }
+    with cli.db.connected() as con:
+        assert cli.db.get_characterization(con, "mk", "ollama", "qwen3") is None
+        assert cli.db.get_characterization(
+            con, "mk", "ollama", "qwen3:latest")["safe_context"] == 4096
 
 
 def test_characterize_ollama_refuses_if_manifest_changes_during_measurement(
@@ -7392,7 +7407,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     if show is None and size is None:
         monkeypatch.setattr(
             cli, "_ollama_estimated_ceiling",
-            lambda _m: ((estimated, "estimated", None) if estimated is not None else None),
+            lambda _m, **_k: ((estimated, "estimated", None) if estimated is not None else None),
         )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
 
@@ -7420,6 +7435,51 @@ def test_serve_treats_implicit_latest_as_installed(make_console, monkeypatch):
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3") == 1
     assert "didn't load" in buf.getvalue()
+
+
+def test_serve_canonicalizes_implicit_latest_before_lock_and_ownership(
+        make_console, monkeypatch):
+    canonical = "qwen3:latest"
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    served = cli._governed_name(canonical, artifact_id=artifact, context=8192)
+    rows = [{"name": served + ":latest", "context_length": 8192,
+             "size": 100, "size_vram": 100, "digest": "b" * 64}]
+    _wire_serve(
+        monkeypatch, names=(canonical,), ps_rows=rows,
+        characterization={"safe_context": 8192, "artifact_id": artifact},
+    )
+    record = cli.ollama.OllamaModel(name=canonical, digest="a" * 64)
+    monkeypatch.setattr(cli.ollama, "inventory", lambda timeout=2.0: [record])
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: "a" * 64 if name in ("qwen3", canonical) else "b" * 64,
+    )
+    created = {}
+    monkeypatch.setattr(
+        cli.ollama, "create",
+        lambda name, from_model, ctx: created.update(
+            name=name, from_model=from_model, context=ctx) or True,
+    )
+    locks = []
+
+    @contextlib.contextmanager
+    def setup_lock(_endpoint, name):
+        locks.append(name)
+        yield
+
+    monkeypatch.setattr(cli.locking, "ollama_setup_lock", setup_lock)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
+    ownership = {}
+    monkeypatch.setattr(
+        cli.activity, "record_ollama_serving",
+        lambda **fields: ownership.update(fields),
+    )
+
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3", ctx=8192) == 0
+    assert created == {"name": served, "from_model": canonical, "context": 8192}
+    assert locks == [served]
+    assert ownership["model"] == canonical and ownership["served_name"] == served
 
 
 def test_serve_pulls_missing_model_then_serves(make_console, monkeypatch):
@@ -7537,7 +7597,8 @@ def test_serve_rejects_nonpositive_ctx_before_ollama_side_effects(make_console, 
 
 def test_serve_explicit_ctx_cannot_exceed_estimated_bound(make_console, monkeypatch):
     _wire_serve(monkeypatch, characterization=None)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda _m, **_k: (8192, "estimated", None))
     monkeypatch.setattr(cli.ollama, "create", lambda *_a, **_k: pytest.fail("unsafe create"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=16384) == 1
@@ -7547,7 +7608,7 @@ def test_serve_explicit_ctx_cannot_exceed_estimated_bound(make_console, monkeypa
 def test_serve_explicit_ctx_refuses_without_measured_or_estimated_bound(
         make_console, monkeypatch):
     _wire_serve(monkeypatch, characterization=None)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: None)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m, **_k: None)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a, **_k: pytest.fail("unbounded create"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
@@ -7601,7 +7662,7 @@ def test_serve_uses_estimated_ceiling_when_unmeasured(make_console, monkeypatch,
              "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)   # nothing measured
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
-                        lambda m: (8192, "estimated", None))
+                        lambda m, **_k: (8192, "estimated", None))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -7613,7 +7674,7 @@ def test_serve_estimated_ceiling_nudges_to_characterize(make_console, monkeypatc
              "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
-                        lambda m: (8192, "estimated", None))
+                        lambda m, **_k: (8192, "estimated", None))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
     out = buf.getvalue()
@@ -7656,7 +7717,8 @@ def test_serve_ignores_measurement_for_retargeted_ollama_manifest(
              "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization={"safe_context": 4096,
                                                "artifact_id": old_artifact}, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (2048, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda _m, **_k: (2048, "estimated", None))
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -8240,6 +8302,21 @@ def test_ollama_estimated_ceiling_uses_inventory_size_without_refetch(monkeypatc
     assert captured["weights"] == 0.5
 
 
+def test_named_serve_passes_inventory_record_to_estimator(make_console, monkeypatch):
+    record = cli.ollama.OllamaModel(
+        name="qwen3:0.6b", digest="a" * 64, size_bytes=500_000_000)
+    _wire_serve(monkeypatch, characterization=None, ps_rows=_SERVE_LOADED)
+    monkeypatch.setattr(cli.ollama, "inventory", lambda timeout=2.0: [record])
+    seen = []
+    monkeypatch.setattr(
+        cli, "_ollama_estimated_ceiling",
+        lambda _model, *, record=None: seen.append(record) or (8192, "estimated", None),
+    )
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b") == 0
+    assert seen == [record]
+
+
 def test_ollama_estimated_ceiling_none_when_show_unavailable(monkeypatch):
     monkeypatch.setattr(cli.ollama, "show", lambda n, timeout=30.0: None)
     assert cli._ollama_estimated_ceiling("m") is None
@@ -8366,7 +8443,8 @@ def test_serve_estimated_heals_to_measured(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 100, "size_vram": 100}]                # no spill
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m, **_k: (8192, "estimated", None))
     saved = _wire_save_recorder(monkeypatch)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
@@ -8380,7 +8458,8 @@ def test_serve_estimated_does_not_heal_on_spill(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 200, "size_vram": 100}]                # spilled — no clean evidence
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m, **_k: (8192, "estimated", None))
     saved = _wire_save_recorder(monkeypatch)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
@@ -8399,7 +8478,8 @@ def test_serve_estimated_heal_json_flag(make_console, monkeypatch, capsys):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda m, **_k: (8192, "estimated", None))
     _wire_save_recorder(monkeypatch)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
@@ -8410,7 +8490,8 @@ def test_serve_unknown_residency_is_not_reported_or_saved_as_measured(
         make_console, monkeypatch, capsys):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda _m, **_k: (8192, "estimated", None))
     saved = _wire_save_recorder(monkeypatch)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
@@ -8425,7 +8506,8 @@ def test_serve_unknown_residency_is_clear_in_text(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": True, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
-    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda _m: (8192, "estimated", None))
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
+                        lambda _m, **_k: (8192, "estimated", None))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
     out = buf.getvalue()

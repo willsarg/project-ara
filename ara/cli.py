@@ -2692,6 +2692,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     record = ollama.find_model(models, model)
     if record is None:
         return err(f"{model} isn't in Ollama — pull it first: ollama pull {model}")
+    model = record.name
     artifact_id = _ollama_artifact_id(model, record=record)
     if artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to measure mutable "
@@ -3026,6 +3027,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         if not as_json:
             c.emit(c.style("dim", "  pulled."))
 
+    model = record.name
     base_artifact_id = _ollama_artifact_id(model, record=record)
     if base_artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to serve mutable "
@@ -3039,7 +3041,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         with db.connected() as con:
             found = _ollama_safe_ceiling(
                 con, profile.machine_key(), model, base_artifact_id)
-        bound = found or _ollama_estimated_ceiling(model)
+        bound = found or _ollama_estimated_ceiling(model, record=record)
         if bound is None:
             return err(f"no measured or estimated safe bound for {model} — refusing --ctx {ctx}; "
                        f"run `ara characterize {model}` first.")
@@ -3056,7 +3058,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         # No measurement yet → fall back to a conservative engine-free ESTIMATE (labelled as such,
         # never as measured — Rule #3), so a fresh model still serves safely in one command.
         if found is None:
-            found = _ollama_estimated_ceiling(model)
+            found = _ollama_estimated_ceiling(model, record=record)
         if found is None:
             return err(f"couldn't determine a safe ceiling for {model} — run "
                        f"`ara characterize {model}` to measure one.")
