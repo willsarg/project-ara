@@ -1,10 +1,9 @@
-# CI for human pull requests and pushes to main. Dependabot PRs use dependabot-ci.yml instead so a
-# dependency update never launches the same cross-OS suite twice. The Python job reuses the exact
-# release gate; the coordinator job covers its Linux container build independently and in parallel.
-name: Gate · Pull Requests and Main
+# Post-merge CI for main. Human pull requests are deliberately verified locally instead of spending
+# GitHub-hosted runner capacity on every revision; Dependabot keeps its dedicated PR gate. The
+# Python job reuses the exact release gate while the coordinator validates in parallel.
+name: Gate · Main
 
 on:
-  pull_request:
   push:
     branches: [main]
 
@@ -12,16 +11,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   python:
-    if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
     uses: ./.github/workflows/test.yml
 
   coordinator:
-    if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:

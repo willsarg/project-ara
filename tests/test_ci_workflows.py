@@ -50,18 +50,25 @@ def test_parallel_pytest_runner_is_locked_as_a_dev_dependency():
     )
 
 
-def test_human_ci_gates_pull_requests_and_main_without_duplicating_dependabot():
+def test_main_ci_runs_after_merge_but_never_on_human_pull_requests():
     workflow = (_WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
 
-    assert "pull_request:" in workflow
+    assert "pull_request:" not in workflow
     assert "push:" in workflow
     assert "branches: [main]" in workflow
-    assert "github.event.pull_request.user.login != 'dependabot[bot]'" in workflow
+    assert "github.event.pull_request" not in workflow
 
 
 def test_pr_gates_cancel_stale_runs_for_the_same_branch():
-    for name in ("ci.yml", "dependabot-ci.yml"):
-        workflow = (_WORKFLOWS / name).read_text(encoding="utf-8")
-        assert "concurrency:" in workflow
-        assert "github.event.pull_request.number || github.ref" in workflow
-        assert "cancel-in-progress: true" in workflow
+    workflow = (_WORKFLOWS / "dependabot-ci.yml").read_text(encoding="utf-8")
+
+    assert "concurrency:" in workflow
+    assert "github.event.pull_request.number || github.ref" in workflow
+    assert "cancel-in-progress: true" in workflow
+
+
+def test_main_gate_cancels_only_an_obsolete_main_run():
+    workflow = (_WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+
+    assert "group: ci-${{ github.workflow }}-${{ github.ref }}" in workflow
+    assert "cancel-in-progress: true" in workflow
