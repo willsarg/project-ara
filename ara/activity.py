@@ -685,7 +685,8 @@ def ollama_ownership() -> list[Activity]:
 
 
 def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
-    records = _read_serving_records(root)
+    records = [(record, name) for record, name in _read_serving_records(root)
+               if _valid_serving_record(record)]
     if not records:
         return []
     # Import lazily: status remains core/engine-free and contacts Ollama only when ARA has a
@@ -703,26 +704,22 @@ def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
     live = []
     for record, name in matching:
         served = record["served_name"]
-        legacy = set(record) == _LEGACY_SERVING_FIELDS
-        if set(record) == _SERVING_V2_FIELDS:
-            endpoint_authority = ollama.endpoint_authority(record["endpoint"])
-            authority = ollama.runtime_authority(endpoint_authority)
-            observed_authority = {
-                "runtime_version": authority.server_version,
-                "server_instance_id": authority.server_instance_id,
-                "configured_inputs": dict(authority.configured_inputs),
-                "configured_num_parallel": authority.configured_num_parallel,
-                "configured_num_parallel_authority": authority.configured_num_parallel_authority,
-            }
-            if authority.issue is not None or observed_authority != record["runtime_authority"]:
-                continue
-        expected_served = None
-        if not legacy:
-            base_digest = ollama.manifest_digest(record["model"])
-            expected_base = _OLLAMA_ARTIFACT_PREFIX + base_digest if base_digest else None
-            if expected_base != record["base_artifact_id"]:
-                continue
-            expected_served = record["served_artifact_id"].removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+        endpoint_authority = ollama.endpoint_authority(record["endpoint"])
+        authority = ollama.runtime_authority(endpoint_authority)
+        observed_authority = {
+            "runtime_version": authority.server_version,
+            "server_instance_id": authority.server_instance_id,
+            "configured_inputs": dict(authority.configured_inputs),
+            "configured_num_parallel": authority.configured_num_parallel,
+            "configured_num_parallel_authority": authority.configured_num_parallel_authority,
+        }
+        if authority.issue is not None or observed_authority != record["runtime_authority"]:
+            continue
+        base_digest = ollama.manifest_digest(record["model"])
+        expected_base = _OLLAMA_ARTIFACT_PREFIX + base_digest if base_digest else None
+        if expected_base != record["base_artifact_id"]:
+            continue
+        expected_served = record["served_artifact_id"].removeprefix(_OLLAMA_ARTIFACT_PREFIX)
         entry = next((item for item in loaded if isinstance(item, dict)
                       and isinstance(item.get("name"), str)
                       and item["name"] in (served, served + ":latest")
@@ -730,7 +727,7 @@ def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
                       and not isinstance(item["context_length"], bool)
                       and item["context_length"] > 0
                       and item["context_length"] == record["context"]
-                      and (legacy or item.get("digest") == expected_served)), None)
+                      and item.get("digest") == expected_served), None)
         if entry is None:
             continue
         live.append((_serving_activity(record), name))

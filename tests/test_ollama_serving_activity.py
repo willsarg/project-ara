@@ -58,6 +58,22 @@ def _wire_live(monkeypatch, entries=None, endpoint="http://127.0.0.1:11434"):
     monkeypatch.setattr("ara.ollama.base_url", lambda: endpoint)
     monkeypatch.setattr("ara.ollama.manifest_digest", lambda _name: "a" * 64)
     monkeypatch.setattr("ara.ollama.ps", lambda: _live() if entries is None else entries)
+    monkeypatch.setattr(
+        "ara.ollama.endpoint_authority",
+        lambda url: cli.ollama.OllamaEndpoint(url, "loopback"),
+    )
+    monkeypatch.setattr(
+        "ara.ollama.runtime_authority",
+        lambda received: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=received,
+            server_version=_AUTHORITY["runtime_version"],
+            server_instance_id=_AUTHORITY["server_instance_id"],
+            configured_inputs=tuple(_AUTHORITY["configured_inputs"].items()),
+            configured_num_parallel=_AUTHORITY["configured_num_parallel"],
+            configured_num_parallel_authority=
+            _AUTHORITY["configured_num_parallel_authority"],
+        ),
+    )
 
 
 def test_manifest_is_atomic_minimal_and_same_identity_updates_in_place(
@@ -198,7 +214,8 @@ def test_snapshot_skips_ollama_when_no_valid_manifests(registry, monkeypatch):
     assert activity.snapshot() == []
 
 
-def test_snapshot_preserves_live_legacy_ara_service_visibility(registry, monkeypatch):
+def test_snapshot_preserves_legacy_ownership_without_granting_live_authority(
+        registry, monkeypatch):
     serving = registry / "serving"
     serving.mkdir(parents=True)
     (serving / "legacy.json").write_text(json.dumps({
@@ -206,25 +223,27 @@ def test_snapshot_preserves_live_legacy_ara_service_visibility(registry, monkeyp
         "context": 4096, "endpoint": "http://127.0.0.1:11434", "started_at": 100.0,
     }))
     _wire_live(monkeypatch)
-    found = activity.snapshot()
+    assert activity.snapshot() == []
+    found = activity.ollama_ownership()
     assert len(found) == 1
     assert found[0].model == "org/model" and found[0].runtime == "ollama"
     assert found[0].base_artifact_id is None and found[0].served_artifact_id is None
 
 
 def test_snapshot_correlates_exact_latest_name_context_and_endpoint(registry, monkeypatch):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch)
     assert activity.snapshot() == [activity.Activity(
         kind="serving", model="org/model", pid=None, started_at=100.0,
         runtime="ollama", served_name="org-model-ara", context=4096,
         endpoint="http://127.0.0.1:11434", base_artifact_id=_BASE_ARTIFACT,
-        served_artifact_id=_SERVED_ARTIFACT)]
+        served_artifact_id=_SERVED_ARTIFACT, policy_version=_POLICY,
+        runtime_authority=_AUTHORITY)]
 
 
 def test_snapshot_scans_past_malformed_and_wrong_matching_rows_to_later_valid_row(
         registry, monkeypatch):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch, [
         {"name": "org-model-ara", "context_length": True},
         {"name": "org-model-ara:latest", "context_length": "4096"},
@@ -245,10 +264,10 @@ def test_snapshot_scans_past_malformed_and_wrong_matching_rows_to_later_valid_ro
 ])
 def test_snapshot_suppresses_every_uncorroborated_manifest(
         registry, monkeypatch, entries, endpoint):
-    _record()
-    monkeypatch.setattr("ara.ollama.base_url", lambda: endpoint)
-    monkeypatch.setattr("ara.ollama.manifest_digest", lambda _name: "a" * 64)
-    monkeypatch.setattr("ara.ollama.ps", lambda: entries)
+    _record_v2()
+    _wire_live(monkeypatch, entries, endpoint)
+    if entries is None:
+        monkeypatch.setattr("ara.ollama.ps", lambda: None)
     assert activity.snapshot() == []
 
 
@@ -256,13 +275,13 @@ def test_snapshot_suppresses_every_uncorroborated_manifest(
 @pytest.mark.parametrize("context", [4096, True, "4096", 0, -1, None])
 def test_snapshot_suppresses_malformed_loaded_name_and_context_without_crashing(
         registry, monkeypatch, name, context):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch, [{"name": name, "context_length": context}])
     assert activity.snapshot() == []
 
 
 def test_unrelated_live_models_never_appear(registry, monkeypatch):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch, [
         {"name": "someone-else:latest", "context_length": 99999},
         *_live(),
@@ -272,7 +291,7 @@ def test_unrelated_live_models_never_appear(registry, monkeypatch):
 
 
 def test_non_ollama_ephemeral_activity_survives_unreachable_ollama(registry, monkeypatch):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch, entries=None)
     monkeypatch.setattr("ara.ollama.ps", lambda: None)
     with activity.track("running", "org/local"):
@@ -281,7 +300,7 @@ def test_non_ollama_ephemeral_activity_survives_unreachable_ollama(registry, mon
 
 
 def test_snapshot_observation_never_mutates_persistent_manifests(registry, monkeypatch):
-    manifest = _record()
+    manifest = _record_v2()
     before = manifest.read_bytes()
     _wire_live(monkeypatch, _live(context=1))
     monkeypatch.setattr(activity.os, "replace", lambda *_a: pytest.fail("replace called"))
@@ -292,8 +311,8 @@ def test_snapshot_observation_never_mutates_persistent_manifests(registry, monke
 
 def test_snapshot_merges_and_sorts_ephemeral_with_multiple_persistent_states(
         registry, monkeypatch):
-    _record(served_name="b-ara", model="org/b", started_at=20.0)
-    _record(served_name="a-ara", model="org/a", started_at=10.0)
+    _record_v2(served_name="b-ara", model="org/b", started_at=20.0)
+    _record_v2(served_name="a-ara", model="org/a", started_at=10.0)
     _wire_live(monkeypatch, [
         {"name": "a-ara:latest", "context_length": 4096, "digest": "b" * 64},
         {"name": "b-ara", "context_length": 4096, "digest": "b" * 64},
@@ -306,7 +325,7 @@ def test_snapshot_merges_and_sorts_ephemeral_with_multiple_persistent_states(
 
 def test_status_text_and_json_expose_persistent_serving_without_pid(
         registry, monkeypatch, make_console, capsys):
-    _record()
+    _record_v2()
     _wire_live(monkeypatch)
     c, buf = make_console()
     cli.render_status(c)

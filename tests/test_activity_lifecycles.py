@@ -781,6 +781,37 @@ def _ollama_artifact_fields():
     }
 
 
+def _ollama_runtime_authority_fields():
+    return {
+        "policy_version": cli._OLLAMA_DERIVED_POLICY_VERSION,
+        "runtime_authority": {
+            "runtime_version": "0.30.10",
+            "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+            "configured_inputs": {},
+            "configured_num_parallel": 1,
+            "configured_num_parallel_authority": "exact_version_default",
+        },
+    }
+
+
+def _wire_ollama_status_authority(monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint(
+        url="http://127.0.0.1:11434", scope="loopback")
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda _url: endpoint)
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority",
+        lambda received: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=received,
+            server_version="0.30.10",
+            server_instance_id="42:1234.500000:/usr/bin/ollama",
+            listener_pid=42,
+            listener_bind_host="127.0.0.1",
+            configured_num_parallel=1,
+            configured_num_parallel_authority="exact_version_default",
+        ),
+    )
+
+
 def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
@@ -876,7 +907,9 @@ def test_ollama_status_requires_exact_base_and_served_manifest_digests(
         served_name="base-model-ara", model="base:model", context=4096,
         endpoint="http://127.0.0.1:11434", base_artifact_id=base_artifact,
         served_artifact_id=served_artifact, started_at=1.0,
+        **_ollama_runtime_authority_fields(),
     )
+    _wire_ollama_status_authority(monkeypatch)
     monkeypatch.setattr(activity.ollama if hasattr(activity, "ollama") else cli.ollama,
                         "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.ollama, "manifest_digest",
@@ -897,7 +930,8 @@ def test_ollama_status_requires_exact_base_and_served_manifest_digests(
     assert activity.snapshot() == []
 
 
-def test_ollama_status_suppresses_retargeted_base_manifest(monkeypatch):
+def test_ollama_status_never_promotes_pre_v2_ownership_to_live_authority(
+        monkeypatch, activity_registry):
     activity.record_ollama_serving(
         served_name="base-model-ara", model="base:model", context=4096,
         endpoint="http://127.0.0.1:11434",
@@ -905,6 +939,28 @@ def test_ollama_status_suppresses_retargeted_base_manifest(monkeypatch):
         served_artifact_id="ollama-manifest-sha256:" + "b" * 64,
         started_at=1.0,
     )
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "a" * 64)
+    monkeypatch.setattr(cli.ollama, "ps", lambda: [{
+        "name": "base-model-ara:latest", "context_length": 4096,
+        "digest": "b" * 64,
+    }])
+
+    ownership = activity.ollama_ownership()
+    assert len(ownership) == 1
+    assert ownership[0].policy_version is None
+    assert activity.snapshot() == []
+
+
+def test_ollama_status_suppresses_retargeted_base_manifest(monkeypatch):
+    activity.record_ollama_serving(
+        served_name="base-model-ara", model="base:model", context=4096,
+        endpoint="http://127.0.0.1:11434",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "b" * 64,
+        started_at=1.0, **_ollama_runtime_authority_fields(),
+    )
+    _wire_ollama_status_authority(monkeypatch)
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "d" * 64)
     monkeypatch.setattr(cli.ollama, "ps", lambda: [{
         "name": "base-model-ara:latest", "context_length": 4096,
@@ -921,7 +977,7 @@ def test_ollama_refuses_takeover_of_served_identity_owned_by_another_base(
     activity.record_ollama_serving(
         served_name="shared", model="org/old", context=4096,
         endpoint="http://127.0.0.1:11434", started_at=1.0,
-        **_ollama_artifact_fields())
+        **_ollama_artifact_fields(), **_ollama_runtime_authority_fields())
     loaded = [{"name": "shared:latest", "context_length": 4096,
                "size": 10, "size_vram": 10, "digest": "b" * 64}]
     monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
