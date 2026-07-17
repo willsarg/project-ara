@@ -484,8 +484,15 @@ def _det_engines(c: Console, m, *, show_absent: bool = False) -> None:
             if rt.requires:  # installed, but can't accelerate on this hardware
                 c.emit(c.field("·", val, f"installed · {rt.requires}", value_role="warn"))
             elif rt.serving is False:  # a server runtime that's installed but not up
-                c.emit(c.field("·", val, "installed · not serving — run `ollama serve`",
-                               value_role="warn"))
+                if rt.endpoint_scope == "unknown":
+                    detail = "installed · invalid Ollama endpoint configuration"
+                elif rt.endpoint_scope in {"remote", "cloud"}:
+                    detail = f"installed · {rt.endpoint_scope} endpoint unreachable"
+                else:
+                    detail = "installed · local endpoint not serving — run `ollama serve`"
+                if rt.endpoint is not None:
+                    detail += f" · {rt.endpoint}"
+                c.emit(c.field("·", val, detail, value_role="warn"))
             elif rt.serving is True:
                 detail = "serving"
                 if rt.endpoint_scope is not None:

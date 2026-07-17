@@ -1030,11 +1030,46 @@ def test_det_engines_shows_ollama_endpoint_scope(make_console):
 
 def test_det_engines_installed_not_serving_guides_serve(make_console):
     c, buf = make_console()
-    m = _machine(runtimes=[Runtime("Ollama", True, "0.30.10", kind="engine", serving=False)])
+    m = _machine(runtimes=[Runtime(
+        "Ollama", True, "0.30.10", kind="engine", serving=False,
+        endpoint="http://127.0.0.1:11434", endpoint_scope="loopback")])
     cli._det_engines(c, m)
     out = buf.getvalue()
-    assert "not serving" in out
+    assert "local endpoint not serving" in out
     assert "ollama serve" in out         # actionable guidance, not suppression
+    assert "http://127.0.0.1:11434" in out
+
+
+@pytest.mark.parametrize("scope,endpoint", [
+    ("remote", "http://box.local:11434"),
+    ("cloud", "https://ollama.com"),
+])
+def test_det_engines_unreachable_nonlocal_endpoint_preserves_authority(
+        make_console, scope, endpoint):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime(
+        "Ollama", True, "0.30.10", kind="engine", serving=False,
+        endpoint=endpoint, endpoint_scope=scope)])
+
+    cli._det_engines(c, m)
+
+    out = buf.getvalue()
+    assert f"{scope} endpoint unreachable" in out
+    assert endpoint in out
+    assert "ollama serve" not in out
+
+
+def test_det_engines_invalid_endpoint_reports_configuration_not_local_daemon(make_console):
+    c, buf = make_console()
+    m = _machine(runtimes=[Runtime(
+        "Ollama", True, "0.30.10", kind="engine", serving=False,
+        endpoint=None, endpoint_scope="unknown")])
+
+    cli._det_engines(c, m)
+
+    out = buf.getvalue()
+    assert "invalid Ollama endpoint configuration" in out
+    assert "ollama serve" not in out
 
 
 def test_det_engines_serving_none_renders_found(make_console):
