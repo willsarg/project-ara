@@ -2069,32 +2069,94 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     return 0
 
 
-def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
-                     ctx: int | None = None, max_tokens: int | None = None,
-                     repeat: int = 1, assume_yes: bool = False,
-                     exec_consent: bool = False, as_json: bool = False) -> int:
-    """Run a capability probe set against *model* and store the score as a measured tier result.
+class _OllamaBenchmarkBackend:
+    """Backend-shaped adapter whose execution stays inside ARA's Ollama governance boundary."""
 
-    Requires a characterization ceiling (or explicit ``--ctx``) and an engine backend that supports
-    ``benchmark`` (Apple/MLX, CPU, Vulkan, and CUDA). Spec 2026-06-28-recommend-use-case-and-serve-selection."""
-    def err(msg: str) -> int:
-        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-        return 1
+    def __init__(self, endpoint, authority, record, safe, config, artifact_id):
+        self.endpoint = endpoint
+        self.authority = authority
+        self.record = record
+        self.safe = safe
+        self.config = config
+        self.artifact_id = artifact_id
 
-    if use_case not in benchmark.USE_CASES:
-        return err(f"unknown use-case {use_case!r} — choose one of: "
-                   f"{', '.join(benchmark.USE_CASES)}")
-    if max_tokens is not None and max_tokens <= 0:
-        return err("--max-tokens must be a positive integer")
-    if repeat < 1:
-        return err("--repeat must be a positive integer")
+    def benchmark(self, model, prompts, *, max_context, max_tokens=256):
+        if model != self.record.name or max_context != self.safe:
+            raise _OllamaGovernanceError("Ollama benchmark execution plan changed")
+        with _governed_ollama_request(
+                self.endpoint, self.authority, self.record, self.safe, self.config,
+                self.artifact_id, activity_kind="benchmarking", label="benchmark"):
+            return ollama.benchmark_prompts(
+                self.record.name, prompts, self.safe, max_tokens,
+                think="thinking" in self.record.capabilities)
 
-    # Hard gate on code execution — un-bypassable by --json/--yes/non-tty (those only suppress the
-    # interactive prompt). The coding benchmark runs model-generated Python with full user
-    # privileges (NOT a security sandbox); require deliberate, explicit consent in every mode.
-    if use_case == "coding" and not exec_consent:
-        return err("the coding benchmark executes model-generated Python on this machine "
-                   "(NOT a security sandbox) — re-run with --exec-consent to allow it")
+
+def _ollama_benchmark_plan(model: str, ctx: int | None) -> tuple[dict | None, str | None]:
+    """Resolve exact reusable Ollama evidence into the generic benchmark execution shape."""
+
+    endpoint, endpoint_error = _ollama_governed_endpoint()
+    if endpoint_error is not None:
+        return None, endpoint_error
+    try:
+        activity.validate_ollama_serving_fields(
+            served_name=_governed_name(model), model=model, context=1,
+            endpoint=endpoint.url or ollama.base_url())
+    except ValueError as exc:
+        return None, f"invalid Ollama model identity: {exc}"
+    authority, authority_error = _ollama_runtime_authority(endpoint)
+    if authority_error is not None:
+        return None, authority_error
+    models = ollama.inventory()
+    if models is None:
+        return None, "couldn't list Ollama models — is the server reachable?"
+    record = ollama.find_model(models, model)
+    if record is None:
+        return None, f"{model} isn't in Ollama — pull it with Ollama and characterize it first"
+    if (support_error := ollama.initial_governed_model_error(record)) is not None:
+        return None, support_error
+    with db.connected() as con:
+        assessment = ollama_evidence.assess_characterization(
+            con, profile.machine_key(), record, authority)
+    if assessment.reusable is None:
+        reason = assessment.reason or "incomplete_evidence"
+        return None, (f"{record.name}'s Ollama characterization is display-only ({reason}); "
+                      "re-characterize it on this server before benchmark")
+    row = assessment.reusable
+    safe = row["safe_context"]
+    if ctx is not None:
+        if ctx <= 0:
+            return None, "--ctx must be a positive integer"
+        if msg := _ctx_gate_msg(ctx, safe, record.name):
+            return None, msg
+        safe = ctx
+    config = row["config"]
+    artifact_id = row["artifact_id"]
+    placement = config["placement"]
+    backend = {
+        "cpu": "cpu",
+        "unified": "apple",
+        "accelerator": "cuda",
+        "partial_offload": "cuda",
+    }[placement]
+    return {
+        "key": "ollama",
+        "backend": backend,
+        "bk": _OllamaBenchmarkBackend(
+            endpoint, authority, record, safe, config, artifact_id),
+        "row": row,
+        "safe": safe,
+        "ceiling_measured_at": row.get("measured_at"),
+        "artifact_id": artifact_id,
+        "evidence_model": record.name,
+        "record": record,
+        "authority": authority,
+        "config": config,
+    }, None
+
+
+def _native_benchmark_plan(model: str, engine: str | None,
+                           ctx: int | None) -> tuple[dict | None, str | None]:
+    """Resolve one native-engine benchmark plan without loading weights."""
 
     auto_engine = engine is None or engine == "auto"
     if auto_engine:
@@ -2103,22 +2165,19 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         key = engines.resolve(engine)
     if key is None:
         if engine is not None:
-            return err(f"benchmark doesn't support --engine {engine!r} — choose one of: "
-                       "auto, mlx, cuda, cpu, vulkan, cuda-gguf")
-        return err("no benchmark-capable engine matches this machine")
+            return None, (f"benchmark doesn't support --engine {engine!r} — choose one of: "
+                          "auto, ollama, mlx, cuda, cpu, vulkan, cuda-gguf")
+        return None, "no benchmark-capable engine matches this machine"
     default_backend = engines.ENGINES.get(key, {}).get("backend") if key else None
     default_bk = get_backend(default_backend) if default_backend else None
     if default_bk is None or not hasattr(default_bk, "benchmark"):
         be_name = default_backend or "none"
-        return err(f"benchmark isn't supported on the {be_name} engine")
+        return None, f"benchmark isn't supported on the {be_name} engine"
 
     mk = profile.machine_key()
     evidence_model = scoring.durable_model_id(model)
     with db.connected() as con:
         if auto_engine:
-            # Auto is evidence-led: prefer the detected engine on a tie, but fall back to any
-            # benchmark-capable engine on which this exact artifact has a compatible measured
-            # ceiling.  A CPU-characterized GGUF therefore remains usable on a CUDA host.
             candidates = []
             config_errors = []
             unavailable = []
@@ -2148,10 +2207,6 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                     continue
                 if not staleness.artifact_matches(
                         evidence_model, candidate_row["artifact_id"]):
-                    # A missing local snapshot is recoverable when the characterization's
-                    # authority names an exact Hub revision (and exact GGUF selector, if any).
-                    # Keep that evidence candidate so _prefetch_plan can reacquire the same bytes;
-                    # only an unparseable/non-recoverable authority is a real mismatch here.
                     if staleness.authorized_download_ref(
                             evidence_model, candidate_row["artifact_id"]) is None:
                         artifact_mismatch = True
@@ -2160,50 +2215,103 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                                    candidate_backend, candidate_bk, candidate_row))
             if not candidates:
                 if config_errors:
-                    return err(config_errors[0])
+                    return None, config_errors[0]
                 if missing_artifact_authority:
-                    return err(f"the measured ceiling for {model} is not bound to an exact "
-                               f"artifact — re-run: ara characterize {model}")
+                    return None, (f"the measured ceiling for {model} is not bound to an exact "
+                                  f"artifact — re-run: ara characterize {model}")
                 if artifact_mismatch:
-                    return err(f"the cached artifact for {model} differs from its measured "
-                               f"ceiling — re-run: ara characterize {model}")
+                    return None, (f"the cached artifact for {model} differs from its measured "
+                                  f"ceiling — re-run: ara characterize {model}")
                 if unavailable:
                     unavailable_key, label = unavailable[0]
-                    return err(f"the {label} isn't installed — run: ara install "
-                               f"--engine {unavailable_key}")
-                return err(f"no measured ceiling for {model} — run: ara characterize {model}")
+                    return None, (f"the {label} isn't installed — run: ara install "
+                                  f"--engine {unavailable_key}")
+                return None, f"no measured ceiling for {model} — run: ara characterize {model}"
             _, key, backend, bk, row = max(candidates, key=lambda candidate: candidate[0])
         else:
             backend, bk = default_backend, default_bk
             installed, label = engine_status(backend)
             if not installed:
-                return err(f"the {label} isn't installed — run: ara install --engine {key}")
-            row = db.get_characterization(
-                con, mk, key, evidence_model)  # keyed by engine key, not backend
+                return None, f"the {label} isn't installed — run: ara install --engine {key}"
+            row = db.get_characterization(con, mk, key, evidence_model)
             if not row or row.get("safe_context") is None:
-                return err(f"no measured ceiling for {model} — run: ara characterize {model}")
+                return None, f"no measured ceiling for {model} — run: ara characterize {model}"
             if msg := _measurement_config_error(
                     row, _measurement_config(backend), backend, model):
-                return err(msg)
+                return None, msg
         characterized_artifact_id = row.get("artifact_id")
         if not characterized_artifact_id:
-            return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
-                       f"re-run: ara characterize {model}")
+            return None, (f"the measured ceiling for {model} is not bound to an exact artifact — "
+                          f"re-run: ara characterize {model}")
         if ctx is not None:
             if ctx <= 0:
-                return err("--ctx must be a positive integer")
+                return None, "--ctx must be a positive integer"
             if msg := _ctx_gate_msg(ctx, row["safe_context"], model):
-                return err(msg)
+                return None, msg
             safe = ctx
-            # The requested cap is lower, but its authority still comes from this characterization;
-            # preserve that evidence timestamp so changed cache artifacts remain visibly stale.
-            ceiling_measured_at = row.get("measured_at")
         else:
             safe = row["safe_context"]
-            ceiling_measured_at = row.get("measured_at")
+    return {
+        "key": key,
+        "backend": backend,
+        "bk": bk,
+        "row": row,
+        "safe": safe,
+        "ceiling_measured_at": row.get("measured_at"),
+        "artifact_id": characterized_artifact_id,
+        "evidence_model": evidence_model,
+    }, None
 
-    stale_ceiling = _stale_ceiling_note(
-        c, evidence_model, ceiling_measured_at, as_json=as_json)
+
+def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | None = None,
+                     ctx: int | None = None, max_tokens: int | None = None,
+                     repeat: int = 1, assume_yes: bool = False,
+                     exec_consent: bool = False, as_json: bool = False) -> int:
+    """Run a capability probe set against *model* and store the score as a measured tier result.
+
+    Requires a characterization ceiling; ``--ctx`` may only lower it. Native engines and an
+    explicitly selected local Ollama runtime share the same judge-free scoring path."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if use_case not in benchmark.USE_CASES:
+        return err(f"unknown use-case {use_case!r} — choose one of: "
+                   f"{', '.join(benchmark.USE_CASES)}")
+    if max_tokens is not None and max_tokens <= 0:
+        return err("--max-tokens must be a positive integer")
+    if repeat < 1:
+        return err("--repeat must be a positive integer")
+
+    # Hard gate on code execution — un-bypassable by --json/--yes/non-tty (those only suppress the
+    # interactive prompt). The coding benchmark runs model-generated Python with full user
+    # privileges (NOT a security sandbox); require deliberate, explicit consent in every mode.
+    if use_case == "coding" and not exec_consent:
+        return err("the coding benchmark executes model-generated Python on this machine "
+                   "(NOT a security sandbox) — re-run with --exec-consent to allow it")
+
+    ollama_mode = engine == "ollama"
+    if ollama_mode:
+        plan, plan_error = _ollama_benchmark_plan(model, ctx)
+    else:
+        plan, plan_error = _native_benchmark_plan(model, engine, ctx)
+    if plan_error is not None:
+        return err(plan_error)
+    key = plan["key"]
+    backend = plan["backend"]
+    bk = plan["bk"]
+    row = plan["row"]
+    safe = plan["safe"]
+    ceiling_measured_at = plan["ceiling_measured_at"]
+    characterized_artifact_id = plan["artifact_id"]
+    evidence_model = plan["evidence_model"]
+    mk = profile.machine_key()
+
+    stale_ceiling = (
+        False
+        if ollama_mode else
+        _stale_ceiling_note(c, evidence_model, ceiling_measured_at, as_json=as_json)
+    )
     items = benchmark.load_probe(use_case)
     n = len(items)
     if n == 0:
@@ -2223,23 +2331,49 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
     # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
+    effective_generation_cap = max_tokens if max_tokens is not None else 256
+    ollama_policy = None
+    ollama_metric_names = frozenset({
+        "prompt_tokens", "completion_tokens", "total_duration_ns", "load_duration_ns",
+        "prompt_eval_duration_ns", "eval_duration_ns",
+    })
+    if ollama_mode:
+        ollama_policy = {
+            "api": "/api/generate",
+            "raw": False,
+            "think": "thinking" in plan["record"].capabilities,
+            "template": "model_default",
+            "truncate": False,
+            "shift": False,
+            "temperature": 0.0,
+            "seed": 0,
+            "max_tokens": effective_generation_cap,
+        }
     # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
     # One record owns the complete operational lifecycle: an on-demand fetch and every repeat
     # backend call. All deterministic gates above run before ARA claims that work is live.
-    prefetch, prefetch_size, rc = _prefetch_plan(
-        c, model, bk, key, as_json=as_json,
-        authorized_artifact_id=characterized_artifact_id)
+    if ollama_mode:
+        prefetch, prefetch_size, rc = False, None, None
+    else:
+        prefetch, prefetch_size, rc = _prefetch_plan(
+            c, model, bk, key, as_json=as_json,
+            authorized_artifact_id=characterized_artifact_id)
     if rc is not None:
         return rc
-    with activity.track("benchmarking", model):
+    activity_scope = nullcontext() if ollama_mode else activity.track("benchmarking", model)
+    with activity_scope:
         if prefetch and (rc := _download_prefetched_weights(
                 c, model, bk, prefetch_size,
                 as_json=as_json, progress=progress)) is not None:
             return rc
-        artifact_id = _artifact_identity_for_plan(
-            evidence_model, prefetch_size, expected=characterized_artifact_id)
+        artifact_id = (
+            _ollama_artifact_id(evidence_model)
+            if ollama_mode else
+            _artifact_identity_for_plan(
+                evidence_model, prefetch_size, expected=characterized_artifact_id)
+        )
         if artifact_id != characterized_artifact_id:
             return err(f"the cached artifact for {model} differs from its measured ceiling — "
                        f"re-run: ara characterize {model}")
@@ -2249,10 +2383,15 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
         run_scores: list[float] = []
         refused_n = 0
         errored_n = 0
+        ollama_runtime_metrics: dict[str, int] = {}
         loaded_model_ref = evidence_model
         try:
-            with _pinned_model_for_plan(
-                    evidence_model, artifact_id, prefetch_size) as pinned_model:
+            model_scope = (
+                nullcontext(evidence_model)
+                if ollama_mode else
+                _pinned_model_for_plan(evidence_model, artifact_id, prefetch_size)
+            )
+            with model_scope as pinned_model:
                 loaded_model_ref = pinned_model
                 for _ in range(repeat):
                     try:
@@ -2265,7 +2404,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                     if (not isinstance(reported_context, int) or isinstance(reported_context, bool)
                             or reported_context != safe):
                         return err(f"invalid benchmark result: the engine reported context "
-                                   f"{reported_context!r}, expected {safe}")
+                                       f"{reported_context!r}, expected {safe}")
+                    if ollama_mode and result.get("request_policy") != ollama_policy:
+                        return err("invalid benchmark result: Ollama request policy changed")
                     if result.get("refused"):
                         # A whole-run refusal on ANY run aborts — no partial band scraped from a failed load.
                         return err(f"the engine refused: {result.get('reason', 'no reason given')}")
@@ -2291,6 +2432,18 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                         if outcome == "completion":
                             if not isinstance(r["completion"], str):
                                 return err("invalid benchmark result: completion must be text")
+                            if ollama_mode:
+                                usage = r.get("usage")
+                                if (not isinstance(usage, dict)
+                                        or not set(usage).issubset(ollama_metric_names)
+                                        or any(
+                                        type(value) is not int or value < 0
+                                        for value in usage.values())):
+                                    return err("invalid benchmark result: Ollama usage metrics "
+                                               "must be nonnegative integers")
+                                for metric, value in usage.items():
+                                    ollama_runtime_metrics[metric] = (
+                                        ollama_runtime_metrics.get(metric, 0) + value)
                             completions[idx] = r["completion"]
                         elif outcome == "refused":
                             if r["refused"] is not True:
@@ -2301,8 +2454,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                                 return err("invalid benchmark result: error must be text")
                             errored_n += 1
                     run_scores.append(benchmark.score_probe_set(use_case, items, completions))
-                    current_artifact_id = _artifact_identity_for_plan(
-                        evidence_model, prefetch_size, expected=artifact_id)
+                    current_artifact_id = (
+                        _ollama_artifact_id(evidence_model)
+                        if ollama_mode else
+                        _artifact_identity_for_plan(
+                            evidence_model, prefetch_size, expected=artifact_id)
+                    )
                     if current_artifact_id != artifact_id:
                         return err(f"the cached artifact for {model} changed during the benchmark — "
                                    "no measurement taken")
@@ -2324,26 +2481,48 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     score = sum(run_scores) / repeat         # MEAN across runs — a better estimate than any one roll
     lo, hi = min(run_scores), max(run_scores)
     low_confidence = n < 100
-    effective_generation_cap = max_tokens if max_tokens is not None else 256
     band_source = f" band={lo * 100:.0f}-{hi * 100:.0f}" if repeat > 1 else ""
     source = (f"{key} probe={n} ctx={safe} max_tokens={effective_generation_cap} "
               f"repeat={repeat}{band_source} ({model})")
+    if ollama_mode:
+        config_digest = hashlib.sha256(json.dumps(
+            plan["config"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        policy_digest = hashlib.sha256(json.dumps(
+            ollama_policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        source += (
+            f" runtime={plan['authority'].server_version}"
+            f" instance={plan['authority'].server_instance_id}"
+            f" endpoint={plan['config']['endpoint_authority']}"
+            f" placement={plan['config']['placement']}"
+            " api=/api/generate template=model_default think="
+            f"{'true' if 'thinking' in plan['record'].capabilities else 'false'}"
+            " truncate=false shift=false temperature=0 seed=0"
+            f" config_sha256={config_digest} policy_sha256={policy_digest}"
+            " runtime_metrics="
+            + json.dumps(ollama_runtime_metrics, sort_keys=True, separators=(",", ":"))
+        )
     if low_confidence:
         source += f"; low_confidence n={n}"
     # Record the quant the score was actually taken at (the quant×capability degradation an
     # imported score hides): prefer the catalog's recorded quant, else derive it from the id.
     with db.connected() as con:
-        canonical_model_id = scoring.canonical_model_id(evidence_model)
-        mrow = db.get_model(con, evidence_model) or db.get_model(con, canonical_model_id)
-        quant = (scoring.quant_key(evidence_model) or scoring.quant_key(loaded_model_ref)
-                 or (mrow.get("quant") if mrow else None))
-        if evidence_model != canonical_model_id:
-            catalog.remember_variant(
-                con, evidence_model, canonical_model_id, quant=quant,
-                weights_gb=staleness.artifact_size_gb(evidence_model))
+        if ollama_mode:
+            canonical_model_id = evidence_model
+            quant = plan["record"].quantization
+            base_model = evidence_model
+        else:
+            canonical_model_id = scoring.canonical_model_id(evidence_model)
+            mrow = db.get_model(con, evidence_model) or db.get_model(con, canonical_model_id)
+            quant = (scoring.quant_key(evidence_model) or scoring.quant_key(loaded_model_ref)
+                     or (mrow.get("quant") if mrow else None))
+            if evidence_model != canonical_model_id:
+                catalog.remember_variant(
+                    con, evidence_model, canonical_model_id, quant=quant,
+                    weights_gb=staleness.artifact_size_gb(evidence_model))
+            base_model = scoring.base_key(canonical_model_id)
         db.save_benchmark_result(con, mk, evidence_model, use_case, score=score, source=source,
                                  engine_key=key, backend=backend,
-                                 base_model=scoring.base_key(canonical_model_id), quant=quant,
+                                 base_model=base_model, quant=quant,
                                  benchmark_id=use_case, max_score=1.0, sample_size=n,
                                  methodology_id=methodology_id,
                                  refused_n=refused_n, errored_n=errored_n,
@@ -2356,16 +2535,25 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if ollama_mode:
+            payload["concurrency_scope"] = (
+                "ARA governs these requests; outside Ollama clients remain concurrent")
         if c.verbose:
             payload.update(
                 backend=backend,
                 probe_context=safe,
                 generation_cap=effective_generation_cap,
-                generation_cap_source=("explicit" if max_tokens is not None
-                                       else "backend_default"),
+                generation_cap_source=(
+                    "explicit" if max_tokens is not None else
+                    "ara_default" if ollama_mode else "backend_default"),
                 total_generations=total,
                 source=source,
             )
+            if ollama_mode:
+                payload.update(
+                    request_policy=ollama_policy,
+                    runtime_metrics=ollama_runtime_metrics,
+                )
         if stale_ceiling:
             payload["stale_ceiling"] = True
         if repeat > 1:
@@ -2384,12 +2572,16 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if c.verbose:
         c.emit(c.field("engine", f"{key} ({backend})"))
         c.emit(c.field("probe context", f"{safe} tokens"))
+        default_source = "ARA default" if ollama_mode else "backend default"
         generation_cap = (f"{max_tokens} tokens" if max_tokens is not None
-                          else f"{effective_generation_cap} tokens (backend default)")
+                          else f"{effective_generation_cap} tokens ({default_source})")
         c.emit(c.field("generation cap", generation_cap))
         evidence = f"{n} prompts" if repeat == 1 else f"{n} prompts × {repeat} runs"
         c.emit(c.field("evidence", evidence))
         c.emit(c.field("quant", quant or "unknown"))
+    if ollama_mode:
+        c.emit(c.style(
+            "warn", "  note: ARA governs these requests; outside Ollama clients remain concurrent."))
     if repeat > 1:
         score_line = (f"  {use_case}: {score * 100:.0f}% measured here  "
                       f"(mean of {repeat} runs, band {lo * 100:.0f}–{hi * 100:.0f}%, "
@@ -2406,7 +2598,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
             partial.append(f"{errored_n} errored")
         score_line += f" (partial: {', '.join(partial)})"
     c.emit(c.style("good", score_line))
-    c.emit(c.style("dim", f"  stored — ara models recommend --use-case {use_case} now shows it"))
+    if ollama_mode:
+        c.emit(c.style("dim", "  stored as measured capability evidence"))
+    else:
+        c.emit(c.style("dim", f"  stored — ara models recommend --use-case {use_case} now shows it"))
     if repeat > 1 and lo == hi:
         # Zero variance under greedy decoding is determinism, not measured robustness — say so
         # honestly rather than let an identical-across-runs band read as evidence of stability.
@@ -4612,8 +4807,8 @@ def _recon_options(func):
 
 def _engine_option(func):
     return click.option("--engine", callback=_engine_callback, metavar="ENGINE",
-                        help=("Select an execution engine. Choices: auto, mlx, cuda, cpu, vulkan, "
-                              "cuda-gguf."))(func)
+                        help=("Select an execution engine. Choices: auto, ollama, mlx, cuda, cpu, "
+                              "vulkan, cuda-gguf."))(func)
 
 
 def _run_engine_option(func):
@@ -5011,7 +5206,7 @@ def _click_benchmark(ctx: click.Context, model: str, use_case: str, engine: str 
                      serve_ctx: int | None, max_tokens: int | None, repeat_count: int,
                      exec_consent: bool, assume_yes: bool, verbose: bool, as_json: bool) -> int:
     """Run a judge-free capability probe against MODEL's actual quant on the selected engine,
-    then store the measured score for model recommendations.
+    then store the measured capability evidence.
 
     Requires a prior matching characterization; --ctx may lower, but never replace or exceed,
     that measured safe ceiling. Coding probes execute model-written Python only with

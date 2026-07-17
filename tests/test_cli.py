@@ -215,10 +215,10 @@ def test_benchmark_help_explains_its_purpose_and_safety_contract(capsys):
     benchmark_help = capsys.readouterr().out
     normalized = " ".join(benchmark_help.split())
     assert ("Run a judge-free capability probe against MODEL's actual quant on the selected engine, "
-            "then store the measured score for model recommendations.") in normalized
+            "then store the measured capability evidence.") in normalized
     assert "Requires a prior matching characterization; --ctx may lower, but never replace or exceed" in normalized
     assert "Measured capability category." in benchmark_help
-    assert "Choices: auto, mlx, cuda, cpu, vulkan, cuda-gguf." in normalized
+    assert "Choices: auto, ollama, mlx, cuda, cpu, vulkan, cuda-gguf." in normalized
     assert "Authorize execution of coding-probe output." in normalized
 
 
@@ -10212,6 +10212,231 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     return saved
 
 
+_OLLAMA_BENCHMARK_POLICY = {
+    "api": "/api/generate",
+    "raw": False,
+    "think": False,
+    "template": "model_default",
+    "truncate": False,
+    "shift": False,
+    "temperature": 0.0,
+    "seed": 0,
+    "max_tokens": 256,
+}
+
+
+def _wire_benchmark_ollama(monkeypatch, *, response=Ellipsis):
+    calls = _wire_ollama_run(
+        monkeypatch,
+        characterization={"safe_context": 4096},
+    )
+    monkeypatch.setattr(
+        cli.db, "connect",
+        lambda: types.SimpleNamespace(close=lambda: None, commit=lambda: None),
+    )
+    items = [{"id": 0}, {"id": 1}]
+    monkeypatch.setattr(cli.benchmark, "load_probe", lambda _use_case: list(items))
+    monkeypatch.setattr(
+        cli.benchmark, "prompt_for", lambda _use_case, item: f"prompt-{item['id']}")
+    monkeypatch.setattr(
+        cli.benchmark, "score_probe_set",
+        lambda _use_case, _items, completions: 1.0 if completions == ["a0", "a1"] else 0.0,
+    )
+    result = {
+        "context": 4096,
+        "results": [
+            {"prompt_index": 0, "completion": "a0", "usage": {}},
+            {"prompt_index": 1, "completion": "a1", "usage": {}},
+        ],
+        "request_policy": dict(_OLLAMA_BENCHMARK_POLICY),
+    } if response is Ellipsis else response
+    monkeypatch.setattr(
+        cli.ollama,
+        "benchmark_prompts",
+        lambda name, prompts, context, tokens, *, think:
+        calls.append(("benchmark", name, prompts, context, tokens, think)) or result,
+    )
+    monkeypatch.setattr(
+        cli, "_prefetch_plan", lambda *_a, **_k: pytest.fail("prefetched Ollama artifact"))
+    monkeypatch.setattr(
+        cli, "_pinned_model_for_plan", lambda *_a, **_k: pytest.fail("pinned Ollama artifact"))
+    monkeypatch.setattr(
+        cli.staleness,
+        "ceiling_is_stale",
+        lambda *_a, **_k: pytest.fail("used Hugging Face staleness for Ollama evidence"),
+    )
+    saved = {}
+    monkeypatch.setattr(
+        cli.db,
+        "save_benchmark_result",
+        lambda _con, _mk, model, use_case, **fields:
+        saved.update(model=model, use_case=use_case, **fields),
+    )
+    return calls, saved
+
+
+def test_render_benchmark_ollama_uses_governed_base_model_and_canonical_scorer(
+        make_console, monkeypatch):
+    calls, saved = _wire_benchmark_ollama(monkeypatch)
+    c, buf = make_console()
+
+    rc = cli.render_benchmark(
+        c, "qwen3:0.6b", use_case="reasoning", engine="ollama",
+        assume_yes=True)
+    assert rc == 0, buf.getvalue()
+    assert calls[-1] == (
+        "benchmark", "qwen3:0.6b", ["prompt-0", "prompt-1"], 4096, 256, False)
+    assert saved["model"] == "qwen3:0.6b"
+    assert saved["engine_key"] == "ollama"
+    assert saved["backend"] == "apple"
+    assert saved["artifact_id"] == _SERVE_BASE_ARTIFACT
+    assert saved["score"] == 1.0
+    assert "endpoint=http://127.0.0.1:11434" in saved["source"]
+    output = buf.getvalue()
+    assert "reasoning: 100% measured here" in output
+    assert "outside Ollama clients remain concurrent" in output
+    assert "stored as measured capability evidence" in output
+    assert "models recommend --use-case" not in output
+
+
+def test_render_benchmark_ollama_refuses_changed_request_policy(
+        make_console, monkeypatch):
+    response = {
+        "context": 4096,
+        "results": [
+            {"prompt_index": 0, "completion": "a0", "usage": {}},
+            {"prompt_index": 1, "completion": "a1", "usage": {}},
+        ],
+        "request_policy": {**_OLLAMA_BENCHMARK_POLICY, "seed": 1},
+    }
+    _, saved = _wire_benchmark_ollama(monkeypatch, response=response)
+    c, buf = make_console()
+    assert cli.render_benchmark(
+        c, "qwen3:0.6b", use_case="reasoning", engine="ollama",
+        assume_yes=True) == 1
+    assert "Ollama request policy changed" in buf.getvalue()
+    assert saved == {}
+
+
+def test_render_benchmark_ollama_refuses_invalid_runtime_metrics(
+        make_console, monkeypatch):
+    response = {
+        "context": 4096,
+        "results": [
+            {"prompt_index": 0, "completion": "a0", "usage": {"completion_tokens": True}},
+            {"prompt_index": 1, "completion": "a1", "usage": {}},
+        ],
+        "request_policy": dict(_OLLAMA_BENCHMARK_POLICY),
+    }
+    _, saved = _wire_benchmark_ollama(monkeypatch, response=response)
+    c, buf = make_console()
+    assert cli.render_benchmark(
+        c, "qwen3:0.6b", use_case="reasoning", engine="ollama",
+        assume_yes=True) == 1
+    assert "usage metrics must be nonnegative integers" in buf.getvalue()
+    assert saved == {}
+
+
+def test_render_benchmark_ollama_verbose_json_exposes_runtime_only_metrics(
+        make_console, monkeypatch, capsys):
+    response = {
+        "context": 4096,
+        "results": [
+            {"prompt_index": 0, "completion": "a0", "usage": {"completion_tokens": 2}},
+            {"prompt_index": 1, "completion": "a1", "usage": {"completion_tokens": 3}},
+        ],
+        "request_policy": dict(_OLLAMA_BENCHMARK_POLICY),
+    }
+    _, saved = _wire_benchmark_ollama(monkeypatch, response=response)
+    c, _ = make_console(verbose=True)
+    assert cli.render_benchmark(
+        c, "qwen3:0.6b", use_case="reasoning", engine="ollama",
+        assume_yes=True, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["generation_cap_source"] == "ara_default"
+    assert payload["concurrency_scope"] == (
+        "ARA governs these requests; outside Ollama clients remain concurrent")
+    assert payload["request_policy"] == _OLLAMA_BENCHMARK_POLICY
+    assert payload["runtime_metrics"] == {"completion_tokens": 5}
+    assert "runtime_metrics={\"completion_tokens\":5}" in saved["source"]
+
+
+def test_ollama_benchmark_backend_rejects_changed_execution_plan(monkeypatch):
+    _wire_benchmark_ollama(monkeypatch)
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", None)
+    assert error is None
+    with pytest.raises(cli._OllamaGovernanceError, match="execution plan changed"):
+        plan["bk"].benchmark("other", ["p"], max_context=4096)
+
+
+def test_ollama_benchmark_plan_preserves_endpoint_refusal(monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint(None, "unknown")
+    monkeypatch.setattr(cli, "_ollama_governed_endpoint", lambda: (endpoint, "bad endpoint"))
+    assert cli._ollama_benchmark_plan("m", None) == (None, "bad endpoint")
+
+
+def test_ollama_benchmark_plan_refuses_invalid_identity(monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(
+        cli.activity,
+        "validate_ollama_serving_fields",
+        lambda **_fields: (_ for _ in ()).throw(ValueError("bad identity")),
+    )
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", None)
+    assert plan is None and "invalid Ollama model identity: bad identity" in error
+
+
+def test_ollama_benchmark_plan_preserves_runtime_authority_refusal(monkeypatch):
+    _wire_serve(monkeypatch)
+    authority = cli.ollama.runtime_authority(
+        cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+    monkeypatch.setattr(
+        cli, "_ollama_runtime_authority", lambda _endpoint: (authority, "bad runtime"))
+    assert cli._ollama_benchmark_plan("qwen3:0.6b", None) == (None, "bad runtime")
+
+
+def test_ollama_benchmark_plan_refuses_unreadable_inventory(monkeypatch):
+    _wire_serve(monkeypatch, names=None)
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", None)
+    assert plan is None and "couldn't list Ollama models" in error
+
+
+def test_ollama_benchmark_plan_refuses_missing_model(monkeypatch):
+    _wire_serve(monkeypatch, names=("other:1",))
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", None)
+    assert plan is None and "pull it with Ollama and characterize it first" in error
+
+
+def test_ollama_benchmark_plan_refuses_unsupported_model(monkeypatch):
+    _wire_serve(monkeypatch)
+    monkeypatch.setattr(
+        cli.ollama, "initial_governed_model_error", lambda _record: "unsupported capability")
+    assert cli._ollama_benchmark_plan("qwen3:0.6b", None) == (
+        None, "unsupported capability")
+
+
+def test_ollama_benchmark_plan_refuses_display_only_evidence(monkeypatch):
+    _wire_serve(monkeypatch, characterization=None)
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", None)
+    assert plan is None and "display-only" in error
+
+
+@pytest.mark.parametrize(("ctx", "message"), [
+    (0, "positive integer"),
+    (8192, "exceeds the measured safe ceiling"),
+])
+def test_ollama_benchmark_plan_refuses_invalid_context(monkeypatch, ctx, message):
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096})
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", ctx)
+    assert plan is None and message in error
+
+
+def test_ollama_benchmark_plan_allows_lower_context(monkeypatch):
+    _wire_serve(monkeypatch, characterization={"safe_context": 4096})
+    plan, error = cli._ollama_benchmark_plan("qwen3:0.6b", 2048)
+    assert error is None and plan["safe"] == 2048
+
+
 def test_render_benchmark_happy_path(make_console, monkeypatch):
     saved = _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
     c, buf = make_console()
@@ -10391,7 +10616,7 @@ def test_render_benchmark_unsupported_backend(make_console, monkeypatch):
     assert "benchmark isn't supported on the fauxengine engine" in buf.getvalue()
 
 
-@pytest.mark.parametrize("engine", ["bogus", "ollama"])
+@pytest.mark.parametrize("engine", ["bogus"])
 def test_render_benchmark_names_invalid_or_unsupported_engine(
         make_console, monkeypatch, engine):
     monkeypatch.setattr(cli.engines, "resolve", lambda _engine: None)
