@@ -8402,6 +8402,15 @@ def test_serve_canonicalizes_implicit_latest_before_lock_and_ownership(
     assert created == {"name": served, "from_model": canonical, "context": 8192}
     assert locks == [served]
     assert ownership["model"] == canonical and ownership["served_name"] == served
+    assert ownership["policy_version"] == cli._OLLAMA_DERIVED_POLICY_VERSION
+    assert ownership["runtime_authority"] == {
+        "runtime_version": "0.30.10",
+        "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+        "configured_inputs": {
+            "OLLAMA_KV_CACHE_TYPE": "q8_0", "OLLAMA_KEEP_ALIVE": "2m"},
+        "configured_num_parallel": 1,
+        "configured_num_parallel_authority": "exact_version_default",
+    }
 
 
 def test_serve_pulls_missing_model_then_serves(make_console, monkeypatch):
@@ -9010,14 +9019,14 @@ def test_serve_reuses_exact_owned_manifest_without_recreating(make_console, monk
                 ps_rows=[{"name": f"{served}:latest", "context_length": 8192,
                           "size": 100, "size_vram": 100,
                           "digest": "b" * 64}])
-    monkeypatch.setattr(
-        cli.activity, "snapshot",
-        lambda: [types.SimpleNamespace(runtime="ollama", served_name=served,
-                                       context=8192, endpoint="http://127.0.0.1:11434",
-                                       model="qwen3:0.6b",
-                                       base_artifact_id=_SERVE_BASE_ARTIFACT,
-                                       served_artifact_id=_SERVE_DERIVED_ARTIFACT)],
-    )
+    claim = types.SimpleNamespace(
+        runtime="ollama", served_name=served, context=8192,
+        endpoint="http://127.0.0.1:11434", model="qwen3:0.6b",
+        base_artifact_id=_SERVE_BASE_ARTIFACT,
+        served_artifact_id=_SERVE_DERIVED_ARTIFACT,
+        policy_version=cli._OLLAMA_DERIVED_POLICY_VERSION)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [claim])
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [claim])
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a, **_k: pytest.fail("owned manifest recreated"))
     c, buf = make_console()
@@ -9042,20 +9051,53 @@ def test_serve_refuses_duplicate_while_legacy_ara_service_is_live(make_console, 
 def test_serve_owned_manifest_failure_does_not_cleanup_user_state(make_console, monkeypatch):
     served = _serve_name()
     _wire_serve(monkeypatch, names=("qwen3:0.6b", f"{served}:latest"))
-    monkeypatch.setattr(
-        cli.activity, "snapshot",
-        lambda: [types.SimpleNamespace(runtime="ollama", served_name=served,
-                                       context=8192, endpoint="http://127.0.0.1:11434",
-                                       model="qwen3:0.6b",
-                                       base_artifact_id=_SERVE_BASE_ARTIFACT,
-                                       served_artifact_id=_SERVE_DERIVED_ARTIFACT)],
-    )
+    claim = types.SimpleNamespace(
+        runtime="ollama", served_name=served, context=8192,
+        endpoint="http://127.0.0.1:11434", model="qwen3:0.6b",
+        base_artifact_id=_SERVE_BASE_ARTIFACT,
+        served_artifact_id=_SERVE_DERIVED_ARTIFACT,
+        policy_version=cli._OLLAMA_DERIVED_POLICY_VERSION)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [claim])
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [claim])
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "_delete_exact_ollama_model",
                         lambda *_a, **_k: pytest.fail("owned model cleaned up"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "couldn't load" in buf.getvalue()
+
+
+def test_serve_reuses_exact_owned_manifest_after_daemon_eviction(
+        make_console, monkeypatch):
+    served = _serve_name()
+    _wire_serve(monkeypatch, names=("qwen3:0.6b", f"{served}:latest"))
+    claim = types.SimpleNamespace(
+        runtime="ollama", served_name=served, context=8192,
+        endpoint="http://127.0.0.1:11434", model="qwen3:0.6b",
+        base_artifact_id=_SERVE_BASE_ARTIFACT,
+        served_artifact_id=_SERVE_DERIVED_ARTIFACT,
+        policy_version=cli._OLLAMA_DERIVED_POLICY_VERSION)
+    monkeypatch.setattr(cli.activity, "snapshot", lambda: [])
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [claim])
+    observations = [[], [cli.ollama.OllamaProcess(
+        name=served, digest="b" * 64, size_bytes=100, size_vram_bytes=100,
+        effective_context_per_request=8192)]]
+    monkeypatch.setattr(cli.ollama, "processes", lambda: observations.pop(0))
+    monkeypatch.setattr(
+        cli.ollama, "create", lambda *_a, **_k: pytest.fail("cold owned manifest recreated"))
+    loads = []
+    monkeypatch.setattr(
+        cli.ollama, "load",
+        lambda name, keep_alive=None: loads.append((name, keep_alive)) or {"done": True})
+    recorded = {}
+    monkeypatch.setattr(
+        cli.activity, "record_ollama_serving", lambda **fields: recorded.update(fields))
+
+    c, _ = make_console()
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert loads == [(served, None)]
+    assert recorded["served_artifact_id"] == _SERVE_DERIVED_ARTIFACT
+    assert recorded["policy_version"] == cli._OLLAMA_DERIVED_POLICY_VERSION
 
 
 def test_serve_reports_cleanup_failure(make_console, monkeypatch):

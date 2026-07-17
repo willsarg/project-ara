@@ -3763,6 +3763,14 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     served_preexisting = ollama.find_model(models, served) is not None
     endpoint_base = endpoint_authority.url
     live_activity = activity.snapshot()
+    ownership_activity = activity.ollama_ownership()
+    handoff_authority = {
+        "runtime_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "configured_inputs": dict(authority.configured_inputs),
+        "configured_num_parallel": authority.configured_num_parallel,
+        "configured_num_parallel_authority": authority.configured_num_parallel_authority,
+    }
     legacy_item = next((item for item in live_activity
                         if item.runtime == "ollama" and item.model == model
                         and item.endpoint == endpoint_base and item.base_artifact_id is None), None)
@@ -3771,11 +3779,12 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                    "refusing to load a duplicate; stop and remove that legacy service first.")
     owned_item = next((
         item
-        for item in live_activity
+        for item in ownership_activity
         if item.runtime == "ollama" and item.served_name == served
         and item.context == safe and item.endpoint == endpoint_base
         and item.model == model and item.base_artifact_id == base_artifact_id
         and item.served_artifact_id is not None
+        and item.policy_version == _OLLAMA_DERIVED_POLICY_VERSION
     ), None)
     already_owned = owned_item is not None
     if served_preexisting and not already_owned:
@@ -3794,6 +3803,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         "context": safe,
         "endpoint": endpoint_base,
         "base_artifact_id": base_artifact_id,
+        "policy_version": _OLLAMA_DERIVED_POLICY_VERSION,
+        "runtime_authority": handoff_authority,
     }
 
     def setup_err(msg: str) -> int:
@@ -3811,7 +3822,13 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             msg += "; deleted the untracked manifest without expiring its runner"
         return err(msg)
 
-    setup_activity = nullcontext() if already_owned else activity.track("serving", model)
+    already_live = any(
+        item.runtime == "ollama" and item.served_name == served
+        and item.context == safe and item.endpoint == endpoint_base
+        and item.model == model and item.base_artifact_id == base_artifact_id
+        and item.served_artifact_id == served_artifact_id
+        for item in live_activity)
+    setup_activity = nullcontext() if already_live else activity.track("serving", model)
     create_confirmed = False
     try:
         with locking.ollama_setup_lock(endpoint_base, served):
@@ -3864,18 +3881,17 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                 residency_verified = True
                 spilled = process.size_vram_bytes < process.size_bytes
 
-            if not already_owned:
-                if _ollama_artifact_id(model) != base_artifact_id:
-                    return setup_err(
-                        f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
-                try:
-                    activity.record_ollama_serving(
-                        **ownership_fields, served_artifact_id=served_artifact_id)
-                    ownership_recorded = True
-                except (OSError, ValueError) as exc:
-                    return setup_err(
-                        f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: "
-                        f"{exc}")
+            if _ollama_artifact_id(model) != base_artifact_id:
+                return setup_err(
+                    f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
+            try:
+                activity.record_ollama_serving(
+                    **ownership_fields, served_artifact_id=served_artifact_id)
+                ownership_recorded = True
+            except (OSError, ValueError) as exc:
+                return setup_err(
+                    f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: "
+                    f"{exc}")
     except locking.OllamaSetupBusy as exc:
         return err(str(exc))
     except BaseException:
@@ -3903,8 +3919,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                           "handoff": {
                               "claim": "verified_point_in_time",
                               "policy_version": _OLLAMA_DERIVED_POLICY_VERSION,
-                              "runtime_version": authority.server_version,
-                              "server_instance_id": authority.server_instance_id,
+                              **handoff_authority,
                               "continuous_admission": False,
                               "future_reload": "ollama_daemon_policy",
                           },

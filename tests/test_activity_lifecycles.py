@@ -841,6 +841,14 @@ def test_ollama_reserve_same_live_identity_never_duplicates_status(
     activity.record_ollama_serving(
         served_name=_ollama_served_name(), model="base:model", context=4096,
         endpoint="http://127.0.0.1:11434", started_at=1.0,
+        policy_version=cli._OLLAMA_DERIVED_POLICY_VERSION,
+        runtime_authority={
+            "runtime_version": "0.30.10",
+            "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+            "configured_inputs": {},
+            "configured_num_parallel": 1,
+            "configured_num_parallel_authority": "exact_version_default",
+        },
         **_ollama_artifact_fields())
     loaded = [{"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
                "size": 10, "size_vram": 10, "digest": "b" * 64}]

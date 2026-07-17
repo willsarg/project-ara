@@ -14,6 +14,14 @@ from ara import activity, cli
 
 _BASE_ARTIFACT = "ollama-manifest-sha256:" + "a" * 64
 _SERVED_ARTIFACT = "ollama-manifest-sha256:" + "b" * 64
+_POLICY = "ollama-derived-v2"
+_AUTHORITY = {
+    "runtime_version": "0.30.10",
+    "server_instance_id": "42:1000.000000:ollama",
+    "configured_inputs": {"OLLAMA_KEEP_ALIVE": "2m"},
+    "configured_num_parallel": 1,
+    "configured_num_parallel_authority": "exact_version_default",
+}
 
 
 @pytest.fixture
@@ -35,6 +43,10 @@ def _record(**over):
     }
     fields.update(over)
     return activity.record_ollama_serving(**fields)
+
+
+def _record_v2(**over):
+    return _record(policy_version=_POLICY, runtime_authority=_AUTHORITY, **over)
 
 
 def _live(name="org-model-ara:latest", context=4096):
@@ -94,6 +106,69 @@ def test_multiple_served_identities_have_deterministic_distinct_manifests(regist
     assert len(paths) == 2
     assert {path.parent for path in paths} == {registry / "serving"}
     assert len(list((registry / "serving").glob("*.json"))) == 2
+
+
+def test_ownership_view_reads_cold_v2_claim_without_contacting_ollama(
+        registry, monkeypatch):
+    manifest = _record_v2()
+    monkeypatch.setattr("ara.ollama.ps", lambda: pytest.fail("ownership view contacted Ollama"))
+    found = activity.ollama_ownership()
+    assert found == [activity.Activity(
+        kind="serving", model="org/model", pid=None, started_at=100.0,
+        runtime="ollama", served_name="org-model-ara", context=4096,
+        endpoint="http://127.0.0.1:11434", base_artifact_id=_BASE_ARTIFACT,
+        served_artifact_id=_SERVED_ARTIFACT, policy_version=_POLICY,
+        runtime_authority=_AUTHORITY)]
+    assert json.loads(manifest.read_text())["runtime_authority"] == _AUTHORITY
+
+
+def test_v2_live_status_requires_exact_runtime_authority(registry, monkeypatch):
+    _record_v2()
+    _wire_live(monkeypatch)
+    monkeypatch.setattr(
+        "ara.ollama.endpoint_authority",
+        lambda url: cli.ollama.OllamaEndpoint(url, "loopback"),
+    )
+    monkeypatch.setattr(
+        "ara.ollama.runtime_authority",
+        lambda endpoint: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=endpoint,
+            server_version=_AUTHORITY["runtime_version"],
+            server_instance_id=_AUTHORITY["server_instance_id"],
+            configured_inputs=tuple(_AUTHORITY["configured_inputs"].items()),
+            configured_num_parallel=1,
+            configured_num_parallel_authority="exact_version_default",
+        ),
+    )
+    assert len(activity.snapshot()) == 1
+
+    monkeypatch.setattr(
+        "ara.ollama.runtime_authority",
+        lambda endpoint: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=endpoint, server_version="0.30.10",
+            server_instance_id="different", issue=None,
+            configured_num_parallel=1,
+            configured_num_parallel_authority="exact_version_default",
+        ),
+    )
+    assert activity.snapshot() == []
+
+
+def test_ownership_view_closes_root_when_serving_scan_raises(registry, monkeypatch):
+    registry.mkdir()
+    failure = KeyboardInterrupt()
+    closed = []
+    monkeypatch.setattr(
+        activity, "_read_serving_records",
+        lambda _root: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        activity, "_close_guards",
+        lambda guards, original=None: closed.append((guards, original)),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        activity.ollama_ownership()
+    assert len(closed) == 1 and closed[0][1] is failure
 
 
 @pytest.mark.parametrize("field,value", [

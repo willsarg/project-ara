@@ -44,6 +44,8 @@ class Activity:
     endpoint: str | None = None
     base_artifact_id: str | None = None
     served_artifact_id: str | None = None
+    policy_version: str | None = None
+    runtime_authority: dict | None = None
 
 
 def activity_dir() -> Path:
@@ -386,10 +388,15 @@ _SERVING_FIELDS = {
     "runtime", "served_name", "model", "context", "endpoint", "started_at",
     "base_artifact_id", "served_artifact_id",
 }
+_SERVING_V2_FIELDS = _SERVING_FIELDS | {"policy_version", "runtime_authority"}
 _LEGACY_SERVING_FIELDS = {
     "runtime", "served_name", "model", "context", "endpoint", "started_at",
 }
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
+_RUNTIME_AUTHORITY_FIELDS = {
+    "runtime_version", "server_instance_id", "configured_inputs",
+    "configured_num_parallel", "configured_num_parallel_authority",
+}
 
 
 def _valid_ollama_artifact_id(value) -> bool:
@@ -399,8 +406,8 @@ def _valid_ollama_artifact_id(value) -> bool:
     return len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
 
 
-def _valid_serving_record(record) -> bool:
-    return (isinstance(record, dict) and set(record) == _SERVING_FIELDS
+def _valid_serving_identity(record, fields) -> bool:
+    return (isinstance(record, dict) and set(record) == fields
             and record.get("runtime") == "ollama"
             and _display_safe(record.get("served_name"))
             and _display_safe(record.get("model"))
@@ -411,6 +418,30 @@ def _valid_serving_record(record) -> bool:
             and record["context"] > 0
             and _display_safe(record.get("endpoint"))
             and _number(record.get("started_at")))
+
+
+def _valid_runtime_authority(value) -> bool:
+    configured = value.get("configured_inputs") if isinstance(value, dict) else None
+    return (isinstance(value, dict) and set(value) == _RUNTIME_AUTHORITY_FIELDS
+            and _display_safe(value.get("runtime_version"))
+            and _display_safe(value.get("server_instance_id"))
+            and isinstance(configured, dict)
+            and all(_display_safe(key) and isinstance(item, str) and len(item) <= 512
+                    for key, item in configured.items())
+            and isinstance(value.get("configured_num_parallel"), int)
+            and not isinstance(value.get("configured_num_parallel"), bool)
+            and value["configured_num_parallel"] > 0
+            and _display_safe(value.get("configured_num_parallel_authority")))
+
+
+def _valid_serving_record(record) -> bool:
+    return (_valid_serving_identity(record, _SERVING_V2_FIELDS)
+            and _display_safe(record.get("policy_version"))
+            and _valid_runtime_authority(record.get("runtime_authority")))
+
+
+def _valid_v1_serving_record(record) -> bool:
+    return _valid_serving_identity(record, _SERVING_FIELDS)
 
 
 def _valid_legacy_serving_record(record) -> bool:
@@ -432,14 +463,20 @@ def _valid_legacy_serving_record(record) -> bool:
 
 def validate_ollama_serving(*, served_name: str, model: str, context: int,
                             endpoint: str, base_artifact_id: str,
-                            served_artifact_id: str) -> None:
+                            served_artifact_id: str, policy_version: str | None = None,
+                            runtime_authority: dict | None = None) -> None:
     """Validate public persistent-ownership fields without touching the filesystem."""
     record = {
         "runtime": "ollama", "served_name": served_name, "model": model,
         "context": context, "endpoint": endpoint, "started_at": 0.0,
         "base_artifact_id": base_artifact_id, "served_artifact_id": served_artifact_id,
     }
-    if not _valid_serving_record(record):
+    if policy_version is not None or runtime_authority is not None:
+        record.update(policy_version=policy_version, runtime_authority=runtime_authority)
+        valid = _valid_serving_record(record)
+    else:
+        valid = _valid_v1_serving_record(record)
+    if not valid:
         raise ValueError("invalid Ollama serving activity")
 
 
@@ -454,11 +491,14 @@ def validate_ollama_serving_fields(*, served_name: str, model: str, context: int
 
 def record_ollama_serving(*, served_name: str, model: str, context: int,
                           endpoint: str, base_artifact_id: str, served_artifact_id: str,
+                          policy_version: str | None = None,
+                          runtime_authority: dict | None = None,
                           started_at: float | None = None) -> Path:
     """Atomically own one exactly identified governed model on an Ollama endpoint."""
     validate_ollama_serving(
         served_name=served_name, model=model, context=context, endpoint=endpoint,
-        base_artifact_id=base_artifact_id, served_artifact_id=served_artifact_id)
+        base_artifact_id=base_artifact_id, served_artifact_id=served_artifact_id,
+        policy_version=policy_version, runtime_authority=runtime_authority)
     record = {
         "runtime": "ollama",
         "served_name": served_name,
@@ -469,6 +509,8 @@ def record_ollama_serving(*, served_name: str, model: str, context: int,
         "served_artifact_id": served_artifact_id,
         "started_at": time.time() if started_at is None else started_at,
     }
+    if policy_version is not None or runtime_authority is not None:
+        record.update(policy_version=policy_version, runtime_authority=runtime_authority)
     if not _number(record["started_at"]):
         raise ValueError("invalid Ollama serving activity")
     identity = hashlib.sha256(
@@ -603,13 +645,43 @@ def _read_serving_records(root: _DirectoryGuard) -> list[tuple[dict, str]]:
     try:
         for name in _record_names(serving.path, guard=serving):
             record = _json_record(serving.path / name, guard=serving)
-            if _valid_serving_record(record) or _valid_legacy_serving_record(record):
+            if (_valid_serving_record(record) or _valid_v1_serving_record(record)
+                    or _valid_legacy_serving_record(record)):
                 found.append((record, name))
     except BaseException as original:
         _close_guards([serving], original=original)
         raise
     _close_guards([serving])
     return found
+
+
+def _serving_activity(record: dict) -> Activity:
+    return Activity(
+        kind="serving", model=record["model"], pid=None,
+        started_at=float(record["started_at"]), runtime="ollama",
+        served_name=record["served_name"], context=record["context"],
+        endpoint=record["endpoint"],
+        base_artifact_id=record.get("base_artifact_id"),
+        served_artifact_id=record.get("served_artifact_id"),
+        policy_version=record.get("policy_version"),
+        runtime_authority=record.get("runtime_authority"),
+    )
+
+
+def ollama_ownership() -> list[Activity]:
+    """Read validated persistent ownership claims without requiring live residency."""
+    directory = activity_dir()
+    try:
+        root = _open_root(create=False, path=directory)
+    except OSError:
+        return []
+    try:
+        records = _read_serving_records(root)
+    except BaseException as original:
+        _close_guards([root], original=original)
+        raise
+    _close_guards([root])
+    return [_serving_activity(record) for record, _name in records]
 
 
 def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
@@ -632,6 +704,18 @@ def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
     for record, name in matching:
         served = record["served_name"]
         legacy = set(record) == _LEGACY_SERVING_FIELDS
+        if set(record) == _SERVING_V2_FIELDS:
+            endpoint_authority = ollama.endpoint_authority(record["endpoint"])
+            authority = ollama.runtime_authority(endpoint_authority)
+            observed_authority = {
+                "runtime_version": authority.server_version,
+                "server_instance_id": authority.server_instance_id,
+                "configured_inputs": dict(authority.configured_inputs),
+                "configured_num_parallel": authority.configured_num_parallel,
+                "configured_num_parallel_authority": authority.configured_num_parallel_authority,
+            }
+            if authority.issue is not None or observed_authority != record["runtime_authority"]:
+                continue
         expected_served = None
         if not legacy:
             base_digest = ollama.manifest_digest(record["model"])
@@ -649,13 +733,7 @@ def _live_ollama_serving(root: _DirectoryGuard) -> list[tuple[Activity, str]]:
                       and (legacy or item.get("digest") == expected_served)), None)
         if entry is None:
             continue
-        live.append((Activity(
-            kind="serving", model=record["model"], pid=None,
-            started_at=float(record["started_at"]), runtime="ollama",
-            served_name=served, context=record["context"], endpoint=endpoint,
-            base_artifact_id=record.get("base_artifact_id"),
-            served_artifact_id=record.get("served_artifact_id"),
-        ), name))
+        live.append((_serving_activity(record), name))
     return live
 
 
