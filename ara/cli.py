@@ -4386,6 +4386,88 @@ def render_node(c: Console, rest: list[str], *, token: str | None = None,
                      "usage: ara node {enroll|run|install|start|stop|status|uninstall}")
 
 
+def _ollama_doctor_report() -> dict:
+    """Read-only Ollama endpoint and persistent-ownership health for ``ara doctor``."""
+    endpoint = ollama.endpoint_authority()
+    claims = activity.ollama_ownership()
+    findings: list[dict] = []
+
+    def finding(code: str, detail: str, *, served_name: str | None = None) -> None:
+        row = {"code": code, "severity": "warning", "detail": detail}
+        if served_name is not None:
+            row["served_name"] = served_name
+        findings.append(row)
+
+    report = {
+        "endpoint": endpoint.url,
+        "scope": endpoint.scope,
+        "version": None,
+        "ownership_claims": len(claims),
+        "findings": findings,
+    }
+    if endpoint.url is None:
+        finding("endpoint_invalid", "the configured Ollama endpoint could not be identified")
+        return report
+    version = ollama.version()
+    report["version"] = version
+    models = ollama.inventory() if version is not None else None
+    if version is None or models is None:
+        finding("runtime_unreadable", "the configured Ollama runtime or inventory is unreadable")
+        return report
+    authority = _ollama_display_authority(endpoint)
+    observed_authority = {
+        "runtime_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "configured_inputs": dict(authority.configured_inputs),
+        "configured_num_parallel": authority.configured_num_parallel,
+        "configured_num_parallel_authority": authority.configured_num_parallel_authority,
+    }
+    if endpoint.scope != "loopback":
+        finding("non_loopback_endpoint", "direct governed execution is limited to loopback Ollama")
+    for claim in claims:
+        name = claim.served_name or "unknown"
+        if claim.policy_version is None or claim.runtime_authority is None:
+            finding("legacy_ownership",
+                    "ownership predates runtime-bound policy evidence", served_name=name)
+        else:
+            if claim.policy_version != _OLLAMA_DERIVED_POLICY_VERSION:
+                finding("policy_stale", "ownership was created under another derived policy",
+                        served_name=name)
+            if claim.endpoint != endpoint.url:
+                finding("endpoint_mismatch", "ownership belongs to another Ollama endpoint",
+                        served_name=name)
+            if authority.issue is not None or claim.runtime_authority != observed_authority:
+                finding("runtime_authority_stale",
+                        "the current daemon no longer matches the recorded handoff authority",
+                        served_name=name)
+        base = ollama.find_model(models, claim.model) if claim.model is not None else None
+        current_base = (_OLLAMA_ARTIFACT_PREFIX + base.digest
+                        if base is not None and base.digest is not None else None)
+        if current_base != claim.base_artifact_id:
+            finding("base_artifact_stale", "the base manifest is missing or changed",
+                    served_name=name)
+        served = ollama.find_model(models, name)
+        current_served = (_OLLAMA_ARTIFACT_PREFIX + served.digest
+                          if served is not None and served.digest is not None else None)
+        if current_served != claim.served_artifact_id:
+            finding("served_artifact_stale", "the derived manifest is missing or changed",
+                    served_name=name)
+    for model in models:
+        if not _is_ara_ollama_derived(model.name):
+            continue
+        artifact_id = (_OLLAMA_ARTIFACT_PREFIX + model.digest
+                       if model.digest is not None else None)
+        authoritative = any(
+            claim.policy_version == _OLLAMA_DERIVED_POLICY_VERSION
+            and claim.served_artifact_id == artifact_id
+            and ollama.find_model([model], claim.served_name or "") is not None
+            for claim in claims)
+        if not authoritative:
+            finding("unowned_derived_tag", "ARA-derived tag has no current authoritative claim",
+                    served_name=model.name)
+    return report
+
+
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
 
 
@@ -4411,8 +4493,10 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
         print(json.dumps({"error": msg, "database": str(path)})) if as_json \
             else c.emit(c.style("bad", f"  {msg}"))
         return 1
+    ollama_report = _ollama_doctor_report()
     if as_json:
-        out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other}
+        out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other,
+                     "ollama": ollama_report}
         if rekey:
             out["rekeyed_rows"] = rekeyed
         if c.verbose:
@@ -4430,6 +4514,14 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
     if c.verbose:
         c.emit(f"    {'database':<20} {path}")
         c.emit(f"    {'schema version':<20} {schema_version}")
+    if ollama_report["findings"]:
+        c.emit(c.section("  OLLAMA"))
+        for finding in ollama_report["findings"]:
+            name = f" · {finding['served_name']}" if "served_name" in finding else ""
+            c.emit(c.style("warn", f"    {finding['code'].replace('_', ' ')}{name}")
+                   + c.style("dim", f" — {finding['detail']}"))
+    elif c.verbose:
+        c.emit(c.style("dim", "    Ollama ownership: no findings"))
     return 0
 
 

@@ -238,7 +238,18 @@ def test_hf_help_explains_group_and_subcommands(capsys):
     assert "visible in shell history and process lists" in rendered[("login",)]
 
 
-def test_render_doctor_json_reports_key_and_counts(store, monkeypatch, capsys):
+@pytest.fixture
+def doctor_ollama_clean(monkeypatch):
+    report = {
+        "endpoint": "http://127.0.0.1:11434", "scope": "loopback",
+        "version": "0.30.10", "ownership_claims": 0, "findings": [],
+    }
+    monkeypatch.setattr(cli, "_ollama_doctor_report", lambda: report)
+    return report
+
+
+def test_render_doctor_json_reports_key_and_counts(
+        store, monkeypatch, capsys, doctor_ollama_clean):
     from ara import db, profile
     monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
     db.save_characterization(store, "ara1|C|G|32|Linux", "cpu", "m1", safe_context=8, points=[])
@@ -249,9 +260,11 @@ def test_render_doctor_json_reports_key_and_counts(store, monkeypatch, capsys):
     assert out["machine_key"] == "ara1|C|G|32|Linux"
     assert out["counts"]["characterizations"] == 1      # only this machine's rows
     assert out["other_keys_rows"] >= 1                    # foreign/legacy rows counted separately
+    assert out["ollama"] == doctor_ollama_clean
 
 
-def test_render_doctor_rekey_reports_migrated_count(store, monkeypatch, capsys):
+def test_render_doctor_rekey_reports_migrated_count(
+        store, monkeypatch, capsys, doctor_ollama_clean):
     from ara import db, profile
     monkeypatch.setattr(profile, "machine_key", lambda: "ara1|TestCPU|TestGPU|32|Linux")
     db.save_characterization(store, "TestCPU|TestGPU|34359738368|Linux", "cpu", "m1",
@@ -262,7 +275,8 @@ def test_render_doctor_rekey_reports_migrated_count(store, monkeypatch, capsys):
     assert out["rekeyed_rows"] == 1
 
 
-def test_render_doctor_text_variants(store, monkeypatch, make_console):
+def test_render_doctor_text_variants(
+        store, monkeypatch, make_console, doctor_ollama_clean):
     from ara import db, profile
     monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
     db.save_characterization(store, "someoneelse|X", "cpu", "m2", safe_context=8, points=[])
@@ -294,7 +308,8 @@ def test_render_doctor_text_variants(store, monkeypatch, make_console):
     assert "rekeyed 0 legacy row" in out and "other machine keys" not in out
 
 
-def test_render_doctor_verbose_reports_store_details(store, monkeypatch, make_console, capsys):
+def test_render_doctor_verbose_reports_store_details(
+        store, monkeypatch, make_console, capsys, doctor_ollama_clean):
     from ara import db, profile
     monkeypatch.setattr(profile, "machine_key", lambda: "ara1|C|G|32|Linux")
     c, buf = make_console(verbose=True)
@@ -310,6 +325,123 @@ def test_render_doctor_verbose_reports_store_details(store, monkeypatch, make_co
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
     assert out_json["schema_version"] == 3
+
+
+def test_render_doctor_text_reports_ollama_findings(
+        store, monkeypatch, make_console, doctor_ollama_clean):
+    doctor_ollama_clean["ownership_claims"] = 1
+    doctor_ollama_clean["findings"] = [{
+        "code": "legacy_ownership", "severity": "warning",
+        "served_name": "old:latest",
+        "detail": "ownership predates runtime-bound policy evidence",
+    }]
+    c, buf = make_console()
+    assert cli.render_doctor(c) == 0
+    out = buf.getvalue()
+    assert "OLLAMA" in out and "legacy ownership" in out
+    assert "old:latest" in out
+
+
+def test_ollama_doctor_reports_stale_legacy_and_unowned_artifacts(monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback")
+    authority = _pick_authority()
+    observed = {
+        "runtime_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "configured_inputs": {},
+        "configured_num_parallel": 1,
+        "configured_num_parallel_authority": "exact_version_default",
+    }
+    legacy = cli.activity.Activity(
+        kind="serving", model="legacy-base:1", pid=None, started_at=1,
+        runtime="ollama", served_name="legacy-custom:1", context=1024,
+        endpoint=endpoint.url, base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "b" * 64)
+    served_name = "ara-base-ctx2048-" + "c" * 24
+    stale = cli.activity.Activity(
+        kind="serving", model="base:1", pid=None, started_at=2,
+        runtime="ollama", served_name=served_name, context=2048,
+        endpoint="http://other:11434",
+        base_artifact_id="ollama-manifest-sha256:" + "d" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "e" * 64,
+        policy_version="older-policy", runtime_authority={**observed,
+                                                           "server_instance_id": "old"})
+    models = [
+        _local_ollama_model("legacy-base:1", digest="f" * 64),
+        _local_ollama_model("base:1", digest="d" * 64),
+        _local_ollama_model(served_name, digest="e" * 64),
+        _local_ollama_model(
+            "ara-orphan-ctx4096-" + "1" * 24 + ":latest", digest="1" * 64),
+    ]
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(cli.ollama, "version", lambda: "0.30.10")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: models)
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: authority)
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [legacy, stale])
+
+    report = cli._ollama_doctor_report()
+    codes = {finding["code"] for finding in report["findings"]}
+    assert report["ownership_claims"] == 2
+    assert codes == {
+        "legacy_ownership", "base_artifact_stale", "served_artifact_stale",
+        "policy_stale", "endpoint_mismatch", "runtime_authority_stale",
+        "unowned_derived_tag",
+    }
+
+
+@pytest.mark.parametrize("case", ["invalid_endpoint", "unreachable", "inventory"])
+def test_ollama_doctor_reports_unreadable_endpoint_states(monkeypatch, case):
+    endpoint = cli.ollama.OllamaEndpoint(
+        None if case == "invalid_endpoint" else "http://127.0.0.1:11434",
+        "unknown" if case == "invalid_endpoint" else "loopback")
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [])
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(cli.ollama, "version", lambda: None if case == "unreachable" else "1")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: None if case == "inventory" else [])
+    report = cli._ollama_doctor_report()
+    expected = "endpoint_invalid" if case == "invalid_endpoint" else "runtime_unreadable"
+    assert [finding["code"] for finding in report["findings"]] == [expected]
+
+
+def test_ollama_doctor_accepts_current_authoritative_tag(monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback")
+    authority = _pick_authority()
+    runtime = {
+        "runtime_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "configured_inputs": {},
+        "configured_num_parallel": 1,
+        "configured_num_parallel_authority": "exact_version_default",
+    }
+    served_name = "ara-base-ctx2048-" + "a" * 24
+    claim = cli.activity.Activity(
+        kind="serving", model="base:1", pid=None, started_at=1,
+        runtime="ollama", served_name=served_name, context=2048,
+        endpoint=endpoint.url,
+        base_artifact_id="ollama-manifest-sha256:" + "b" * 64,
+        served_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        policy_version=cli._OLLAMA_DERIVED_POLICY_VERSION,
+        runtime_authority=runtime)
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [claim])
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(cli.ollama, "version", lambda: "0.30.10")
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: authority)
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [
+        _local_ollama_model("base:1", digest="b" * 64),
+        _local_ollama_model(served_name + ":latest", digest="a" * 64),
+    ])
+    assert cli._ollama_doctor_report()["findings"] == []
+
+
+def test_ollama_doctor_warns_for_non_loopback_endpoint(monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint("http://host.example:11434", "remote")
+    monkeypatch.setattr(cli.activity, "ollama_ownership", lambda: [])
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(cli.ollama, "version", lambda: "0.30.10")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [])
+    report = cli._ollama_doctor_report()
+    assert [finding["code"] for finding in report["findings"]] == [
+        "non_loopback_endpoint"]
 
 
 @pytest.mark.parametrize("as_json", [False, True])
