@@ -2629,7 +2629,7 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
             if (base_artifact_id is not None
                     and _ollama_artifact_id(model) != base_artifact_id):
                 raise RuntimeError("base manifest changed during probe creation")
-        ollama.load(probe)
+        ollama.load(probe, keep_alive=None)
         processes = ollama.processes()
         expected_digest = (probe_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
                            if probe_artifact_id is not None else None)
@@ -2648,10 +2648,13 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
     return best, points
 
 
-def _cleanup_ollama_probe(probe: str, expected_artifact_id: str | None = None) -> str | None:
-    """Unload, verify absence, then delete a characterization probe; return any cleanup error."""
-    return _cleanup_ollama_model(
-        probe, label="probe", delete=True, expected_artifact_id=expected_artifact_id)
+def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
+    """Delete one exact probe manifest without expiring its potentially shared Ollama runner."""
+    if _ollama_artifact_id(probe) != expected_artifact_id:
+        return "probe manifest identity changed; refused delete"
+    if not ollama.delete(probe):
+        return "couldn't delete probe model"
+    return None
 
 
 def _cleanup_ollama_model(name: str, *, label: str, delete: bool,

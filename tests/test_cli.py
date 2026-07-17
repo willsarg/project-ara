@@ -3792,19 +3792,24 @@ def test_ollama_ramp_contexts_schedule():
 def test_ollama_measure_ceiling_finds_the_wall(monkeypatch):
     st = {"ctx": 0}
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: (st.update(ctx=ctx), True)[1])
-    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    keep_alives = []
+    monkeypatch.setattr(
+        cli.ollama, "load",
+        lambda p, keep_alive="not-passed": keep_alives.append(keep_alive) or {},
+    )
     monkeypatch.setattr(cli.ollama, "ps",  # spill (size_vram < size) once ctx reaches 8192
                         lambda *_a: [{"name": "pr", "context_length": st["ctx"],
                                   "size": 1000, "size_vram": 500 if st["ctx"] >= 8192 else 1000}])
     best, points = cli._ollama_measure_ceiling("m", 8192, "pr")
     assert best == 4096                                     # largest no-spill rung
     assert [p["fit"] for p in points] == [True, True, False]
+    assert keep_alives == [None, None, None]
 
 
 def test_ollama_measure_ceiling_all_rungs_fit(monkeypatch):
     st = {"ctx": 0}
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: (st.update(ctx=ctx), True)[1])
-    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps",   # never spills → ramp runs to the top rung
                         lambda *_a: [{"name": "pr", "context_length": st["ctx"],
                                   "size": 1000, "size_vram": 1000}])
@@ -3814,7 +3819,7 @@ def test_ollama_measure_ceiling_all_rungs_fit(monkeypatch):
 
 def test_ollama_measure_ceiling_none_when_floor_spills(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
-    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps",
                         lambda *_a: [{"name": "pr", "context_length": 2048,
                                   "size": 1000, "size_vram": 400}])
@@ -3830,7 +3835,7 @@ def test_ollama_measure_ceiling_stops_on_create_fail(monkeypatch):
 
 def test_ollama_measure_ceiling_stops_when_governance_not_taken(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
-    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [])
     with pytest.raises(RuntimeError, match="not resident after load"):
         cli._ollama_measure_ceiling("m", 2048, "pr")
@@ -3842,7 +3847,7 @@ def test_ollama_measure_ceiling_stops_when_governance_not_taken(monkeypatch):
 ])
 def test_ollama_measure_ceiling_rejects_unverified_residency(monkeypatch, size, vram):
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
-    monkeypatch.setattr(cli.ollama, "load", lambda p: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
         "name": "pr", "context_length": 2048, "size": size, "size_vram": vram,
     }])
@@ -3856,7 +3861,7 @@ def test_ollama_measure_ceiling_binds_probe_and_base_manifest_before_load(monkey
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base" else "b" * 64)
     loads = []
-    monkeypatch.setattr(cli.ollama, "load", lambda name: loads.append(name) or {})
+    monkeypatch.setattr(cli.ollama, "load", lambda name, **_k: loads.append(name) or {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
         "name": "probe:latest", "context_length": 2048,
         "size": 10, "size_vram": 10, "digest": "b" * 64,
@@ -3872,7 +3877,7 @@ def test_ollama_measure_ceiling_binds_probe_and_base_manifest_before_load(monkey
 def test_ollama_measure_ceiling_can_track_probe_without_base_gate(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
         "name": "probe:latest", "context_length": 2048,
         "size": 10, "size_vram": 10, "digest": "b" * 64,
@@ -3891,7 +3896,7 @@ def test_ollama_measure_ceiling_refuses_retargeted_base_before_probe_load(monkey
         lambda name: next(base_digests) if name == "base" else "b" * 64,
     )
     monkeypatch.setattr(cli.ollama, "load",
-                        lambda *_a: pytest.fail("loaded probe from retargeted base"))
+                        lambda *_a, **_k: pytest.fail("loaded probe from retargeted base"))
     with pytest.raises(RuntimeError, match="changed during probe creation"):
         cli._ollama_measure_ceiling(
             "base", 2048, "probe",
@@ -3927,7 +3932,7 @@ def test_ollama_measure_ceiling_accepts_verified_probe_without_provenance_dict(m
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base" else "b" * 64)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
         "name": "probe:latest", "context_length": 2048,
         "size": 10, "size_vram": 10, "digest": "b" * 64,
@@ -3943,7 +3948,7 @@ def test_ollama_measure_ceiling_refuses_additional_resident_model(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base" else "b" * 64)
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a: {})
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [
         {"name": "probe:latest", "digest": "b" * 64, "context_length": 2048,
          "size": 10, "size_vram": 10},
@@ -3969,66 +3974,55 @@ def test_cleanup_ollama_probe_refuses_retargeted_manifest(monkeypatch):
     assert "identity changed" in error and "refused" in error
 
 
-def test_cleanup_ollama_probe_refuses_retarget_before_delete(monkeypatch):
+def test_cleanup_ollama_probe_deletes_exact_manifest_without_expiring_runner(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("expired shared runner"))
+    monkeypatch.setattr(cli.ollama, "ps", lambda: pytest.fail("polled shared runner"))
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "delete",
+                        lambda name: calls.append(("delete", name)) or True)
+    assert cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64) is None
+    assert calls == [("delete", "probe")]
+
+
+def test_cleanup_ollama_probe_reports_delete_failure(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: False)
+    assert "delete probe model" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+
+
+def test_cleanup_ollama_model_refuses_retargeted_manifest(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("unloaded retargeted model"))
+    error = cli._cleanup_ollama_model(
+        "model", label="governed model", delete=True,
+        expected_artifact_id="ollama-manifest-sha256:" + "b" * 64)
+    assert "identity changed" in error and "refused unload and delete" in error
+
+
+def test_cleanup_ollama_model_refuses_retarget_before_delete(monkeypatch):
     digests = iter(["b" * 64, "c" * 64])
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: next(digests))
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda: [])
     monkeypatch.setattr(cli.ollama, "delete",
-                        lambda *_a, **_k: pytest.fail("deleted retargeted probe"))
-    error = cli._cleanup_ollama_probe(
-        "probe", "ollama-manifest-sha256:" + "b" * 64)
+                        lambda *_a, **_k: pytest.fail("deleted retargeted model"))
+    error = cli._cleanup_ollama_model(
+        "model", label="governed model", delete=True,
+        expected_artifact_id="ollama-manifest-sha256:" + "b" * 64)
     assert "identity changed" in error and "refused delete" in error
 
 
-def test_cleanup_ollama_probe_unloads_verifies_then_deletes(monkeypatch):
-    calls = []
-    monkeypatch.setattr(cli.ollama, "load",
-                        lambda name, keep_alive=-1: calls.append(("load", name, keep_alive)) or {})
+def test_cleanup_ollama_model_reports_delete_failure(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda: [])
-    monkeypatch.setattr(cli.ollama, "delete",
-                        lambda name: calls.append(("delete", name)) or True)
-    assert cli._cleanup_ollama_probe("probe") is None
-    assert calls == [("load", "probe", 0), ("delete", "probe")]
-
-
-def test_cleanup_ollama_probe_reports_still_resident_and_deletes(monkeypatch):
-    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [{"name": "probe"}])
-    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
-    deleted = []
-    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
-    assert "still resident" in cli._cleanup_ollama_probe("probe")
-    assert deleted == []
-
-
-def test_cleanup_ollama_probe_polls_until_absent_before_delete(monkeypatch):
-    states = iter([[{"name": "probe"}], [{"name": "probe:latest"}], []])
-    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: next(states))
-    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
-    deleted = []
-    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
-    assert cli._cleanup_ollama_probe("probe") is None
-    assert deleted == ["probe"]
-
-
-def test_cleanup_ollama_probe_reports_api_failures(monkeypatch):
-    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: None)
-    monkeypatch.setattr(cli.ollama, "ps", lambda: None)
-    deleted = []
-    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or False)
-    error = cli._cleanup_ollama_probe("probe")
-    assert "request probe unload" in error
-    assert "verify probe unload" in error
-    assert deleted == []
-
-
-def test_cleanup_ollama_probe_reports_delete_failure_after_verified_unload(monkeypatch):
-    monkeypatch.setattr(cli.ollama, "load", lambda name, keep_alive=-1: {})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
-    monkeypatch.setattr(cli.ollama, "delete", lambda name: False)
-    assert "delete probe model" in cli._cleanup_ollama_probe("probe")
+    monkeypatch.setattr(cli.ollama, "delete", lambda _name: False)
+    assert "delete governed model" in cli._cleanup_ollama_model(
+        "model", label="governed model", delete=True)
 
 
 def _local_ollama_model(name, **fields):

@@ -494,11 +494,24 @@ def test_load_generates_empty_prompt_with_keepalive(monkeypatch):
         return {"done": True}
 
     monkeypatch.setattr(ollama, "_post_json", fake_post)
-    assert ollama.load("x-ara", keep_alive=-1) == {"done": True}
+    assert ollama.load("x-ara") == {"done": True}
     assert seen["path"] == "/api/generate"
     assert seen["payload"]["model"] == "x-ara"
     assert seen["payload"]["keep_alive"] == -1
     assert seen["payload"]["prompt"] == ""
+
+
+def test_load_can_defer_keepalive_to_daemon_policy(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload)
+        return {"done": True}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+    assert ollama.load("x-ara", keep_alive=None) == {"done": True}
+    assert seen["path"] == "/api/generate"
+    assert seen["payload"] == {"model": "x-ara", "prompt": "", "stream": False}
 
 
 # --------------------------------------------------------------------------- #
