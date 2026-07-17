@@ -1073,8 +1073,140 @@ def _measured_ramp_slope(row: dict | None) -> float | None:
         return None
 
 
-def render_model_detail(c: Console, model_id: str, *, as_json: bool = False) -> int:
+def _ollama_display_authority(endpoint: ollama.OllamaEndpoint) -> ollama.OllamaRuntimeAuthority:
+    """Return attributable local authority, or explicit display-only authority for other scopes."""
+    if endpoint.scope == "loopback":
+        return ollama.runtime_authority(endpoint)
+    return ollama.OllamaRuntimeAuthority(endpoint=endpoint, issue="non_loopback_endpoint")
+
+
+def _ollama_trained_context(record: ollama.OllamaModel, detail: dict | None) -> int | None:
+    """Prefer typed inventory context, then an exact positive ``model_info`` context field."""
+    if record.context_length is not None:
+        return record.context_length
+    info = detail.get("model_info") if isinstance(detail, dict) else None
+    if not isinstance(info, dict):
+        return None
+    values = [value for key, value in info.items()
+              if isinstance(key, str) and key.endswith(".context_length")
+              and isinstance(value, int) and not isinstance(value, bool) and value > 0]
+    return max(values) if values else None
+
+
+def _ollama_characterization_view(
+    assessment: ollama_evidence.CharacterizationAssessment,
+    artifact_id: str | None,
+) -> list[dict]:
+    """Public, target/config-separated view of the current compatibility-schema evidence row."""
+    row = assessment.display
+    if row is None:
+        return []
+    config = row.get("config") if isinstance(row.get("config"), dict) else None
+    reusable = assessment.reusable is not None
+    artifact_matches = artifact_id is not None and row.get("artifact_id") == artifact_id
+    return [{
+        "safe_context": row.get("safe_context"),
+        "measured_at": row.get("measured_at"),
+        "artifact_id": row.get("artifact_id"),
+        "artifact_matches": artifact_matches,
+        "stale": not artifact_matches,
+        "target": config.get("endpoint_authority") if config is not None else None,
+        "config": config,
+        "reusable": reusable,
+        "status": "reusable" if reusable else "display_only",
+        "reason": assessment.reason,
+    }]
+
+
+def _render_model_detail_ollama(c: Console, model_id: str, *, as_json: bool) -> int:
+    """Read-only exact Ollama artifact, API detail, and reusable/display-only evidence."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    endpoint = ollama.endpoint_authority()
+    if endpoint.url is None:
+        return err("couldn't identify the configured Ollama endpoint")
+    models = ollama.inventory()
+    if models is None:
+        return err("couldn't list Ollama models — is the server reachable?")
+    record = ollama.find_model(models, model_id)
+    if record is None:
+        return err(f"{model_id} isn't in the configured Ollama store")
+    detail = ollama.show(record.name)
+    authority = _ollama_display_authority(endpoint)
+    with ExitStack() as stack:
+        scratch = sqlite3.connect(":memory:")
+        scratch.row_factory = sqlite3.Row
+        scratch.executescript(db.SCHEMA)
+        stack.callback(scratch.close)
+        con = (stack.enter_context(db.connected_readonly())
+               if db._db_path().is_file() else scratch)
+        assessment = ollama_evidence.assess_characterization(
+            con, profile.machine_key(), record, authority)
+    artifact_id = (_OLLAMA_ARTIFACT_PREFIX + record.digest
+                   if record.digest is not None else None)
+    info = detail.get("model_info") if isinstance(detail, dict) else None
+    payload = {
+        "model_id": model_id,
+        "canonical_name": record.name,
+        "runtime": "ollama",
+        "endpoint": endpoint.url,
+        "endpoint_scope": endpoint.scope,
+        "scope": record.scope,
+        "remote_model": record.remote_model,
+        "remote_host": record.remote_host,
+        "artifact_id": artifact_id,
+        "digest": record.digest,
+        "size_bytes": record.size_bytes,
+        "format": record.format,
+        "family": record.family,
+        "families": list(record.families),
+        "parameter_size": record.parameter_size,
+        "quantization": record.quantization,
+        "capabilities": list(record.capabilities),
+        "trained_context": _ollama_trained_context(record, detail),
+        "embedding_length": record.embedding_length,
+        "show_available": isinstance(detail, dict),
+        "model_info": info if isinstance(info, dict) else None,
+        "baked_parameters": detail.get("parameters") if isinstance(detail, dict) else None,
+        "template": detail.get("template") if isinstance(detail, dict) else None,
+        "runtime_authority_issue": authority.issue,
+        "characterizations": _ollama_characterization_view(assessment, artifact_id),
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    c.emit()
+    c.emit(c.section(f"  {record.name}") + c.style("dim", "  (Ollama)"))
+    c.emit(c.field("artifact", artifact_id or "unknown"))
+    c.emit(c.field("scope", record.scope))
+    c.emit(c.field("format", record.format or "unknown"))
+    c.emit(c.field("quant", record.quantization or "unknown"))
+    c.emit(c.field("parameters", record.parameter_size or "unknown"))
+    c.emit(c.field("capabilities", ", ".join(record.capabilities) or "unknown"))
+    trained = payload["trained_context"]
+    c.emit(c.field("trained context", str(trained) if trained is not None else "unknown"))
+    rows = payload["characterizations"]
+    if not rows:
+        c.emit(c.field("ceiling", "not characterized for this exact artifact"))
+    else:
+        for row in rows:
+            ceiling = row["safe_context"]
+            label = f"~{ceiling} tokens" if ceiling is not None else "no safe ceiling"
+            label += f" · {row['status'].replace('_', ' ')}"
+            if row["reason"] is not None:
+                label += f" ({row['reason'].replace('_', ' ')})"
+            c.emit(c.field("ollama ceiling", label))
+    c.emit()
+    return 0
+
+
+def render_model_detail(c: Console, model_id: str, *, as_json: bool = False,
+                        engine: str | None = None) -> int:
     """Detail for one model: architecture (from its HF config) + its safe ceiling here."""
+    if engine == "ollama":
+        return _render_model_detail_ollama(c, model_id, as_json=as_json)
     meta = catalog.describe(model_id)
     if meta is None:
         if as_json:
@@ -1739,7 +1871,8 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
     c.emit()
 
 
-def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None = None) -> int:
+def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None = None,
+                     engine: str | None = None) -> int:
     """Analytic recommendations — which cataloged models fit this machine, ranked by the context
     the estimated budget supports (most first), marking those already characterized here.
 
@@ -1749,6 +1882,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     *measured here* (a local benchmark on the actual quant) or *imported* (a published number,
     labelled), never a guess (Rule #3). Stays engine-free either way. Spec
     2026-06-23-capability-pipeline + 2026-06-28-recommend-use-case-and-serve-selection."""
+    if engine == "ollama":
+        return _render_recommend_ollama(c, as_json=as_json, use_case=use_case)
     if use_case is not None and use_case not in scoring.USE_CASES:
         msg = (f"unknown use-case {use_case!r} — choose one of: "
                f"{', '.join(scoring.USE_CASES)}")
@@ -3143,28 +3278,135 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     return 0
 
 
+def _is_ara_ollama_derived(name: str) -> bool:
+    """Recognize ARA's exact content-addressed governed/probe model-name shape."""
+    base = name.removesuffix(":latest").removesuffix("-probe")
+    parts = base.rsplit("-", 1)
+    return (len(parts) == 2 and parts[0].startswith("ara-") and "-ctx" in parts[0]
+            and len(parts[1]) == 24 and all(char in "0123456789abcdef" for char in parts[1]))
+
+
+def _ollama_ranked_models(
+    models: list[ollama.OllamaModel],
+    authority: ollama.OllamaRuntimeAuthority,
+) -> list[dict]:
+    """Central Ollama recommendation result shared by model UX and bare ``serve``.
+
+    Only exact reusable characterization evidence is selection-eligible. Analytic estimates are
+    retained as labelled comparison evidence and never promoted into execution authority.
+    """
+    with ExitStack() as stack:
+        scratch = sqlite3.connect(":memory:")
+        scratch.row_factory = sqlite3.Row
+        scratch.executescript(db.SCHEMA)
+        stack.callback(scratch.close)
+        con = (stack.enter_context(db.connected_readonly())
+               if db._db_path().is_file() else scratch)
+        mk = profile.machine_key()
+        ranked = []
+        for record in models:
+            if (_is_ara_ollama_derived(record.name)
+                    or ollama.initial_governed_model_error(record) is not None):
+                continue
+            assessment = ollama_evidence.assess_characterization(con, mk, record, authority)
+            reusable = assessment.reusable
+            safe_context = reusable.get("safe_context") if reusable is not None else None
+            estimate_found = _ollama_estimated_ceiling(record.name, record=record)
+            estimated_context = estimate_found[0] if estimate_found is not None else None
+            if assessment.reusable is not None:
+                evidence_status = "reusable"
+            elif assessment.display is not None:
+                evidence_status = "display_only"
+            else:
+                evidence_status = "missing"
+            ranked.append({
+                "model_id": record.name,
+                "artifact_id": (_OLLAMA_ARTIFACT_PREFIX + record.digest
+                                if record.digest is not None else None),
+                "digest": record.digest,
+                "size_bytes": record.size_bytes,
+                "format": record.format,
+                "family": record.family,
+                "parameter_size": record.parameter_size,
+                "quantization": record.quantization,
+                "capabilities": list(record.capabilities),
+                "scope": record.scope,
+                "safe_context": safe_context,
+                "estimated_context": estimated_context,
+                "selection_eligible": reusable is not None,
+                "evidence_status": evidence_status,
+                "evidence_reason": assessment.reason,
+            })
+    return sorted(
+        ranked,
+        key=lambda item: (
+            not item["selection_eligible"],
+            -(item["safe_context"] if item["selection_eligible"]
+              else item["estimated_context"] or -1),
+            item["model_id"],
+        ),
+    )
+
+
+def _render_recommend_ollama(
+    c: Console, *, as_json: bool, use_case: str | None,
+) -> int:
+    """Read-only ranking of supported local Ollama artifacts and their exact evidence."""
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if use_case is not None:
+        return err("--use-case ranking is not yet available for the Ollama runtime; "
+                   "omit --use-case to rank certified completion artifacts")
+    endpoint = ollama.endpoint_authority()
+    if endpoint.url is None:
+        return err("couldn't identify the configured Ollama endpoint")
+    models = ollama.inventory()
+    if models is None:
+        return err("couldn't list Ollama models — is the server reachable?")
+    authority = _ollama_display_authority(endpoint)
+    ranked = _ollama_ranked_models(models, authority)
+    if as_json:
+        print(json.dumps(ranked, indent=2))
+        return 0
+    c.emit()
+    c.emit(c.section("  RECOMMENDED OLLAMA MODELS")
+           + c.style("dim", "  (exact reusable evidence first)"))
+    if not ranked:
+        c.emit(c.style("dim", "  no local cached GGUF completion artifacts are supported"))
+        c.emit()
+        return 0
+    for item in ranked:
+        if item["selection_eligible"]:
+            tail = f"~{item['safe_context']} tok measured · eligible for governed selection"
+            role = "good"
+        elif item["estimated_context"] is not None:
+            tail = (f"~{item['estimated_context']} tok analytic estimate · comparison only"
+                    f" · {item['evidence_status'].replace('_', ' ')}")
+            role = "accent"
+        else:
+            tail = f"unrankable · {item['evidence_status'].replace('_', ' ')}"
+            role = "dim"
+        if item["evidence_reason"] not in (None, "missing"):
+            tail += f" ({item['evidence_reason'].replace('_', ' ')})"
+        quant = f" [{item['quantization']}]" if item["quantization"] else ""
+        c.emit("  " + c.style("metric", item["model_id"])
+               + c.style("dim", quant + "  →  ") + c.style(role, tail))
+    eligible = sum(1 for item in ranked if item["selection_eligible"])
+    c.emit()
+    c.emit(c.style("dim", f"  {len(ranked)} supported local · {eligible} certified for selection"))
+    c.emit()
+    return 0
+
+
 def _ollama_pick_best(
     models: list[ollama.OllamaModel],
     authority: ollama.OllamaRuntimeAuthority,
 ) -> str | None:
-    """Zero-arg ``ara serve`` selection: of the models already in the Ollama store, the one whose
-    safe ceiling is largest — measured if we have it, else the conservative estimate — so a bare
-    ``ara serve`` stands up the model that gives this machine the most usable context. ``None`` when
-    nothing in the store fits/estimates. Recommend applied to what you already have; no HF round-trip."""
-    mk = profile.machine_key()
-    best_name, best_ceiling = None, -1
-    with db.connected() as con:
-        for record in models:
-            if ollama.initial_governed_model_error(record) is not None:
-                continue
-            n = record.name
-            artifact_id = _ollama_artifact_id(n, record=record)
-            found = (_ollama_safe_ceiling(con, mk, record, authority)
-                     if artifact_id else None)
-            found = found or _ollama_estimated_ceiling(n, record=record)
-            if found and found[0] is not None and found[0] > best_ceiling:
-                best_name, best_ceiling = n, found[0]
-    return best_name
+    """Return the best central recommendation eligible for automatic governed execution."""
+    return next((item["model_id"] for item in _ollama_ranked_models(models, authority)
+                 if item["selection_eligible"]), None)
 
 
 def _governed_name(model: str, *, artifact_id: str | None = None,
@@ -4472,24 +4714,29 @@ def _click_models_search(ctx: click.Context, query: tuple[str, ...],
 
 
 @_click_models.command("recommend", context_settings=_HELP_SETTINGS)
+@click.option("--engine", type=click.Choice(["ollama"], case_sensitive=False),
+              help="Rank artifacts in an external runtime store (currently: ollama).")
 @click.option("--use-case", metavar="USE_CASE",
               help="Rank by capability evidence: extraction, reasoning, rag, agentic, or coding.")
 @_json_verbose_options
 @click.pass_context
-def _click_models_recommend(ctx: click.Context, use_case: str | None,
+def _click_models_recommend(ctx: click.Context, engine: str | None, use_case: str | None,
                             verbose: bool, as_json: bool) -> int:
     """Rank cached models by estimated usable context or capability evidence."""
-    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case,
+                            engine=engine)
 
 
 @_click_models.command("show", context_settings=_HELP_SETTINGS)
 @click.argument("model")
+@click.option("--engine", type=click.Choice(["ollama"], case_sensitive=False),
+              help="Inspect MODEL in an external runtime store (currently: ollama).")
 @_json_verbose_options
 @click.pass_context
-def _click_models_show(ctx: click.Context, model: str,
+def _click_models_show(ctx: click.Context, model: str, engine: str | None,
                        verbose: bool, as_json: bool) -> int:
     """Show cached architecture and this machine's measured ceilings."""
-    return render_model_detail(_mark_json(ctx, as_json), model, as_json=as_json)
+    return render_model_detail(_mark_json(ctx, as_json), model, as_json=as_json, engine=engine)
 
 
 @_click_cli.command("search", hidden=True, context_settings=_HELP_SETTINGS)

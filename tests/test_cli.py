@@ -91,8 +91,9 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
-                        lambda c, as_json=False, use_case=None:
-                        (rec.update(recommend=as_json, recommend_uc=use_case) or 0))
+                        lambda c, as_json=False, use_case=None, engine=None:
+                        (rec.update(recommend=as_json, recommend_uc=use_case,
+                                    recommend_engine=engine) or 0))
     monkeypatch.setattr(cli, "render_run",
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_serve",
@@ -431,9 +432,13 @@ def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, 
     (["models", "search", "smol model", "--json", "-v"],
      {"query": "smol model", "as_json": True}),
     (["models", "recommend", "--use-case", "coding", "--json", "--verbose"],
-     {"as_json": True, "use_case": "coding"}),
+     {"as_json": True, "use_case": "coding", "engine": None}),
+    (["models", "recommend", "--engine", "ollama", "--json"],
+     {"as_json": True, "use_case": None, "engine": "ollama"}),
     (["models", "show", "org/m", "--json", "-v"],
-     {"model_id": "org/m", "as_json": True}),
+     {"model_id": "org/m", "as_json": True, "engine": None}),
+    (["models", "show", "qwen3:0.6b", "--engine", "ollama", "--json"],
+     {"model_id": "qwen3:0.6b", "as_json": True, "engine": "ollama"}),
 ])
 def test_models_subcommands_dispatch_to_existing_renderers(monkeypatch, argv, expected):
     seen = {}
@@ -9450,45 +9455,349 @@ def _pick_authority():
     )
 
 
-def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
+def test_ollama_model_show_reports_exact_artifact_and_evidence(
+        make_console, monkeypatch, capsys, tmp_path):
+    record = _local_ollama_model(
+        "qwen3:0.6b", digest="a" * 64, size_bytes=500_000_000,
+        context_length=32768, parameter_size="596.05M", quantization="Q4_K_M")
+    stored = {
+        "safe_context": 16384,
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "measured_at": "2026-07-17T12:00:00Z",
+        "config": {"endpoint_authority": "http://127.0.0.1:11434",
+                   "placement": "unified"},
+        "points": [],
+    }
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [record])
+    monkeypatch.setattr(
+        cli.ollama, "show",
+        lambda _name: {"model_info": {"general.architecture": "qwen3",
+                                      "qwen3.context_length": 32768},
+                       "parameters": "num_ctx 4096\ntemperature 0.6",
+                       "template": "{{ .Prompt }}"},
+    )
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli.db, "_db_path", lambda: tmp_path / "missing.sqlite")
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(stored, stored, None),
+    )
+
+    c, _ = make_console()
+    assert cli.render_model_detail(c, "qwen3:0.6b", engine="ollama", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["canonical_name"] == "qwen3:0.6b"
+    assert payload["artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
+    assert payload["trained_context"] == 32768
+    assert payload["baked_parameters"].startswith("num_ctx 4096")
+    assert payload["scope"] == "local"
+    assert payload["characterizations"] == [{
+        "safe_context": 16384,
+        "measured_at": "2026-07-17T12:00:00Z",
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "artifact_matches": True,
+        "stale": False,
+        "target": "http://127.0.0.1:11434",
+        "config": stored["config"],
+        "reusable": True,
+        "status": "reusable",
+        "reason": None,
+    }]
+
+
+@pytest.mark.parametrize(("case", "as_json"), [
+    ("endpoint", True),
+    ("inventory", False),
+    ("missing", True),
+])
+def test_ollama_model_show_reports_read_failures(
+        make_console, monkeypatch, capsys, case, as_json):
+    endpoint = cli.ollama.OllamaEndpoint(
+        None if case == "endpoint" else "http://127.0.0.1:11434",
+        "unknown" if case == "endpoint" else "loopback")
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda: None if case == "inventory" else [],
+    )
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "missing:1", engine="ollama", as_json=as_json) == 1
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert output
+
+
+def test_ollama_model_show_text_preserves_unknown_and_display_only_evidence(
+        make_console, monkeypatch, tmp_path):
+    record = cli.ollama.OllamaModel(name="legacy:1", scope="local")
+    stored = {"safe_context": None, "artifact_id": "old", "measured_at": None,
+              "config": None}
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    observed = {}
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [record])
+    monkeypatch.setattr(cli.ollama, "show", lambda _name: None)
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+
+    def assess(con, *_args):
+        observed["con"] = con
+        return cli.ollama_evidence.CharacterizationAssessment(
+            stored, None, "artifact_mismatch")
+
+    monkeypatch.setattr(cli.ollama_evidence, "assess_characterization", assess)
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "legacy:1", engine="ollama") == 0
+    out = buf.getvalue()
+    assert observed["con"] == "stored"
+    assert "artifact" in out and "unknown" in out
+    assert "no safe ceiling · display only (artifact mismatch)" in out
+
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            None, None, "missing"),
+    )
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "legacy:1", engine="ollama") == 0
+    assert "not characterized for this exact artifact" in buf.getvalue()
+
+    reusable = {**stored, "safe_context": 2048}
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            reusable, reusable, None),
+    )
+    c, buf = make_console()
+    assert cli.render_model_detail(c, "legacy:1", engine="ollama") == 0
+    assert "~2048 tokens · reusable" in buf.getvalue()
+
+
+def test_ollama_detail_helpers_cover_remote_and_show_context_fallback(monkeypatch):
+    remote = cli.ollama.OllamaEndpoint("https://host.example", "remote")
+    authority = cli._ollama_display_authority(remote)
+    assert authority.endpoint == remote and authority.issue == "non_loopback_endpoint"
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority",
+        lambda _endpoint: pytest.fail("attributed a remote endpoint locally"),
+    )
+    record = cli.ollama.OllamaModel(name="m")
+    assert cli._ollama_trained_context(record, None) is None
+    assert cli._ollama_trained_context(record, {"model_info": []}) is None
+    assert cli._ollama_trained_context(record, {"model_info": {
+        "bad.context_length": True,
+        "negative.context_length": -1,
+        "good.context_length": 4096,
+        1: 8192,
+    }}) == 4096
+    assert cli._ollama_characterization_view(
+        cli.ollama_evidence.CharacterizationAssessment(None, None, "missing"), None) == []
+
+
+def test_ollama_recommendation_separates_certified_selection_from_estimates(
+        make_console, monkeypatch, capsys, tmp_path):
+    measured = _local_ollama_model("measured:1", digest="a" * 64)
+    estimated = _local_ollama_model("estimated:1", digest="b" * 64)
+    cloud = _local_ollama_model(
+        "cloud:1", digest="c" * 64, scope="cloud", remote_model="upstream")
+    embedding = cli.ollama.OllamaModel(
+        name="embed:1", digest="d" * 64, size_bytes=500_000_000,
+        format="gguf", capabilities=("embedding",), scope="local")
+    derived = _local_ollama_model(
+        "ara-qwen3-0.6b-ctx8192-" + "e" * 24 + "-probe:latest", digest="e" * 64)
+    row = {"safe_context": 8192, "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+           "config": {"placement": "unified"}}
+    monkeypatch.setattr(
+        cli.ollama, "inventory", lambda: [estimated, cloud, measured, embedding, derived])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli.db, "_db_path", lambda: tmp_path / "missing.sqlite")
+
+    def assess(_con, _mk, record, _authority):
+        if record is derived:
+            pytest.fail("ranked ARA's internal derived artifact")
+        if record.name == "measured:1":
+            return cli.ollama_evidence.CharacterizationAssessment(row, row, None)
+        return cli.ollama_evidence.CharacterizationAssessment(None, None, "missing")
+
+    monkeypatch.setattr(cli.ollama_evidence, "assess_characterization", assess)
+    monkeypatch.setattr(
+        cli, "_ollama_estimated_ceiling",
+        lambda name, *, record=None: (16384, "estimated", None)
+        if name == "estimated:1" else None,
+    )
+
+    c, _ = make_console()
+    assert cli.render_recommend(c, engine="ollama", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [item["model_id"] for item in payload] == ["measured:1", "estimated:1"]
+    assert payload[0]["selection_eligible"] is True
+    assert payload[0]["safe_context"] == 8192
+    assert payload[0]["evidence_status"] == "reusable"
+    assert payload[1]["selection_eligible"] is False
+    assert payload[1]["estimated_context"] == 16384
+    assert payload[1]["evidence_status"] == "missing"
+
+
+@pytest.mark.parametrize(("case", "as_json"), [
+    ("use_case", True),
+    ("endpoint", False),
+    ("inventory", True),
+])
+def test_ollama_recommendation_reports_read_and_contract_failures(
+        make_console, monkeypatch, capsys, case, as_json):
+    endpoint = cli.ollama.OllamaEndpoint(
+        None if case == "endpoint" else "http://127.0.0.1:11434",
+        "unknown" if case == "endpoint" else "loopback")
+    monkeypatch.setattr(cli.ollama, "endpoint_authority", lambda: endpoint)
+    monkeypatch.setattr(
+        cli.ollama, "inventory", lambda: None if case == "inventory" else [])
+    c, buf = make_console()
+    use_case = "coding" if case == "use_case" else None
+    assert cli.render_recommend(
+        c, engine="ollama", use_case=use_case, as_json=as_json) == 1
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert output
+
+
+def test_ollama_recommendation_text_labels_all_evidence_tiers(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [object()])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args: [
+        {"model_id": "measured:1", "selection_eligible": True, "safe_context": 8192,
+         "estimated_context": None, "evidence_status": "reusable", "evidence_reason": None,
+         "quantization": "Q4_K_M"},
+        {"model_id": "estimated:1", "selection_eligible": False, "safe_context": None,
+         "estimated_context": 4096, "evidence_status": "display_only",
+         "evidence_reason": "artifact_mismatch", "quantization": None},
+        {"model_id": "unknown:1", "selection_eligible": False, "safe_context": None,
+         "estimated_context": None, "evidence_status": "missing", "evidence_reason": "missing",
+         "quantization": None},
+    ])
+    c, buf = make_console()
+    assert cli.render_recommend(c, engine="ollama") == 0
+    out = buf.getvalue()
+    assert "eligible for governed selection" in out
+    assert "analytic estimate · comparison only · display only (artifact mismatch)" in out
+    assert "unrankable · missing" in out
+    assert "3 supported local · 1 certified" in out
+
+
+def test_ollama_recommendation_text_handles_no_supported_models(make_console, monkeypatch):
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args: [])
+    c, buf = make_console()
+    assert cli.render_recommend(c, engine="ollama") == 0
+    assert "no local cached GGUF completion artifacts" in buf.getvalue()
+
+
+def test_ollama_ranked_models_preserves_display_only_weak_identity(
+        monkeypatch, tmp_path):
+    record = _local_ollama_model("display:1")
+    stored = {"safe_context": 2048}
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+
+    def assess(con, *_args):
+        assert con == "stored"
+        return cli.ollama_evidence.CharacterizationAssessment(
+            stored, None, "artifact_mismatch")
+
+    monkeypatch.setattr(cli.ollama_evidence, "assess_characterization", assess)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda *_a, **_k: None)
+    assert cli._ollama_ranked_models([record], _pick_authority()) == [{
+        "model_id": "display:1",
+        "artifact_id": None,
+        "digest": None,
+        "size_bytes": 500_000_000,
+        "format": "gguf",
+        "family": None,
+        "parameter_size": None,
+        "quantization": None,
+        "capabilities": ["completion"],
+        "scope": "local",
+        "safe_context": None,
+        "estimated_context": None,
+        "selection_eligible": False,
+        "evidence_status": "display_only",
+        "evidence_reason": "artifact_mismatch",
+    }]
+
+
+@pytest.mark.parametrize(("name", "expected"), [
+    ("qwen3:0.6b", False),
+    ("user-model-" + "a" * 24, False),
+    ("ara-user-model-" + "a" * 24, False),
+    ("ara-user-ctx8192-short", False),
+    ("ara-user-ctx8192-" + "g" * 24, False),
+    ("ara-user-ctx8192-" + "a" * 24, True),
+    ("ara-user-ctx8192-" + "a" * 24 + "-probe:latest", True),
+])
+def test_recognizes_only_exact_ara_ollama_derived_names(name, expected):
+    assert cli._is_ara_ollama_derived(name) is expected
+
+
+def test_ollama_pick_best_consumes_central_certified_ranking(monkeypatch):
+    models = [_local_ollama_model("measured:1", digest="a" * 64)]
+    seen = {}
+
+    def ranked(records, authority):
+        seen.update(records=records, authority=authority)
+        return [{"model_id": "measured:1", "selection_eligible": True}]
+
+    monkeypatch.setattr(cli, "_ollama_ranked_models", ranked)
+    authority = _pick_authority()
+    assert cli._ollama_pick_best(models, authority) == "measured:1"
+    assert seen == {"records": models, "authority": authority}
+
+
+def test_ollama_pick_best_does_not_authorize_analytic_estimates(monkeypatch):
     _wire_pick(monkeypatch)
     ceils = {"a:1": (4000, "estimated", None), "b:1": (9000, "estimated", None),
              "c:1": (6000, "estimated", None)}
     models = [_local_ollama_model(n, digest=ch * 64)
               for n, ch in zip(ceils, "abc", strict=True)]
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(None, None, "missing"),
+    )
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
                         lambda m, *, record=None: ceils.get(m))
     monkeypatch.setattr(
         cli.ollama, "manifest_digest",
         lambda _n: pytest.fail("refetched inventory identity while ranking"),
     )
-    assert cli._ollama_pick_best(models, _pick_authority()) == "b:1"
+    assert cli._ollama_pick_best(models, _pick_authority()) is None
 
 
-def test_ollama_pick_best_uses_measured_when_present(monkeypatch):
+def test_ollama_pick_best_prefers_certified_measurement_over_larger_estimate(monkeypatch):
     _wire_pick(monkeypatch)
     authority = cli.ollama.OllamaRuntimeAuthority(
         endpoint=cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
         server_version="0.30.10", server_instance_id="one",
         configured_num_parallel=1,
         configured_num_parallel_authority="exact_version_default")
-    # a has a measured ceiling; b only an estimate — each model uses its own best source, then
-    # we rank by value (b's 9000 estimate legitimately beats a's 5000 measured).
-    seen = []
+    measured = {"safe_context": 5000}
 
-    def safe(con, mk, record, runtime):
-        seen.append((record, runtime))
-        return (5000, "measured", None) if record.name == "a:1" else None
+    def assess(_con, _mk, record, _runtime):
+        if record.name == "a:1":
+            return cli.ollama_evidence.CharacterizationAssessment(
+                measured, measured, None)
+        return cli.ollama_evidence.CharacterizationAssessment(None, None, "missing")
 
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", safe)
+    monkeypatch.setattr(cli.ollama_evidence, "assess_characterization", assess)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
                         lambda m, *, record=None:
                         (9000, "estimated", None) if m == "b:1" else None)
     models = [_local_ollama_model(n, digest=ch * 64)
               for n, ch in (("a:1", "a"), ("b:1", "b"))]
-    assert cli._ollama_pick_best(models, authority) == "b:1"
-    assert seen == [(models[0], authority), (models[1], authority)]
+    assert cli._ollama_pick_best(models, authority) == "a:1"
 
 
 def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
@@ -9505,7 +9814,13 @@ def test_ollama_pick_best_skips_models_outside_initial_governed_cell(monkeypatch
     cloud = cli.ollama.OllamaModel(
         name="cloud:1", digest="b" * 64, format="gguf",
         capabilities=("completion",), remote_model="upstream", scope="cloud")
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda *_a, **_k: None)
+    measured = {"safe_context": 4096}
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda _con, _mk, record, _authority:
+        cli.ollama_evidence.CharacterizationAssessment(measured, measured, None)
+        if record.name == "local:1" else pytest.fail("assessed a cloud model"),
+    )
 
     def estimate(model, *, record=None):
         if model == "cloud:1":

@@ -160,11 +160,11 @@ same production entrypoint. In a checkout, prefix either with `uv run`.
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
 | `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
 | `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
-| `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget, ordered by estimated usable context, marking the ones already characterized here. Analytic — no engine or model load. |
-| `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. |
+| `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget. Add `--engine ollama` to rank supported local Ollama artifacts with exact reusable measurements first; analytic estimates remain clearly labeled comparison-only and cannot authorize execution. Read-only — no model load. |
+| `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. Add `--engine ollama` for the exact cached manifest, Ollama capabilities/parameters, and reusable or display-only characterization evidence. |
 | `ara run <model> "<prompt>"` | **Governed one-shot inference**: generate a completion capped at the model's characterized safe ceiling, never over the wall. Refuses if the model hasn't been characterized yet. Runs on every engine (CPU, MLX, CUDA, Vulkan, cuda-gguf). |
 | `ara benchmark <model> --use-case <coding\|reasoning\|agentic\|extraction\|rag>` | **Governed capability benchmark**: run a judge-free probe set against the model's actual quant, under its characterized ceiling, and store the measured score. `--max-tokens N` lifts the generation cap for thinking models. Coding output executes only with `--exec-consent`; ARA uses macOS Seatbelt and skips coding execution on hosts where it cannot provide a sandbox. |
-| `ara serve [model]` | Stand up a **governed OpenAI-compatible endpoint** through an existing Ollama installation or the native MLX server. With no model, ARA selects the best-fitting model already in Ollama; an uncharacterized Ollama model starts under a conservatively estimated bound that is explicitly labeled estimated. `--ctx` can lower but never exceed the safe bound. |
+| `ara serve [model]` | Stand up a **governed OpenAI-compatible endpoint** through an existing Ollama installation or the native MLX server. With no model, ARA selects the largest exact reusable Ollama characterization through the same logic as `models recommend --engine ollama`; estimates never authorize that automatic choice. A named uncharacterized Ollama model can still start under an explicitly labeled conservative bound. `--ctx` can lower but never exceed the safe bound. |
 | `ara hub` | Build and run ARA's version-matched **fleet coordinator** in Docker, attached in the foreground. SQLite state persists in ARA's host data directory; `--bind`, `--port`, `--data-dir`, and `--rebuild` control the host deployment. The default bind is loopback; put HTTPS/TLS termination in front before enrolling remote nodes. |
 | `ara hf login` / `logout` / `status` | Manage your Hugging Face token (needed for gated models). `login` reads it from a hidden prompt, piped stdin, or `--token`, verifies it against the Hub, and stores it in the **standard HF token file** — so every fetch and engine worker picks it up. `status` shows who you're logged in as (never the token); `logout` removes it. |
 | `ara node enroll` / `run` | Enroll with a coordinator and run ARA's push-only node loop. Nodes dial out; the coordinator never opens SSH or connects back into them. Install the `project-ara[node]` extra for the HTTP client. |
@@ -195,8 +195,9 @@ hardware-specific engine; it picks a backend for the machine and loads only that
 - **NVIDIA, oversized for VRAM** → the built-in **cuda-gguf** engine (llama.cpp GGUF, partial
   offload `n_gpu_layers=K`) — ARA's first **two-wall** engine, governing discrete VRAM *and*
   system RAM at once so a model too big for VRAM runs K layers on the GPU and the rest on CPU.
-- **Existing Ollama installation** → a first-class, optional adapter for governed
-  characterization and serving. Ollama is never required for recon or for ARA's native engines.
+- **Existing Ollama installation** → a first-class, optional adapter for exact model inspection,
+  certified recommendation, governed characterization, one-shot inference, and serving. Ollama is
+  never required for recon or for ARA's native engines.
 
 The engine is **not a core dependency**. ARA ships the native MLX and CUDA package sources under
 `ara/_engine_packages/{mlx,cuda}` and installs only the matched package and its heavy dependencies
