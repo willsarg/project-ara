@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -32,3 +33,35 @@ def test_mutation_summary_uses_one_atomic_redirect_block():
     workflow = (_WORKFLOWS / "mutation.yml").read_text(encoding="utf-8")
 
     assert workflow.count('>> "$GITHUB_STEP_SUMMARY"') == 1
+
+
+def test_cross_os_suite_uses_bounded_parallelism_and_reports_slowest_tests():
+    workflow = (_WORKFLOWS / "test.yml").read_text(encoding="utf-8")
+
+    assert "uv run pytest -n 4 --dist=loadfile --durations=25" in workflow
+
+
+def test_parallel_pytest_runner_is_locked_as_a_dev_dependency():
+    config = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert any(
+        requirement.startswith("pytest-xdist>=")
+        for requirement in config["dependency-groups"]["dev"]
+    )
+
+
+def test_human_ci_gates_pull_requests_and_main_without_duplicating_dependabot():
+    workflow = (_WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+
+    assert "pull_request:" in workflow
+    assert "push:" in workflow
+    assert "branches: [main]" in workflow
+    assert "github.event.pull_request.user.login != 'dependabot[bot]'" in workflow
+
+
+def test_pr_gates_cancel_stale_runs_for_the_same_branch():
+    for name in ("ci.yml", "dependabot-ci.yml"):
+        workflow = (_WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "concurrency:" in workflow
+        assert "github.event.pull_request.number || github.ref" in workflow
+        assert "cancel-in-progress: true" in workflow

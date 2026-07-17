@@ -1,0 +1,44 @@
+# CI for human pull requests and pushes to main. Dependabot PRs use dependabot-ci.yml instead so a
+# dependency update never launches the same cross-OS suite twice. The Python job reuses the exact
+# release gate; the coordinator job covers its Linux container build independently and in parallel.
+name: Gate · Pull Requests and Main
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
+    uses: ./.github/workflows/test.yml
+
+  coordinator:
+    if: github.event_name == 'push' || github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: coordinator
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "26"    # matches the Dockerfile base (node:26-bookworm-slim)
+          cache: npm
+          cache-dependency-path: coordinator/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+        env:
+          ARA_COORDINATOR_SECRET: ci-build-placeholder
