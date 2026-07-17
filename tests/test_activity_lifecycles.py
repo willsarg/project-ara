@@ -711,9 +711,53 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
     )
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
+    wall_evidence = {
+        "placement": "unified",
+        "resident_total_bytes": 500_000_000,
+        "resident_accelerator_bytes": 500_000_000,
+        "applicable_walls": ["system_unified"],
+        "system_memory_delta_bytes": 500_000_000,
+        "accelerator_memory_delta_bytes": None,
+        "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
+        "accelerator_margin_bytes": None,
+    }
+    point = {
+        "fit": True,
+        "context": 4096,
+        "requested_context": 4096,
+        "effective_per_request_context": 4096,
+        "refusal_reasons": [],
+        **wall_evidence,
+    }
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 4096, "measured_at": None,
-        "artifact_id": "ollama-manifest-sha256:" + "a" * 64})
+        "safe_context": 4096,
+        "measured_at": None,
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "points": [point],
+        "config": {
+            "methodology": "ollama-physical-walls-v1",
+            "runtime": "ollama",
+            "runtime_version": "0.30.10",
+            "endpoint_authority": "http://127.0.0.1:11434",
+            "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+            "format": "gguf",
+            "capability": "completion",
+            "configured_inputs": {},
+            "configured_num_parallel": 1,
+            "configured_num_parallel_authority": "exact_version_default",
+            "effective_num_parallel": 1,
+            "effective_num_parallel_authority": "configured_maximum_is_one",
+            "requested_context": 4096,
+            "effective_per_request_context": 4096,
+            "configured_kv_cache_type": "unknown",
+            "effective_kv_cache_type": "unknown",
+            "configured_flash_attention": "unknown",
+            "effective_flash_attention": "unknown",
+            "configured_scheduler_spread": "unknown",
+            "effective_scheduler_spread": "unknown",
+            **wall_evidence,
+        },
+    })
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base:model" else "b" * 64)
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))

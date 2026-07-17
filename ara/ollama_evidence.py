@@ -12,12 +12,13 @@ from typing import Any
 
 import psutil
 
-from ara import hardware, ollama
+from ara import db, hardware, ollama
 
 
 _MIB = 1024 ** 2
 SYSTEM_MARGIN_BYTES = 2 * 1024 ** 3
 ACCELERATOR_MARGIN_BYTES = 1 * 1024 ** 3
+_OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,167 @@ class MemorySnapshot:
     accelerator_total_bytes: int | None
     accelerator_available_bytes: int | None
     unified: bool
+
+
+@dataclass(frozen=True)
+class CharacterizationAssessment:
+    """One display row and the separately gated row safe for automatic reuse."""
+
+    display: dict[str, Any] | None
+    reusable: dict[str, Any] | None
+    reason: str | None
+
+
+def _display_only(row: dict[str, Any], reason: str) -> CharacterizationAssessment:
+    return CharacterizationAssessment(row, None, reason)
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _wall_evidence_complete(config: dict[str, Any], point: dict[str, Any]) -> bool:
+    placement = config.get("placement")
+    expected_walls = {
+        "cpu": ["system"],
+        "unified": ["system_unified"],
+        "accelerator": ["system", "accelerator"],
+        "partial_offload": ["system", "accelerator"],
+    }[placement]
+    evidence_fields = (
+        "placement",
+        "resident_total_bytes",
+        "resident_accelerator_bytes",
+        "applicable_walls",
+        "system_memory_delta_bytes",
+        "accelerator_memory_delta_bytes",
+        "system_margin_bytes",
+        "accelerator_margin_bytes",
+    )
+    if any(config.get(field) != point.get(field) for field in evidence_fields):
+        return False
+    total = config.get("resident_total_bytes")
+    accelerator = config.get("resident_accelerator_bytes")
+    if not _nonnegative_int(total) or total == 0 or not _nonnegative_int(accelerator):
+        return False
+    placement_residency = {
+        "cpu": accelerator == 0,
+        "unified": accelerator <= total,
+        "accelerator": accelerator == total,
+        "partial_offload": 0 < accelerator < total,
+    }
+    if not placement_residency[placement]:
+        return False
+    if config.get("applicable_walls") != expected_walls:
+        return False
+    if (
+        not _nonnegative_int(config.get("system_memory_delta_bytes"))
+        or config.get("system_margin_bytes") != SYSTEM_MARGIN_BYTES
+    ):
+        return False
+    if "accelerator" in expected_walls:
+        return (
+            _nonnegative_int(config.get("accelerator_memory_delta_bytes"))
+            and config.get("accelerator_margin_bytes") == ACCELERATOR_MARGIN_BYTES
+        )
+    return (
+        config.get("accelerator_memory_delta_bytes") is None
+        and config.get("accelerator_margin_bytes") is None
+    )
+
+
+def assess_characterization(
+    con: Any,
+    machine_key: str,
+    model: ollama.OllamaModel,
+    authority: ollama.OllamaRuntimeAuthority,
+) -> CharacterizationAssessment:
+    """Read Ollama history without allowing display-only evidence into governed decisions."""
+
+    row = db.get_characterization(con, machine_key, "ollama", model.name)
+    if row is None:
+        return CharacterizationAssessment(None, None, "missing")
+    config = row.get("config")
+    if not isinstance(config, dict) or config.get("methodology") != "ollama-physical-walls-v1":
+        return _display_only(row, "methodology_missing_or_unsupported")
+    if ollama.initial_governed_model_error(model) is not None:
+        return _display_only(row, "unsupported_model_cell")
+    expected_artifact = (
+        _OLLAMA_ARTIFACT_PREFIX + model.digest if model.digest is not None else None)
+    if expected_artifact is None or row.get("artifact_id") != expected_artifact:
+        return _display_only(row, "artifact_mismatch")
+    safe_context = row.get("safe_context")
+    if (
+        not isinstance(safe_context, int)
+        or isinstance(safe_context, bool)
+        or safe_context <= 0
+    ):
+        return _display_only(row, "safe_context_missing")
+    if authority.issue is not None:
+        return _display_only(row, "runtime_authority_incomplete")
+    if (
+        authority.endpoint.scope != "loopback"
+        or config.get("endpoint_authority") != authority.endpoint.url
+    ):
+        return _display_only(row, "endpoint_mismatch")
+    if (
+        config.get("runtime") != "ollama"
+        or config.get("runtime_version") != authority.server_version
+    ):
+        return _display_only(row, "runtime_version_mismatch")
+    if config.get("server_instance_id") != authority.server_instance_id:
+        return _display_only(row, "server_instance_mismatch")
+    if config.get("configured_inputs") != dict(authority.configured_inputs):
+        return _display_only(row, "configured_inputs_mismatch")
+    configured_inputs = dict(authority.configured_inputs)
+    runtime_config = {
+        "configured_kv_cache_type": configured_inputs.get(
+            "OLLAMA_KV_CACHE_TYPE", "unknown"),
+        "effective_kv_cache_type": "unknown",
+        "configured_flash_attention": configured_inputs.get(
+            "OLLAMA_FLASH_ATTENTION", "unknown"),
+        "effective_flash_attention": "unknown",
+        "configured_scheduler_spread": configured_inputs.get(
+            "OLLAMA_SCHED_SPREAD", "unknown"),
+        "effective_scheduler_spread": "unknown",
+    }
+    if any(config.get(key) != value for key, value in runtime_config.items()):
+        return _display_only(row, "runtime_config_evidence_incomplete")
+    if (
+        authority.configured_num_parallel != 1
+        or config.get("configured_num_parallel") != authority.configured_num_parallel
+        or config.get("configured_num_parallel_authority")
+        != authority.configured_num_parallel_authority
+        or config.get("effective_num_parallel") != 1
+        or config.get("effective_num_parallel_authority") != "configured_maximum_is_one"
+    ):
+        return _display_only(row, "parallelism_mismatch")
+    if config.get("format") != "gguf" or config.get("capability") != "completion":
+        return _display_only(row, "model_cell_mismatch")
+    if (
+        config.get("requested_context") != safe_context
+        or config.get("effective_per_request_context") != safe_context
+    ):
+        return _display_only(row, "context_evidence_incomplete")
+    points = row.get("points")
+    point = next((
+        item for item in points
+        if isinstance(item, dict)
+        and item.get("fit") is True
+        and item.get("context") == safe_context
+        and item.get("requested_context") == safe_context
+        and item.get("effective_per_request_context") == safe_context
+        and item.get("refusal_reasons") == []
+    ), None) if isinstance(points, list) else None
+    if point is None:
+        return _display_only(row, "context_evidence_incomplete")
+    if config.get("placement") not in {
+        "cpu", "unified", "accelerator", "partial_offload",
+    }:
+        return _display_only(row, "placement_unsupported")
+    if not _wall_evidence_complete(config, point):
+        return _display_only(row, "wall_evidence_incomplete")
+    return CharacterizationAssessment(row, row, None)
 
 
 def _run(command: list[str]) -> str:

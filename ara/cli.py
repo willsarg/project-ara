@@ -2573,17 +2573,17 @@ def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None)
     return _OLLAMA_ARTIFACT_PREFIX + digest if digest else None
 
 
-def _ollama_safe_ceiling(con, mk: str, model: str, artifact_id: str):
-    """The measured Ollama safe ceiling for this exact manifest on this machine, as
-    ``(safe_context, "measured", measured_at)``, or ``None`` if none is recorded. ``measured_at``
-    is retained for output metadata. Legacy and other-runtime measurements lack artifact proof and
-    cannot authorize an Ollama load (Rule #1/#3)."""
-    row = db.get_characterization(con, mk, "ollama", model)
-    if (not row or row.get("artifact_id") != artifact_id
-            or row.get("safe_context") is None):
-        return None
-    config = row.get("config", {})
-    if config not in ({}, None):
+def _ollama_safe_ceiling(
+    con,
+    mk: str,
+    record: ollama.OllamaModel,
+    authority: ollama.OllamaRuntimeAuthority,
+):
+    """Return a measured ceiling only from the strict reusable-evidence assessment."""
+
+    row = ollama_evidence.assess_characterization(
+        con, mk, record, authority).reusable
+    if row is None:
         return None
     return row["safe_context"], "measured", row.get("measured_at")
 
@@ -2724,6 +2724,7 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
 
 def _ollama_characterization_config(
     authority: ollama.OllamaRuntimeAuthority,
+    record: ollama.OllamaModel,
     best: int | None,
     points: list[dict],
 ) -> dict:
@@ -2739,8 +2740,10 @@ def _ollama_characterization_config(
         "methodology": "ollama-physical-walls-v1",
         "runtime": "ollama",
         "runtime_version": authority.server_version,
-        "endpoint": authority.endpoint.url,
+        "endpoint_authority": authority.endpoint.url,
         "server_instance_id": authority.server_instance_id,
+        "format": record.format.casefold() if record.format is not None else None,
+        "capability": "completion" if "completion" in record.capabilities else None,
         "configured_inputs": configured,
         "configured_num_parallel": authority.configured_num_parallel,
         "configured_num_parallel_authority": authority.configured_num_parallel_authority,
@@ -2878,7 +2881,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     if ollama.runtime_authority(endpoint) != authority:
         return err("Ollama runtime authority changed during measurement — refusing to store "
                    "evidence for an ambiguous daemon configuration.")
-    config = _ollama_characterization_config(authority, best, points)
+    config = _ollama_characterization_config(authority, record, best, points)
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None,
@@ -2896,7 +2899,10 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     return 0
 
 
-def _ollama_pick_best(models: list[ollama.OllamaModel]) -> str | None:
+def _ollama_pick_best(
+    models: list[ollama.OllamaModel],
+    authority: ollama.OllamaRuntimeAuthority,
+) -> str | None:
     """Zero-arg ``ara serve`` selection: of the models already in the Ollama store, the one whose
     safe ceiling is largest — measured if we have it, else the conservative estimate — so a bare
     ``ara serve`` stands up the model that gives this machine the most usable context. ``None`` when
@@ -2909,7 +2915,8 @@ def _ollama_pick_best(models: list[ollama.OllamaModel]) -> str | None:
                 continue
             n = record.name
             artifact_id = _ollama_artifact_id(n, record=record)
-            found = (_ollama_safe_ceiling(con, mk, n, artifact_id) if artifact_id else None)
+            found = (_ollama_safe_ceiling(con, mk, record, authority)
+                     if artifact_id else None)
             found = found or _ollama_estimated_ceiling(n, record=record)
             if found and found[0] is not None and found[0] > best_ceiling:
                 best_name, best_ceiling = n, found[0]
@@ -3166,7 +3173,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     if model is not None and (invalid := validate_identity(model)) is not None:
         return invalid
 
-    if authority_error := _ollama_runtime_authority_error(endpoint_authority):
+    authority, authority_error = _ollama_runtime_authority(endpoint_authority)
+    if authority_error:
         return err(authority_error)
 
     # 1. liveness was established by the attributed runtime-authority check above.
@@ -3179,7 +3187,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         if not models:
             return err("no models in Ollama — pull one (`ollama pull <model>`), or name one: "
                        "`ara serve <model>`.")
-        model = _ollama_pick_best(models)
+        model = _ollama_pick_best(models, authority)
         if model is None:
             return err("no model in Ollama fits this machine — pull a smaller / more-quantized "
                        "one, or name one explicitly.")
@@ -3225,7 +3233,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         # bound for this exact manifest on this machine.
         with db.connected() as con:
             found = _ollama_safe_ceiling(
-                con, profile.machine_key(), model, base_artifact_id)
+                con, profile.machine_key(), record, authority)
         bound = found or _ollama_estimated_ceiling(model, record=record)
         if bound is None:
             return err(f"no measured or estimated safe bound for {model} — refusing --ctx {ctx}; "
@@ -3239,7 +3247,7 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     else:
         with db.connected() as con:
             found = _ollama_safe_ceiling(
-                con, profile.machine_key(), model, base_artifact_id)
+                con, profile.machine_key(), record, authority)
         # No measurement yet → fall back to a conservative engine-free ESTIMATE (labelled as such,
         # never as measured — Rule #3), so a fresh model still serves safely in one command.
         if found is None:

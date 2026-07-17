@@ -4282,6 +4282,9 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
         assert row["config"]["methodology"] == "ollama-physical-walls-v1"
         assert row["config"]["runtime_version"] == "0.30.10"
         assert row["config"]["server_instance_id"] == "42:1234.500000:/usr/bin/ollama"
+        assert row["config"]["endpoint_authority"] == "http://127.0.0.1:11434"
+        assert row["config"]["format"] == "gguf"
+        assert row["config"]["capability"] == "completion"
         assert row["config"]["configured_inputs"] == {
             "OLLAMA_KEEP_ALIVE": "2m", "OLLAMA_KV_CACHE_TYPE": "q8_0"}
         assert row["config"]["requested_context"] == 4096
@@ -7770,6 +7773,60 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     if characterization is not None and "artifact_id" not in characterization:
         characterization = {**characterization,
                             "artifact_id": "ollama-manifest-sha256:" + "a" * 64}
+    if (characterization is not None
+            and characterization.get("safe_context") is not None
+            and "config" not in characterization):
+        safe_context = characterization["safe_context"]
+        point = {
+            "context": safe_context,
+            "requested_context": safe_context,
+            "effective_per_request_context": safe_context,
+            "fit": True,
+            "placement": "unified",
+            "resident_total_bytes": 100,
+            "resident_accelerator_bytes": 100,
+            "system_memory_delta_bytes": 0,
+            "accelerator_memory_delta_bytes": None,
+            "applicable_walls": ["system_unified"],
+            "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
+            "accelerator_margin_bytes": None,
+            "refusal_reasons": [],
+        }
+        characterization = {
+            **characterization,
+            "points": [point],
+            "config": {
+                "methodology": "ollama-physical-walls-v1",
+                "runtime": "ollama",
+                "runtime_version": "0.30.10",
+                "endpoint_authority": "http://127.0.0.1:11434",
+                "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+                "format": "gguf",
+                "capability": "completion",
+                "configured_inputs": {
+                    "OLLAMA_KV_CACHE_TYPE": "q8_0", "OLLAMA_KEEP_ALIVE": "2m"},
+                "configured_kv_cache_type": "q8_0",
+                "effective_kv_cache_type": "unknown",
+                "configured_flash_attention": "unknown",
+                "effective_flash_attention": "unknown",
+                "configured_scheduler_spread": "unknown",
+                "effective_scheduler_spread": "unknown",
+                "configured_num_parallel": 1,
+                "configured_num_parallel_authority": "exact_version_default",
+                "effective_num_parallel": 1,
+                "effective_num_parallel_authority": "configured_maximum_is_one",
+                "requested_context": safe_context,
+                "effective_per_request_context": safe_context,
+                "placement": "unified",
+                "resident_total_bytes": 100,
+                "resident_accelerator_bytes": 100,
+                "applicable_walls": ["system_unified"],
+                "system_memory_delta_bytes": 0,
+                "accelerator_memory_delta_bytes": None,
+                "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
+                "accelerator_margin_bytes": None,
+            },
+        }
     monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: characterization)
     monkeypatch.setattr(cli.db, "save_characterization", lambda *a, **k: None)
     if show is None and size is None:
@@ -8808,69 +8865,43 @@ def test_characterize_ollama_refuses_display_only_runtime_before_inventory(
     assert "another process" in buf.getvalue()
 
 
-def test_ollama_safe_ceiling_requires_matching_manifest_artifact(monkeypatch):
-    artifact = "ollama-manifest-sha256:" + "a" * 64
-    chars = {"ollama": {"safe_context": 8000,
-                         "measured_at": "2026-06-01T00:00:00+00:00",
-                         "artifact_id": artifact}}
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) == (
+def test_ollama_safe_ceiling_uses_only_the_reusable_assessment(monkeypatch):
+    record = _local_ollama_model("m", digest="a" * 64)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    reusable = {
+        "safe_context": 8000,
+        "measured_at": "2026-06-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "assess_characterization",
+        lambda con, mk, model, runtime: cli.ollama_evidence.CharacterizationAssessment(
+            display=reusable, reusable=reusable, reason=None),
+    )
+
+    assert cli._ollama_safe_ceiling(object(), "mk", record, authority) == (
         8000, "measured", "2026-06-01T00:00:00+00:00")
-    assert cli._ollama_safe_ceiling(
-        object(), "mk", "m", "ollama-manifest-sha256:" + "b" * 64) is None
 
 
-def test_ollama_safe_ceiling_rejects_nondefault_measurement_config(monkeypatch):
-    artifact = "ollama-manifest-sha256:" + "a" * 64
-    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: {
-        "safe_context": 8000, "artifact_id": artifact, "config": {"kv_quant": "q4_0"},
-    })
-    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) is None
+def test_ollama_safe_ceiling_rejects_display_only_assessment(monkeypatch):
+    record = _local_ollama_model("m", digest="a" * 64)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+    display = {"safe_context": 8000}
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "assess_characterization",
+        lambda con, mk, model, runtime: cli.ollama_evidence.CharacterizationAssessment(
+            display=display, reusable=None, reason="artifact_mismatch"),
+    )
 
-
-def test_ollama_safe_ceiling_does_not_transfer_other_runtime_or_legacy_rows(monkeypatch):
-    chars = {
-        "ollama": {"safe_context": 7000, "artifact_id": None},
-        "cpu": {"safe_context": 8000},
-        "cuda-gguf": {"safe_context": 9000},
-    }
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    artifact = "ollama-manifest-sha256:" + "a" * 64
-    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) is None
-
-
-def test_ollama_safe_ceiling_vulkan_only_is_none(monkeypatch):
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: (
-        {"safe_context": 8000, "config": {}} if e == "vulkan" else None
-    ))
-    assert cli._ollama_safe_ceiling(
-        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
-
-
-def test_ollama_safe_ceiling_none_when_unfitted(monkeypatch):
-    chars = {"cpu": None, "vulkan": {"safe_context": None}}
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(
-        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
-
-
-def test_ollama_safe_ceiling_does_not_transfer_cuda_gguf_without_artifact_proof(monkeypatch):
-    chars = {"cpu": {"safe_context": 4000}, "vulkan": {"safe_context": 5000},
-             "cuda-gguf": {"safe_context": 12000}}
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(
-        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
-
-
-def test_ollama_safe_ceiling_skips_other_runtime_configs(monkeypatch):
-    rows = {
-        "vulkan": {"safe_context": 16000, "config": {"kv_quant": "q4_0"}},
-        "cpu": {"safe_context": 4000, "config": {}},
-    }
-    monkeypatch.setattr(cli.db, "get_characterization",
-                        lambda con, mk, key, model: rows.get(key))
-    assert cli._ollama_safe_ceiling(
-        object(), "mk", "m", "ollama-manifest-sha256:" + "a" * 64) is None
+    assert cli._ollama_safe_ceiling(object(), "mk", record, authority) is None
 
 
 # _ollama_estimated_ceiling — engine-free fallback via Ollama's own /api/show
@@ -8957,6 +8988,16 @@ def _wire_pick(monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mk")
 
 
+def _pick_authority():
+    return cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+
+
 def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
     _wire_pick(monkeypatch)
     ceils = {"a:1": (4000, "estimated", None), "b:1": (9000, "estimated", None),
@@ -8970,21 +9011,32 @@ def test_ollama_pick_best_ranks_by_ceiling_measured_or_estimated(monkeypatch):
         cli.ollama, "manifest_digest",
         lambda _n: pytest.fail("refetched inventory identity while ranking"),
     )
-    assert cli._ollama_pick_best(models) == "b:1"
+    assert cli._ollama_pick_best(models, _pick_authority()) == "b:1"
 
 
 def test_ollama_pick_best_uses_measured_when_present(monkeypatch):
     _wire_pick(monkeypatch)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10", server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default")
     # a has a measured ceiling; b only an estimate — each model uses its own best source, then
     # we rank by value (b's 9000 estimate legitimately beats a's 5000 measured).
-    monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact:
-                        (5000, "measured", None) if m == "a:1" else None)
+    seen = []
+
+    def safe(con, mk, record, runtime):
+        seen.append((record, runtime))
+        return (5000, "measured", None) if record.name == "a:1" else None
+
+    monkeypatch.setattr(cli, "_ollama_safe_ceiling", safe)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling",
                         lambda m, *, record=None:
                         (9000, "estimated", None) if m == "b:1" else None)
     models = [_local_ollama_model(n, digest=ch * 64)
               for n, ch in (("a:1", "a"), ("b:1", "b"))]
-    assert cli._ollama_pick_best(models) == "b:1"
+    assert cli._ollama_pick_best(models, authority) == "b:1"
+    assert seen == [(models[0], authority), (models[1], authority)]
 
 
 def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
@@ -8992,7 +9044,7 @@ def test_ollama_pick_best_none_when_nothing_fits(monkeypatch):
     monkeypatch.setattr(cli, "_ollama_safe_ceiling", lambda con, mk, m, artifact: None)
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda m, *, record=None: None)
     models = [_local_ollama_model(n) for n in ("a:1", "b:1")]
-    assert cli._ollama_pick_best(models) is None
+    assert cli._ollama_pick_best(models, _pick_authority()) is None
 
 
 def test_ollama_pick_best_skips_models_outside_initial_governed_cell(monkeypatch):
@@ -9009,23 +9061,31 @@ def test_ollama_pick_best_skips_models_outside_initial_governed_cell(monkeypatch
         return 4096, "estimated", None
 
     monkeypatch.setattr(cli, "_ollama_estimated_ceiling", estimate)
-    assert cli._ollama_pick_best([cloud, local]) == "local:1"
+    assert cli._ollama_pick_best([cloud, local], _pick_authority()) == "local:1"
 
 
 def test_serve_zero_arg_selects_and_serves_json(make_console, monkeypatch, capsys):
     _wire_serve(monkeypatch, names=("qwen3:0.6b",), characterization={"safe_context": 8192},
                 ps_rows=_SERVE_LOADED)
-    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: "qwen3:0.6b")
+    seen = {}
+
+    def pick(models, authority):
+        seen.update(models=models, authority=authority)
+        return "qwen3:0.6b"
+
+    monkeypatch.setattr(cli, "_ollama_pick_best", pick)
     c, _ = make_console()
     assert cli.render_serve(c, None, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["base_model"] == "qwen3:0.6b" and payload["auto_selected"] is True
+    assert seen["models"][0].name == "qwen3:0.6b"
+    assert seen["authority"].server_instance_id == "42:1234.500000:/usr/bin/ollama"
 
 
 def test_serve_zero_arg_text_announces_pick(make_console, monkeypatch):
     _wire_serve(monkeypatch, names=("qwen3:0.6b",), characterization={"safe_context": 8192},
                 ps_rows=_SERVE_LOADED)
-    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: "qwen3:0.6b")
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names, authority: "qwen3:0.6b")
     c, buf = make_console()
     assert cli.render_serve(c, None) == 0
     assert "auto-selected qwen3:0.6b" in buf.getvalue()
@@ -9033,7 +9093,7 @@ def test_serve_zero_arg_text_announces_pick(make_console, monkeypatch):
 
 def test_serve_zero_arg_refuses_when_nothing_fits(make_console, monkeypatch):
     _wire_serve(monkeypatch, names=("qwen3:0.6b",))
-    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names: None)
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda names, authority: None)
     c, buf = make_console()
     assert cli.render_serve(c, None) == 1
     assert "no model in Ollama fits" in buf.getvalue()
@@ -9048,7 +9108,7 @@ def test_serve_zero_arg_refuses_when_store_empty(make_console, monkeypatch):
 
 def test_serve_zero_arg_rejects_unsafe_selected_model(make_console, monkeypatch):
     _wire_serve(monkeypatch, names=("present:model",))
-    monkeypatch.setattr(cli, "_ollama_pick_best", lambda _names: "bad\nmodel")
+    monkeypatch.setattr(cli, "_ollama_pick_best", lambda _names, authority: "bad\nmodel")
     c, buf = make_console()
     assert cli.render_serve(c, None) == 1
     assert "invalid serving identity" in buf.getvalue()
@@ -9138,15 +9198,6 @@ def test_serve_unknown_residency_is_a_clear_text_refusal(make_console, monkeypat
     assert cli.render_serve(c, "qwen3:0.6b") == 1
     out = buf.getvalue()
     assert "strict admission" in out and "did not unload" in out
-
-
-def test_ollama_safe_ceiling_includes_ollama_engine(monkeypatch):
-    # a ceiling measured through Ollama (engine "ollama") is picked up as measured on later serves.
-    artifact = "ollama-manifest-sha256:" + "a" * 64
-    chars = {"ollama": {"safe_context": 7777, "artifact_id": artifact}}
-    monkeypatch.setattr(cli.db, "get_characterization", lambda con, mk, e, m: chars.get(e))
-    assert cli._ollama_safe_ceiling(object(), "mk", "m", artifact) == (
-        7777, "measured", None)
 
 
 # --- stale-ceiling advisory (2026-07-02-ara-ceiling-staleness) --------------- #

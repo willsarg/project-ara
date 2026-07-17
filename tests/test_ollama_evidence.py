@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""Topology-aware Ollama characterization evidence (umbrella design Slice 4)."""
+"""Topology-aware and strictly reusable Ollama characterization evidence."""
+from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from ara import ollama, ollama_evidence as evidence
+from ara import db, ollama, ollama_evidence as evidence
 
 
 GIB = 1024 ** 3
@@ -33,6 +35,394 @@ def _process(*, size=4, accelerator=0, context=4096):
         size_vram_bytes=accelerator * GIB,
         effective_context_per_request=context,
     )
+
+
+def _authority(**changes):
+    authority = ollama.OllamaRuntimeAuthority(
+        endpoint=ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="42:1234.500000:/usr/bin/ollama",
+        listener_pid=42,
+        listener_bind_host="127.0.0.1",
+        configured_inputs=(("OLLAMA_KEEP_ALIVE", "2m"),),
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    return replace(authority, **changes)
+
+
+def _model(**changes):
+    model = ollama.OllamaModel(
+        name="qwen3:0.6b",
+        digest="a" * 64,
+        size_bytes=522_000_000,
+        format="gguf",
+        capabilities=("completion",),
+        scope="local",
+    )
+    return replace(model, **changes)
+
+
+def _complete_characterization(store, *, authority=None, model=None):
+    authority = authority or _authority()
+    model = model or _model()
+    snapshot = _snapshot(total=24, available=8, kind="apple", count=1, unified=True)
+    point = evidence.characterization_point(
+        snapshot,
+        snapshot,
+        ollama.OllamaProcess(
+            name="probe", size_bytes=785_000_000, size_vram_bytes=785_000_000,
+            effective_context_per_request=4096),
+        4096,
+    )
+    config = {
+        "methodology": "ollama-physical-walls-v1",
+        "runtime": "ollama",
+        "runtime_version": authority.server_version,
+        "endpoint_authority": authority.endpoint.url,
+        "server_instance_id": authority.server_instance_id,
+        "format": "gguf",
+        "capability": "completion",
+        "configured_inputs": dict(authority.configured_inputs),
+        "configured_num_parallel": 1,
+        "configured_num_parallel_authority": "exact_version_default",
+        "effective_num_parallel": 1,
+        "effective_num_parallel_authority": "configured_maximum_is_one",
+        "requested_context": 4096,
+        "effective_per_request_context": 4096,
+        "placement": "unified",
+        "resident_total_bytes": point["resident_total_bytes"],
+        "resident_accelerator_bytes": point["resident_accelerator_bytes"],
+        "applicable_walls": point["applicable_walls"],
+        "system_memory_delta_bytes": point["system_memory_delta_bytes"],
+        "accelerator_memory_delta_bytes": point["accelerator_memory_delta_bytes"],
+        "system_margin_bytes": point["system_margin_bytes"],
+        "accelerator_margin_bytes": point["accelerator_margin_bytes"],
+        "configured_kv_cache_type": "unknown",
+        "effective_kv_cache_type": "unknown",
+        "configured_flash_attention": "unknown",
+        "effective_flash_attention": "unknown",
+        "configured_scheduler_spread": "unknown",
+        "effective_scheduler_spread": "unknown",
+    }
+    db.save_characterization(
+        store,
+        "machine",
+        "ollama",
+        model.name,
+        safe_context=4096,
+        points=[point],
+        artifact_id="ollama-manifest-sha256:" + model.digest,
+        config=config,
+    )
+    return model, authority
+
+
+def _rewrite_characterization_config(store, **changes):
+    row = db.get_characterization(store, "machine", "ollama", "qwen3:0.6b")
+    config = {**row["config"], **changes}
+    store.execute(
+        "UPDATE characterizations SET config_json=? WHERE machine_key='machine'",
+        (json.dumps(config, sort_keys=True),),
+    )
+    store.commit()
+
+
+def _rewrite_characterization_points(store, points):
+    store.execute(
+        "UPDATE characterizations SET points_json=? WHERE machine_key='machine'",
+        (json.dumps(points),),
+    )
+    store.commit()
+
+
+def _rewrite_matching_wall_evidence(store, **changes):
+    row = db.get_characterization(store, "machine", "ollama", "qwen3:0.6b")
+    _rewrite_characterization_config(store, **changes)
+    _rewrite_characterization_points(store, [{**row["points"][0], **changes}])
+
+
+def _replace_characterization_evidence(store, before, after, process):
+    point = evidence.characterization_point(before, after, process, 4096)
+    _rewrite_characterization_config(
+        store,
+        **{key: point[key] for key in (
+            "placement",
+            "resident_total_bytes",
+            "resident_accelerator_bytes",
+            "applicable_walls",
+            "system_memory_delta_bytes",
+            "accelerator_memory_delta_bytes",
+            "system_margin_bytes",
+            "accelerator_margin_bytes",
+        )},
+    )
+    _rewrite_characterization_points(store, [point])
+
+
+def test_assessment_separates_display_row_from_strict_reusable_row(store):
+    model, authority = _complete_characterization(store)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.display["safe_context"] == 4096
+    assert assessment.reusable is assessment.display
+    assert assessment.reason is None
+
+
+def test_legacy_characterization_stays_displayable_but_is_not_reusable(store):
+    model = _model()
+    db.save_characterization(
+        store,
+        "machine",
+        "ollama",
+        model.name,
+        safe_context=4096,
+        points=[],
+        artifact_id="ollama-manifest-sha256:" + model.digest,
+        config={},
+    )
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, _authority())
+
+    assert assessment.display["safe_context"] == 4096
+    assert assessment.reusable is None
+    assert assessment.reason == "methodology_missing_or_unsupported"
+
+
+@pytest.mark.parametrize(("model_changes", "reason"), [
+    ({"digest": "b" * 64}, "artifact_mismatch"),
+    ({"scope": "cloud", "remote_model": "qwen3"}, "unsupported_model_cell"),
+    ({"format": "safetensors"}, "unsupported_model_cell"),
+    ({"capabilities": ("embedding",)}, "unsupported_model_cell"),
+])
+def test_reuse_requires_the_exact_supported_model_cell(store, model_changes, reason):
+    model, authority = _complete_characterization(store)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", replace(model, **model_changes), authority)
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == reason
+
+
+def test_reuse_requires_a_positive_measured_ceiling(store):
+    model, authority = _complete_characterization(store)
+    store.execute(
+        "UPDATE characterizations SET safe_context=NULL WHERE machine_key='machine'")
+    store.commit()
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == "safe_context_missing"
+
+
+def test_reuse_requires_complete_current_runtime_authority(store):
+    model, _authority_at_measurement = _complete_characterization(store)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, _authority(issue="listener_unattributed"))
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == "runtime_authority_incomplete"
+
+
+@pytest.mark.parametrize(("authority_changes", "reason"), [
+    ({"endpoint": ollama.OllamaEndpoint("http://127.0.0.1:22434", "loopback")},
+     "endpoint_mismatch"),
+    ({"server_version": "0.30.11"}, "runtime_version_mismatch"),
+    ({"server_instance_id": "99:999.000000:/usr/bin/ollama"},
+     "server_instance_mismatch"),
+    ({"configured_inputs": (("OLLAMA_KEEP_ALIVE", "5m"),)},
+     "configured_inputs_mismatch"),
+    ({"configured_num_parallel": 2}, "parallelism_mismatch"),
+    ({"configured_num_parallel_authority": "explicit_process_environment"},
+     "parallelism_mismatch"),
+])
+def test_reuse_invalidates_on_exact_runtime_or_config_drift(
+        store, authority_changes, reason):
+    model, authority = _complete_characterization(store)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, replace(authority, **authority_changes))
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == reason
+    assert db.get_characterization(
+        store, "machine", "ollama", model.name)["safe_context"] == 4096
+
+
+@pytest.mark.parametrize("changes", [
+    {"configured_kv_cache_type": "f16"},
+    {"effective_kv_cache_type": "f16"},
+    {"configured_flash_attention": "true"},
+    {"effective_flash_attention": True},
+    {"configured_scheduler_spread": "true"},
+    {"effective_scheduler_spread": False},
+])
+def test_reuse_requires_complete_runtime_config_evidence(store, changes):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, **changes)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "runtime_config_evidence_incomplete"
+
+
+@pytest.mark.parametrize("changes", [
+    {"format": "safetensors"},
+    {"capability": "embedding"},
+])
+def test_reuse_requires_stored_supported_cell_classification(store, changes):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, **changes)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "model_cell_mismatch"
+
+
+@pytest.mark.parametrize("changes", [
+    {"requested_context": 8192},
+    {"effective_per_request_context": 2048},
+])
+def test_reuse_requires_exact_requested_and_effective_context(store, changes):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, **changes)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "context_evidence_incomplete"
+
+
+def test_reuse_requires_a_matching_successful_characterization_point(store):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_points(store, [])
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "context_evidence_incomplete"
+
+
+@pytest.mark.parametrize("changes", [
+    {"context": 8192},
+    {"refusal_reasons": ["system_margin_breached"]},
+])
+def test_reuse_rejects_a_self_contradicting_success_point(store, changes):
+    model, authority = _complete_characterization(store)
+    row = db.get_characterization(store, "machine", "ollama", model.name)
+    _rewrite_characterization_points(store, [{**row["points"][0], **changes}])
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "context_evidence_incomplete"
+
+
+def test_reuse_requires_a_supported_observed_placement(store):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, placement="unknown", applicable_walls=[])
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "placement_unsupported"
+
+
+@pytest.mark.parametrize("changes", [
+    {"resident_total_bytes": None},
+    {"resident_accelerator_bytes": 900_000_000},
+    {"applicable_walls": ["system", "accelerator"]},
+    {"system_memory_delta_bytes": None},
+    {"system_memory_delta_bytes": -1},
+    {"system_margin_bytes": 0},
+    {"accelerator_memory_delta_bytes": 1},
+    {"accelerator_margin_bytes": 1},
+])
+def test_reuse_requires_complete_consistent_wall_evidence(store, changes):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, **changes)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "wall_evidence_incomplete"
+
+
+@pytest.mark.parametrize("changes", [
+    {"resident_total_bytes": -1},
+    {"resident_total_bytes": 0},
+    {"resident_accelerator_bytes": -1},
+    {"resident_accelerator_bytes": 900_000_000},
+    {"applicable_walls": ["system"]},
+    {"system_memory_delta_bytes": -1},
+    {"system_margin_bytes": 0},
+    {"accelerator_memory_delta_bytes": 1},
+    {"accelerator_margin_bytes": 1},
+])
+def test_reuse_rejects_matching_but_invalid_wall_claims(store, changes):
+    model, authority = _complete_characterization(store)
+    _rewrite_matching_wall_evidence(store, **changes)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reusable is None
+    assert assessment.reason == "wall_evidence_incomplete"
+
+
+@pytest.mark.parametrize(("before", "after", "process", "placement"), [
+    (_snapshot(available=10), _snapshot(available=6), _process(), "cpu"),
+    (
+        _snapshot(
+            total=32, available=24, kind="nvidia", count=1,
+            accelerator_total=8, accelerator_available=7),
+        _snapshot(
+            total=32, available=20, kind="nvidia", count=1,
+            accelerator_total=8, accelerator_available=2),
+        _process(size=6, accelerator=6),
+        "accelerator",
+    ),
+    (
+        _snapshot(
+            total=32, available=24, kind="nvidia", count=1,
+            accelerator_total=8, accelerator_available=7),
+        _snapshot(
+            total=32, available=20, kind="nvidia", count=1,
+            accelerator_total=8, accelerator_available=2),
+        _process(size=10, accelerator=6),
+        "partial_offload",
+    ),
+])
+def test_reuse_accepts_each_certifiable_placement(
+        store, before, after, process, placement):
+    model, authority = _complete_characterization(store)
+    _replace_characterization_evidence(store, before, after, process)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reason is None
+    assert assessment.reusable["config"]["placement"] == placement
 
 
 def test_cpu_point_uses_system_wall_and_records_observed_delta():
