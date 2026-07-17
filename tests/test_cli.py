@@ -318,13 +318,13 @@ def test_render_doctor_verbose_reports_store_details(
 
     out = buf.getvalue()
     assert f"database             {db._db_path()}" in out
-    assert "schema version       3" in out
+    assert "schema version       4" in out
 
     c = cli.Console.from_env(verbose=True)
     assert cli.render_doctor(c, as_json=True) == 0
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
-    assert out_json["schema_version"] == 3
+    assert out_json["schema_version"] == 4
 
 
 def test_render_doctor_text_reports_ollama_findings(
@@ -9944,6 +9944,37 @@ def test_ollama_use_case_ranking_consumes_only_exact_current_measurements(
     assert all(item["evidence_warning"] is None for item in ranked)
 
 
+def test_ollama_use_case_ranking_selects_exact_cell_when_native_result_coexists(
+        monkeypatch, tmp_path):
+    authority = _pick_authority()
+    config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    record = _local_ollama_model(
+        "shared:1", digest="a" * 64, quantization="Q4_K_M")
+    ollama_row = _ollama_measured_row(
+        record, score=0.8, use_case="extraction", authority=authority, config=config)
+    native_row = {**ollama_row, "engine_key": "mlx", "score": 0.2}
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+    monkeypatch.setattr(
+        cli.db, "list_benchmark_results", lambda _con, _mk: [ollama_row, native_row])
+    reusable = {"safe_context": 4096, "config": config}
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            reusable, reusable, None),
+    )
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda *_a, **_k: None)
+
+    item = cli._ollama_ranked_models(
+        [record], authority, use_case="extraction")[0]
+
+    assert item["score"].value == 0.8
+    assert item["evidence_warning"] is None
+
+
 @pytest.mark.parametrize(("field", "value", "warning"), [
     ("source", "", "invalid stored benchmark evidence"),
     ("engine_key", "mlx", "invalid stored Ollama benchmark evidence"),
@@ -11442,6 +11473,27 @@ def test_recommend_measured_score_beats_imported(make_console, monkeypatch, set_
     # Strong's measured 0.9 beats Weak's imported 0.7, so Strong ranks first.
     assert out.index("org/Strong") < out.index("org/Weak")
     assert "measured" in out
+
+
+def test_native_recommendation_ignores_coexisting_ollama_runtime_cell(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(
+        monkeypatch, set_platform,
+        [_model_row("org/Shared", weights_gb=4.0, max_context=131072)],
+    )
+    native = _measured_row(
+        "org/Shared", score=0.8, source="mlx probe=164 (org/Shared)")
+    ollama = {**native, "engine_key": "ollama", "score": 0.2}
+    monkeypatch.setattr(
+        cli.db, "list_benchmark_results", lambda _con, _mk: [native, ollama])
+    monkeypatch.setattr(cli.scoring, "load_imported", lambda: {})
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, use_case="coding") == 0
+
+    out = buf.getvalue()
+    assert "coding 80% (measured)" in out
+    assert "invalid stored benchmark evidence" not in out
 
 
 # --------------------------------------------------------------------------- #

@@ -22,6 +22,45 @@ from pathlib import Path
 
 import platformdirs
 
+_BENCHMARK_RESULTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    machine_key  TEXT NOT NULL,
+    model_id     TEXT NOT NULL,
+    use_case     TEXT NOT NULL,
+    evidence_key TEXT NOT NULL,
+    runtime      TEXT NOT NULL,
+    placement    TEXT NOT NULL,
+    config_key   TEXT NOT NULL,
+    request_policy_key TEXT NOT NULL,
+    engine_key   TEXT,
+    backend      TEXT NOT NULL,
+    base_model   TEXT,
+    quant        TEXT,
+    benchmark_id TEXT,
+    methodology_id TEXT,
+    tier         TEXT NOT NULL DEFAULT 'measured',
+    score        REAL NOT NULL,
+    max_score    REAL,
+    sample_size  INTEGER,
+    refused_n    INTEGER,
+    errored_n    INTEGER,
+    probe_context INTEGER,
+    generation_cap INTEGER,
+    repeat_count INTEGER,
+    total_generations INTEGER,
+    run_scores_json TEXT,
+    artifact_id  TEXT,
+    canonical_model_id TEXT,
+    target_json TEXT,
+    request_policy_json TEXT,
+    runtime_metrics_json TEXT,
+    source       TEXT NOT NULL,
+    measured_at  TEXT NOT NULL,
+    PRIMARY KEY (machine_key, model_id, use_case, evidence_key)
+);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calibrations (
     machine_key       TEXT NOT NULL,
@@ -65,38 +104,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     captured_at  TEXT NOT NULL,
     profile_json TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS benchmark_results (
-    machine_key  TEXT NOT NULL,
-    model_id     TEXT NOT NULL,
-    use_case     TEXT NOT NULL,
-    engine_key   TEXT,
-    backend      TEXT,
-    base_model   TEXT,
-    quant        TEXT,
-    benchmark_id TEXT,
-    methodology_id TEXT,
-    tier         TEXT NOT NULL DEFAULT 'measured',
-    score        REAL NOT NULL,
-    max_score    REAL,
-    sample_size  INTEGER,
-    refused_n    INTEGER,
-    errored_n    INTEGER,
-    probe_context INTEGER,
-    generation_cap INTEGER,
-    repeat_count INTEGER,
-    total_generations INTEGER,
-    run_scores_json TEXT,
-    artifact_id  TEXT,
-    canonical_model_id TEXT,
-    target_json TEXT,
-    request_policy_json TEXT,
-    runtime_metrics_json TEXT,
-    source       TEXT NOT NULL,
-    measured_at  TEXT NOT NULL,
-    PRIMARY KEY (machine_key, model_id, use_case)
-);
-"""
+""" + _BENCHMARK_RESULTS_DDL.format(table="benchmark_results")
 
 
 def _db_path() -> Path:
@@ -176,6 +184,24 @@ def connect() -> sqlite3.Connection:
             con.rollback()
             con.close()
             raise
+    if con.execute("PRAGMA user_version").fetchone()[0] < 4:
+        rebuild = _benchmark_cells_v4_needed(con)
+        if rebuild:
+            _backup_before_target_cells_v4(con, path)
+        con.commit()
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if rebuild:
+                _migrate_benchmark_cells_v4(con)
+            con.execute("PRAGMA user_version = 4")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.execute("PRAGMA foreign_keys = ON")
+            con.close()
+            raise
+        con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
@@ -193,9 +219,10 @@ _ENGINE_REKEY_TABLES = (
 )
 
 
-def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> None:
-    """Keep one byte-independent SQLite backup of the pre-v3 evidence store."""
-    backup_path = path.with_name(path.name + ".pre-engine-identity-v3.bak")
+def _backup_before_migration(con: sqlite3.Connection, path: Path, *, suffix: str,
+                             validation_label: str) -> None:
+    """Keep one byte-independent validated SQLite backup before a schema migration."""
+    backup_path = path.with_name(path.name + suffix)
     expected_version = con.execute("PRAGMA user_version").fetchone()[0]
 
     def valid(candidate: Path) -> bool:
@@ -231,15 +258,122 @@ def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> No
         finally:
             backup.close()
         if not valid(temp_path):
-            raise sqlite3.DatabaseError("pre-v3 backup validation failed")
+            raise sqlite3.DatabaseError(f"{validation_label} backup validation failed")
         os.replace(temp_path, backup_path)
         if not valid(backup_path):
-            raise sqlite3.DatabaseError("published pre-v3 backup validation failed")
+            raise sqlite3.DatabaseError(
+                f"published {validation_label} backup validation failed")
     finally:
         try:
             temp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _backup_before_engine_identity_v3(con: sqlite3.Connection, path: Path) -> None:
+    """Keep one byte-independent SQLite backup of the pre-v3 evidence store."""
+    _backup_before_migration(
+        con, path, suffix=".pre-engine-identity-v3.bak", validation_label="pre-v3")
+
+
+def _backup_before_target_cells_v4(con: sqlite3.Connection, path: Path) -> None:
+    """Keep one byte-independent SQLite backup of the pre-v4 benchmark store."""
+    _backup_before_migration(
+        con, path, suffix=".pre-target-cells-v4.bak", validation_label="pre-v4")
+
+
+_ENGINE_TARGET_CELLS = {
+    "mlx": ("mlx", "apple"),
+    "cuda": ("torch", "cuda"),
+    "cpu": ("llamacpp", "cpu"),
+    "vulkan": ("llamacpp", "vulkan"),
+    "cuda-gguf": ("llamacpp", "cuda"),
+    "ollama": ("ollama", "unknown"),
+}
+
+
+def _json_object(raw) -> dict | None:
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _benchmark_cell_values(*, engine_key: str | None, backend: str | None,
+                           artifact_id: str | None, methodology_id: str | None,
+                           target: dict | None, request_policy: dict | None) -> dict[str, str]:
+    """Build the durable identity for one benchmark runtime cell."""
+    from ara.engine_identity import canonical_engine
+
+    canonical = canonical_engine(engine_key)
+    mapped_runtime, mapped_backend = _ENGINE_TARGET_CELLS.get(
+        canonical, (canonical or "unknown", "unknown"))
+    target = target if isinstance(target, dict) else {}
+
+    def text_value(name: str, fallback: str) -> str:
+        value = target.get(name)
+        return value if isinstance(value, str) and value else fallback
+
+    runtime = text_value("runtime", mapped_runtime)
+    cell_backend = text_value(
+        "backend", backend if isinstance(backend, str) and backend else mapped_backend)
+    placement = text_value("placement", "unknown")
+    config_key = text_value("config_key", "")
+    if not config_key:
+        digest = target.get("config_sha256")
+        config_key = (f"cfg:v1:sha256:{digest}"
+                      if isinstance(digest, str) and digest else "default")
+    request_policy_key = (
+        "policy:v1:" + _compact_json(request_policy)
+        if isinstance(request_policy, dict) else "unknown")
+    identity = {
+        "runtime": runtime,
+        "backend": cell_backend,
+        "placement": placement,
+        "artifact_id": text_value("artifact_id", artifact_id or "unknown"),
+        "config_key": config_key,
+        "request_policy_key": request_policy_key,
+        "methodology_id": methodology_id or "unknown",
+    }
+    return {
+        "evidence_key": "cell:v1:" + _compact_json(identity),
+        "runtime": runtime,
+        "backend": cell_backend,
+        "placement": placement,
+        "config_key": config_key,
+        "request_policy_key": request_policy_key,
+    }
+
+
+def _benchmark_cells_v4_needed(con: sqlite3.Connection) -> bool:
+    columns = {row["name"] for row in con.execute("PRAGMA table_info(benchmark_results)")}
+    return "evidence_key" not in columns
+
+
+def _migrate_benchmark_cells_v4(con: sqlite3.Connection) -> None:
+    """Rebuild the benchmark PK so distinct runtime cells cannot overwrite one another."""
+    rows = [dict(row) for row in con.execute("SELECT * FROM benchmark_results")]
+    con.execute("DROP TABLE IF EXISTS benchmark_results_new")
+    con.execute(_BENCHMARK_RESULTS_DDL.format(table="benchmark_results_new"))
+    columns = [row["name"] for row in con.execute(
+        "PRAGMA table_info(benchmark_results_new)")]
+    for row in rows:
+        target = _json_object(row.get("target_json"))
+        request_policy = _json_object(row.get("request_policy_json"))
+        cell = _benchmark_cell_values(
+            engine_key=row.get("engine_key"), backend=row.get("backend"),
+            artifact_id=row.get("artifact_id"), methodology_id=row.get("methodology_id"),
+            target=target, request_policy=request_policy)
+        values = {column: row.get(column) for column in columns}
+        values.update(cell)
+        con.execute(
+            f"INSERT INTO benchmark_results_new ({','.join(columns)}) "  # noqa: S608
+            f"VALUES ({','.join(':' + column for column in columns)})",
+            values,
+        )
+    con.execute("DROP TABLE benchmark_results")
+    con.execute("ALTER TABLE benchmark_results_new RENAME TO benchmark_results")
 
 
 def _canonicalize_engine_pk_table(con: sqlite3.Connection, table: str,
@@ -332,6 +466,11 @@ def _rekey_legacy(con: sqlite3.Connection) -> int:
             con.execute("UPDATE profiles SET machine_key=? WHERE rowid=?", (new_key, r["rowid"]))
             n += 1
     for table, pk_rest, ts in _REKEY_PK_TABLES:
+        if (table == "benchmark_results"
+                and "evidence_key" in {
+                    row["name"] for row in con.execute(
+                        "PRAGMA table_info(benchmark_results)")}):
+            pk_rest = (*pk_rest, "evidence_key")
         n += _rekey_pk_table(con, table, pk_rest, ts)
     con.commit()
     return n
@@ -549,35 +688,49 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
                           request_policy: dict | None = None,
                           runtime_metrics: dict | None = None) -> None:
     from ara.engine_identity import canonical_engine
+    canonical = canonical_engine(engine_key)
+    cell = _benchmark_cell_values(
+        engine_key=canonical, backend=backend, artifact_id=artifact_id,
+        methodology_id=methodology_id, target=target, request_policy=request_policy)
+    row = {
+        "machine_key": machine_key,
+        "model_id": model_id,
+        "use_case": use_case,
+        **cell,
+        "engine_key": canonical,
+        "base_model": base_model,
+        "quant": quant,
+        "benchmark_id": benchmark_id,
+        "methodology_id": methodology_id,
+        "tier": tier,
+        "score": score,
+        "max_score": max_score,
+        "sample_size": sample_size,
+        "refused_n": refused_n,
+        "errored_n": errored_n,
+        "probe_context": probe_context,
+        "generation_cap": generation_cap,
+        "repeat_count": repeat_count,
+        "total_generations": total_generations,
+        "run_scores_json": json.dumps(run_scores) if run_scores is not None else None,
+        "artifact_id": artifact_id,
+        "canonical_model_id": canonical_model_id,
+        "target_json": _compact_json(target),
+        "request_policy_json": _compact_json(request_policy),
+        "runtime_metrics_json": _compact_json(runtime_metrics),
+        "source": source,
+        "measured_at": _now(),
+    }
+    columns = ", ".join(row)
+    placeholders = ", ".join(f":{column}" for column in row)
+    updates = ", ".join(
+        f"{column}=excluded.{column}" for column in row
+        if column not in {"machine_key", "model_id", "use_case", "evidence_key"})
     con.execute(
-        "INSERT INTO benchmark_results "
-        "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
-        "benchmark_id, methodology_id, tier, score, max_score, sample_size, refused_n, errored_n, "
-        "probe_context, generation_cap, repeat_count, total_generations, run_scores_json, "
-        "artifact_id, canonical_model_id, target_json, request_policy_json, "
-        "runtime_metrics_json, source, measured_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(machine_key, model_id, use_case) DO UPDATE SET "
-        "engine_key=excluded.engine_key, backend=excluded.backend, "
-        "base_model=excluded.base_model, quant=excluded.quant, "
-        "benchmark_id=excluded.benchmark_id, methodology_id=excluded.methodology_id, "
-        "tier=excluded.tier, score=excluded.score, "
-        "max_score=excluded.max_score, sample_size=excluded.sample_size, "
-        "refused_n=excluded.refused_n, errored_n=excluded.errored_n, "
-        "probe_context=excluded.probe_context, generation_cap=excluded.generation_cap, "
-        "repeat_count=excluded.repeat_count, total_generations=excluded.total_generations, "
-        "run_scores_json=excluded.run_scores_json, "
-        "artifact_id=excluded.artifact_id, canonical_model_id=excluded.canonical_model_id, "
-        "target_json=excluded.target_json, request_policy_json=excluded.request_policy_json, "
-        "runtime_metrics_json=excluded.runtime_metrics_json, "
-        "source=excluded.source, measured_at=excluded.measured_at",
-        (machine_key, model_id, use_case, canonical_engine(engine_key), backend, base_model, quant,
-         benchmark_id, methodology_id, tier, score, max_score, sample_size, refused_n, errored_n,
-         probe_context, generation_cap, repeat_count, total_generations,
-         json.dumps(run_scores) if run_scores is not None else None,
-         artifact_id, canonical_model_id,
-         _compact_json(target), _compact_json(request_policy), _compact_json(runtime_metrics),
-         source, _now()))
+        f"INSERT INTO benchmark_results ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT(machine_key, model_id, use_case, evidence_key) DO UPDATE SET "
+        f"{updates}",
+        row)
     con.commit()
 
 
@@ -601,14 +754,16 @@ def _benchmark_row(row: sqlite3.Row) -> dict:
 def get_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: str,
                          use_case: str) -> dict | None:
     row = con.execute(
-        "SELECT * FROM benchmark_results WHERE machine_key=? AND model_id=? AND use_case=?",
+        "SELECT * FROM benchmark_results WHERE machine_key=? AND model_id=? AND use_case=? "
+        "ORDER BY measured_at DESC, rowid DESC LIMIT 1",
         (machine_key, model_id, use_case)).fetchone()
     return _benchmark_row(row) if row else None
 
 
 def list_benchmark_results(con: sqlite3.Connection, machine_key: str) -> list[dict]:
-    """All benchmark results for a machine, ordered by model_id then use_case."""
+    """All benchmark runtime-cell results for a machine in deterministic evidence order."""
     rows = con.execute(
-        "SELECT * FROM benchmark_results WHERE machine_key=? ORDER BY model_id, use_case",
+        "SELECT * FROM benchmark_results WHERE machine_key=? "
+        "ORDER BY model_id, use_case, measured_at, evidence_key",
         (machine_key,)).fetchall()
     return [_benchmark_row(r) for r in rows]

@@ -93,7 +93,7 @@ def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
     assert db.get_calibration(con, _NEW, "cpu") is not None
     assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
     assert db.get_latest_profile(con, _NEW) is not None
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 4
     assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
 
 
@@ -175,8 +175,8 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     con = db.connect()
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
-    # The migration chain now ends at v3; the single-field key 'm' is not a legacy machine key.
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 3
+    # The migration chain now ends at v4; the single-field key 'm' is not a legacy machine key.
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 4
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
@@ -523,6 +523,137 @@ def test_benchmark_result_upsert_updates_score_no_duplicate(store):
     assert count == 1
 
 
+def test_benchmark_results_preserve_distinct_runtime_cells_and_upsert_exact_cell(store):
+    common = {
+        "machine_key": "m",
+        "model_id": "org/model",
+        "use_case": "coding",
+        "source": "probe",
+        "methodology_id": "sha256:method",
+    }
+    native_target = {
+        "runtime": "torch",
+        "backend": "cuda",
+        "placement": "accelerator",
+        "artifact_id": "hf:org/model@abc",
+        "config_key": "cfg:v1:native",
+    }
+    ollama_target = {
+        "runtime": "ollama",
+        "backend": "cuda",
+        "placement": "accelerator",
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "config_key": "cfg:v1:ollama",
+    }
+    db.save_benchmark_result(
+        store, common["machine_key"], common["model_id"], common["use_case"],
+        score=0.4, source=common["source"], methodology_id=common["methodology_id"],
+        engine_key="cuda", backend="cuda", artifact_id=native_target["artifact_id"],
+        target=native_target, request_policy={"temperature": 0.0},
+    )
+    db.save_benchmark_result(
+        store, common["machine_key"], common["model_id"], common["use_case"],
+        score=0.7, source=common["source"], methodology_id=common["methodology_id"],
+        engine_key="ollama", backend="cuda", artifact_id=ollama_target["artifact_id"],
+        target=ollama_target, request_policy={"temperature": 0.0},
+    )
+    db.save_benchmark_result(
+        store, common["machine_key"], common["model_id"], common["use_case"],
+        score=0.8, source="rerun", methodology_id=common["methodology_id"],
+        engine_key="ollama", backend="cuda", artifact_id=ollama_target["artifact_id"],
+        target=ollama_target, request_policy={"temperature": 0.0},
+    )
+
+    rows = db.list_benchmark_results(store, "m")
+    assert len(rows) == 2
+    by_runtime = {row["runtime"]: row for row in rows}
+    assert by_runtime["torch"]["score"] == 0.4
+    assert by_runtime["ollama"]["score"] == 0.8
+    assert by_runtime["ollama"]["source"] == "rerun"
+    assert all(row["evidence_key"].startswith("cell:v1:") for row in rows)
+
+
+def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently(
+        tmp_path, monkeypatch):
+    path = tmp_path / "benchmark-cells.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE benchmark_results (
+        machine_key TEXT NOT NULL, model_id TEXT NOT NULL, use_case TEXT NOT NULL,
+        engine_key TEXT, backend TEXT, tier TEXT NOT NULL DEFAULT 'measured',
+        score REAL NOT NULL, source TEXT NOT NULL, measured_at TEXT NOT NULL,
+        PRIMARY KEY (machine_key, model_id, use_case)
+    );
+    INSERT INTO benchmark_results VALUES
+        ('m', 'org/model', 'coding', 'mystery-runtime', NULL, 'measured', 0.5,
+         'legacy', '2026-01-01T00:00:00+00:00');
+    PRAGMA user_version = 3;
+    """)
+    con.close()
+
+    first = db.connect()
+    row = db.get_benchmark_result(first, "m", "org/model", "coding")
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert row is not None
+    assert row["runtime"] == "mystery-runtime"
+    assert row["backend"] == "unknown"
+    assert row["placement"] == "unknown"
+    assert row["config_key"] == "default"
+    assert row["request_policy_key"] == "unknown"
+    assert row["evidence_key"].startswith("cell:v1:")
+    first.close()
+
+    second = db.connect()
+    assert second.execute("SELECT COUNT(*) FROM benchmark_results").fetchone()[0] == 1
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 4
+    second.close()
+    backup = path.with_name(path.name + ".pre-target-cells-v4.bak")
+    assert backup.exists()
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert saved.execute("SELECT source FROM benchmark_results").fetchone()[0] == "legacy"
+    saved.close()
+
+
+def test_v4_benchmark_rebuild_failure_rolls_back_and_keeps_v3_store(
+        tmp_path, monkeypatch):
+    path = tmp_path / "benchmark-cells-rollback.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE benchmark_results (
+        machine_key TEXT NOT NULL, model_id TEXT NOT NULL, use_case TEXT NOT NULL,
+        engine_key TEXT, backend TEXT, tier TEXT NOT NULL DEFAULT 'measured',
+        score REAL NOT NULL, source TEXT NOT NULL, measured_at TEXT NOT NULL,
+        PRIMARY KEY (machine_key, model_id, use_case)
+    );
+    INSERT INTO benchmark_results VALUES
+        ('m', 'org/model', 'coding', 'cpu', 'cpu', 'measured', 0.5,
+         'legacy', '2026-01-01T00:00:00+00:00');
+    PRAGMA user_version = 3;
+    """)
+    con.close()
+    monkeypatch.setattr(
+        db, "_migrate_benchmark_cells_v4",
+        lambda _con: (_ for _ in ()).throw(RuntimeError("forced v4 failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="forced v4 failure"):
+        db.connect()
+
+    saved = sqlite3.connect(path)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert "evidence_key" not in {
+        row[1] for row in saved.execute("PRAGMA table_info(benchmark_results)")}
+    assert saved.execute("SELECT source FROM benchmark_results").fetchone()[0] == "legacy"
+    saved.close()
+
+
+def test_json_object_rejects_malformed_json():
+    assert db._json_object("{") is None
+
+
 def test_list_benchmark_results_returns_machine_rows_only(store):
     db.save_benchmark_result(store, "m", "org/a", "coding", score=0.7, source="s1")
     db.save_benchmark_result(store, "m", "org/b", "math", score=0.6, source="s2")
@@ -636,6 +767,15 @@ def _v2_engine_identity_db(tmp_path, monkeypatch, name="identity.db"):
     monkeypatch.setenv("ARA_DB_PATH", str(path))
     con = sqlite3.connect(path)
     con.executescript(db.SCHEMA)
+    con.executescript("""
+    DROP TABLE benchmark_results;
+    CREATE TABLE benchmark_results (
+        machine_key TEXT NOT NULL, model_id TEXT NOT NULL, use_case TEXT NOT NULL,
+        engine_key TEXT, backend TEXT, tier TEXT NOT NULL DEFAULT 'measured',
+        score REAL NOT NULL, source TEXT NOT NULL, measured_at TEXT NOT NULL,
+        PRIMARY KEY (machine_key, model_id, use_case)
+    );
+    """)
     con.execute("PRAGMA user_version = 2")
     return path, con
 
@@ -660,7 +800,7 @@ def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monk
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
     assert [tuple(row) for row in migrated.execute(
         "SELECT machine_key, engine, fixed_overhead_gb, calibrated_at, wall_gb, "
         "safe_budget_gb FROM calibrations ORDER BY machine_key"
@@ -705,7 +845,7 @@ def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_pa
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 4
     assert migrated.execute("SELECT engine FROM calibrations WHERE machine_key='old'").fetchone()[0] == "mlx"
     tie = dict(migrated.execute("SELECT * FROM calibrations WHERE machine_key='tie'").fetchone())
     assert tie["engine"] == "mlx" and tie["fixed_overhead_gb"] == 2.0 and tie["wall_gb"] == 22.0
@@ -755,7 +895,7 @@ def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monke
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
     before = backup.read_bytes()
     second = db.connect()
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 4
     assert second.execute("SELECT engine FROM calibrations").fetchone()[0] == "mlx"
     second.close()
     assert backup.read_bytes() == before

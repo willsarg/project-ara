@@ -1933,24 +1933,28 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             bench_measured = {}
             evidence_warnings = {}
             catalog_quants = {rec["model_id"]: rec["quant"] for rec in recs}
-            for row in rows:
+            for row in reversed(rows):
                 evidence_key = (row["model_id"], row["use_case"])
                 evidence, evidence_warning = scoring.validate_measured_evidence(row)
                 if evidence is None:
-                    evidence_warnings[evidence_key] = evidence_warning
+                    evidence_warnings.setdefault(evidence_key, evidence_warning)
                     continue
                 engine_spec = engines.ENGINES.get(row["engine_key"])
                 if engine_spec is None or engine_spec.get("backend") != row["backend"]:
-                    evidence_warnings[evidence_key] = "invalid stored benchmark evidence"
+                    evidence_warnings.setdefault(
+                        evidence_key, "invalid stored benchmark evidence")
                     continue
                 if (row["model_id"] in catalog_quants
                         and row.get("quant") != catalog_quants[row["model_id"]]):
-                    evidence_warnings[evidence_key] = "invalid stored benchmark evidence"
+                    evidence_warnings.setdefault(
+                        evidence_key, "invalid stored benchmark evidence")
                     continue
                 if staleness.artifact_identity(row["model_id"]) != row["artifact_id"]:
-                    evidence_warnings[evidence_key] = "cached model changed since benchmark"
+                    evidence_warnings.setdefault(
+                        evidence_key, "cached model changed since benchmark")
                     continue
-                bench_measured[evidence_key] = evidence
+                bench_measured.setdefault(evidence_key, evidence)
+                evidence_warnings.pop(evidence_key, None)
             bench_measured = bench_measured or None
             recs = scoring.rank(recs, use_case, measured=bench_measured,
                                 imported=scoring.load_imported())
@@ -3613,9 +3617,11 @@ def _ollama_ranked_models(
         con = (stack.enter_context(db.connected_readonly())
                if db._db_path().is_file() else scratch)
         mk = profile.machine_key()
-        benchmark_rows = ({(row["model_id"], row["use_case"]): row
-                           for row in db.list_benchmark_results(con, mk)}
-                          if use_case is not None else {})
+        benchmark_rows: dict[tuple[str, str], list[dict]] = {}
+        if use_case is not None:
+            for row in db.list_benchmark_results(con, mk):
+                benchmark_rows.setdefault(
+                    (row["model_id"], row["use_case"]), []).append(row)
         ranked = []
         for record in models:
             if (_is_ara_ollama_derived(record.name)
@@ -3653,18 +3659,26 @@ def _ollama_ranked_models(
             if use_case is not None:
                 score = None
                 benchmark_warning = None
-                benchmark_row = benchmark_rows.get((record.name, use_case))
-                if benchmark_row is None:
+                candidates = benchmark_rows.get((record.name, use_case), [])
+                if not candidates:
                     benchmark_warning = "no stored Ollama benchmark evidence"
                 elif assessment.reusable is None:
                     benchmark_warning = "current Ollama characterization is not reusable"
                 else:
-                    measured, benchmark_warning = _ollama_benchmark_evidence(
-                        benchmark_row, record, authority, assessment.reusable["config"])
-                    if measured is not None:
-                        score = scoring.score_for(
-                            record.name, use_case,
-                            measured={(record.name, use_case): measured})
+                    rejected = []
+                    for benchmark_row in reversed(candidates):
+                        measured, warning = _ollama_benchmark_evidence(
+                            benchmark_row, record, authority,
+                            assessment.reusable["config"])
+                        if measured is not None:
+                            score = scoring.score_for(
+                                record.name, use_case,
+                                measured={(record.name, use_case): measured})
+                            benchmark_warning = None
+                            break
+                        rejected.append(warning)
+                    if score is None:
+                        benchmark_warning = rejected[0]
                 item["score"] = score
                 item["evidence_warning"] = benchmark_warning
             ranked.append(item)
