@@ -3833,11 +3833,52 @@ def test_ollama_measure_ceiling_stops_on_create_fail(monkeypatch):
     assert best is None and points == []
 
 
-def test_ollama_measure_ceiling_stops_when_governance_not_taken(monkeypatch):
+def test_ollama_measure_ceiling_treats_absent_floor_as_non_fit(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
     monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [])
-    with pytest.raises(RuntimeError, match="not resident after load"):
+    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    assert best is None
+    assert points == [{"context": 2048, "fit": False}]
+
+
+def test_ollama_measure_ceiling_preserves_lower_fit_when_previous_runner_remains(monkeypatch):
+    state = {"ctx": 0}
+
+    def create(_probe, _model, ctx):
+        state["ctx"] = ctx
+        return True
+
+    monkeypatch.setattr(cli.ollama, "create", create)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda name: (
+        "a" * 64 if name == "base" else ("b" if state["ctx"] == 2048 else "c") * 64
+    ))
+    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
+        "name": "probe:latest", "digest": "b" * 64, "context_length": 2048,
+        "size": 10, "size_vram": 10,
+    }])
+
+    best, points = cli._ollama_measure_ceiling(
+        "base", 4096, "probe",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        provenance={},
+    )
+
+    assert best == 2048
+    assert points == [
+        {"context": 2048, "fit": True, "size": 10, "size_vram": 10},
+        {"context": 4096, "fit": False},
+    ]
+
+
+def test_ollama_measure_ceiling_rejects_unexpected_nonempty_residency(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
+    monkeypatch.setattr(cli.ollama, "load", lambda p, **_k: {})
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
+        "name": "pr:latest", "context_length": 1024, "size": 10, "size_vram": 10,
+    }])
+    with pytest.raises(RuntimeError, match="strict admission"):
         cli._ollama_measure_ceiling("m", 2048, "pr")
 
 

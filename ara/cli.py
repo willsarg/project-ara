@@ -2611,6 +2611,7 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
     (``size_vram >= size``). KV grows monotonically, so the first spill/failure ends the ramp.
     Returns ``(best_ctx | None, points)``. Spec 2026-07-04-characterize-through-ollama-ramp."""
     best, points = None, []
+    previous_context, previous_digest = None, None
     for ctx in _ollama_ramp_contexts(max_ctx):
         if (base_artifact_id is not None
                 and _ollama_artifact_id(model) != base_artifact_id):
@@ -2637,6 +2638,15 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
             processes, allowed_name=probe, allowed_digest=expected_digest,
             allowed_context=ctx, require_target=True)
         if residency_error is not None:
+            previous_runner_remains = (
+                previous_context is not None
+                and _ollama_residency_error(
+                    processes, allowed_name=probe, allowed_digest=previous_digest,
+                    allowed_context=previous_context, require_target=True) is None
+            )
+            if processes == [] or previous_runner_remains:
+                points.append({"context": ctx, "fit": False})
+                break
             raise RuntimeError(residency_error)
         process = processes[0]
         size, vram = process.size_bytes, process.size_vram_bytes
@@ -2645,6 +2655,7 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
         if not fit:                                   # hit/failed to verify the wall — stop safely
             break
         best = ctx
+        previous_context, previous_digest = ctx, expected_digest
     return best, points
 
 
