@@ -4098,7 +4098,24 @@ def _local_ollama_model(name, **fields):
         name=name, format="gguf", capabilities=("completion",), **fields)
 
 
+def _wire_runtime_authority(monkeypatch, *, issue=None):
+    def authority(endpoint):
+        return cli.ollama.OllamaRuntimeAuthority(
+            endpoint=endpoint,
+            server_version="0.30.10",
+            server_instance_id="42:1234.500000:/usr/bin/ollama",
+            listener_pid=42,
+            listener_bind_host="127.0.0.1",
+            configured_num_parallel=(1 if issue is None else None),
+            configured_num_parallel_authority=(
+                "exact_version_default" if issue is None else None),
+            issue=issue,
+        )
+    monkeypatch.setattr(cli.ollama, "runtime_authority", authority)
+
+
 def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
+    _wire_runtime_authority(monkeypatch)
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "ps", lambda t=2.0: [])
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
@@ -4385,6 +4402,7 @@ def test_characterize_ollama_records_none_when_it_spills(store, monkeypatch, mak
 
 
 def test_characterize_ollama_not_serving(make_console, monkeypatch):
+    _wire_runtime_authority(monkeypatch, issue="server_unreachable")
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: None)
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
@@ -4402,6 +4420,7 @@ def test_characterize_ollama_refuses_non_loopback_before_contact(make_console, m
 
 
 def test_characterize_ollama_tags_unreachable(make_console, monkeypatch):
+    _wire_runtime_authority(monkeypatch)
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: None)
     monkeypatch.setattr(cli.ollama, "inventory", lambda t=2.0: None)
@@ -4418,6 +4437,7 @@ def test_characterize_ollama_not_in_store(make_console, monkeypatch):
 
 
 def test_characterize_ollama_refuses_cloud_model_before_load(make_console, monkeypatch):
+    _wire_runtime_authority(monkeypatch)
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.ollama, "version", lambda *_a, **_k: "1.0")
     monkeypatch.setattr(cli.ollama, "inventory", lambda *_a, **_k: [
@@ -7486,6 +7506,8 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
     """Wire render_serve's Ollama + db seams. ``names=None`` ⇒ tags() unreachable;
     ``ps_rows`` is what /api/ps returns after load (set per-test for the verify branches).
     ``pull_ok`` is ollama.pull's result; ``show``/``size`` feed the estimated-ceiling fallback."""
+    _wire_runtime_authority(
+        monkeypatch, issue=("server_unreachable" if version is None else None))
     pulled = set()
 
     def pull(n, timeout=600.0):
@@ -7588,6 +7610,7 @@ def test_serve_refuses_when_tags_unreachable(make_console, monkeypatch):
 
 
 def test_serve_refuses_cloud_model_before_artifact_or_load(make_console, monkeypatch):
+    _wire_runtime_authority(monkeypatch)
     monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
     monkeypatch.setattr(cli.ollama, "version", lambda *_a, **_k: "1.0")
     monkeypatch.setattr(cli.ollama, "inventory", lambda *_a, **_k: [
@@ -8557,6 +8580,37 @@ def test_ollama_governed_endpoint_rejects_ambiguous_configuration(monkeypatch):
 
     assert endpoint.scope == "unknown" and endpoint.url is None
     assert "invalid or ambiguous" in error
+
+
+@pytest.mark.parametrize(("issue", "message"), [
+    ("listener_unattributed", "attribute"),
+    ("listener_ambiguous", "ambiguous"),
+    ("listener_not_ollama", "another process"),
+    ("server_unreachable", "isn't serving"),
+    ("process_environment_unavailable", "configured process inputs"),
+    ("parallelism_unknown", "parallelism is unknown"),
+    ("parallelism_not_one", "parallelism of one"),
+    ("future_issue", "authority is incomplete"),
+])
+def test_ollama_runtime_authority_error_is_plain_and_fail_closed(
+        monkeypatch, issue, message):
+    _wire_runtime_authority(monkeypatch, issue=issue)
+    endpoint = cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback")
+
+    assert message in cli._ollama_runtime_authority_error(endpoint)
+
+
+def test_characterize_ollama_refuses_display_only_runtime_before_inventory(
+        make_console, monkeypatch):
+    _wire_runtime_authority(monkeypatch, issue="listener_not_ollama")
+    monkeypatch.setattr(
+        cli.ollama, "version", lambda *_a, **_k: pytest.fail("contacted proxy endpoint"))
+    monkeypatch.setattr(
+        cli.ollama, "inventory", lambda *_a, **_k: pytest.fail("read proxy inventory"))
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    assert "another process" in buf.getvalue()
 
 
 def test_ollama_safe_ceiling_requires_matching_manifest_artifact(monkeypatch):

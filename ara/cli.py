@@ -2523,12 +2523,41 @@ _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 def _ollama_governed_endpoint() -> tuple[ollama.OllamaEndpoint, str | None]:
     """Return configured endpoint authority and any initial local-governance refusal."""
     endpoint = ollama.endpoint_authority()
-    if endpoint.scope == "loopback":
-        return endpoint, None
     if endpoint.scope == "unknown":
         return endpoint, "Ollama's configured endpoint is invalid or ambiguous"
-    return endpoint, ("governed Ollama operations require a local loopback endpoint; "
-                      f"the configured endpoint is {endpoint.scope}")
+    if endpoint.scope != "loopback":
+        return endpoint, ("governed Ollama operations require a local loopback endpoint; "
+                          f"the configured endpoint is {endpoint.scope}")
+    return endpoint, None
+
+
+def _ollama_runtime_authority_error(endpoint: ollama.OllamaEndpoint) -> str | None:
+    """Return why a loopback Ollama is display-only, or ``None`` when it is authoritative."""
+    authority = ollama.runtime_authority(endpoint)
+    errors = {
+        "listener_unattributed": (
+            "ARA couldn't attribute the local Ollama listener; detection remains available, "
+            "but governed operations require a directly owned Ollama process"),
+        "listener_ambiguous": (
+            "the local Ollama port has ambiguous process ownership; refusing governed work"),
+        "listener_not_ollama": (
+            "the loopback endpoint is owned by another process, not Ollama; refusing a proxy as "
+            "runtime authority"),
+        "server_unreachable": (
+            "Ollama isn't serving on its directly attributed listener"),
+        "process_environment_unavailable": (
+            "ARA can identify the Ollama server, but cannot read its configured process inputs; "
+            "detection remains available, governed operations do not"),
+        "parallelism_unknown": (
+            "Ollama's configured parallelism is unknown for this exact server version; "
+            "detection remains available, governed operations do not"),
+        "parallelism_not_one": (
+            "initial governed Ollama support requires configured maximum parallelism of one"),
+    }
+    if authority.issue is not None:
+        return errors.get(
+            authority.issue, "Ollama runtime authority is incomplete; refusing governed work")
+    return None
 
 
 def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None) -> str | None:
@@ -2695,8 +2724,8 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     endpoint, endpoint_error = _ollama_governed_endpoint()
     if endpoint_error is not None:
         return err(endpoint_error)
-    if ollama.version() is None:
-        return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
+    if authority_error := _ollama_runtime_authority_error(endpoint):
+        return err(authority_error)
     models = ollama.inventory()
     if models is None:
         return err("couldn't list Ollama models — is the server reachable?")
@@ -3046,10 +3075,10 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     if model is not None and (invalid := validate_identity(model)) is not None:
         return invalid
 
-    # 1. liveness — honest about a server that isn't there (Rule #3)
-    if ollama.version() is None:
-        return err("Ollama isn't serving — start it with `ollama serve` (or set OLLAMA_HOST).")
+    if authority_error := _ollama_runtime_authority_error(endpoint_authority):
+        return err(authority_error)
 
+    # 1. liveness was established by the attributed runtime-authority check above.
     models = ollama.inventory()
     if models is None:
         return err("couldn't list Ollama models — is the server reachable?")

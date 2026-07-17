@@ -688,6 +688,18 @@ def test_mlx_serve_sigterm_unwind_cleans_activity(
 
 
 def _wire_ollama_serve(monkeypatch, *, isatty=False):
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority",
+        lambda endpoint: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=endpoint,
+            server_version="0.30.10",
+            server_instance_id="42:1234.500000:/usr/bin/ollama",
+            listener_pid=42,
+            listener_bind_host="127.0.0.1",
+            configured_num_parallel=1,
+            configured_num_parallel_authority="exact_version_default",
+        ),
+    )
     monkeypatch.setattr(cli.ollama, "version", lambda: "1.0")
     monkeypatch.setattr(cli.ollama, "ps", lambda _timeout=2.0: [])
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model"])

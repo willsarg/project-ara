@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
 """Thin Ollama client — liveness probe. Spec 2026-06-26-detect-ollama-liveness."""
+from types import SimpleNamespace
+
+import pytest
+
 from ara import ollama
 
 
@@ -59,6 +63,234 @@ def test_endpoint_authority_fails_closed_on_ambiguous_urls():
 def test_endpoint_authority_does_not_trust_loopback_lookalikes():
     assert ollama.endpoint_authority("http://127.0.0.2:11434").scope == "loopback"
     assert ollama.endpoint_authority("http://localhost.example:11434").scope == "remote"
+
+
+# --------------------------------------------------------------------------- #
+# local runtime authority — direct listener + exact daemon configuration
+# --------------------------------------------------------------------------- #
+def _listener(*, pid=42, host="127.0.0.1", name="ollama", executable="/usr/bin/ollama",
+              command=("ollama", "serve"), environment=(), environment_readable=True):
+    return ollama.OllamaListener(
+        pid=pid,
+        create_time=1234.5,
+        bind_host=host,
+        process_name=name,
+        executable=executable,
+        command=command,
+        configured_inputs=environment,
+        environment_readable=environment_readable,
+    )
+
+
+def test_runtime_authority_attests_direct_listener_and_exact_version_default(monkeypatch):
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", "9")  # the caller shell is not daemon evidence
+    monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port: [_listener()])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: "0.30.10")
+
+    authority = ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+
+    assert authority.server_instance_id == "42:1234.500000:/usr/bin/ollama"
+    assert authority.server_version == "0.30.10"
+    assert authority.configured_num_parallel == 1
+    assert authority.configured_num_parallel_authority == "exact_version_default"
+    assert authority.issue is None
+
+
+def test_runtime_authority_prefers_observed_process_input_over_version_default(monkeypatch):
+    listener = _listener(
+        environment=(("OLLAMA_NUM_PARALLEL", "2"), ("OLLAMA_KV_CACHE_TYPE", "q8_0")))
+    monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port: [listener])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: "99.0.0")
+
+    authority = ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://localhost:11434", "loopback"))
+
+    assert authority.configured_inputs == listener.configured_inputs
+    assert authority.configured_num_parallel == 2
+    assert authority.configured_num_parallel_authority == "process_environment"
+    assert authority.issue == "parallelism_not_one"
+
+
+@pytest.mark.parametrize("version", ["0.8.0", "0.9.7-dev", "0.32.2", "not-a-version"])
+def test_runtime_authority_fails_closed_when_unset_default_is_not_verified(
+        monkeypatch, version):
+    monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port: [_listener()])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: version)
+
+    authority = ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+
+    assert authority.configured_num_parallel is None
+    assert authority.configured_num_parallel_authority is None
+    assert authority.issue == "parallelism_unknown"
+
+
+@pytest.mark.parametrize("raw", ["", "invalid", "-1", "1.5"])
+def test_runtime_authority_fails_closed_on_invalid_explicit_parallelism(monkeypatch, raw):
+    listener = _listener(environment=(("OLLAMA_NUM_PARALLEL", raw),))
+    monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port: [listener])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: "0.30.10")
+
+    authority = ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+
+    assert authority.configured_num_parallel is None
+    assert authority.issue == "parallelism_unknown"
+
+
+def test_runtime_authority_rejects_proxy_ambiguous_and_wildcard_listeners(monkeypatch):
+    monkeypatch.setattr(ollama, "version", lambda *_a, **_k: pytest.fail("contacted non-Ollama"))
+    endpoint = ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback")
+
+    for listeners, issue in (
+        ([_listener(name="caddy", executable="/usr/bin/caddy", command=("caddy",))],
+         "listener_not_ollama"),
+        ([_listener(), _listener(pid=43)], "listener_ambiguous"),
+        ([_listener(host="0.0.0.0")], "listener_unattributed"),
+        ([], "listener_unattributed"),
+    ):
+        monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port, rows=listeners: rows)
+        assert ollama.runtime_authority(endpoint).issue == issue
+
+
+def test_runtime_authority_reports_inaccessible_process_environment(monkeypatch):
+    monkeypatch.setattr(
+        ollama, "_local_tcp_listeners", lambda port: [_listener(environment_readable=False)])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: "0.30.10")
+
+    authority = ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+
+    assert authority.server_instance_id is not None
+    assert authority.issue == "process_environment_unavailable"
+
+
+def test_runtime_authority_rejects_non_loopback_or_unreachable_server(monkeypatch):
+    monkeypatch.setattr(
+        ollama, "_local_tcp_listeners", lambda port: pytest.fail("inspected remote processes"))
+    assert ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://box.local:11434", "remote")).issue == "endpoint_not_loopback"
+
+    monkeypatch.setattr(ollama, "_local_tcp_listeners", lambda port: [_listener()])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: None)
+    assert ollama.runtime_authority(
+        ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback")).issue == "server_unreachable"
+
+
+def test_local_tcp_listeners_isolates_process_failures_and_reads_whitelisted_config(monkeypatch):
+    listening = SimpleNamespace(
+        status=ollama.psutil.CONN_LISTEN,
+        laddr=SimpleNamespace(ip="127.0.0.1", port=11434),
+    )
+    wrong_status = SimpleNamespace(status="ESTABLISHED", laddr=listening.laddr)
+    wrong_port = SimpleNamespace(
+        status=ollama.psutil.CONN_LISTEN,
+        laddr=SimpleNamespace(ip="127.0.0.1", port=9999),
+    )
+
+    class Process:
+        def __init__(self, pid, connections, *, fail_connections=False, fail_identity=False,
+                     fail_environment=False):
+            self.pid = pid
+            self._connections = connections
+            self.fail_connections = fail_connections
+            self.fail_identity = fail_identity
+            self.fail_environment = fail_environment
+
+        def net_connections(self, kind):
+            assert kind == "tcp"
+            if self.fail_connections:
+                raise ollama.psutil.AccessDenied(self.pid)
+            return self._connections
+
+        def name(self):
+            if self.fail_identity:
+                raise ollama.psutil.NoSuchProcess(self.pid)
+            return "ollama"
+
+        def exe(self):
+            return "/opt/ollama"
+
+        def cmdline(self):
+            return ["ollama", "serve"]
+
+        def create_time(self):
+            return 10.25
+
+        def environ(self):
+            if self.fail_environment:
+                raise ollama.psutil.AccessDenied(self.pid)
+            return {
+                "OLLAMA_NUM_PARALLEL": "1",
+                "OLLAMA_KV_CACHE_TYPE": "q8_0",
+                "UNRELATED_SECRET": "not captured",
+                3: "ignored",
+                "OLLAMA_CONTEXT_LENGTH": 7,
+            }
+
+    class LegacyProcess(Process):
+        net_connections = None
+
+        def connections(self, kind):
+            assert kind == "tcp"
+            return self._connections
+
+    processes = [
+        Process(1, [], fail_connections=True),
+        Process(2, [wrong_status, wrong_port]),
+        Process(3, [listening], fail_identity=True),
+        Process(4, [listening], fail_environment=True),
+        Process(5, [listening]),
+        LegacyProcess(6, [listening]),
+    ]
+    monkeypatch.setattr(ollama.psutil, "process_iter", lambda: processes)
+
+    listeners = ollama._local_tcp_listeners(11434)
+
+    assert [listener.pid for listener in listeners] == [4, 5, 6]
+    assert listeners[0].environment_readable is False
+    assert listeners[1].configured_inputs == (
+        ("OLLAMA_NUM_PARALLEL", "1"), ("OLLAMA_KV_CACHE_TYPE", "q8_0"))
+
+
+def test_configured_inputs_normalizes_keys_only_for_windows_semantics():
+    environment = {"ollama_num_parallel": "1", "OLLAMA_VULKAN": "true"}
+    assert ollama._configured_inputs(environment, case_insensitive=False) == (
+        ("OLLAMA_VULKAN", "true"),)
+    assert ollama._configured_inputs(environment, case_insensitive=True) == (
+        ("OLLAMA_NUM_PARALLEL", "1"), ("OLLAMA_VULKAN", "true"))
+
+
+def test_listener_identity_fallbacks_and_non_ip_bind():
+    command_only = _listener(name="", executable="", command=("ollama.exe",))
+    name_only = _listener(name="ollama", executable="", command=())
+    unrelated = _listener(name="caddy", executable="", command=())
+
+    assert ollama._is_ollama_listener(command_only)
+    assert ollama._is_ollama_listener(name_only)
+    assert not ollama._is_ollama_listener(unrelated)
+    assert ollama._server_instance_id(command_only).endswith(":ollama.exe")
+    assert ollama._server_instance_id(name_only).endswith(":ollama")
+    assert not ollama._is_loopback_address("localhost")
+
+
+@pytest.mark.parametrize(("url", "expected_port"), [
+    ("http://127.0.0.1", 80),
+    ("https://127.0.0.1", 443),
+])
+def test_runtime_authority_uses_scheme_default_port_and_implicit_endpoint(
+        monkeypatch, url, expected_port):
+    endpoint = ollama.OllamaEndpoint(url, "loopback")
+    monkeypatch.setattr(ollama, "endpoint_authority", lambda: endpoint)
+    seen = []
+    monkeypatch.setattr(
+        ollama, "_local_tcp_listeners",
+        lambda port: seen.append(port) or [_listener()])
+    monkeypatch.setattr(ollama, "version", lambda timeout=0.5: "v0.30.10")
+
+    assert ollama.runtime_authority().issue is None
+    assert seen == [expected_port]
 
 
 # --------------------------------------------------------------------------- #
