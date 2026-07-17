@@ -2069,6 +2069,57 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     return 0
 
 
+_OLLAMA_BENCHMARK_METRIC_NAMES = frozenset({
+    "prompt_tokens", "completion_tokens", "total_duration_ns", "load_duration_ns",
+    "prompt_eval_duration_ns", "eval_duration_ns",
+})
+
+
+def _ollama_backend_for_placement(placement: str) -> str:
+    return {
+        "cpu": "cpu",
+        "unified": "apple",
+        "accelerator": "cuda",
+        "partial_offload": "cuda",
+    }[placement]
+
+
+def _ollama_benchmark_policy(record: ollama.OllamaModel, max_tokens: int) -> dict:
+    return {
+        "api": "/api/generate",
+        "raw": False,
+        "think": "thinking" in record.capabilities,
+        "template": "model_default",
+        "truncate": False,
+        "shift": False,
+        "temperature": 0.0,
+        "seed": 0,
+        "max_tokens": max_tokens,
+    }
+
+
+def _ollama_benchmark_target(
+    authority: ollama.OllamaRuntimeAuthority,
+    record: ollama.OllamaModel,
+    config: dict,
+    backend: str,
+    artifact_id: str,
+) -> dict:
+    config_digest = hashlib.sha256(json.dumps(
+        config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "runtime": "ollama",
+        "model": record.name,
+        "artifact_id": artifact_id,
+        "endpoint_authority": authority.endpoint.url,
+        "runtime_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "backend": backend,
+        "placement": config.get("placement"),
+        "config_sha256": config_digest,
+    }
+
+
 class _OllamaBenchmarkBackend:
     """Backend-shaped adapter whose execution stays inside ARA's Ollama governance boundary."""
 
@@ -2132,12 +2183,7 @@ def _ollama_benchmark_plan(model: str, ctx: int | None) -> tuple[dict | None, st
     config = row["config"]
     artifact_id = row["artifact_id"]
     placement = config["placement"]
-    backend = {
-        "cpu": "cpu",
-        "unified": "apple",
-        "accelerator": "cuda",
-        "partial_offload": "cuda",
-    }[placement]
+    backend = _ollama_backend_for_placement(placement)
     return {
         "key": "ollama",
         "backend": backend,
@@ -2333,22 +2379,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
     effective_generation_cap = max_tokens if max_tokens is not None else 256
     ollama_policy = None
-    ollama_metric_names = frozenset({
-        "prompt_tokens", "completion_tokens", "total_duration_ns", "load_duration_ns",
-        "prompt_eval_duration_ns", "eval_duration_ns",
-    })
     if ollama_mode:
-        ollama_policy = {
-            "api": "/api/generate",
-            "raw": False,
-            "think": "thinking" in plan["record"].capabilities,
-            "template": "model_default",
-            "truncate": False,
-            "shift": False,
-            "temperature": 0.0,
-            "seed": 0,
-            "max_tokens": effective_generation_cap,
-        }
+        ollama_policy = _ollama_benchmark_policy(
+            plan["record"], effective_generation_cap)
     # Pre-fetch weights so CUDA/MLX benchmark uncached models on demand (like the GGUF engines),
     # instead of the worker refusing "model not found in HF cache" (#109).
     progress = (not as_json) and sys.stderr.isatty()
@@ -2435,7 +2468,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                             if ollama_mode:
                                 usage = r.get("usage")
                                 if (not isinstance(usage, dict)
-                                        or not set(usage).issubset(ollama_metric_names)
+                                        or not set(usage).issubset(
+                                            _OLLAMA_BENCHMARK_METRIC_NAMES)
                                         or any(
                                         type(value) is not int or value < 0
                                         for value in usage.values())):
@@ -2484,9 +2518,11 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     band_source = f" band={lo * 100:.0f}-{hi * 100:.0f}" if repeat > 1 else ""
     source = (f"{key} probe={n} ctx={safe} max_tokens={effective_generation_cap} "
               f"repeat={repeat}{band_source} ({model})")
+    ollama_target = None
     if ollama_mode:
-        config_digest = hashlib.sha256(json.dumps(
-            plan["config"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        ollama_target = _ollama_benchmark_target(
+            plan["authority"], plan["record"], plan["config"], backend, artifact_id)
+        config_digest = ollama_target["config_sha256"]
         policy_digest = hashlib.sha256(json.dumps(
             ollama_policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         source += (
@@ -2529,7 +2565,10 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
                                  probe_context=safe, generation_cap=effective_generation_cap,
                                  repeat_count=repeat, total_generations=total,
                                  run_scores=run_scores, artifact_id=artifact_id,
-                                 canonical_model_id=canonical_model_id)
+                                 canonical_model_id=canonical_model_id,
+                                 target=ollama_target, request_policy=ollama_policy,
+                                 runtime_metrics=(ollama_runtime_metrics
+                                                  if ollama_mode else None))
         con.commit()
 
     if as_json:
@@ -3518,9 +3557,48 @@ def _is_ara_ollama_derived(name: str) -> bool:
             and len(parts[1]) == 24 and all(char in "0123456789abcdef" for char in parts[1]))
 
 
+def _ollama_benchmark_evidence(
+    row: dict,
+    record: ollama.OllamaModel,
+    authority: ollama.OllamaRuntimeAuthority,
+    config: dict,
+) -> tuple[dict | None, str | None]:
+    """Validate one Ollama score against the exact target that would run now."""
+    evidence, warning = scoring.validate_measured_evidence(row)
+    if evidence is None:
+        return None, warning
+    if row.get("engine_key") != "ollama" or row.get("quant") != record.quantization:
+        return None, "invalid stored Ollama benchmark evidence"
+    artifact_id = (_OLLAMA_ARTIFACT_PREFIX + record.digest
+                   if record.digest is not None else None)
+    if row.get("artifact_id") != artifact_id:
+        return None, "Ollama benchmark artifact changed"
+    try:
+        backend = _ollama_backend_for_placement(config["placement"])
+    except (KeyError, TypeError):
+        return None, "Ollama benchmark target changed"
+    if row.get("backend") != backend:
+        return None, "Ollama benchmark target changed"
+    expected_target = _ollama_benchmark_target(
+        authority, record, config, backend, artifact_id)
+    if row.get("target") != expected_target:
+        return None, "Ollama benchmark target changed"
+    expected_policy = _ollama_benchmark_policy(record, row["generation_cap"])
+    if row.get("request_policy") != expected_policy:
+        return None, "Ollama benchmark request policy changed"
+    metrics = row.get("runtime_metrics")
+    if (not isinstance(metrics, dict)
+            or not set(metrics).issubset(_OLLAMA_BENCHMARK_METRIC_NAMES)
+            or any(type(value) is not int or value < 0 for value in metrics.values())):
+        return None, "invalid Ollama benchmark runtime metrics"
+    return evidence, None
+
+
 def _ollama_ranked_models(
     models: list[ollama.OllamaModel],
     authority: ollama.OllamaRuntimeAuthority,
+    *,
+    use_case: str | None = None,
 ) -> list[dict]:
     """Central Ollama recommendation result shared by model UX and bare ``serve``.
 
@@ -3535,6 +3613,9 @@ def _ollama_ranked_models(
         con = (stack.enter_context(db.connected_readonly())
                if db._db_path().is_file() else scratch)
         mk = profile.machine_key()
+        benchmark_rows = ({(row["model_id"], row["use_case"]): row
+                           for row in db.list_benchmark_results(con, mk)}
+                          if use_case is not None else {})
         ranked = []
         for record in models:
             if (_is_ara_ollama_derived(record.name)
@@ -3551,7 +3632,7 @@ def _ollama_ranked_models(
                 evidence_status = "display_only"
             else:
                 evidence_status = "missing"
-            ranked.append({
+            item = {
                 "model_id": record.name,
                 "artifact_id": (_OLLAMA_ARTIFACT_PREFIX + record.digest
                                 if record.digest is not None else None),
@@ -3568,10 +3649,31 @@ def _ollama_ranked_models(
                 "selection_eligible": reusable is not None,
                 "evidence_status": evidence_status,
                 "evidence_reason": assessment.reason,
-            })
+            }
+            if use_case is not None:
+                score = None
+                benchmark_warning = None
+                benchmark_row = benchmark_rows.get((record.name, use_case))
+                if benchmark_row is None:
+                    benchmark_warning = "no stored Ollama benchmark evidence"
+                elif assessment.reusable is None:
+                    benchmark_warning = "current Ollama characterization is not reusable"
+                else:
+                    measured, benchmark_warning = _ollama_benchmark_evidence(
+                        benchmark_row, record, authority, assessment.reusable["config"])
+                    if measured is not None:
+                        score = scoring.score_for(
+                            record.name, use_case,
+                            measured={(record.name, use_case): measured})
+                item["score"] = score
+                item["evidence_warning"] = benchmark_warning
+            ranked.append(item)
     return sorted(
         ranked,
         key=lambda item: (
+            use_case is not None and item["score"] is None,
+            -(item["score"].value
+              if use_case is not None and item["score"] is not None else 0.0),
             not item["selection_eligible"],
             -(item["safe_context"] if item["selection_eligible"]
               else item["estimated_context"] or -1),
@@ -3588,9 +3690,9 @@ def _render_recommend_ollama(
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
-    if use_case is not None:
-        return err("--use-case ranking is not yet available for the Ollama runtime; "
-                   "omit --use-case to rank certified completion artifacts")
+    if use_case is not None and use_case not in benchmark.USE_CASES:
+        return err(f"unknown use-case {use_case!r} — choose one of: "
+                   f"{', '.join(benchmark.USE_CASES)}")
     endpoint = ollama.endpoint_authority()
     if endpoint.url is None:
         return err("couldn't identify the configured Ollama endpoint")
@@ -3598,13 +3700,19 @@ def _render_recommend_ollama(
     if models is None:
         return err("couldn't list Ollama models — is the server reachable?")
     authority = _ollama_display_authority(endpoint)
-    ranked = _ollama_ranked_models(models, authority)
+    ranked = (_ollama_ranked_models(models, authority, use_case=use_case)
+              if use_case is not None else _ollama_ranked_models(models, authority))
     if as_json:
+        if use_case is not None:
+            ranked = [{**item, "score": (
+                asdict(item["score"]) if item["score"] is not None else None)}
+                      for item in ranked]
         print(json.dumps(ranked, indent=2))
         return 0
     c.emit()
-    c.emit(c.section("  RECOMMENDED OLLAMA MODELS")
-           + c.style("dim", "  (exact reusable evidence first)"))
+    sub = ("  (exact reusable evidence first)" if use_case is None else
+           f"  (for {use_case} — exact current Ollama measurements only)")
+    c.emit(c.section("  RECOMMENDED OLLAMA MODELS") + c.style("dim", sub))
     if not ranked:
         c.emit(c.style("dim", "  no local cached GGUF completion artifacts are supported"))
         c.emit()
@@ -3622,12 +3730,36 @@ def _render_recommend_ollama(
             role = "dim"
         if item["evidence_reason"] not in (None, "missing"):
             tail += f" ({item['evidence_reason'].replace('_', ' ')})"
+        if use_case is not None:
+            score = item["score"]
+            if score is None:
+                head = f"{use_case} unknown"
+            else:
+                head = f"{use_case} {score.value * 100:.0f}% ({score.tier})"
+                if score.refused_n or score.errored_n:
+                    partial = []
+                    denominator = f"/{score.total_generations}" if score.total_generations else ""
+                    if score.refused_n:
+                        partial.append(f"{score.refused_n}{denominator} refused")
+                    if score.errored_n:
+                        partial.append(f"{score.errored_n}{denominator} errored")
+                    head += f" [partial: {', '.join(partial)}]"
+                if score.sample_size is not None and score.sample_size < 100:
+                    head += f" [low-confidence n={score.sample_size}]"
+            if item["evidence_warning"]:
+                head += f" [{item['evidence_warning']}]"
+            tail = f"{head} · {tail}"
         quant = f" [{item['quantization']}]" if item["quantization"] else ""
         c.emit("  " + c.style("metric", item["model_id"])
                + c.style("dim", quant + "  →  ") + c.style(role, tail))
     eligible = sum(1 for item in ranked if item["selection_eligible"])
+    measured = (sum(1 for item in ranked if item["score"] is not None)
+                if use_case is not None else None)
     c.emit()
-    c.emit(c.style("dim", f"  {len(ranked)} supported local · {eligible} certified for selection"))
+    summary = f"  {len(ranked)} supported local · {eligible} certified for selection"
+    if measured is not None:
+        summary += f" · {measured} reusable {use_case} measurement"
+    c.emit(c.style("dim", summary))
     c.emit()
     return 0
 

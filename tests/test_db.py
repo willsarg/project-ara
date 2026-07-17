@@ -468,7 +468,10 @@ def test_benchmark_result_save_and_get_round_trips_all_fields(store):
         methodology_id="sha256:test-method",
         probe_context=4096, generation_cap=512, repeat_count=3,
         total_generations=300, run_scores=[0.7, 0.72, 0.74],
-        artifact_id="hf:org/model@abc", canonical_model_id="org/model")
+        artifact_id="hf:org/model@abc", canonical_model_id="org/model",
+        target={"runtime": "ollama", "artifact_id": "hf:org/model@abc"},
+        request_policy={"temperature": 0.0, "seed": 0},
+        runtime_metrics={"completion_tokens": 42})
     row = db.get_benchmark_result(store, "machine-abc", "org/model", "coding")
     assert row is not None
     assert row["machine_key"] == "machine-abc"
@@ -491,6 +494,14 @@ def test_benchmark_result_save_and_get_round_trips_all_fields(store):
     assert row["run_scores_json"] == "[0.7, 0.72, 0.74]"
     assert row["artifact_id"] == "hf:org/model@abc"
     assert row["canonical_model_id"] == "org/model"
+    assert row["target_json"] == (
+        '{"artifact_id":"hf:org/model@abc","runtime":"ollama"}')
+    assert row["request_policy_json"] == '{"seed":0,"temperature":0.0}'
+    assert row["runtime_metrics_json"] == '{"completion_tokens":42}'
+    assert row["target"] == {
+        "artifact_id": "hf:org/model@abc", "runtime": "ollama"}
+    assert row["request_policy"] == {"seed": 0, "temperature": 0.0}
+    assert row["runtime_metrics"] == {"completion_tokens": 42}
     assert row["tier"] == "measured"
     assert row["measured_at"]   # auto-filled timestamp
 
@@ -595,7 +606,8 @@ def test_migration_adds_benchmark_honesty_columns_to_old_schema(tmp_path, monkey
     cols = {r["name"] for r in con.execute("PRAGMA table_info(benchmark_results)")}
     assert {"refused_n", "errored_n", "probe_context", "generation_cap", "repeat_count",
             "total_generations", "run_scores_json", "artifact_id",
-            "canonical_model_id", "methodology_id"} <= cols
+            "canonical_model_id", "methodology_id", "target_json",
+            "request_policy_json", "runtime_metrics_json"} <= cols
     row = db.get_benchmark_result(con, "m", "org/model", "coding")
     assert row is not None and row["score"] == 0.5
     assert row["refused_n"] is None and row["errored_n"] is None
@@ -604,6 +616,18 @@ def test_migration_adds_benchmark_honesty_columns_to_old_schema(tmp_path, monkey
     assert row["run_scores_json"] is None
     assert row["artifact_id"] is None and row["canonical_model_id"] is None
     assert row["methodology_id"] is None
+    assert row["target"] is None and row["request_policy"] is None
+    assert row["runtime_metrics"] is None
+
+
+@pytest.mark.parametrize("raw", ["not-json", "[]", "null"])
+def test_benchmark_result_malformed_structured_json_is_not_decoded(store, raw):
+    db.save_benchmark_result(store, "m", "org/model", "coding", score=0.5, source="s")
+    store.execute(
+        "UPDATE benchmark_results SET target_json=? WHERE machine_key='m'", (raw,))
+    row = db.get_benchmark_result(store, "m", "org/model", "coding")
+    assert row["target_json"] == raw
+    assert row["target"] is None
 
 
 # --- canonical engine identity migration (user_version 2 -> 3) ---

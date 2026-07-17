@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     run_scores_json TEXT,
     artifact_id  TEXT,
     canonical_model_id TEXT,
+    target_json TEXT,
+    request_policy_json TEXT,
+    runtime_metrics_json TEXT,
     source       TEXT NOT NULL,
     measured_at  TEXT NOT NULL,
     PRIMARY KEY (machine_key, model_id, use_case)
@@ -141,6 +144,9 @@ def connect() -> sqlite3.Connection:
         ("artifact_id", "TEXT"),
         ("canonical_model_id", "TEXT"),
         ("methodology_id", "TEXT"),
+        ("target_json", "TEXT"),
+        ("request_policy_json", "TEXT"),
+        ("runtime_metrics_json", "TEXT"),
     ):
         if column not in bench_cols:
             con.execute(f"ALTER TABLE benchmark_results ADD COLUMN {column} {column_type}")  # noqa: S608
@@ -538,15 +544,19 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
                           total_generations: int | None = None,
                           run_scores: list[float] | None = None,
                           artifact_id: str | None = None,
-                          canonical_model_id: str | None = None) -> None:
+                          canonical_model_id: str | None = None,
+                          target: dict | None = None,
+                          request_policy: dict | None = None,
+                          runtime_metrics: dict | None = None) -> None:
     from ara.engine_identity import canonical_engine
     con.execute(
         "INSERT INTO benchmark_results "
         "(machine_key, model_id, use_case, engine_key, backend, base_model, quant, "
         "benchmark_id, methodology_id, tier, score, max_score, sample_size, refused_n, errored_n, "
         "probe_context, generation_cap, repeat_count, total_generations, run_scores_json, "
-        "artifact_id, canonical_model_id, source, measured_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "artifact_id, canonical_model_id, target_json, request_policy_json, "
+        "runtime_metrics_json, source, measured_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(machine_key, model_id, use_case) DO UPDATE SET "
         "engine_key=excluded.engine_key, backend=excluded.backend, "
         "base_model=excluded.base_model, quant=excluded.quant, "
@@ -558,13 +568,34 @@ def save_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: s
         "repeat_count=excluded.repeat_count, total_generations=excluded.total_generations, "
         "run_scores_json=excluded.run_scores_json, "
         "artifact_id=excluded.artifact_id, canonical_model_id=excluded.canonical_model_id, "
+        "target_json=excluded.target_json, request_policy_json=excluded.request_policy_json, "
+        "runtime_metrics_json=excluded.runtime_metrics_json, "
         "source=excluded.source, measured_at=excluded.measured_at",
         (machine_key, model_id, use_case, canonical_engine(engine_key), backend, base_model, quant,
          benchmark_id, methodology_id, tier, score, max_score, sample_size, refused_n, errored_n,
          probe_context, generation_cap, repeat_count, total_generations,
          json.dumps(run_scores) if run_scores is not None else None,
-         artifact_id, canonical_model_id, source, _now()))
+         artifact_id, canonical_model_id,
+         _compact_json(target), _compact_json(request_policy), _compact_json(runtime_metrics),
+         source, _now()))
     con.commit()
+
+
+def _compact_json(value: dict | None) -> str | None:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"))
+            if value is not None else None)
+
+
+def _benchmark_row(row: sqlite3.Row) -> dict:
+    result = dict(row)
+    for name in ("target", "request_policy", "runtime_metrics"):
+        raw = result.get(f"{name}_json")
+        try:
+            decoded = json.loads(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            decoded = None
+        result[name] = decoded if isinstance(decoded, dict) else None
+    return result
 
 
 def get_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: str,
@@ -572,7 +603,7 @@ def get_benchmark_result(con: sqlite3.Connection, machine_key: str, model_id: st
     row = con.execute(
         "SELECT * FROM benchmark_results WHERE machine_key=? AND model_id=? AND use_case=?",
         (machine_key, model_id, use_case)).fetchone()
-    return dict(row) if row else None
+    return _benchmark_row(row) if row else None
 
 
 def list_benchmark_results(con: sqlite3.Connection, machine_key: str) -> list[dict]:
@@ -580,4 +611,4 @@ def list_benchmark_results(con: sqlite3.Connection, machine_key: str) -> list[di
     rows = con.execute(
         "SELECT * FROM benchmark_results WHERE machine_key=? ORDER BY model_id, use_case",
         (machine_key,)).fetchall()
-    return [dict(r) for r in rows]
+    return [_benchmark_row(r) for r in rows]

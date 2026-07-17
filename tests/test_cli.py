@@ -9795,7 +9795,6 @@ def test_ollama_recommendation_separates_certified_selection_from_estimates(
 
 
 @pytest.mark.parametrize(("case", "as_json"), [
-    ("use_case", True),
     ("endpoint", False),
     ("inventory", True),
 ])
@@ -9808,11 +9807,17 @@ def test_ollama_recommendation_reports_read_and_contract_failures(
     monkeypatch.setattr(
         cli.ollama, "inventory", lambda: None if case == "inventory" else [])
     c, buf = make_console()
-    use_case = "coding" if case == "use_case" else None
     assert cli.render_recommend(
-        c, engine="ollama", use_case=use_case, as_json=as_json) == 1
+        c, engine="ollama", as_json=as_json) == 1
     output = capsys.readouterr().out if as_json else buf.getvalue()
     assert output
+
+
+def test_ollama_recommendation_rejects_nonbenchmark_use_case(
+        make_console, monkeypatch):
+    c, buf = make_console()
+    assert cli.render_recommend(c, engine="ollama", use_case="chat") == 1
+    assert "unknown use-case 'chat'" in buf.getvalue()
 
 
 def test_ollama_recommendation_text_labels_all_evidence_tiers(make_console, monkeypatch):
@@ -9881,6 +9886,233 @@ def test_ollama_ranked_models_preserves_display_only_weak_identity(
         "evidence_status": "display_only",
         "evidence_reason": "artifact_mismatch",
     }]
+
+
+def _ollama_measured_row(record, *, score, use_case, authority, config):
+    probe_n = len(cli.benchmark.load_probe(use_case))
+    artifact_id = "ollama-manifest-sha256:" + record.digest
+    backend = cli._ollama_backend_for_placement(config["placement"])
+    return _measured_row(
+        record.name, use_case=use_case, score=score,
+        source=f"ollama probe={probe_n} ({record.name})",
+        engine_key="ollama", backend=backend, base_model=record.name,
+        quant=record.quantization, artifact_id=artifact_id,
+        canonical_model_id=record.name,
+        probe_context=4096, generation_cap=256, repeat_count=1,
+        total_generations=probe_n, run_scores_json=json.dumps([score]),
+        target=cli._ollama_benchmark_target(
+            authority, record, config, backend, artifact_id),
+        request_policy=cli._ollama_benchmark_policy(record, 256),
+        runtime_metrics={"completion_tokens": 12},
+    )
+
+
+def test_ollama_use_case_ranking_consumes_only_exact_current_measurements(
+        monkeypatch, tmp_path):
+    authority = _pick_authority()
+    config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    stronger = _local_ollama_model(
+        "stronger:1", digest="a" * 64, quantization="Q4_K_M")
+    weaker = _local_ollama_model(
+        "weaker:1", digest="b" * 64, quantization="Q4_K_M")
+    rows = [
+        _ollama_measured_row(
+            stronger, score=0.9, use_case="extraction", authority=authority, config=config),
+        _ollama_measured_row(
+            weaker, score=0.4, use_case="extraction", authority=authority, config=config),
+    ]
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+    monkeypatch.setattr(
+        cli.db, "list_benchmark_results", lambda con, mk: rows)
+    reusable = {"safe_context": 4096, "config": config}
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            reusable, reusable, None),
+    )
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda *_a, **_k: None)
+
+    ranked = cli._ollama_ranked_models(
+        [weaker, stronger], authority, use_case="extraction")
+
+    assert [item["model_id"] for item in ranked] == ["stronger:1", "weaker:1"]
+    assert [item["score"].value for item in ranked] == [0.9, 0.4]
+    assert all(item["evidence_warning"] is None for item in ranked)
+
+
+@pytest.mark.parametrize(("field", "value", "warning"), [
+    ("source", "", "invalid stored benchmark evidence"),
+    ("engine_key", "mlx", "invalid stored Ollama benchmark evidence"),
+    ("quant", "Q8_0", "invalid stored Ollama benchmark evidence"),
+    ("artifact_id", "ollama-manifest-sha256:" + "b" * 64,
+     "Ollama benchmark artifact changed"),
+    ("backend", "cpu", "Ollama benchmark target changed"),
+    ("target", {"runtime": "ollama"}, "Ollama benchmark target changed"),
+    ("request_policy", {"temperature": 1.0}, "Ollama benchmark request policy changed"),
+    ("runtime_metrics", None, "invalid Ollama benchmark runtime metrics"),
+    ("runtime_metrics", {"unknown": 1}, "invalid Ollama benchmark runtime metrics"),
+    ("runtime_metrics", {"completion_tokens": -1},
+     "invalid Ollama benchmark runtime metrics"),
+    ("runtime_metrics", {"completion_tokens": True},
+     "invalid Ollama benchmark runtime metrics"),
+])
+def test_ollama_use_case_ranking_downgrades_nonreusable_measurement(
+        monkeypatch, tmp_path, field, value, warning):
+    authority = _pick_authority()
+    config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    record = _local_ollama_model(
+        "changed:1", digest="a" * 64, quantization="Q4_K_M")
+    row = _ollama_measured_row(
+        record, score=0.9, use_case="extraction", authority=authority, config=config)
+    row[field] = value
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [row])
+    reusable = {"safe_context": 4096, "config": config}
+    monkeypatch.setattr(
+        cli.ollama_evidence, "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            reusable, reusable, None),
+    )
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda *_a, **_k: None)
+
+    item = cli._ollama_ranked_models(
+        [record], authority, use_case="extraction")[0]
+
+    assert item["score"] is None
+    assert item["evidence_warning"] == warning
+
+
+@pytest.mark.parametrize("config", [{}, None])
+def test_ollama_benchmark_evidence_rejects_invalid_current_config(config):
+    authority = _pick_authority()
+    valid_config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    record = _local_ollama_model(
+        "changed:1", digest="a" * 64, quantization="Q4_K_M")
+    row = _ollama_measured_row(
+        record, score=0.9, use_case="extraction", authority=authority,
+        config=valid_config)
+    assert cli._ollama_benchmark_evidence(row, record, authority, config) == (
+        None, "Ollama benchmark target changed")
+
+
+def test_ollama_benchmark_evidence_rejects_model_without_current_digest():
+    authority = _pick_authority()
+    config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    stored = _local_ollama_model(
+        "changed:1", digest="a" * 64, quantization="Q4_K_M")
+    current = _local_ollama_model("changed:1", quantization="Q4_K_M")
+    row = _ollama_measured_row(
+        stored, score=0.9, use_case="extraction", authority=authority, config=config)
+    assert cli._ollama_benchmark_evidence(row, current, authority, config) == (
+        None, "Ollama benchmark artifact changed")
+
+
+def test_ollama_use_case_ranking_labels_missing_and_uncertified_evidence(
+        monkeypatch, tmp_path):
+    authority = _pick_authority()
+    config = {"endpoint_authority": authority.endpoint.url, "placement": "unified"}
+    missing = _local_ollama_model("missing:1", digest="a" * 64)
+    display = _local_ollama_model("display:1", digest="b" * 64)
+    row = _ollama_measured_row(
+        display, score=0.9, use_case="extraction", authority=authority, config=config)
+    db_path = tmp_path / "evidence.sqlite"
+    db_path.touch()
+    monkeypatch.setattr(cli.db, "_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        cli.db, "connected_readonly", lambda: contextlib.nullcontext("stored"))
+    monkeypatch.setattr(cli.db, "list_benchmark_results", lambda _con, _mk: [row])
+
+    def assess(_con, _mk, record, _authority):
+        if record is display:
+            return cli.ollama_evidence.CharacterizationAssessment(
+                {"safe_context": 4096, "config": config}, None, "artifact_mismatch")
+        reusable = {"safe_context": 4096, "config": config}
+        return cli.ollama_evidence.CharacterizationAssessment(reusable, reusable, None)
+
+    monkeypatch.setattr(cli.ollama_evidence, "assess_characterization", assess)
+    monkeypatch.setattr(cli, "_ollama_estimated_ceiling", lambda *_a, **_k: None)
+    by_name = {item["model_id"]: item for item in cli._ollama_ranked_models(
+        [missing, display], authority, use_case="extraction")}
+    assert by_name["missing:1"]["evidence_warning"] == (
+        "no stored Ollama benchmark evidence")
+    assert by_name["display:1"]["evidence_warning"] == (
+        "current Ollama characterization is not reusable")
+    assert by_name["missing:1"]["score"] is None
+    assert by_name["display:1"]["score"] is None
+
+
+def test_ollama_use_case_recommendation_serializes_and_labels_measured_evidence(
+        make_console, monkeypatch, capsys):
+    score = cli.scoring.Score(
+        "measured", 0.75, "ollama probe", sample_size=30,
+        refused_n=2, errored_n=1, total_generations=30)
+    item = {
+        "model_id": "measured:1", "selection_eligible": True,
+        "safe_context": 8192, "estimated_context": None,
+        "evidence_status": "reusable", "evidence_reason": None,
+        "evidence_warning": None, "score": score, "quantization": "Q4_K_M",
+    }
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [object()])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(
+        cli, "_ollama_ranked_models", lambda *_args, **_kwargs: [item])
+
+    c, buf = make_console()
+    assert cli.render_recommend(c, engine="ollama", use_case="extraction") == 0
+    out = buf.getvalue()
+    assert "extraction 75% (measured)" in out
+    assert "partial: 2/30 refused, 1/30 errored" in out
+    assert "low-confidence n=30" in out
+
+    c, _ = make_console()
+    assert cli.render_recommend(
+        c, engine="ollama", use_case="extraction", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["score"]["value"] == 0.75
+
+
+def test_ollama_use_case_recommendation_labels_unknown_and_partial_shapes(
+        make_console, monkeypatch):
+    base = {
+        "selection_eligible": True, "safe_context": 8192,
+        "estimated_context": None, "evidence_status": "reusable",
+        "evidence_reason": None, "quantization": None,
+    }
+    ranked = [
+        {**base, "model_id": "unknown:1", "score": None,
+         "evidence_warning": "Ollama benchmark target changed"},
+        {**base, "model_id": "refused:1",
+         "score": cli.scoring.Score(
+             "measured", 0.5, "s", sample_size=100, refused_n=1, errored_n=0),
+         "evidence_warning": None},
+        {**base, "model_id": "errored:1",
+         "score": cli.scoring.Score(
+             "measured", 0.5, "s", sample_size=None, refused_n=0, errored_n=1,
+             total_generations=10),
+         "evidence_warning": None},
+        {**base, "model_id": "clean:1",
+         "score": cli.scoring.Score(
+             "measured", 0.5, "s", sample_size=100, refused_n=0, errored_n=0),
+         "evidence_warning": None},
+    ]
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [object()])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(
+        cli, "_ollama_ranked_models", lambda *_args, **_kwargs: ranked)
+    c, buf = make_console()
+    assert cli.render_recommend(c, engine="ollama", use_case="extraction") == 0
+    out = buf.getvalue()
+    assert "extraction unknown [Ollama benchmark target changed]" in out
+    assert "partial: 1 refused" in out
+    assert "partial: 1/10 errored" in out
 
 
 @pytest.mark.parametrize(("name", "expected"), [
@@ -10291,6 +10523,11 @@ def test_render_benchmark_ollama_uses_governed_base_model_and_canonical_scorer(
     assert saved["backend"] == "apple"
     assert saved["artifact_id"] == _SERVE_BASE_ARTIFACT
     assert saved["score"] == 1.0
+    assert saved["target"]["runtime"] == "ollama"
+    assert saved["target"]["artifact_id"] == _SERVE_BASE_ARTIFACT
+    assert saved["target"]["endpoint_authority"] == "http://127.0.0.1:11434"
+    assert saved["request_policy"] == _OLLAMA_BENCHMARK_POLICY
+    assert saved["runtime_metrics"] == {}
     assert "endpoint=http://127.0.0.1:11434" in saved["source"]
     output = buf.getvalue()
     assert "reasoning: 100% measured here" in output
