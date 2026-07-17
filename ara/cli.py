@@ -2687,9 +2687,9 @@ def _cleanup_ollama_model(name: str, *, label: str, delete: bool,
 
 def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int:
     """``ara characterize <model> --engine ollama``: ramp the model's residency through Ollama to
-    find and record its true measured safe ceiling (engine ``"ollama"``), instead of relying on
-    serve's self-heal which only ever records the one context it served at. Serve stays fast; this
-    is where the slow, thorough measurement lives (Will, 2026-07-04). Spec
+    find and record its true measured safe ceiling (engine ``"ollama"``). Serving from an estimated
+    ceiling never manufactures measured evidence; this is where the slow, thorough measurement
+    lives (Will, 2026-07-04). Spec
     2026-07-04-characterize-through-ollama-ramp."""
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
@@ -3264,20 +3264,6 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                 c.emit(c.style("warn", f"  interrupted setup cleanup failed: {cleanup}"))
         raise
 
-    # 5b. self-heal: we just loaded this model at `safe` ctx and verified it fits with NO spill —
-    # that is an empirical measurement, not a guess. Record it (engine "ollama") so the next serve
-    # reads a `measured` ceiling and skips the estimate. Only ever persist observed-good evidence:
-    # never a higher untested ceiling (Rule #1), never a measurement we already had (source
-    # "estimated" only), never on spill (no clean evidence). Rule #3: labelled measured because we
-    # measured it fits.
-    recorded_measured = False
-    if source == "estimated" and residency_verified and spilled is False:
-        with db.connected() as con:
-            db.save_characterization(con, profile.machine_key(), "ollama", model,
-                                     safe_context=safe, points=[{"context": safe, "fit": True}],
-                                     measured_at=None, artifact_id=base_artifact_id)
-        recorded_measured = True
-
     # 6. the handoff — connection info, then ARA exits (the model stays served)
     endpoint = endpoint_base + "/v1"
     if as_json:
@@ -3286,8 +3272,8 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                           "residency_verified": residency_verified,
                           "base_artifact_id": base_artifact_id,
                           "served_artifact_id": served_artifact_id,
-                          "auto_selected": auto_selected, "recorded_measured": recorded_measured,
-                          "stale_ceiling": stale_ceiling, "openai_base_url": endpoint}, indent=2))
+                          "auto_selected": auto_selected, "stale_ceiling": stale_ceiling,
+                          "openai_base_url": endpoint}, indent=2))
         return 0
     c.emit()
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
@@ -3295,8 +3281,6 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
     if spilled is True:
         c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
-    elif recorded_measured:
-        c.emit(c.style("dim", "  recorded a measured ceiling — future serves skip the estimate."))
     c.emit()
     return 0
 

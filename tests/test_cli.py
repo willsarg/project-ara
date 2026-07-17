@@ -8657,8 +8657,7 @@ def test_serve_zero_arg_with_engine_refuses(make_console, monkeypatch):
     assert "pass a model to use --engine" in buf.getvalue()
 
 
-# self-healing ceiling: an estimated serve that loads cleanly (no spill) records a `measured`
-# ceiling so the next serve skips the estimate. Spec 2026-07-04-ara-serve-self-healing-ceiling.
+# Serving from an estimated ceiling must not manufacture measured characterization evidence.
 def _wire_save_recorder(monkeypatch):
     saved = []
     monkeypatch.setattr(cli.db, "save_characterization",
@@ -8666,7 +8665,7 @@ def _wire_save_recorder(monkeypatch):
     return saved
 
 
-def test_serve_estimated_heals_to_measured(make_console, monkeypatch):
+def test_serve_estimated_does_not_persist_measured_evidence(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 100, "size_vram": 100}]                # no spill
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
@@ -8675,13 +8674,11 @@ def test_serve_estimated_heals_to_measured(make_console, monkeypatch):
     saved = _wire_save_recorder(monkeypatch)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b") == 0
-    assert saved == [{"engine": "ollama", "model": "qwen3:0.6b", "safe_context": 8192,
-                      "points": [{"context": 8192, "fit": True}], "measured_at": None,
-                      "artifact_id": "ollama-manifest-sha256:" + "a" * 64}]
-    assert "recorded a measured ceiling" in buf.getvalue()
+    assert saved == []
+    assert "recorded a measured ceiling" not in buf.getvalue()
 
 
-def test_serve_estimated_does_not_heal_on_spill(make_console, monkeypatch):
+def test_serve_estimated_with_spill_does_not_persist_measured_evidence(make_console, monkeypatch):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 200, "size_vram": 100}]                # spilled — no clean evidence
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
@@ -8693,7 +8690,7 @@ def test_serve_estimated_does_not_heal_on_spill(make_console, monkeypatch):
     assert saved == []                                      # never record an uncertain ceiling
 
 
-def test_serve_measured_does_not_reheal(make_console, monkeypatch):
+def test_serve_measured_does_not_rewrite_characterization(make_console, monkeypatch):
     _wire_serve(monkeypatch, characterization={"safe_context": 8192}, ps_rows=_SERVE_LOADED)
     saved = _wire_save_recorder(monkeypatch)
     c, _ = make_console()
@@ -8701,7 +8698,7 @@ def test_serve_measured_does_not_reheal(make_console, monkeypatch):
     assert saved == []                                      # already measured — nothing to heal
 
 
-def test_serve_estimated_heal_json_flag(make_console, monkeypatch, capsys):
+def test_serve_estimated_json_omits_recorded_measured_claim(make_console, monkeypatch, capsys):
     rows = [{"name": "qwen3-0.6b-ara:latest", "context_length": 8192,
              "size": 100, "size_vram": 100}]
     _wire_serve(monkeypatch, characterization=None, ps_rows=rows)
@@ -8710,7 +8707,7 @@ def test_serve_estimated_heal_json_flag(make_console, monkeypatch, capsys):
     _wire_save_recorder(monkeypatch)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", as_json=True) == 0
-    assert json.loads(capsys.readouterr().out)["recorded_measured"] is True
+    assert "recorded_measured" not in json.loads(capsys.readouterr().out)
 
 
 def test_serve_unknown_residency_is_refused_and_not_saved_as_measured(
