@@ -74,6 +74,7 @@ dev = [
     "mutmut>=3",
     "httpx>=0.27",
     "jsonschema>=4.26.0",
+    "pytest-xdist>=3",
 ]
 
 [tool.pytest.ini_options]

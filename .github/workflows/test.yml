@@ -8,8 +8,8 @@
 #   - workflow_dispatch: run it by hand from the Actions tab for on-demand cross-platform feedback.
 #
 # Hardening: read-only token, actions pinned to commit SHAs, checkout creds not persisted, locked
-# deps, per-job timeout. The run steps are single uv commands, so they work in bash (Linux/macOS)
-# and PowerShell (Windows) unchanged — no shell-specific syntax.
+# deps, per-job timeout. Four loadfile workers keep each OS bounded while avoiding needless serial
+# execution; the run steps remain portable between bash (Linux/macOS) and PowerShell (Windows).
 name: Shared · Test Suite (cross-OS)
 
 on:
@@ -38,4 +38,5 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --frozen --group dev
-      - run: uv run pytest         # unit suite + 100% coverage gate
+      - run: uv run pytest -n 4 --dist=loadfile --durations=25
+        # Unit suite + 100% coverage gate. Durations make future regressions visible in the log.

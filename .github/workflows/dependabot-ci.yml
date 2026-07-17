@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dependabot-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # The Python core, cross-OS. Delegated to the reusable workflow so a bump is gated by the exact
   # same suite the release pipeline runs.

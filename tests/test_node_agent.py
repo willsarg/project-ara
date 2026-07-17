@@ -1060,6 +1060,7 @@ def test_flush_posts_but_retains_spool_when_accepted_cleanup_is_impossible(
 def test_immediate_post_retains_spool_when_accepted_cleanup_is_impossible(
         tmp_path, monkeypatch):
     client = FakeClient([{"id": "j1", "kind": "run", "args": {}}])
+    sleeps = []
     monkeypatch.setattr(agent, "_quarantine_spool",
                         lambda _path: (_ for _ in ()).throw(OSError("rename denied")))
 
@@ -1069,10 +1070,13 @@ def test_immediate_post_retains_spool_when_accepted_cleanup_is_impossible(
         accepted.mkdir()
         return {"ok": True}
 
-    agent.run_loop(_cfg(), client=client, runner=runner, max_iterations=1)
+    agent.run_loop(
+        _cfg(), client=client, runner=runner, max_iterations=1, sleep=sleeps.append,
+    )
 
     assert client.posted and client.posted[0][0] == "j1"
     assert len(_spool_files(tmp_path)) == 1
+    assert sleeps == [5.0]
 
 
 def test_permanent_flush_rejection_retains_spool_when_accepted_cleanup_is_impossible(
