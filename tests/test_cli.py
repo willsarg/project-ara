@@ -4038,6 +4038,7 @@ def _local_ollama_model(name, **fields):
 
 def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
     monkeypatch.setattr(cli.ollama, "version", lambda t=0.5: "0.30")
+    monkeypatch.setattr(cli.ollama, "ps", lambda t=2.0: [])
     monkeypatch.setattr(cli.ollama, "tags", lambda t=2.0: ["qwen3:0.6b"] if in_store else [])
     monkeypatch.setattr(
         cli.ollama, "inventory",
