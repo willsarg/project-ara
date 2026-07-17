@@ -4359,12 +4359,25 @@ def test_cleanup_ollama_probe_refuses_retargeted_manifest(monkeypatch):
     assert "identity changed" in error and "refused" in error
 
 
-def test_cleanup_ollama_probe_deletes_exact_manifest_without_expiring_runner(monkeypatch):
-    calls = []
+def test_cleanup_ollama_probe_retains_exact_manifest_while_runner_is_resident(monkeypatch):
     monkeypatch.setattr(cli.ollama, "load",
                         lambda *_a, **_k: pytest.fail("expired shared runner"))
-    monkeypatch.setattr(cli.ollama, "ps", lambda: pytest.fail("polled shared runner"))
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(
+        cli.ollama,
+        "processes",
+        lambda: [cli.ollama.OllamaProcess(name="probe", digest="b" * 64)],
+    )
+    monkeypatch.setattr(
+        cli.ollama, "delete", lambda _name: pytest.fail("orphaned resident probe"))
+    assert cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64) is None
+
+
+def test_cleanup_ollama_probe_deletes_exact_manifest_when_not_resident(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "processes", lambda: [])
     monkeypatch.setattr(cli.ollama, "delete",
                         lambda name: calls.append(("delete", name)) or True)
     assert cli._cleanup_ollama_probe(
@@ -4374,8 +4387,26 @@ def test_cleanup_ollama_probe_deletes_exact_manifest_without_expiring_runner(mon
 
 def test_cleanup_ollama_probe_reports_delete_failure(monkeypatch):
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "processes", lambda: [])
     monkeypatch.setattr(cli.ollama, "delete", lambda name: False)
     assert "delete probe model" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+
+
+def test_cleanup_ollama_probe_refuses_unreadable_or_ambiguous_residency(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(
+        cli.ollama, "delete", lambda _name: pytest.fail("deleted ambiguous probe"))
+    monkeypatch.setattr(cli.ollama, "processes", lambda: None)
+    assert "inspect probe residency" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+
+    monkeypatch.setattr(
+        cli.ollama,
+        "processes",
+        lambda: [cli.ollama.OllamaProcess(name="probe", digest="c" * 64)],
+    )
+    assert "residency identity changed" in cli._cleanup_ollama_probe(
         "probe", "ollama-manifest-sha256:" + "b" * 64)
 
 
@@ -4493,6 +4524,10 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
         assert row["config"]["applicable_walls"] == ["system_unified"]
         assert row["config"]["configured_kv_cache_type"] == "q8_0"
         assert row["config"]["effective_kv_cache_type"] == "unknown"
+        assert row["config"]["characterization_probe_name"].endswith("-probe")
+        assert row["config"]["characterization_probe_artifact_id"] == (
+            "ollama-manifest-sha256:" + "a" * 64)
+        assert row["config"]["characterization_probe_context"] == 8192
 
 
 def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, capsys):
@@ -8133,6 +8168,142 @@ def test_run_ollama_reuses_exact_warm_target_without_a_warm_request(
         c, "qwen3:0.6b", prompt="Hi", engine="ollama", assume_yes=True) == 0
 
     assert [call[0] for call in calls] == ["generate"]
+
+
+def test_run_ollama_accepts_exact_retained_characterization_probe(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch, warm=True)
+    probe = cli._governed_name(
+        "qwen3:0.6b",
+        artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        context=8192,
+    ) + "-probe"
+    probe_artifact = "ollama-manifest-sha256:" + "b" * 64
+    config = {
+        "methodology": "ollama-physical-walls-v1",
+        "runtime_version": "0.30.10",
+        "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+        "placement": "unified",
+        "applicable_walls": ["system_unified"],
+        "resident_total_bytes": 100,
+        "resident_accelerator_bytes": 100,
+        "characterization_probe_name": probe,
+        "characterization_probe_artifact_id": probe_artifact,
+        "characterization_probe_context": 8192,
+    }
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "assess_characterization",
+        lambda *_args: cli.ollama_evidence.CharacterizationAssessment(
+            {
+                "safe_context": 4096,
+                "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+                "config": config,
+            },
+            {
+                "safe_context": 4096,
+                "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+                "config": config,
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        cli.ollama,
+        "inventory",
+        lambda: [
+            _local_ollama_model("qwen3:0.6b", digest="a" * 64),
+            _local_ollama_model(probe, digest="b" * 64),
+        ],
+    )
+    resident = cli.ollama.OllamaProcess(
+        name=probe,
+        digest="b" * 64,
+        size_bytes=100,
+        size_vram_bytes=100,
+        effective_context_per_request=4096,
+    )
+    monkeypatch.setattr(cli.ollama, "processes", lambda: [resident])
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", assume_yes=True) == 0
+
+    assert [call[0] for call in calls] == ["generate"]
+    assert calls[0][1] == "qwen3:0.6b"
+
+
+@pytest.mark.parametrize("config,models", [
+    ({}, []),
+    ({"characterization_probe_name": 42}, []),
+    ({"characterization_probe_name": "not-an-ara-probe"}, []),
+    ({
+        "characterization_probe_name": "ara-model-ctx4096-" + "1" * 24 + "-probe",
+        "characterization_probe_artifact_id": 42,
+    }, []),
+    ({
+        "characterization_probe_name": "ara-model-ctx4096-" + "1" * 24 + "-probe",
+        "characterization_probe_artifact_id": "wrong-prefix:" + "b" * 64,
+    }, []),
+    ({
+        "characterization_probe_name": "ara-model-ctx4096-" + "1" * 24 + "-probe",
+        "characterization_probe_artifact_id": "ollama-manifest-sha256:" + "b" * 64,
+    }, None),
+])
+def test_recorded_ollama_probe_target_rejects_incomplete_evidence(config, models):
+    assert cli._ollama_recorded_probe_target(
+        config, models,
+        model_name="qwen3:0.6b",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+    ) is None
+
+
+def test_recorded_ollama_probe_target_rejects_changed_inventory():
+    base_artifact = "ollama-manifest-sha256:" + "a" * 64
+    name = cli._governed_name(
+        "qwen3:0.6b", artifact_id=base_artifact, context=4096) + "-probe"
+    config = {
+        "characterization_probe_name": name,
+        "characterization_probe_artifact_id": "ollama-manifest-sha256:" + "b" * 64,
+        "characterization_probe_context": 4096,
+    }
+    assert cli._ollama_recorded_probe_target(
+        config, [], model_name="qwen3:0.6b", base_artifact_id=base_artifact) is None
+    assert cli._ollama_recorded_probe_target(
+        config, [_local_ollama_model(name, digest="c" * 64)],
+        model_name="qwen3:0.6b", base_artifact_id=base_artifact) is None
+
+
+def test_recorded_ollama_probe_target_requires_base_bound_name():
+    base_artifact = "ollama-manifest-sha256:" + "a" * 64
+    name = cli._governed_name(
+        "other:latest", artifact_id=base_artifact, context=8192) + "-probe"
+    config = {
+        "characterization_probe_name": name,
+        "characterization_probe_artifact_id": "ollama-manifest-sha256:" + "b" * 64,
+        "characterization_probe_context": 8192,
+    }
+    assert cli._ollama_recorded_probe_target(
+        config,
+        [_local_ollama_model(name, digest="b" * 64)],
+        model_name="qwen3:0.6b",
+        base_artifact_id=base_artifact,
+    ) is None
+
+
+@pytest.mark.parametrize("digest", ["b" * 63, "g" * 64])
+def test_recorded_ollama_probe_target_rejects_invalid_artifact_digest(digest):
+    base_artifact = "ollama-manifest-sha256:" + "a" * 64
+    name = cli._governed_name(
+        "qwen3:0.6b", artifact_id=base_artifact, context=4096) + "-probe"
+    config = {
+        "characterization_probe_name": name,
+        "characterization_probe_artifact_id": "ollama-manifest-sha256:" + digest,
+        "characterization_probe_context": 4096,
+    }
+    assert cli._ollama_recorded_probe_target(
+        config, [_local_ollama_model(name, digest=digest)],
+        model_name="qwen3:0.6b", base_artifact_id=base_artifact) is None
 
 
 def test_run_ollama_refuses_warm_target_with_drifted_placement_before_generation(

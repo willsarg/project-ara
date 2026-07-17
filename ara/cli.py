@@ -2706,6 +2706,10 @@ def _governed_ollama_request(
             if current_record is None or current_record.digest != record.digest:
                 raise _OllamaGovernanceError(
                     f"the Ollama manifest changed before the {label}")
+            probe_target = _ollama_recorded_probe_target(
+                config, current_models,
+                model_name=record.name, base_artifact_id=artifact_id)
+            alternate_targets = ((probe_target,) if probe_target is not None else ())
 
             processes = ollama.processes()
             residency_error = _ollama_residency_error(
@@ -2713,6 +2717,7 @@ def _governed_ollama_request(
                 allowed_name=record.name,
                 allowed_digest=expected_digest,
                 allowed_context=safe,
+                alternate_targets=alternate_targets,
             )
             if residency_error is not None:
                 raise _OllamaGovernanceError(residency_error)
@@ -2746,6 +2751,7 @@ def _governed_ollama_request(
                     allowed_name=record.name,
                     allowed_digest=expected_digest,
                     allowed_context=safe,
+                    alternate_targets=alternate_targets,
                     require_target=True,
                 )
                 if residency_error is not None:
@@ -2769,12 +2775,18 @@ def _governed_ollama_request(
             if final_record is None or final_record.digest != record.digest:
                 raise _OllamaGovernanceError(
                     f"the Ollama manifest changed during the {label}; no result shown")
+            final_probe_target = _ollama_recorded_probe_target(
+                config, final_models,
+                model_name=record.name, base_artifact_id=artifact_id)
+            final_alternate_targets = (
+                (final_probe_target,) if final_probe_target is not None else ())
             final_processes = ollama.processes()
             residency_error = _ollama_residency_error(
                 final_processes,
                 allowed_name=record.name,
                 allowed_digest=expected_digest,
                 allowed_context=safe,
+                alternate_targets=final_alternate_targets,
                 require_target=True,
             )
             if residency_error is not None:
@@ -3461,7 +3473,19 @@ def _ollama_characterization_config(
 
 
 def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
-    """Delete one exact probe manifest without expiring its potentially shared Ollama runner."""
+    """Delete an idle probe, or retain its exact manifest while its runner is resident."""
+    if _ollama_artifact_id(probe) != expected_artifact_id:
+        return "probe manifest identity changed; refused delete"
+    processes = ollama.processes()
+    if processes is None:
+        return "couldn't inspect probe residency; refused delete"
+    accepted_names = {probe, probe + ":latest"}
+    residents = [process for process in processes if process.name in accepted_names]
+    if residents:
+        expected_digest = expected_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+        if len(processes) == 1 and residents[0].digest == expected_digest:
+            return None
+        return "probe residency identity changed; refused delete"
     return _delete_exact_ollama_model(
         probe, label="probe", expected_artifact_id=expected_artifact_id)
 
@@ -3567,6 +3591,11 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
         return err("Ollama runtime authority changed during measurement — refusing to store "
                    "evidence for an ambiguous daemon configuration.")
     config = _ollama_characterization_config(authority, record, best, points)
+    probe_artifact_id = provenance.get("artifact_id")
+    if isinstance(probe_artifact_id, str):
+        config["characterization_probe_name"] = probe
+        config["characterization_probe_artifact_id"] = probe_artifact_id
+        config["characterization_probe_context"] = max_ctx
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None,
@@ -3856,6 +3885,7 @@ def _ollama_residency_error(
         allowed_name: str | None = None,
         allowed_digest: str | None = None,
         allowed_context: int | None = None,
+        alternate_targets: tuple[tuple[str, str], ...] = (),
         require_target: bool = False) -> str | None:
     """Return a strict admission refusal, or ``None`` for an admissible snapshot.
 
@@ -3878,10 +3908,12 @@ def _ollama_residency_error(
     if len(processes) != 1 or allowed_name is None:
         return refusal
     process = processes[0]
-    accepted_names = {allowed_name, allowed_name + ":latest"}
+    targets = ((allowed_name, allowed_digest), *alternate_targets)
     verified = (
-        process.name in accepted_names
-        and process.digest == allowed_digest
+        any(
+            process.name in {name, name + ":latest"} and process.digest == digest
+            for name, digest in targets
+        )
         and process.effective_context_per_request == allowed_context
         and isinstance(process.size_bytes, int) and not isinstance(process.size_bytes, bool)
         and process.size_bytes > 0
@@ -3890,6 +3922,35 @@ def _ollama_residency_error(
         and process.size_vram_bytes >= 0
     )
     return None if verified else refusal
+
+
+def _ollama_recorded_probe_target(
+        config: dict, models: list[ollama.OllamaModel] | None, *,
+        model_name: str, base_artifact_id: str) -> tuple[str, str] | None:
+    """Return an exact, still-installed characterization probe admitted by stored evidence."""
+    name = config.get("characterization_probe_name")
+    artifact_id = config.get("characterization_probe_artifact_id")
+    context = config.get("characterization_probe_context")
+    if (
+        not isinstance(name, str)
+        or not _is_ara_ollama_derived(name)
+        or not isinstance(artifact_id, str)
+        or not artifact_id.startswith(_OLLAMA_ARTIFACT_PREFIX)
+        or not isinstance(context, int)
+        or isinstance(context, bool)
+        or context <= 0
+        or name != _governed_name(
+            model_name, artifact_id=base_artifact_id, context=context) + "-probe"
+        or models is None
+    ):
+        return None
+    digest = artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        return None
+    model = ollama.find_model(models, name)
+    if model is None or model.digest != digest:
+        return None
+    return name, digest
 
 
 def _free_port() -> int:
