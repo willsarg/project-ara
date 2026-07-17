@@ -631,3 +631,43 @@ def probe_generate(name: str, num_ctx: int, timeout: float = 300.0) -> bool:
         timeout,
     )
     return bool(data and data.get("done") is True)
+
+
+def warm_for_run(name: str, num_ctx: int, timeout: float = 300.0) -> dict | None:
+    """Warm one governed runner without overriding the daemon's keep-alive policy."""
+
+    return _post_json(
+        "/api/generate",
+        {
+            "model": name,
+            "prompt": "",
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": num_ctx},
+        },
+        timeout,
+    )
+
+
+def generate_for_run(
+    name: str,
+    prompt: str,
+    num_ctx: int,
+    num_predict: int,
+    timeout: float = 300.0,
+) -> dict | None:
+    """Buffer one native completion under explicit non-rewriting request options."""
+
+    return _post_json(
+        "/api/generate",
+        {
+            "model": name,
+            "prompt": prompt,
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": num_ctx, "num_predict": num_predict},
+        },
+        timeout,
+    )

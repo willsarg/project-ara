@@ -394,3 +394,69 @@ def preflight_refusal_reason(
     if model_size_bytes > capacity:
         return "model_exceeds_available_memory_walls"
     return None
+
+
+def live_headroom_refusal_reason(
+    snapshot: MemorySnapshot,
+    config: dict[str, Any],
+    *,
+    resident: bool,
+) -> str | None:
+    """Require current capacity for the recorded peak before a governed request."""
+
+    placement = config.get("placement")
+    if snapshot.system_total_bytes is None or snapshot.system_available_bytes is None:
+        return "system_wall_unknown"
+    if placement == "unified" and not (
+        snapshot.unified and snapshot.accelerator_kind == "apple"
+    ):
+        return "topology_drift"
+    if placement in {"accelerator", "partial_offload"} and not (
+        snapshot.accelerator_kind == "nvidia" and snapshot.accelerator_count == 1
+    ):
+        return "topology_drift"
+    total = config.get("resident_total_bytes")
+    accelerator = config.get("resident_accelerator_bytes")
+    if not _nonnegative_int(total) or not _nonnegative_int(accelerator):
+        return "wall_evidence_incomplete"
+    system_peak = 0 if resident else (
+        total - accelerator
+        if placement in {"accelerator", "partial_offload"}
+        else total
+    )
+    if not _nonnegative_int(system_peak):
+        return "wall_evidence_incomplete"
+    if snapshot.system_available_bytes < system_peak + SYSTEM_MARGIN_BYTES:
+        return "system_headroom_insufficient"
+    if placement in {"accelerator", "partial_offload"}:
+        if (
+            snapshot.accelerator_total_bytes is None
+            or snapshot.accelerator_available_bytes is None
+        ):
+            return "accelerator_wall_unknown"
+        accelerator_peak = 0 if resident else accelerator
+        if snapshot.accelerator_available_bytes < (
+            accelerator_peak + ACCELERATOR_MARGIN_BYTES
+        ):
+            return "accelerator_headroom_insufficient"
+    return None
+
+
+def live_residency_refusal_reason(
+    snapshot: MemorySnapshot,
+    process: ollama.OllamaProcess,
+    config: dict[str, Any],
+    safe_context: int,
+) -> str | None:
+    """Verify that current residency still matches the reusable measurement cell."""
+
+    point = characterization_point(snapshot, snapshot, process, safe_context)
+    if point["refusal_reasons"]:
+        return point["refusal_reasons"][0]
+    fields = (
+        "placement",
+        "applicable_walls",
+    )
+    if any(point[field] != config.get(field) for field in fields):
+        return "placement_or_allocation_drift"
+    return None

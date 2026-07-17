@@ -2288,6 +2288,235 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 RUN_MAX_TOKENS = 256
 
 
+def _render_run_ollama(
+    c: Console,
+    model: str,
+    *,
+    prompt: str | None,
+    assume_yes: bool,
+    as_json: bool,
+    max_tokens: int,
+    flash_attn: bool,
+    flash_attn_optin: bool,
+    kv_quant: str,
+    weight_quant: str,
+    prefill_chunk: int | None,
+) -> int:
+    """Run one buffered request through an already-authoritative local Ollama daemon."""
+
+    def err(msg: str) -> int:
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+
+    if not prompt or not prompt.strip():
+        return err("usage: ara run <model> <prompt>")
+    if max_tokens <= 0:
+        return err("--max-tokens must be a positive integer")
+    if (
+        kv_quant != "f16"
+        or weight_quant != "none"
+        or prefill_chunk is not None
+        or not flash_attn
+        or flash_attn_optin
+    ):
+        return err("Ollama run doesn't accept native-engine tuning options; omit KV, weight, "
+                   "prefill, and flash-attention flags so the measured daemon config remains "
+                   "authoritative")
+
+    endpoint, endpoint_error = _ollama_governed_endpoint()
+    if endpoint_error is not None:
+        return err(endpoint_error)
+    try:
+        activity.validate_ollama_serving_fields(
+            served_name=_governed_name(model), model=model, context=1,
+            endpoint=endpoint.url or ollama.base_url())
+    except ValueError as exc:
+        return err(f"invalid Ollama model identity: {exc}")
+
+    authority, authority_error = _ollama_runtime_authority(endpoint)
+    if authority_error is not None:
+        return err(authority_error)
+    models = ollama.inventory()
+    if models is None:
+        return err("couldn't list Ollama models — is the server reachable?")
+    record = ollama.find_model(models, model)
+    if record is None:
+        return err(f"{model} isn't in Ollama — pull and characterize it first")
+    if (support_error := ollama.initial_governed_model_error(record)) is not None:
+        return err(support_error)
+
+    with db.connected() as con:
+        assessment = ollama_evidence.assess_characterization(
+            con, profile.machine_key(), record, authority)
+    if assessment.reusable is None:
+        reason = assessment.reason or "incomplete_evidence"
+        return err(f"{record.name}'s Ollama characterization is display-only ({reason}); "
+                   f"re-characterize it on this server before run")
+    row = assessment.reusable
+    safe = row["safe_context"]
+    config = row["config"]
+    artifact_id = row["artifact_id"]
+    expected_digest = artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+
+    if not as_json and not assume_yes and sys.stdin.isatty():
+        if not _confirm(f"Run {record.name} through Ollama at ≤{safe} ctx?"):
+            c.emit(c.style("dim", "  skipped."))
+            return 0
+
+    concurrency_scope = (
+        "ARA governs this request; outside Ollama clients remain concurrent")
+    if not as_json:
+        c.emit(c.style("dim", f"  running {record.name} on Ollama … (≤ ~{safe} tokens)"))
+        c.emit(c.style("warn", f"  note: {concurrency_scope}."))
+
+    result = None
+    try:
+        with locking.ollama_setup_lock(endpoint.url, record.name):
+            with activity.track("running", record.name):
+                if ollama.runtime_authority(endpoint) != authority:
+                    return err("Ollama runtime authority changed before the run")
+                current_models = ollama.inventory()
+                current_record = (
+                    ollama.find_model(current_models, record.name)
+                    if current_models is not None else None)
+                if current_record is None or current_record.digest != record.digest:
+                    return err("the Ollama manifest changed before the run")
+
+                processes = ollama.processes()
+                residency_error = _ollama_residency_error(
+                    processes,
+                    allowed_name=record.name,
+                    allowed_digest=expected_digest,
+                    allowed_context=safe,
+                )
+                if residency_error is not None:
+                    return err(residency_error)
+                resident = bool(processes)
+                before = ollama_evidence.capture_memory_snapshot()
+                headroom_error = ollama_evidence.live_headroom_refusal_reason(
+                    before, config, resident=resident)
+                if headroom_error is not None:
+                    return err(f"live Ollama admission refused: {headroom_error}")
+
+                if resident:
+                    live_error = ollama_evidence.live_residency_refusal_reason(
+                        before, processes[0], config, safe)
+                    if live_error is not None:
+                        return err(f"resident Ollama target does not match reusable evidence: "
+                                   f"{live_error}")
+
+                if not resident:
+                    warmed = ollama.warm_for_run(record.name, safe)
+                    if not isinstance(warmed, dict) or warmed.get("done") is not True:
+                        return err("Ollama couldn't confirm the governed warm request")
+                    if ollama.runtime_authority(endpoint) != authority:
+                        return err("Ollama runtime authority changed during warmup")
+                    processes = ollama.processes()
+                    residency_error = _ollama_residency_error(
+                        processes,
+                        allowed_name=record.name,
+                        allowed_digest=expected_digest,
+                        allowed_context=safe,
+                        require_target=True,
+                    )
+                    if residency_error is not None:
+                        return err(residency_error)
+                    warm_snapshot = ollama_evidence.capture_memory_snapshot()
+                    live_error = ollama_evidence.live_residency_refusal_reason(
+                        warm_snapshot, processes[0], config, safe)
+                    if live_error is not None:
+                        return err(f"Ollama warmup did not match reusable evidence: {live_error}")
+
+                result = ollama.generate_for_run(
+                    record.name, prompt, safe, max_tokens)
+
+                if ollama.runtime_authority(endpoint) != authority:
+                    return err("Ollama runtime authority changed during the run; no result shown")
+                final_models = ollama.inventory()
+                final_record = (
+                    ollama.find_model(final_models, record.name)
+                    if final_models is not None else None)
+                if final_record is None or final_record.digest != record.digest:
+                    return err("the Ollama manifest changed during the run; no result shown")
+                final_processes = ollama.processes()
+                residency_error = _ollama_residency_error(
+                    final_processes,
+                    allowed_name=record.name,
+                    allowed_digest=expected_digest,
+                    allowed_context=safe,
+                    require_target=True,
+                )
+                if residency_error is not None:
+                    return err(f"Ollama residency changed during the run; no result shown: "
+                               f"{residency_error}")
+                final_snapshot = ollama_evidence.capture_memory_snapshot()
+                live_error = ollama_evidence.live_residency_refusal_reason(
+                    final_snapshot, final_processes[0], config, safe)
+                if live_error is not None:
+                    return err(f"Ollama walls changed during the run; no result shown: "
+                               f"{live_error}")
+    except locking.OllamaSetupBusy as exc:
+        return err(str(exc))
+    except (SystemExit, Exception) as exc:
+        return err(f"Ollama run failed: {exc}")
+
+    if not isinstance(result, dict) or result.get("done") is not True:
+        return err("Ollama returned an incomplete completion")
+    if isinstance(result.get("error"), str):
+        return err(f"Ollama run failed: {result['error']}")
+    completion = result.get("response")
+    if not isinstance(completion, str):
+        return err("Ollama returned an invalid completion")
+    thinking = result.get("thinking")
+    if thinking is not None and not isinstance(thinking, str):
+        return err("Ollama returned invalid thinking metadata")
+    stop_reason = result.get("done_reason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        return err("Ollama returned an invalid stop reason")
+
+    def usage_value(key: str) -> int | None:
+        value = result.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    placement = config["placement"]
+    backend = {
+        "cpu": "cpu",
+        "unified": "apple",
+        "accelerator": "cuda",
+        "partial_offload": "cuda",
+    }[placement]
+    payload = {
+        "model": record.name,
+        "engine": "ollama",
+        "runtime": "ollama",
+        "backend": backend,
+        "placement": placement,
+        "artifact_id": artifact_id,
+        "safe_context": safe,
+        "completion": completion,
+        "stop_reason": stop_reason,
+        "usage": {
+            "prompt_tokens": usage_value("prompt_eval_count"),
+            "completion_tokens": usage_value("eval_count"),
+        },
+        "evidence": {
+            "methodology": config["methodology"],
+            "runtime_version": config["runtime_version"],
+            "server_instance_id": config["server_instance_id"],
+        },
+        "concurrency_scope": concurrency_scope,
+    }
+    if thinking is not None:
+        payload["thinking"] = thinking
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    c.emit()
+    c.emit(completion)
+    c.emit()
+    return 0
+
+
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
                assume_yes: bool = False, as_json: bool = False,
                max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
@@ -2300,6 +2529,21 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
+
+    if engine == "ollama":
+        return _render_run_ollama(
+            c,
+            model,
+            prompt=prompt,
+            assume_yes=assume_yes,
+            as_json=as_json,
+            max_tokens=max_tokens,
+            flash_attn=flash_attn,
+            flash_attn_optin=flash_attn_optin,
+            kv_quant=kv_quant,
+            weight_quant=weight_quant,
+            prefill_chunk=prefill_chunk,
+        )
 
     try:
         sel = resolve_engine(engine)
@@ -4000,7 +4244,7 @@ def _run_engine_option(func):
     return click.option(
         "--engine", callback=_engine_callback, metavar="ENGINE",
         help=("Pin ENGINE; omitted selects the compatible characterized engine with the largest "
-              "safe ceiling. Choices: auto, mlx, cuda, cpu, vulkan, cuda-gguf."),
+              "safe ceiling. Choices: auto, mlx, cuda, cpu, vulkan, cuda-gguf, ollama."),
     )(func)
 
 
@@ -4322,9 +4566,10 @@ def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: 
                flash_attn: bool, verbose: bool, as_json: bool) -> int:
     """Generate one governed completion under MODEL's characterized safe ceiling.
 
-    ARA selects a compatible characterized engine unless --engine pins one, and refuses before
-    loading when the requested settings do not match the measurement. Omit tuning options to use
-    ARA's safe defaults.
+    ARA selects a compatible characterized native engine unless --engine pins one. Pin ollama to
+    use the existing local daemon with exact reusable evidence. ARA refuses before loading when
+    requested settings do not match the measurement. Omit tuning options to use ARA's safe
+    defaults.
     """
     return render_run(
         _mark_json(ctx, as_json), model, prompt=" ".join(prompt) or None, engine=engine,

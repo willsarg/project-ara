@@ -475,7 +475,7 @@ def test_run_help_explains_governance_and_generation_controls(capsys):
     assert cli.main(["run", "--help"]) == 0
     out = " ".join(capsys.readouterr().out.split())
     assert "characterized safe ceiling" in out
-    assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf" in out
+    assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf, ollama" in out
     assert "--max-tokens N" in out and "Maximum new tokens" in out
     assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
     assert "Omit tuning options to use ARA's safe defaults" in out
@@ -7835,6 +7835,458 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
             lambda _m, **_k: ((estimated, "estimated", None) if estimated is not None else None),
         )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: isatty))
+
+
+def _ollama_run_process(*, context=4096, accelerator=100):
+    return cli.ollama.OllamaProcess(
+        name="qwen3:0.6b",
+        digest="a" * 64,
+        size_bytes=100,
+        size_vram_bytes=accelerator,
+        effective_context_per_request=context,
+    )
+
+
+def _wire_ollama_run(monkeypatch, *, warm=False, response=Ellipsis, final_process=None,
+                     characterization=None):
+    characterization = characterization or {"safe_context": 4096}
+    _wire_serve(
+        monkeypatch,
+        names=("qwen3:0.6b",),
+        characterization=characterization,
+    )
+    process = _ollama_run_process()
+    observations = ([process, final_process or process] if warm else
+                    [[], process, final_process or process])
+    monkeypatch.setattr(cli.ollama, "processes", lambda: (
+        [item] if (item := observations.pop(0)) else []))
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "capture_memory_snapshot",
+        lambda: cli.ollama_evidence.MemorySnapshot(
+            24 * 1024 ** 3, 8 * 1024 ** 3, "apple", 1, None, None, True),
+    )
+    calls = []
+    monkeypatch.setattr(
+        cli.ollama,
+        "warm_for_run",
+        lambda name, context: calls.append(("warm", name, context)) or {"done": True},
+    )
+    result = {
+        "done": True,
+        "response": "Hello",
+        "thinking": "hidden chain",
+        "done_reason": "stop",
+        "prompt_eval_count": 3,
+        "eval_count": 1,
+    } if response is Ellipsis else response
+    monkeypatch.setattr(
+        cli.ollama,
+        "generate_for_run",
+        lambda name, prompt, context, tokens:
+        calls.append(("generate", name, prompt, context, tokens)) or result,
+    )
+    return calls
+
+
+def test_run_ollama_cold_path_warms_generates_verifies_then_emits_json(
+        make_console, monkeypatch, capsys):
+    calls = _wire_ollama_run(monkeypatch)
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", as_json=True) == 0
+
+    assert calls == [
+        ("warm", "qwen3:0.6b", 4096),
+        ("generate", "qwen3:0.6b", "Hi", 4096, 256),
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "model": "qwen3:0.6b",
+        "engine": "ollama",
+        "runtime": "ollama",
+        "backend": "apple",
+        "placement": "unified",
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "safe_context": 4096,
+        "completion": "Hello",
+        "thinking": "hidden chain",
+        "stop_reason": "stop",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        "evidence": {
+            "methodology": "ollama-physical-walls-v1",
+            "runtime_version": "0.30.10",
+            "server_instance_id": "42:1234.500000:/usr/bin/ollama",
+        },
+        "concurrency_scope": "ARA governs this request; outside Ollama clients remain concurrent",
+    }
+
+
+def test_run_ollama_reuses_exact_warm_target_without_a_warm_request(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch, warm=True)
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", assume_yes=True) == 0
+
+    assert [call[0] for call in calls] == ["generate"]
+
+
+def test_run_ollama_refuses_warm_target_with_drifted_placement_before_generation(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch, warm=True)
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "live_residency_refusal_reason",
+        lambda *_args: "placement_or_allocation_drift",
+    )
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+
+    assert calls == []
+    assert "does not match reusable evidence" in buf.getvalue()
+
+
+def test_run_ollama_text_discloses_concurrency_but_not_thinking(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", assume_yes=True) == 0
+
+    output = buf.getvalue()
+    assert "Hello" in output and "outside Ollama clients" in output
+    assert "hidden chain" not in output
+
+
+def test_run_ollama_refuses_display_only_evidence_before_residency_or_generation(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch, characterization={
+        "safe_context": 4096,
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "config": {},
+    })
+    monkeypatch.setattr(
+        cli.ollama, "processes", lambda: pytest.fail("residency inspected"))
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", assume_yes=True) == 1
+
+    assert calls == []
+    assert "re-characterize" in buf.getvalue()
+
+
+def test_run_ollama_withholds_buffered_completion_when_postcheck_drifts(
+        make_console, monkeypatch, capsys):
+    _wire_ollama_run(
+        monkeypatch,
+        final_process=_ollama_run_process(context=2048),
+        response={"done": True, "response": "SECRET"},
+    )
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", as_json=True) == 1
+
+    output = capsys.readouterr().out
+    assert "SECRET" not in output
+    assert "changed during the run" in json.loads(output)["error"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"kv_quant": "q4_0"},
+    {"weight_quant": "int8"},
+    {"prefill_chunk": 128},
+    {"flash_attn": False},
+    {"flash_attn_optin": True},
+])
+def test_run_ollama_refuses_native_engine_tuning_flags(
+        make_console, monkeypatch, kwargs):
+    calls = _wire_ollama_run(monkeypatch)
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", **kwargs) == 1
+
+    assert calls == []
+    assert "doesn't accept native-engine tuning" in buf.getvalue()
+
+
+@pytest.mark.parametrize(("prompt", "max_tokens", "message"), [
+    ("", 256, "usage"),
+    ("Hi", 0, "positive integer"),
+])
+def test_run_ollama_validates_prompt_and_output_cap_before_contact(
+        make_console, monkeypatch, prompt, max_tokens, message):
+    monkeypatch.setattr(
+        cli.ollama, "base_url", lambda: pytest.fail("contacted Ollama"))
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt=prompt, max_tokens=max_tokens,
+        engine="ollama") == 1
+
+    assert message in buf.getvalue()
+
+
+def test_run_ollama_refuses_nonloopback_and_invalid_identity_before_inventory(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "https://ollama.com")
+    monkeypatch.setattr(
+        cli.ollama, "inventory", lambda: pytest.fail("inventory read"))
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "loopback" in buf.getvalue()
+
+    monkeypatch.setattr(cli.ollama, "base_url", lambda: "http://127.0.0.1:11434")
+    assert cli.render_run(c, "bad\nmodel", prompt="Hi", engine="ollama") == 1
+    assert "invalid Ollama model identity" in buf.getvalue()
+
+
+def test_run_ollama_refuses_incomplete_authority_inventory_and_model_cell(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    _wire_runtime_authority(monkeypatch, issue="listener_unattributed")
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "directly owned Ollama process" in buf.getvalue()
+
+    _wire_runtime_authority(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: None)
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "couldn't list" in buf.getvalue()
+
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [])
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "isn't in Ollama" in buf.getvalue()
+
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [
+        _local_ollama_model(
+            "qwen3:0.6b", digest="a" * 64, scope="cloud", remote_model="qwen3"),
+    ])
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "cloud model" in buf.getvalue()
+
+
+def test_run_ollama_declined_consent_has_no_residency_or_activity(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli, "_confirm", lambda _question: False)
+    monkeypatch.setattr(
+        cli.ollama, "processes", lambda: pytest.fail("residency inspected"))
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 0
+
+    assert calls == [] and "skipped" in buf.getvalue()
+
+
+def test_run_ollama_accepted_interactive_consent_continues(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli, "_confirm", lambda _question: True)
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 0
+
+    assert [call[0] for call in calls] == ["warm", "generate"]
+
+
+def test_run_ollama_refuses_precheck_authority_manifest_residency_and_headroom_drift(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch, warm=True)
+    endpoint = cli.ollama.endpoint_authority()
+    authority = cli.ollama.runtime_authority(endpoint)
+    drifted = dataclasses.replace(authority, server_instance_id="different")
+    authorities = [authority, drifted]
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority", lambda _endpoint: authorities.pop(0))
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "changed before" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    original_inventory = cli.ollama.inventory
+    inventories = [original_inventory(), []]
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: inventories.pop(0))
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "manifest changed before" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    monkeypatch.setattr(cli.ollama, "processes", lambda: None)
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "inspect Ollama residency" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "capture_memory_snapshot",
+        lambda: cli.ollama_evidence.MemorySnapshot(
+            24 * 1024 ** 3, 1, "apple", 1, None, None, True),
+    )
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "system_headroom_insufficient" in buf.getvalue()
+
+
+def test_run_ollama_refuses_unverified_warmup_and_postrun_authority_or_manifest(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(cli.ollama, "warm_for_run", lambda *_args: None)
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "confirm the governed warm" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    endpoint = cli.ollama.endpoint_authority()
+    authority = cli.ollama.runtime_authority(endpoint)
+    authorities = [
+        authority,
+        authority,
+        dataclasses.replace(authority, server_instance_id="different"),
+    ]
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority", lambda _endpoint: authorities.pop(0))
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "changed during the run" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    original_inventory = cli.ollama.inventory
+    inventories = [original_inventory(), original_inventory(), []]
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: inventories.pop(0))
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "manifest changed during" in buf.getvalue()
+
+
+def test_run_ollama_refuses_runtime_or_residency_drift_during_warmup(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    endpoint = cli.ollama.endpoint_authority()
+    authority = cli.ollama.runtime_authority(endpoint)
+    authorities = [
+        authority,
+        authority,
+        dataclasses.replace(authority, server_instance_id="different"),
+    ]
+    monkeypatch.setattr(
+        cli.ollama, "runtime_authority", lambda _endpoint: authorities.pop(0))
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "changed during warmup" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch)
+    observations = [[], []]
+    monkeypatch.setattr(cli.ollama, "processes", lambda: observations.pop(0))
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "not resident after load" in buf.getvalue()
+
+
+def test_run_ollama_formats_lock_and_operational_failures(
+        make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+
+    @contextlib.contextmanager
+    def busy(*_args):
+        raise cli.locking.OllamaSetupBusy("busy endpoint")
+        yield
+
+    monkeypatch.setattr(cli.locking, "ollama_setup_lock", busy)
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "busy endpoint" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    monkeypatch.setattr(
+        cli.locking, "ollama_setup_lock", lambda *_args: contextlib.nullcontext())
+    monkeypatch.setattr(
+        cli.ollama, "generate_for_run",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "Ollama run failed: boom" in buf.getvalue()
+
+
+def test_run_ollama_refuses_warm_or_final_wall_drift(make_console, monkeypatch):
+    _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "live_residency_refusal_reason",
+        lambda *_args: "placement_or_allocation_drift",
+    )
+    c, buf = make_console()
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "warmup did not match" in buf.getvalue()
+
+    _wire_ollama_run(monkeypatch, warm=True)
+    live_results = [None, "system_margin_breached"]
+    monkeypatch.setattr(
+        cli.ollama_evidence,
+        "live_residency_refusal_reason",
+        lambda *_args: live_results.pop(0),
+    )
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+    assert "walls changed during" in buf.getvalue()
+
+
+@pytest.mark.parametrize(("response", "message"), [
+    (None, "incomplete completion"),
+    ({"done": True, "error": "boom", "response": "x"}, "boom"),
+    ({"done": True, "response": 3}, "invalid completion"),
+    ({"done": True, "response": "x", "thinking": 3}, "thinking metadata"),
+    ({"done": True, "response": "x", "done_reason": 3}, "stop reason"),
+])
+def test_run_ollama_rejects_malformed_buffered_results(
+        make_console, monkeypatch, response, message):
+    _wire_ollama_run(monkeypatch, warm=True, response=response)
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama") == 1
+
+    assert message in buf.getvalue()
+
+
+def test_run_ollama_json_omits_unobserved_optional_thinking(
+        make_console, monkeypatch, capsys):
+    _wire_ollama_run(
+        monkeypatch,
+        warm=True,
+        response={"done": True, "response": "Hello", "done_reason": "stop"},
+    )
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", as_json=True) == 0
+
+    assert "thinking" not in json.loads(capsys.readouterr().out)
 
 
 def test_serve_refuses_when_not_serving(make_console, monkeypatch):

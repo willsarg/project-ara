@@ -621,6 +621,143 @@ def test_preflight_capacity_never_treats_reserved_margin_as_available():
     ) == "model_exceeds_available_memory_walls"
 
 
+@pytest.mark.parametrize(("resident", "available"), [
+    (False, 4),
+    (True, 1),
+])
+def test_live_headroom_reserves_the_recorded_peak_and_margin(resident, available):
+    config = {
+        "placement": "unified",
+        "resident_total_bytes": 3 * GIB,
+        "resident_accelerator_bytes": 3 * GIB,
+    }
+
+    assert evidence.live_headroom_refusal_reason(
+        _snapshot(total=24, available=available, kind="apple", count=1, unified=True),
+        config,
+        resident=resident,
+    ) == "system_headroom_insufficient"
+
+
+def test_live_headroom_accepts_cold_and_resident_targets_with_capacity():
+    config = {
+        "placement": "unified",
+        "resident_total_bytes": 3 * GIB,
+        "resident_accelerator_bytes": 3 * GIB,
+    }
+
+    assert evidence.live_headroom_refusal_reason(
+        _snapshot(total=24, available=6, kind="apple", count=1, unified=True),
+        config,
+        resident=False,
+    ) is None
+    assert evidence.live_headroom_refusal_reason(
+        _snapshot(total=24, available=3, kind="apple", count=1, unified=True),
+        config,
+        resident=True,
+    ) is None
+
+
+@pytest.mark.parametrize(("snapshot", "config", "reason"), [
+    (
+        evidence.MemorySnapshot(None, None, None, None, None, None, False),
+        {"placement": "cpu", "resident_total_bytes": 1,
+         "resident_accelerator_bytes": 0},
+        "system_wall_unknown",
+    ),
+    (
+        _snapshot(kind="nvidia", count=1),
+        {"placement": "unified", "resident_total_bytes": 1,
+         "resident_accelerator_bytes": 1},
+        "topology_drift",
+    ),
+    (
+        _snapshot(kind="nvidia", count=2),
+        {"placement": "accelerator", "resident_total_bytes": 1,
+         "resident_accelerator_bytes": 1},
+        "topology_drift",
+    ),
+    (
+        _snapshot(),
+        {"placement": "cpu", "resident_total_bytes": None,
+         "resident_accelerator_bytes": 0},
+        "wall_evidence_incomplete",
+    ),
+    (
+        evidence.MemorySnapshot(32 * GIB, 8 * GIB, "nvidia", 1, None, None, False),
+        {"placement": "accelerator", "resident_total_bytes": 2 * GIB,
+         "resident_accelerator_bytes": 2 * GIB},
+        "accelerator_wall_unknown",
+    ),
+    (
+        _snapshot(total=32, available=8, kind="nvidia", count=1,
+                  accelerator_total=8, accelerator_available=7),
+        {"placement": "accelerator", "resident_total_bytes": 2 * GIB,
+         "resident_accelerator_bytes": None},
+        "wall_evidence_incomplete",
+    ),
+    (
+        _snapshot(total=32, available=8, kind="nvidia", count=1,
+                  accelerator_total=8, accelerator_available=1),
+        {"placement": "accelerator", "resident_total_bytes": 2 * GIB,
+         "resident_accelerator_bytes": 2 * GIB},
+        "accelerator_headroom_insufficient",
+    ),
+])
+def test_live_headroom_fails_closed_for_unknown_or_drifted_walls(
+        snapshot, config, reason):
+    assert evidence.live_headroom_refusal_reason(
+        snapshot, config, resident=False) == reason
+
+
+def test_live_headroom_accepts_one_discrete_accelerator_with_both_walls():
+    snapshot = _snapshot(
+        total=32, available=8, kind="nvidia", count=1,
+        accelerator_total=8, accelerator_available=7)
+    config = {
+        "placement": "partial_offload",
+        "resident_total_bytes": 4 * GIB,
+        "resident_accelerator_bytes": 2 * GIB,
+    }
+
+    assert evidence.live_headroom_refusal_reason(
+        snapshot, config, resident=False) is None
+
+
+def test_live_headroom_rejects_impossible_discrete_residency_split():
+    snapshot = _snapshot(
+        total=32, available=8, kind="nvidia", count=1,
+        accelerator_total=8, accelerator_available=7)
+    config = {
+        "placement": "accelerator",
+        "resident_total_bytes": 1 * GIB,
+        "resident_accelerator_bytes": 2 * GIB,
+    }
+
+    assert evidence.live_headroom_refusal_reason(
+        snapshot, config, resident=False) == "wall_evidence_incomplete"
+
+
+def test_live_residency_must_match_characterized_context_placement_and_walls():
+    config = {
+        "placement": "unified",
+        "resident_total_bytes": 4 * GIB,
+        "resident_accelerator_bytes": 4 * GIB,
+        "applicable_walls": ["system_unified"],
+    }
+    snapshot = _snapshot(total=24, available=8, kind="apple", count=1, unified=True)
+
+    assert evidence.live_residency_refusal_reason(
+        snapshot, _process(size=4, accelerator=4, context=4096), config, 4096) is None
+    assert evidence.live_residency_refusal_reason(
+        snapshot, _process(size=4, accelerator=0, context=4096), config, 4096,
+    ) == "placement_or_allocation_drift"
+    assert evidence.live_residency_refusal_reason(
+        _snapshot(total=24, available=1, kind="apple", count=1, unified=True),
+        _process(size=4, accelerator=4, context=4096), config, 4096,
+    ) == "system_margin_breached"
+
+
 def test_capture_memory_snapshot_parses_one_nvidia_device(monkeypatch):
     monkeypatch.setattr(
         evidence.psutil, "virtual_memory",

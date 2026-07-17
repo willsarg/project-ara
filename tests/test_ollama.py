@@ -783,6 +783,58 @@ def test_probe_generate_fails_closed_on_missing_or_incomplete_response(monkeypat
 
 
 # --------------------------------------------------------------------------- #
+# governed run — warm + buffered native generation
+# --------------------------------------------------------------------------- #
+def test_warm_for_run_uses_the_governed_runner_options_without_keepalive(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload, timeout=timeout)
+        return {"done": True}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+
+    assert ollama.warm_for_run("qwen3:0.6b", 8192) == {"done": True}
+    assert seen == {
+        "path": "/api/generate",
+        "payload": {
+            "model": "qwen3:0.6b",
+            "prompt": "",
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": 8192},
+        },
+        "timeout": 300.0,
+    }
+
+
+def test_generate_for_run_buffers_with_explicit_governed_options(monkeypatch):
+    seen = {}
+    response = {"done": True, "response": "hello"}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload, timeout=timeout)
+        return response
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+
+    assert ollama.generate_for_run("qwen3:0.6b", "Hi", 8192, 256) is response
+    assert seen == {
+        "path": "/api/generate",
+        "payload": {
+            "model": "qwen3:0.6b",
+            "prompt": "Hi",
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": 8192, "num_predict": 256},
+        },
+        "timeout": 300.0,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # pull — fetch a missing model (serve's get-out-of-the-way step)
 # Spec 2026-07-04-ara-serve-one-command-estimated-ceiling.
 # --------------------------------------------------------------------------- #
