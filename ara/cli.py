@@ -24,7 +24,7 @@ import click
 
 from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
                  hub_server,
-                 hf_auth, locking, mlx, ollama, profile, calibration, pythons, scoring, serialize,
+                 hf_auth, locking, mlx, ollama, ollama_evidence, profile, calibration, pythons, scoring, serialize,
                  staleness, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
@@ -2531,8 +2531,10 @@ def _ollama_governed_endpoint() -> tuple[ollama.OllamaEndpoint, str | None]:
     return endpoint, None
 
 
-def _ollama_runtime_authority_error(endpoint: ollama.OllamaEndpoint) -> str | None:
-    """Return why a loopback Ollama is display-only, or ``None`` when it is authoritative."""
+def _ollama_runtime_authority(
+    endpoint: ollama.OllamaEndpoint,
+) -> tuple[ollama.OllamaRuntimeAuthority, str | None]:
+    """Return the attested runtime plus any reason it remains display-only."""
     authority = ollama.runtime_authority(endpoint)
     errors = {
         "listener_unattributed": (
@@ -2555,9 +2557,14 @@ def _ollama_runtime_authority_error(endpoint: ollama.OllamaEndpoint) -> str | No
             "initial governed Ollama support requires configured maximum parallelism of one"),
     }
     if authority.issue is not None:
-        return errors.get(
+        return authority, errors.get(
             authority.issue, "Ollama runtime authority is incomplete; refusing governed work")
-    return None
+    return authority, None
+
+
+def _ollama_runtime_authority_error(endpoint: ollama.OllamaEndpoint) -> str | None:
+    """Return why a loopback Ollama is display-only, or ``None`` when it is authoritative."""
+    return _ollama_runtime_authority(endpoint)[1]
 
 
 def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None) -> str | None:
@@ -2640,15 +2647,29 @@ def _ollama_ramp_contexts(max_ctx: int) -> list[int]:
 
 def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
                             base_artifact_id: str | None = None,
-                            provenance: dict | None = None):
-    """Ramp Ollama residency to the largest context *model* loads with NO spill. For each rung
-    (ascending), bake a *probe* derived model at that ctx, load it, and read ``/api/ps``: it counts
-    only when governance took (effective per-request ``context_length`` == ctx) AND it's fully
-    resident (``size_vram >= size``). KV grows monotonically, so the first spill/failure ends the ramp.
-    Returns ``(best_ctx | None, points)``. Spec 2026-07-04-characterize-through-ollama-ramp."""
+                            provenance: dict | None = None,
+                            authority: ollama.OllamaRuntimeAuthority | None = None,
+                            model_size_bytes: int | None = None):
+    """Ramp Ollama to the largest context proven safe against every physical memory wall.
+
+    Each rung performs one bounded generated token with truncation and shifting disabled, then
+    binds Ollama's effective context and placement evidence to before/after physical-wall
+    snapshots. CPU, unified memory, full accelerator residency, and partial offload are evaluated
+    according to their actual walls; unknown topology fails closed.
+    """
     best, points = None, []
     previous_context, previous_digest = None, None
     for ctx in _ollama_ramp_contexts(max_ctx):
+        before = ollama_evidence.capture_memory_snapshot()
+        if model_size_bytes is not None:
+            preflight_reason = ollama_evidence.preflight_refusal_reason(
+                before, model_size_bytes)
+            if preflight_reason is not None:
+                points.append(ollama_evidence.failed_characterization_point(
+                    ctx, preflight_reason))
+                break
+        if authority is not None and ollama.runtime_authority(authority.endpoint) != authority:
+            raise RuntimeError("Ollama runtime authority changed before measurement")
         if (base_artifact_id is not None
                 and _ollama_artifact_id(model) != base_artifact_id):
             raise RuntimeError("base manifest changed before probe creation")
@@ -2666,8 +2687,14 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
             if (base_artifact_id is not None
                     and _ollama_artifact_id(model) != base_artifact_id):
                 raise RuntimeError("base manifest changed during probe creation")
-        ollama.load(probe, keep_alive=None)
+        if not ollama.probe_generate(probe, ctx):
+            points.append(ollama_evidence.failed_characterization_point(
+                ctx, "generation_failed"))
+            break
+        if authority is not None and ollama.runtime_authority(authority.endpoint) != authority:
+            raise RuntimeError("Ollama runtime authority changed during measurement")
         processes = ollama.processes()
+        after = ollama_evidence.capture_memory_snapshot()
         expected_digest = (probe_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
                            if probe_artifact_id is not None else None)
         residency_error = _ollama_residency_error(
@@ -2681,18 +2708,68 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
                     allowed_context=previous_context, require_target=True) is None
             )
             if processes == [] or previous_runner_remains:
-                points.append({"context": ctx, "fit": False})
+                points.append(ollama_evidence.failed_characterization_point(
+                    ctx, "effective_residency_unverified"))
                 break
             raise RuntimeError(residency_error)
         process = processes[0]
-        size, vram = process.size_bytes, process.size_vram_bytes
-        fit = vram >= size
-        points.append({"context": ctx, "fit": fit, "size": size, "size_vram": vram})
-        if not fit:                                   # hit/failed to verify the wall — stop safely
+        point = ollama_evidence.characterization_point(before, after, process, ctx)
+        points.append(point)
+        if not point["fit"]:                         # hit/failed to verify the wall — stop safely
             break
         best = ctx
         previous_context, previous_digest = ctx, expected_digest
     return best, points
+
+
+def _ollama_characterization_config(
+    authority: ollama.OllamaRuntimeAuthority,
+    best: int | None,
+    points: list[dict],
+) -> dict:
+    """Persist the runtime, scheduler, placement, and wall evidence behind one ceiling."""
+
+    best_point = next(
+        (point for point in reversed(points)
+         if point.get("fit") and point.get("requested_context") == best),
+        None,
+    )
+    configured = dict(authority.configured_inputs)
+    return {
+        "methodology": "ollama-physical-walls-v1",
+        "runtime": "ollama",
+        "runtime_version": authority.server_version,
+        "endpoint": authority.endpoint.url,
+        "server_instance_id": authority.server_instance_id,
+        "configured_inputs": configured,
+        "configured_num_parallel": authority.configured_num_parallel,
+        "configured_num_parallel_authority": authority.configured_num_parallel_authority,
+        "effective_num_parallel": 1,
+        "effective_num_parallel_authority": "configured_maximum_is_one",
+        "requested_context": best,
+        "effective_per_request_context": (
+            best_point.get("effective_per_request_context") if best_point else None),
+        "placement": best_point.get("placement") if best_point else "unknown",
+        "resident_total_bytes": (
+            best_point.get("resident_total_bytes") if best_point else None),
+        "resident_accelerator_bytes": (
+            best_point.get("resident_accelerator_bytes") if best_point else None),
+        "applicable_walls": best_point.get("applicable_walls", []) if best_point else [],
+        "system_memory_delta_bytes": (
+            best_point.get("system_memory_delta_bytes") if best_point else None),
+        "accelerator_memory_delta_bytes": (
+            best_point.get("accelerator_memory_delta_bytes") if best_point else None),
+        "system_margin_bytes": (
+            best_point.get("system_margin_bytes") if best_point else None),
+        "accelerator_margin_bytes": (
+            best_point.get("accelerator_margin_bytes") if best_point else None),
+        "configured_kv_cache_type": configured.get("OLLAMA_KV_CACHE_TYPE", "unknown"),
+        "effective_kv_cache_type": "unknown",
+        "configured_flash_attention": configured.get("OLLAMA_FLASH_ATTENTION", "unknown"),
+        "effective_flash_attention": "unknown",
+        "configured_scheduler_spread": configured.get("OLLAMA_SCHED_SPREAD", "unknown"),
+        "effective_scheduler_spread": "unknown",
+    }
 
 
 def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
@@ -2724,7 +2801,8 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     endpoint, endpoint_error = _ollama_governed_endpoint()
     if endpoint_error is not None:
         return err(endpoint_error)
-    if authority_error := _ollama_runtime_authority_error(endpoint):
+    authority, authority_error = _ollama_runtime_authority(endpoint)
+    if authority_error:
         return err(authority_error)
     models = ollama.inventory()
     if models is None:
@@ -2735,6 +2813,13 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     model = record.name
     if (support_error := ollama.initial_governed_model_error(record)) is not None:
         return err(support_error)
+    if record.size_bytes is None:
+        return err(f"couldn't verify {record.name}'s on-disk size — refusing an unbounded "
+                   "Ollama model load.")
+    preflight_reason = ollama_evidence.preflight_refusal_reason(
+        ollama_evidence.capture_memory_snapshot(), record.size_bytes)
+    if preflight_reason is not None:
+        return err(f"Ollama model-load preflight refused: {preflight_reason.replace('_', ' ')}")
     artifact_id = _ollama_artifact_id(model, record=record)
     if artifact_id is None:
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to measure mutable "
@@ -2767,7 +2852,8 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
                 try:
                     best, points = _ollama_measure_ceiling(
                         model, max_ctx, probe, base_artifact_id=artifact_id,
-                        provenance=provenance)
+                        provenance=provenance, authority=authority,
+                        model_size_bytes=record.size_bytes)
                 except (SystemExit, Exception) as exc:
                     measurement_error = exc
                 finally:
@@ -2789,19 +2875,24 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     if _ollama_artifact_id(model) != artifact_id:
         return err(f"{model}'s Ollama manifest changed during measurement — refusing to store a "
                    "ceiling for ambiguous weights.")
+    if ollama.runtime_authority(endpoint) != authority:
+        return err("Ollama runtime authority changed during measurement — refusing to store "
+                   "evidence for an ambiguous daemon configuration.")
+    config = _ollama_characterization_config(authority, best, points)
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None,
-                                 artifact_id=artifact_id)
+                                 artifact_id=artifact_id, config=config)
     if as_json:
         print(json.dumps({"model": model, "engine": "ollama", "safe_context": best,
                           "source": "measured", "max_context": max_ctx}))
         return 0
     if best is None:
-        c.emit(c.style("warn", f"  no no-spill ceiling for {model} on this box — it spills even at "
-                               f"the smallest tested context (recorded)."))
+        c.emit(c.style("warn", f"  no physically safe ceiling for {model} on this box at the "
+                               f"smallest tested context (recorded)."))
     else:
-        c.emit(c.field("measured ceiling", f"~{best} tokens  (ollama, fully resident)"))
+        placement = config["placement"].replace("_", " ")
+        c.emit(c.field("measured ceiling", f"~{best} tokens  (ollama, {placement})"))
     return 0
 
 

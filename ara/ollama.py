@@ -610,3 +610,24 @@ def load(name: str, keep_alive: int | None = -1, timeout: float = 300.0) -> dict
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
     return _post_json("/api/generate", payload, timeout)
+
+
+def probe_generate(name: str, num_ctx: int, timeout: float = 300.0) -> bool:
+    """Generate exactly one token at *num_ctx* for a characterization observation.
+
+    Truncation and context shifting are disabled so Ollama must either honor the requested
+    context or fail. The daemon's keep-alive policy remains authoritative for the shared runner.
+    """
+    data = _post_json(
+        "/api/generate",
+        {
+            "model": name,
+            "prompt": "ARA",
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": num_ctx, "num_predict": 1},
+        },
+        timeout,
+    )
+    return bool(data and data.get("done") is True)

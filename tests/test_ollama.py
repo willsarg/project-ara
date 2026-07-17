@@ -748,6 +748,41 @@ def test_load_can_defer_keepalive_to_daemon_policy(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# probe_generate — bounded characterization request with no context rewriting
+# --------------------------------------------------------------------------- #
+def test_probe_generate_requests_one_token_without_truncation_or_shift(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload, timeout=timeout)
+        return {"done": True, "response": "x"}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+
+    assert ollama.probe_generate("x-ara", 8192) is True
+    assert seen == {
+        "path": "/api/generate",
+        "payload": {
+            "model": "x-ara",
+            "prompt": "ARA",
+            "stream": False,
+            "truncate": False,
+            "shift": False,
+            "options": {"num_ctx": 8192, "num_predict": 1},
+        },
+        "timeout": 300.0,
+    }
+
+
+def test_probe_generate_fails_closed_on_missing_or_incomplete_response(monkeypatch):
+    monkeypatch.setattr(ollama, "_post_json", lambda p, payload, timeout: None)
+    assert ollama.probe_generate("x-ara", 4096) is False
+
+    monkeypatch.setattr(ollama, "_post_json", lambda p, payload, timeout: {"done": False})
+    assert ollama.probe_generate("x-ara", 4096) is False
+
+
+# --------------------------------------------------------------------------- #
 # pull — fetch a missing model (serve's get-out-of-the-way step)
 # Spec 2026-07-04-ara-serve-one-command-estimated-ceiling.
 # --------------------------------------------------------------------------- #
