@@ -45,6 +45,15 @@ def test_capability_schema_describes_canonical_ara_engine_identity():
     assert schema["properties"]["engine"]["description"] == "Canonical ARA engine identity."
 
 
+def test_ollama_capability_schema_requires_exact_node_target_authority():
+    cap = {
+        "kind": "serve_model", "id": "qwen3:0.6b", "engine": "ollama",
+        "evidence": "characterized",
+    }
+    with pytest.raises(AssertionError):
+        _validate(cap, "https://ara.dev/wire/capability.json")
+
+
 @pytest.fixture
 def env_io(monkeypatch):
     """Deterministic host I/O for the env probes: bare-metal Linux, 32 GiB, no cgroup, no container.
@@ -214,37 +223,76 @@ def test_advertised_capabilities_empty_when_none(monkeypatch):
 
 def test_advertised_capabilities_from_characterizations(monkeypatch):
     monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1")
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "m", "cuda", "org/model-a",
-                                          safe_context=4096, points=[])
+                                          safe_context=4096, points=[], config={},
+                                          artifact_id="hf:org/model-a@revision-a")
     capabilities.db.save_characterization(con, "m", "mlx", "org/model-b",
-                                          safe_context=2048, points=[])
+                                          safe_context=2048, points=[], config={},
+                                          artifact_id="hf:org/model-b@revision-b")
     capabilities.db.save_characterization(con, "other", "cuda", "org/model-z",
-                                          safe_context=1, points=[])       # other machine → excluded
+                                          safe_context=1, points=[], config={},
+                                          artifact_id="hf:org/model-z@revision-z")  # other machine → excluded
     con.close()
     caps = capabilities.advertised_capabilities()
-    assert caps == [
-        {"kind": "serve_model", "id": "org/model-a", "engine": "cuda", "evidence": "characterized"},
-        {"kind": "serve_model", "id": "org/model-b", "engine": "mlx", "evidence": "characterized"},
+    assert [(cap["id"], cap["runtime"], cap["backend"]) for cap in caps] == [
+        ("org/model-a", "torch", "cuda"),
+        ("org/model-b", "mlx", "apple"),
     ]
+    assert all(cap["authority"].startswith("node-target:v1:") for cap in caps)
+    node1_authorities = [cap["authority"] for cap in caps]
     for cap in caps:
         _validate(cap, "https://ara.dev/wire/capability.json")
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node2")
+    assert [cap["authority"] for cap in capabilities.advertised_capabilities()] != node1_authorities
 
 
-def test_advertised_capabilities_skip_nondefault_or_unknown_configurable_rows(monkeypatch):
+def test_advertised_capabilities_only_include_exact_reusable_rows(monkeypatch):
     monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
-    monkeypatch.setattr(capabilities.db, "list_characterizations", lambda con, mk: [
-        {"model_id": "default", "engine": "mlx", "config": {}, "safe_context": 2048},
-        {"model_id": "q4", "engine": "mlx", "config": {"kv_quant": "q4_0"},
-         "safe_context": 4096},
-        {"model_id": "legacy-mlx", "engine": "mlx", "config": None, "safe_context": 2048},
-        {"model_id": "legacy-cpu", "engine": "cpu", "config": None, "safe_context": 2048},
-        {"model_id": "unfit", "engine": "cpu", "config": {}, "safe_context": None},
-        {"model_id": "zero", "engine": "cpu", "config": {}, "safe_context": 0},
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1")
+    monkeypatch.setattr(capabilities.db, "list_reusable_characterizations", lambda con, mk: [
+        {"logical_model_id": "exact", "legacy_engine": "ollama", "runtime": "ollama",
+         "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+         "config_key": "cfg:v1:{}", "safe_context": 2048},
+        {"logical_model_id": "unfit", "legacy_engine": "ollama", "runtime": "ollama",
+         "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "b" * 64,
+         "config_key": "cfg:v1:{}", "safe_context": None},
+        {"logical_model_id": "zero", "legacy_engine": "ollama", "runtime": "ollama",
+         "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "c" * 64,
+         "config_key": "cfg:v1:{}", "safe_context": 0},
     ])
-    assert [cap["id"] for cap in capabilities.advertised_capabilities()] == [
-        "default", "legacy-cpu"
-    ]
+    caps = capabilities.advertised_capabilities()
+    assert [cap["id"] for cap in caps] == ["exact"]
+    _validate(caps[0], "https://ara.dev/wire/capability.json")
+
+
+def test_ollama_execution_authority_is_node_scoped_and_rejects_target_drift(monkeypatch):
+    cap = {
+        "kind": "serve_model", "id": "qwen3:0.6b", "engine": "ollama",
+        "evidence": "characterized", "runtime": "ollama", "backend": "apple",
+        "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "config_key": "cfg:v1:{}", "safe_context": 2048,
+        "authority": "node-target:v1:" + "f" * 64,
+    }
+    monkeypatch.setattr(capabilities, "advertised_capabilities", lambda: [cap])
+    args = {"model": "qwen3:0.6b", "engine": "ollama", "target_authority": cap["authority"]}
+    capabilities.require_execution_authority("run", args)
+    capabilities.require_execution_authority("benchmark", args)
+    for changed in [
+        {**args, "model": "other"},
+        {**args, "model": None},
+        {**args, "target_authority": None},
+        {**args, "target_authority": "node-target:v1:" + "0" * 64},
+    ]:
+        with pytest.raises(ValueError, match="node-scoped runtime authority"):
+            capabilities.require_execution_authority("run", changed)
+
+
+def test_execution_authority_is_only_required_for_governed_remote_ollama_work():
+    capabilities.require_execution_authority("detect", {})
+    capabilities.require_execution_authority("characterize", {"engine": "ollama"})
+    capabilities.require_execution_authority("run", {"engine": "cpu"})
 
 
 # --------------------------------------------------------------------------- #
@@ -269,11 +317,21 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
     monkeypatch.setattr(capabilities.platform, "machine", lambda: "x86_64")
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "chip|GPU|16|Linux", "cuda", "org/m",
-                                          safe_context=8192, points=[])
+                                          safe_context=8192, points=[], config={},
+                                          artifact_id="hf:org/m@revision")
     con.close()
     desc = capabilities.self_description()
-    assert desc["capabilities"] == [
-        {"kind": "serve_model", "id": "org/m", "engine": "cuda", "evidence": "characterized"}]
+    assert len(desc["capabilities"]) == 1
+    cap = desc["capabilities"][0]
+    assert {key: cap[key] for key in (
+        "kind", "id", "engine", "evidence", "runtime", "backend", "artifact_id",
+        "safe_context",
+    )} == {
+        "kind": "serve_model", "id": "org/m", "engine": "cuda",
+        "evidence": "characterized", "runtime": "torch", "backend": "cuda",
+        "artifact_id": "hf:org/m@revision", "safe_context": 8192,
+    }
+    assert cap["authority"].startswith("node-target:v1:")
     _validate(desc, "https://ara.dev/wire/enroll.request.json")
 
 

@@ -1,0 +1,10 @@
+{
+  "job": {
+    "id": "job_01HXYZCHARACTERIZE",
+    "kind": "characterize",
+    "args": {
+      "model": "qwen3:0.6b",
+      "engine": "ollama"
+    }
+  }
+}

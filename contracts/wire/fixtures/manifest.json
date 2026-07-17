@@ -7,6 +7,8 @@
     { "fixture": "enroll-poll.pending.valid.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": true },
     { "fixture": "enroll-poll.active.valid.json", "schema": "https://ara.dev/wire/enroll-poll.response.json", "valid": true },
     { "fixture": "work.response.valid.json", "schema": "https://ara.dev/wire/work.response.json", "valid": true },
+    { "fixture": "work.response.characterize-ollama.valid.json", "schema": "https://ara.dev/wire/work.response.json", "valid": true },
+    { "fixture": "work.response.invalid-ollama-missing-authority.json", "schema": "https://ara.dev/wire/work.response.json", "valid": false },
     { "fixture": "result.request.done.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
     { "fixture": "result.request.failed.valid.json", "schema": "https://ara.dev/wire/result.request.json", "valid": true },
     { "fixture": "result.request.invalid-bad-status.json", "schema": "https://ara.dev/wire/result.request.json", "valid": false },

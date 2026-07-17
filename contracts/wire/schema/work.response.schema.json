@@ -10,9 +10,34 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "kind": { "type": "string", "enum": ["run", "characterize", "detect", "benchmark"] },
-        "args": { "type": "object" }
+        "args": {
+          "type": "object",
+          "properties": {
+            "engine": { "type": "string" },
+            "target_authority": {
+              "type": "string",
+              "pattern": "^node-target:v1:[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": true
+        }
       },
       "required": ["id", "kind", "args"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "enum": ["run", "benchmark"] },
+              "args": {
+                "properties": { "engine": { "const": "ollama" } },
+                "required": ["engine"]
+              }
+            },
+            "required": ["kind", "args"]
+          },
+          "then": { "properties": { "args": { "required": ["target_authority"] } } }
+        }
+      ],
       "additionalProperties": false
     }
   },

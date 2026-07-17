@@ -666,6 +666,7 @@ def _run_loop(config, *, client: NodeClient | None = None,
             sleep(reauth_backoff)
             continue
         try:
+            capabilities.require_execution_authority(job["kind"], job.get("args") or {})
             payload = _result_payload(runner(job["kind"], job.get("args") or {}))
         except Exception as exc:  # noqa: BLE001 — any run failure becomes a reported failed result
             payload = {"status": "failed", "error": f"{type(exc).__name__}: {exc}",

@@ -16,6 +16,8 @@ against the schema.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import platform
 from pathlib import Path
 
@@ -109,22 +111,58 @@ def environment() -> dict:
 
 
 def advertised_capabilities() -> list[dict]:
-    """The models this node has characterized (schema: ``capability.json``), one ``serve_model`` per
-    row of ARA's ``characterizations`` store for this machine — evidence ``"characterized"`` (Rule
-    #1: report only what we've empirically measured). Empty when nothing is characterized yet."""
+    """Advertise exact reusable targets, each bound to this durable node identity.
+
+    Display-only/legacy characterization history is deliberately excluded: a coordinator may route
+    governed work only to an artifact/runtime/config cell the node can independently re-derive.
+    """
     with db.connected() as con:
-        rows = db.list_characterizations(con, profile.machine_key())
-    configurable = {"mlx", "cuda", "vulkan"}
-    return [
-        {"kind": "serve_model", "id": row["model_id"], "engine": row["engine"],
-         "evidence": "characterized"}
-        for row in rows
-        if (isinstance(row.get("safe_context"), int)
-            and not isinstance(row["safe_context"], bool) and row["safe_context"] > 0
-            and (row.get("config", {}) == {}
-            or (row.get("config") is None and row["engine"] not in configurable))
-            )
-    ]
+        rows = db.list_reusable_characterizations(con, profile.machine_key())
+    node_id = config.node_identity()
+    result = []
+    for row in rows:
+        safe_context = row.get("safe_context")
+        if (not isinstance(safe_context, int) or isinstance(safe_context, bool)
+                or safe_context <= 0):
+            continue
+        cap = {
+            "kind": "serve_model",
+            "id": row["logical_model_id"],
+            "engine": row["legacy_engine"],
+            "evidence": "characterized",
+            "runtime": row["runtime"],
+            "backend": row["backend"],
+            "artifact_id": row["artifact_id"],
+            "config_key": row["config_key"],
+            "safe_context": safe_context,
+        }
+        authority_payload = {"node_id": node_id, **cap}
+        digest = hashlib.sha256(json.dumps(
+            authority_payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        cap["authority"] = f"node-target:v1:{digest}"
+        result.append(cap)
+    return result
+
+
+def require_execution_authority(kind: str, args: dict) -> None:
+    """Refuse governed remote Ollama work unless this node still advertises the exact target.
+
+    The bearer session binds the offer to this enrolled node. The authority fingerprint additionally
+    binds model, runtime/backend, immutable artifact, and effective config to the node's current
+    reusable evidence. Other engines retain their existing node behavior in this Ollama slice.
+    """
+    if kind not in {"run", "benchmark"} or args.get("engine") != "ollama":
+        return
+    authority = args.get("target_authority")
+    model = args.get("model")
+    if not isinstance(authority, str) or not isinstance(model, str) or not any(
+        cap["engine"] == "ollama"
+        and cap["id"] == model
+        and cap["authority"] == authority
+        for cap in advertised_capabilities()
+    ):
+        raise ValueError("Ollama work lacks current node-scoped runtime authority")
 
 
 def self_description() -> dict:

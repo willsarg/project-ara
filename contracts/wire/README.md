@@ -27,5 +27,7 @@ and the plan `2026-07-01-ara-phone-home-migration-plan` (in the vault).
 | `POST /api/work/{id}/ack` | session token | Node durably accepted the offer; execution may begin |
 | `POST /api/work/{id}/result` | session token | `result.request` |
 
-Shared: `environment` (on every measurement), `capability` (advertised at enroll). Capability
-*matching*/routing and `/api/nodes/self` refresh are deferred (see the plan's slim-v1 cuts).
+Shared: `environment` (on every measurement), `capability` (advertised at enroll). Governed Ollama
+work is selected from an exact reusable capability and carries its node-scoped target authority;
+the node revalidates that authority before local runtime execution. General capability matching and
+`/api/nodes/self` refresh remain deferred (see the plan's slim-v1 cuts).

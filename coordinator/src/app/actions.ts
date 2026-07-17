@@ -6,8 +6,10 @@ import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { SESSION_COOKIE, createSession, invalidateSessions } from "@/lib/auth";
-import { verifyAdminPassword } from "@/lib/db";
-import { approveAgent, denyAgent, issueEnrollmentToken, revoke } from "@/lib/enrollment";
+import { getAgentById, verifyAdminPassword } from "@/lib/db";
+import {
+  approveAgent, authorizedServeModel, denyAgent, issueEnrollmentToken, revoke,
+} from "@/lib/enrollment";
 import { AgentNotActiveError, enqueue } from "@/lib/work";
 import { clientRateLimitKey, rateLimit } from "@/lib/rate-limit";
 
@@ -87,18 +89,33 @@ export async function revokeAgentAction(form: FormData) {
   redirect("/nodes");
 }
 
-/** Enqueue a `run` job (model + prompt) for an active agent to pick up on its next work poll. */
+/** Enqueue a run bound to one exact capability advertised by the selected active node. */
 export async function submitJobAction(form: FormData) {
   const agentId = Number(form.get("agentId"));
-  const model = String(form.get("model") ?? "").trim();
+  const authority = String(form.get("authority") ?? "").trim();
   const prompt = String(form.get("prompt") ?? "").trim();
-  if (!agentId || !model || !prompt) {
+  if (!agentId || !authority || !prompt) {
+    revalidatePath("/nodes");
+    redirect("/nodes?job=invalid");
+  }
+  const agent = getAgentById(agentId);
+  if (!agent || agent.status !== "active") {
+    revalidatePath("/nodes");
+    redirect("/nodes?job=not-active");
+  }
+  const target = authorizedServeModel(agent, authority);
+  if (!target) {
     revalidatePath("/nodes");
     redirect("/nodes?job=invalid");
   }
   let jobId: string;
   try {
-    jobId = enqueue(agentId, "run", { model, prompt });
+    jobId = enqueue(agentId, "run", {
+      model: target.id,
+      prompt,
+      engine: target.engine,
+      target_authority: target.authority,
+    });
   } catch (error) {
     if (!(error instanceof AgentNotActiveError)) throw error;
     revalidatePath("/nodes");

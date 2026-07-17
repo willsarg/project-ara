@@ -16,8 +16,24 @@
       "type": "string",
       "enum": ["characterized", "estimated", "none"],
       "description": "characterized = empirically measured on this node (Rule #1); estimated = formula prior; none = advertised-only"
+    },
+    "runtime": { "type": "string", "minLength": 1 },
+    "backend": { "type": "string", "minLength": 1 },
+    "artifact_id": { "type": "string", "minLength": 1 },
+    "config_key": { "type": "string", "minLength": 1 },
+    "safe_context": { "type": "integer", "minimum": 1 },
+    "authority": {
+      "type": "string",
+      "pattern": "^node-target:v1:[0-9a-f]{64}$",
+      "description": "Node-scoped fingerprint of this exact reusable runtime target."
     }
   },
   "required": ["kind", "id", "engine", "evidence"],
+  "allOf": [
+    {
+      "if": { "properties": { "engine": { "const": "ollama" } }, "required": ["engine"] },
+      "then": { "required": ["runtime", "backend", "artifact_id", "config_key", "safe_context", "authority"] }
+    }
+  ],
   "additionalProperties": false
 }

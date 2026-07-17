@@ -390,6 +390,30 @@ describe("node-auth defensive hash-mismatch guards (simulated DB tampering)", ()
 });
 
 describe("dashboard agent-listing helper", () => {
+  it("resolves only a complete exact capability selected from this node", () => {
+    const authority = `node-target:v1:${"a".repeat(64)}`;
+    const base = { id: 1, machine_key: "m", status: "active", last_seen: null } as const;
+    const exact = {
+      kind: "serve_model", id: "qwen3:0.6b", engine: "ollama",
+      evidence: "characterized", authority,
+    };
+    const row = { ...base, caps_json: JSON.stringify([
+      null,
+      { ...exact, kind: "embeddings" },
+      { ...exact, evidence: "estimated" },
+      { ...exact, id: "" },
+      { ...exact, engine: "" },
+      exact,
+    ]) } as never;
+    expect(enroll.authorizedServeModel(row, authority)).toEqual({
+      id: "qwen3:0.6b", engine: "ollama", authority,
+    });
+    expect(enroll.authorizedServeModel(row, "missing")).toBeNull();
+    expect(enroll.authorizedServeModel({ ...base, caps_json: null } as never, authority)).toBeNull();
+    expect(enroll.authorizedServeModel({ ...base, caps_json: "{}" } as never, authority)).toBeNull();
+    expect(enroll.authorizedServeModel({ ...base, caps_json: "{" } as never, authority)).toBeNull();
+  });
+
   it("summarizes agents newest-first, token-free, with a capabilities count from caps_json", () => {
     const { token } = enroll.issueEnrollmentToken();
     const { enrollment_id } = enroll.enroll(token, selfDesc("box-dash"))!;
@@ -440,13 +464,17 @@ describe("dashboard agent-listing helper", () => {
 
   it("summarizeAgent extracts serve_model entries into serve_models: {id, engine}", () => {
     const base = { id: 1, machine_key: "m", status: "pending", last_seen: null } as const;
+    const authority = `node-target:v1:${"a".repeat(64)}`;
     const caps = JSON.stringify([
       { kind: "serve_model", id: "qwen3:0.6b", engine: "mlx", evidence: "characterized" },
       { kind: "serve_model", id: "llama3:8b", engine: "cuda", evidence: "characterized" },
+      { kind: "serve_model", id: "qwen3:8b", engine: "ollama", evidence: "characterized",
+        authority },
     ]);
     expect(enroll.summarizeAgent({ ...base, caps_json: caps } as never).serve_models).toEqual([
       { id: "qwen3:0.6b", engine: "mlx" },
       { id: "llama3:8b", engine: "cuda" },
+      { id: "qwen3:8b", engine: "ollama", authority },
     ]);
   });
 

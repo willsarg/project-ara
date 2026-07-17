@@ -135,7 +135,14 @@ export default async function NodesPage({ searchParams }: NodesPageProps) {
                     <td>
                       <form action={submitJobAction} className="rowacts">
                         <input type="hidden" name="agentId" value={a.id} />
-                        <input name="model" placeholder="model" required />
+                        <select name="authority" required defaultValue="">
+                          <option value="" disabled>measured target</option>
+                          {serve_models.filter((m) => m.authority).map((m) => (
+                            <option key={m.authority!} value={m.authority!}>
+                              {m.id} ({m.engine})
+                            </option>
+                          ))}
+                        </select>
                         <input name="prompt" placeholder="prompt" required />
                         <button className="btn" type="submit">
                           run

@@ -28,8 +28,18 @@ export const CAPABILITY_SCHEMA = {
     id: { type: "string", minLength: 1 },
     engine: { type: "string", minLength: 1 },
     evidence: { type: "string", enum: ["characterized", "estimated", "none"] },
+    runtime: { type: "string", minLength: 1 },
+    backend: { type: "string", minLength: 1 },
+    artifact_id: { type: "string", minLength: 1 },
+    config_key: { type: "string", minLength: 1 },
+    safe_context: { type: "integer", minimum: 1 },
+    authority: { type: "string", pattern: "^node-target:v1:[0-9a-f]{64}$" },
   },
   required: ["kind", "id", "engine", "evidence"],
+  allOf: [{
+    if: { properties: { engine: { const: "ollama" } }, required: ["engine"] },
+    then: { required: ["runtime", "backend", "artifact_id", "config_key", "safe_context", "authority"] },
+  }],
   additionalProperties: false,
 } as const;
 
@@ -97,6 +107,12 @@ export interface EnrollmentRequest {
     id: string;
     engine: string;
     evidence: "characterized" | "estimated" | "none";
+    runtime?: string;
+    backend?: string;
+    artifact_id?: string;
+    config_key?: string;
+    safe_context?: number;
+    authority?: string;
   }>;
   environment: Record<string, unknown>;
 }

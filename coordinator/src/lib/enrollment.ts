@@ -118,7 +118,7 @@ export interface AgentSummary {
   last_seen: string | null;
   recently_seen: boolean;
   caps_count: number;
-  serve_models: { id: string; engine: string }[];
+  serve_models: { id: string; engine: string; authority?: string }[];
 }
 
 export const RECENT_HEARTBEAT_WINDOW_MS = 60_000;
@@ -139,7 +139,7 @@ const canonicalEngine = (engine: string) =>
  *  throws — a bad blob just yields 0 / []. */
 export function summarizeAgent(a: AgentRow): AgentSummary {
   let caps_count = 0;
-  let serve_models: { id: string; engine: string }[] = [];
+  let serve_models: { id: string; engine: string; authority?: string }[] = [];
   if (a.caps_json) {
     try {
       const parsed = JSON.parse(a.caps_json);
@@ -147,12 +147,13 @@ export function summarizeAgent(a: AgentRow): AgentSummary {
         caps_count = parsed.length;
         serve_models = parsed
           .filter(
-            (c): c is { kind: unknown; id: string; engine?: unknown } =>
+            (c): c is { kind: unknown; id: string; engine?: unknown; authority?: unknown } =>
               typeof c === "object" && c !== null && c.kind === "serve_model" && typeof c.id === "string",
           )
           .map((c) => ({
             id: c.id,
             engine: canonicalEngine(typeof c.engine === "string" ? c.engine : "?"),
+            ...(typeof c.authority === "string" ? { authority: c.authority } : {}),
           }));
       }
     } catch {
@@ -168,6 +169,40 @@ export function summarizeAgent(a: AgentRow): AgentSummary {
     caps_count,
     serve_models,
   };
+}
+
+export interface AuthorizedServeModel {
+  id: string;
+  engine: string;
+  authority: string;
+}
+
+/** Resolve an admin selection against the capability blob enrolled by this exact node. The
+ * coordinator echoes this opaque authority; the node independently re-derives it before runtime
+ * execution, so dashboard input cannot substitute a model or target. */
+export function authorizedServeModel(
+  agent: AgentRow, authority: string,
+): AuthorizedServeModel | null {
+  if (!agent.caps_json || !authority) return null;
+  try {
+    const parsed: unknown = JSON.parse(agent.caps_json);
+    if (!Array.isArray(parsed)) return null;
+    const cap = parsed.find((candidate): candidate is Record<string, unknown> => (
+      typeof candidate === "object" && candidate !== null
+      && candidate.kind === "serve_model"
+      && candidate.evidence === "characterized"
+      && candidate.authority === authority
+      && typeof candidate.id === "string" && candidate.id.length > 0
+      && typeof candidate.engine === "string" && candidate.engine.length > 0
+    ));
+    return cap ? {
+      id: cap.id as string,
+      engine: canonicalEngine(cap.engine as string),
+      authority,
+    } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Every enrolled agent, newest first, as token-free summaries for the dashboard. */

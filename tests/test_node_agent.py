@@ -131,6 +131,23 @@ def test_one_iteration_runs_job_and_posts_done():
     assert fake.acked == ["j1"]
 
 
+def test_remote_ollama_authority_is_checked_before_runtime_execution(monkeypatch):
+    args = {"model": "m", "engine": "ollama", "target_authority": "stale"}
+    fake = FakeClient([{"id": "j1", "kind": "run", "args": args}])
+    monkeypatch.setattr(
+        capabilities, "require_execution_authority",
+        lambda kind, received: (_ for _ in ()).throw(ValueError("authority drift")),
+    )
+    agent.run_loop(
+        _cfg(), client=fake,
+        runner=lambda _kind, _args: pytest.fail("stale authority must not reach the runtime"),
+        max_iterations=1,
+    )
+    assert fake.acked == ["j1"]
+    assert fake.posted[0][1]["status"] == "failed"
+    assert fake.posted[0][1]["error"] == "ValueError: authority drift"
+
+
 def test_second_run_loop_cannot_share_one_node_state_directory():
     with agent._agent_lease():
         with pytest.raises(agent.NodeAgentBusy, match="already owns"):

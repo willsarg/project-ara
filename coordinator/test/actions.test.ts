@@ -43,9 +43,19 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-async function pendingAgent(machineKey: string) {
+const TARGET_AUTHORITY = `node-target:v1:${"a".repeat(64)}`;
+const EXACT_OLLAMA_CAPABILITY = {
+  kind: "serve_model", id: "qwen3:0.6b", engine: "ollama", evidence: "characterized",
+  runtime: "ollama", backend: "apple",
+  artifact_id: `ollama-manifest-sha256:${"b".repeat(64)}`,
+  config_key: "cfg:v1:{}", safe_context: 2048, authority: TARGET_AUTHORITY,
+};
+
+async function pendingAgent(machineKey: string, capabilities: unknown[] = []) {
   const { token } = enroll.issueEnrollmentToken();
-  const { enrollment_id } = enroll.enroll(token, { machine_key: machineKey, environment: {} })!;
+  const { enrollment_id } = enroll.enroll(token, {
+    machine_key: machineKey, environment: {}, capabilities,
+  })!;
   return db.getAgentByEnrollmentId(enrollment_id)!;
 }
 
@@ -267,26 +277,32 @@ describe("revokeAgentAction", () => {
 });
 
 describe("submitJobAction", () => {
-  it("enqueues a job when agentId and model are present", async () => {
-    const agent = await pendingAgent("box-job");
+  it("enqueues a job bound to an exact advertised node target", async () => {
+    const agent = await pendingAgent("box-job", [EXACT_OLLAMA_CAPABILITY]);
     enroll.approveAgent(agent.id);
     const form = new FormData();
     form.set("agentId", String(agent.id));
-    form.set("model", "qwen");
+    form.set("authority", TARGET_AUTHORITY);
     form.set("prompt", "hello");
     await expect(actions.submitJobAction(form)).rejects.toThrow(
       /^NEXT_REDIRECT:\/nodes\?job=queued&jobId=job_[0-9a-f]{24}$/,
     );
 
     const job = await work.nextForAgent(agent.id, 0);
-    expect(job).toMatchObject({ kind: "run", args: { model: "qwen", prompt: "hello" } });
+    expect(job).toMatchObject({
+      kind: "run",
+      args: {
+        model: "qwen3:0.6b", prompt: "hello", engine: "ollama",
+        target_authority: TARGET_AUTHORITY,
+      },
+    });
   });
 
-  it("rejects when model is missing/blank", async () => {
+  it("rejects when authority is missing or blank", async () => {
     const agent = await pendingAgent("box-job-nomodel");
     const form = new FormData();
     form.set("agentId", String(agent.id));
-    form.set("model", "   "); // trims to empty -> falsy
+    form.set("authority", "   "); // trims to empty -> falsy
     await expect(actions.submitJobAction(form)).rejects.toThrow(
       "NEXT_REDIRECT:/nodes?job=invalid",
     );
@@ -295,17 +311,17 @@ describe("submitJobAction", () => {
 
   it("rejects when agentId is missing/falsy", async () => {
     const form = new FormData();
-    form.set("model", "qwen");
+    form.set("authority", TARGET_AUTHORITY);
     form.set("prompt", "hello");
     await expect(actions.submitJobAction(form)).rejects.toThrow(
       "NEXT_REDIRECT:/nodes?job=invalid",
     );
   });
 
-  it("rejects when the model field is entirely absent (?? \"\" fallback)", async () => {
+  it("rejects when the authority field is entirely absent (?? \"\" fallback)", async () => {
     const agent = await pendingAgent("box-job-nofield");
     const form = new FormData();
-    form.set("agentId", String(agent.id)); // no "model" key at all
+    form.set("agentId", String(agent.id)); // no "authority" key at all
     form.set("prompt", "hello");
     await expect(actions.submitJobAction(form)).rejects.toThrow(
       "NEXT_REDIRECT:/nodes?job=invalid",
@@ -314,12 +330,12 @@ describe("submitJobAction", () => {
   });
 
   it("rejects a missing or blank prompt before enqueueing", async () => {
-    const agent = await pendingAgent("box-job-noprompt");
+    const agent = await pendingAgent("box-job-noprompt", [EXACT_OLLAMA_CAPABILITY]);
     enroll.approveAgent(agent.id);
     for (const prompt of [undefined, "   "]) {
       const form = new FormData();
       form.set("agentId", String(agent.id));
-      form.set("model", "qwen");
+      form.set("authority", TARGET_AUTHORITY);
       if (prompt !== undefined) form.set("prompt", prompt);
       await expect(actions.submitJobAction(form)).rejects.toThrow(
         "NEXT_REDIRECT:/nodes?job=invalid",
@@ -333,7 +349,7 @@ describe("submitJobAction", () => {
     for (const id of [pending.id, 999_999]) {
       const form = new FormData();
       form.set("agentId", String(id));
-      form.set("model", "qwen");
+      form.set("authority", TARGET_AUTHORITY);
       form.set("prompt", "hello");
       await expect(actions.submitJobAction(form)).rejects.toThrow(
         "NEXT_REDIRECT:/nodes?job=not-active",
@@ -342,7 +358,7 @@ describe("submitJobAction", () => {
     enroll.denyAgent(pending.id);
     const denied = new FormData();
     denied.set("agentId", String(pending.id));
-    denied.set("model", "qwen");
+    denied.set("authority", TARGET_AUTHORITY);
     denied.set("prompt", "hello");
     await expect(actions.submitJobAction(denied)).rejects.toThrow(
       "NEXT_REDIRECT:/nodes?job=not-active",
@@ -350,16 +366,45 @@ describe("submitJobAction", () => {
   });
 
   it("does not hide unexpected enqueue failures", async () => {
-    const active = await pendingAgent("box-job-unexpected-error");
+    const active = await pendingAgent("box-job-unexpected-error", [EXACT_OLLAMA_CAPABILITY]);
     enroll.approveAgent(active.id);
     const broken = vi.spyOn(work, "enqueue").mockImplementationOnce(() => {
       throw new Error("database unavailable");
     });
     const form = new FormData();
     form.set("agentId", String(active.id));
-    form.set("model", "qwen");
+    form.set("authority", TARGET_AUTHORITY);
     form.set("prompt", "hello");
     await expect(actions.submitJobAction(form)).rejects.toThrow("database unavailable");
     broken.mockRestore();
+  });
+
+  it("reports a node that becomes inactive during enqueue", async () => {
+    const active = await pendingAgent("box-job-race", [EXACT_OLLAMA_CAPABILITY]);
+    enroll.approveAgent(active.id);
+    const raced = vi.spyOn(work, "enqueue").mockImplementationOnce(() => {
+      throw new work.AgentNotActiveError();
+    });
+    const form = new FormData();
+    form.set("agentId", String(active.id));
+    form.set("authority", TARGET_AUTHORITY);
+    form.set("prompt", "hello");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=not-active",
+    );
+    raced.mockRestore();
+  });
+
+  it("rejects an authority that the selected node did not advertise", async () => {
+    const active = await pendingAgent("box-job-drift", [EXACT_OLLAMA_CAPABILITY]);
+    enroll.approveAgent(active.id);
+    const form = new FormData();
+    form.set("agentId", String(active.id));
+    form.set("authority", `node-target:v1:${"c".repeat(64)}`);
+    form.set("prompt", "hello");
+    await expect(actions.submitJobAction(form)).rejects.toThrow(
+      "NEXT_REDIRECT:/nodes?job=invalid",
+    );
+    expect(await work.nextForAgent(active.id, 0)).toBeNull();
   });
 });

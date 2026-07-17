@@ -5,8 +5,7 @@
     "args": {
       "model": "qwen3:0.6b",
       "prompt": "What is the capital of France?",
-      "engine": "ollama",
-      "target_authority": "node-target:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "engine": "ollama"
     }
   }
 }
