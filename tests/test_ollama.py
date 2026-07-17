@@ -937,7 +937,7 @@ def test_benchmark_prompts_freezes_request_policy_and_preserves_runtime_metrics(
                     "eval_duration_ns": 70,
                 },
             },
-            {"prompt_index": 1, "completion": "answer 1", "usage": {}},
+            {"prompt_index": 1, "error": "missing thinking metadata"},
         ],
         "request_policy": {
             "api": "/api/generate",
@@ -949,6 +949,7 @@ def test_benchmark_prompts_freezes_request_policy_and_preserves_runtime_metrics(
             "temperature": 0.0,
             "seed": 0,
             "max_tokens": 512,
+            "workload_contract": "thinking_completion_v1",
         },
     }
 
@@ -968,6 +969,7 @@ def test_benchmark_prompts_turns_each_invalid_response_into_typed_prompt_error(
     assert result["context"] == 4096
     assert result["results"] == [{"prompt_index": 0, "error": message}]
     assert result["request_policy"]["think"] is False
+    assert result["request_policy"]["workload_contract"] == "completion_v1"
 
 
 def test_benchmark_prompts_ignores_invalid_usage_metrics(monkeypatch):

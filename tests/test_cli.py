@@ -10565,7 +10565,16 @@ _OLLAMA_BENCHMARK_POLICY = {
     "temperature": 0.0,
     "seed": 0,
     "max_tokens": 256,
+    "workload_contract": "completion_v1",
 }
+
+
+def test_ollama_benchmark_policy_certifies_thinking_cell():
+    record = cli.ollama.OllamaModel(
+        name="thinking", format="gguf", capabilities=("completion", "thinking"))
+
+    assert cli._ollama_benchmark_policy(record, 512)["workload_contract"] == (
+        "thinking_completion_v1")
 
 
 def _wire_benchmark_ollama(monkeypatch, *, response=Ellipsis):

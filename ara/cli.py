@@ -2089,16 +2089,19 @@ def _ollama_backend_for_placement(placement: str) -> str:
 
 
 def _ollama_benchmark_policy(record: ollama.OllamaModel, max_tokens: int) -> dict:
+    thinking = "thinking" in record.capabilities
     return {
         "api": "/api/generate",
         "raw": False,
-        "think": "thinking" in record.capabilities,
+        "think": thinking,
         "template": "model_default",
         "truncate": False,
         "shift": False,
         "temperature": 0.0,
         "seed": 0,
         "max_tokens": max_tokens,
+        "workload_contract": (
+            "thinking_completion_v1" if thinking else "completion_v1"),
     }
 
 

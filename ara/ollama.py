@@ -727,6 +727,8 @@ def benchmark_prompts(
         "temperature": 0.0,
         "seed": 0,
         "max_tokens": num_predict,
+        "workload_contract": (
+            "thinking_completion_v1" if think else "completion_v1"),
     }
     metric_keys = {
         "prompt_eval_count": "prompt_tokens",
@@ -766,6 +768,8 @@ def benchmark_prompts(
             error = "incomplete completion"
         elif not isinstance(data.get("response"), str):
             error = "invalid completion"
+        elif think and data.get("thinking") is None:
+            error = "missing thinking metadata"
         elif data.get("thinking") is not None and not isinstance(data["thinking"], str):
             error = "invalid thinking metadata"
         elif data.get("done_reason") is not None and not isinstance(data["done_reason"], str):
