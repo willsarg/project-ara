@@ -689,6 +689,7 @@ def test_mlx_serve_sigterm_unwind_cleans_activity(
 
 def _wire_ollama_serve(monkeypatch, *, isatty=False):
     monkeypatch.setattr(cli.ollama, "version", lambda: "1.0")
+    monkeypatch.setattr(cli.ollama, "ps", lambda _timeout=2.0: [])
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model"])
     monkeypatch.setattr(
         cli.ollama, "inventory",
