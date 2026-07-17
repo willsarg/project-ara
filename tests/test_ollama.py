@@ -873,8 +873,122 @@ def test_generate_for_run_buffers_with_explicit_governed_options(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# pull — fetch a missing model (serve's get-out-of-the-way step)
-# Spec 2026-07-04-ara-serve-one-command-estimated-ceiling.
+# governed benchmark — deterministic sequential native generation
+# --------------------------------------------------------------------------- #
+def test_benchmark_prompts_freezes_request_policy_and_preserves_runtime_metrics(monkeypatch):
+    seen = []
+    responses = iter([
+        {
+            "done": True,
+            "response": "answer 0",
+            "thinking": "reasoning 0",
+            "done_reason": "stop",
+            "prompt_eval_count": 5,
+            "eval_count": 2,
+            "total_duration": 100,
+            "load_duration": 10,
+            "prompt_eval_duration": 20,
+            "eval_duration": 70,
+        },
+        {"done": True, "response": "answer 1"},
+    ])
+
+    def fake_post(path, payload, timeout):
+        seen.append((path, payload, timeout))
+        return next(responses)
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+
+    result = ollama.benchmark_prompts(
+        "qwen3:0.6b", ["prompt 0", "prompt 1"], 8192, 512, think=True)
+
+    expected_payload = {
+        "model": "qwen3:0.6b",
+        "stream": False,
+        "raw": False,
+        "think": True,
+        "truncate": False,
+        "shift": False,
+        "options": {
+            "num_ctx": 8192,
+            "num_predict": 512,
+            "temperature": 0.0,
+            "seed": 0,
+        },
+    }
+    assert seen == [
+        ("/api/generate", {**expected_payload, "prompt": "prompt 0"}, 300.0),
+        ("/api/generate", {**expected_payload, "prompt": "prompt 1"}, 300.0),
+    ]
+    assert result == {
+        "context": 8192,
+        "results": [
+            {
+                "prompt_index": 0,
+                "completion": "answer 0",
+                "thinking": "reasoning 0",
+                "stop_reason": "stop",
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_duration_ns": 100,
+                    "load_duration_ns": 10,
+                    "prompt_eval_duration_ns": 20,
+                    "eval_duration_ns": 70,
+                },
+            },
+            {"prompt_index": 1, "completion": "answer 1", "usage": {}},
+        ],
+        "request_policy": {
+            "api": "/api/generate",
+            "raw": False,
+            "think": True,
+            "template": "model_default",
+            "truncate": False,
+            "shift": False,
+            "temperature": 0.0,
+            "seed": 0,
+            "max_tokens": 512,
+        },
+    }
+
+
+@pytest.mark.parametrize(("response", "message"), [
+    (None, "request failed"),
+    ({"error": "server exploded"}, "server exploded"),
+    ({"done": False}, "incomplete completion"),
+    ({"done": True, "response": 1}, "invalid completion"),
+    ({"done": True, "response": "ok", "thinking": 1}, "invalid thinking metadata"),
+    ({"done": True, "response": "ok", "done_reason": 1}, "invalid stop reason"),
+])
+def test_benchmark_prompts_turns_each_invalid_response_into_typed_prompt_error(
+        monkeypatch, response, message):
+    monkeypatch.setattr(ollama, "_post_json", lambda *_args: response)
+    result = ollama.benchmark_prompts("m", ["p"], 4096, 256, think=False)
+    assert result["context"] == 4096
+    assert result["results"] == [{"prompt_index": 0, "error": message}]
+    assert result["request_policy"]["think"] is False
+
+
+def test_benchmark_prompts_ignores_invalid_usage_metrics(monkeypatch):
+    monkeypatch.setattr(
+        ollama,
+        "_post_json",
+        lambda *_args: {
+            "done": True,
+            "response": "ok",
+            "prompt_eval_count": True,
+            "eval_count": -1,
+            "total_duration": "slow",
+        },
+    )
+    result = ollama.benchmark_prompts("m", ["p"], 4096, 256, think=False)
+    assert result["results"] == [
+        {"prompt_index": 0, "completion": "ok", "usage": {}}]
+
+
+# --------------------------------------------------------------------------- #
+# pull — explicit acquisition primitive (governed serve never calls it)
 # --------------------------------------------------------------------------- #
 def test_pull_success_sends_model_and_returns_true(monkeypatch):
     seen = {}

@@ -700,3 +700,93 @@ def generate_for_run(
         },
         timeout,
     )
+
+
+def benchmark_prompts(
+    name: str,
+    prompts: list[str],
+    num_ctx: int,
+    num_predict: int,
+    *,
+    think: bool,
+    timeout: float = 300.0,
+) -> dict:
+    """Generate one deterministic, independently scored completion per benchmark prompt.
+
+    This is only the Ollama protocol adapter. The caller owns admission, live wall verification,
+    scoring, execution consent, and persistence. Requests are sequential so ARA never manufactures
+    concurrency, and template processing remains bound to the exact Ollama artifact being measured.
+    """
+    policy = {
+        "api": "/api/generate",
+        "raw": False,
+        "think": think,
+        "template": "model_default",
+        "truncate": False,
+        "shift": False,
+        "temperature": 0.0,
+        "seed": 0,
+        "max_tokens": num_predict,
+    }
+    metric_keys = {
+        "prompt_eval_count": "prompt_tokens",
+        "eval_count": "completion_tokens",
+        "total_duration": "total_duration_ns",
+        "load_duration": "load_duration_ns",
+        "prompt_eval_duration": "prompt_eval_duration_ns",
+        "eval_duration": "eval_duration_ns",
+    }
+    results = []
+    for index, prompt in enumerate(prompts):
+        data = _post_json(
+            "/api/generate",
+            {
+                "model": name,
+                "prompt": prompt,
+                "stream": False,
+                "raw": False,
+                "think": think,
+                "truncate": False,
+                "shift": False,
+                "options": {
+                    "num_ctx": num_ctx,
+                    "num_predict": num_predict,
+                    "temperature": 0.0,
+                    "seed": 0,
+                },
+            },
+            timeout,
+        )
+        error = None
+        if not isinstance(data, dict):
+            error = "request failed"
+        elif isinstance(data.get("error"), str):
+            error = data["error"]
+        elif data.get("done") is not True:
+            error = "incomplete completion"
+        elif not isinstance(data.get("response"), str):
+            error = "invalid completion"
+        elif data.get("thinking") is not None and not isinstance(data["thinking"], str):
+            error = "invalid thinking metadata"
+        elif data.get("done_reason") is not None and not isinstance(data["done_reason"], str):
+            error = "invalid stop reason"
+        if error is not None:
+            results.append({"prompt_index": index, "error": error})
+            continue
+
+        usage = {
+            public: value
+            for source, public in metric_keys.items()
+            if type(value := data.get(source)) is int and value >= 0
+        }
+        item = {
+            "prompt_index": index,
+            "completion": data["response"],
+            "usage": usage,
+        }
+        if data.get("thinking") is not None:
+            item["thinking"] = data["thinking"]
+        if data.get("done_reason") is not None:
+            item["stop_reason"] = data["done_reason"]
+        results.append(item)
+    return {"context": num_ctx, "results": results, "request_policy": policy}
