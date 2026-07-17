@@ -8498,7 +8498,7 @@ def test_find_loaded_matches_exact_tagged_and_none():
 def _resident(name="served:latest", *, digest="a" * 64, context=8192,
               size=100, size_vram=100):
     return cli.ollama.OllamaProcess(
-        name=name, digest=digest, context_length=context,
+        name=name, digest=digest, effective_context_per_request=context,
         size_bytes=size, size_vram_bytes=size_vram)
 
 

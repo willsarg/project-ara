@@ -67,14 +67,19 @@ class OllamaModel:
 
 @dataclass(frozen=True)
 class OllamaProcess:
-    """One resident model from a coherent ``GET /api/ps`` safety snapshot."""
+    """One resident model from a coherent ``GET /api/ps`` safety snapshot.
+
+    Ollama's ``context_length`` response field is effective context per request, not the runner's
+    total allocation. The endpoint does not attest daemon parallelism, so it remains unknown.
+    """
 
     name: str
     model: str | None = None
     digest: str | None = None
     size_bytes: int | None = None
     size_vram_bytes: int | None = None
-    context_length: int | None = None
+    effective_context_per_request: int | None = None
+    parallelism: None = None
     expires_at: str | None = None
 
 
@@ -304,7 +309,7 @@ def processes(timeout: float = 2.0) -> list[OllamaProcess] | None:
                     and _MANIFEST_DIGEST.fullmatch(digest) else None),
             size_bytes=_nonnegative_int(row.get("size")),
             size_vram_bytes=_nonnegative_int(row.get("size_vram")),
-            context_length=_positive_int(row.get("context_length")),
+            effective_context_per_request=_positive_int(row.get("context_length")),
             expires_at=_optional_string(row.get("expires_at")),
         ))
     return result
@@ -312,8 +317,9 @@ def processes(timeout: float = 2.0) -> list[OllamaProcess] | None:
 
 def ps(timeout: float = 2.0) -> list[dict] | None:
     """Currently-loaded models via ``GET /api/ps`` — each dict carries ``name``,
-    ``context_length``, ``size`` and ``size_vram`` (``size_vram < size`` ⇒ partial offload /
-    spill). ``None`` when unreachable; non-dict entries are dropped."""
+    ``context_length`` (effective per request, not total runner allocation), ``size`` and
+    ``size_vram`` (``size_vram < size`` ⇒ partial offload / spill). Parallelism is not attested.
+    ``None`` when unreachable; non-dict entries are dropped."""
     data = _get_json("/api/ps", timeout)
     if not data:
         return None

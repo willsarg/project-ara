@@ -2614,8 +2614,8 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
                             provenance: dict | None = None):
     """Ramp Ollama residency to the largest context *model* loads with NO spill. For each rung
     (ascending), bake a *probe* derived model at that ctx, load it, and read ``/api/ps``: it counts
-    only when governance took (``context_length`` == ctx) AND it's fully resident
-    (``size_vram >= size``). KV grows monotonically, so the first spill/failure ends the ramp.
+    only when governance took (effective per-request ``context_length`` == ctx) AND it's fully
+    resident (``size_vram >= size``). KV grows monotonically, so the first spill/failure ends the ramp.
     Returns ``(best_ctx | None, points)``. Spec 2026-07-04-characterize-through-ollama-ramp."""
     best, points = None, []
     previous_context, previous_digest = None, None
@@ -2859,7 +2859,7 @@ def _ollama_residency_error(
     verified = (
         process.name in accepted_names
         and process.digest == allowed_digest
-        and process.context_length == allowed_context
+        and process.effective_context_per_request == allowed_context
         and isinstance(process.size_bytes, int) and not isinstance(process.size_bytes, bool)
         and process.size_bytes > 0
         and isinstance(process.size_vram_bytes, int)

@@ -399,18 +399,19 @@ def test_processes_parses_current_shape(monkeypatch):
         "size": 600_000_000,
         "size_vram": 500_000_000,
         "context_length": 8192,
+        "num_parallel": 4,
         "expires_at": "2026-07-17T12:00:00Z",
     }]})
 
-    assert ollama.processes() == [ollama.OllamaProcess(
-        name="qwen3:0.6b",
-        model="qwen3:0.6b",
-        digest=digest,
-        size_bytes=600_000_000,
-        size_vram_bytes=500_000_000,
-        context_length=8192,
-        expires_at="2026-07-17T12:00:00Z",
-    )]
+    process = ollama.processes()[0]
+    assert process.name == "qwen3:0.6b"
+    assert process.model == "qwen3:0.6b"
+    assert process.digest == digest
+    assert process.size_bytes == 600_000_000
+    assert process.size_vram_bytes == 500_000_000
+    assert process.effective_context_per_request == 8192
+    assert process.parallelism is None
+    assert process.expires_at == "2026-07-17T12:00:00Z"
 
 
 def test_processes_keeps_malformed_optional_fields_unknown(monkeypatch):
