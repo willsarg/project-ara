@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Sequence
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -2423,6 +2423,120 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 RUN_MAX_TOKENS = 256
 
 
+class _OllamaGovernanceError(RuntimeError):
+    """One failed invariant in a governed request on the shared Ollama daemon."""
+
+
+@contextmanager
+def _governed_ollama_request(
+    endpoint: ollama.OllamaEndpoint,
+    authority: ollama.OllamaRuntimeAuthority,
+    record: ollama.OllamaModel,
+    safe: int,
+    config: dict,
+    artifact_id: str,
+    *,
+    activity_kind: str,
+    label: str,
+):
+    """Admit one Ollama operation, warming if needed, and re-attest after it returns."""
+
+    expected_digest = artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+    with locking.ollama_setup_lock(endpoint.url, record.name):
+        with activity.track(activity_kind, record.name):
+            if ollama.runtime_authority(endpoint) != authority:
+                raise _OllamaGovernanceError(
+                    f"Ollama runtime authority changed before the {label}")
+            current_models = ollama.inventory()
+            current_record = (
+                ollama.find_model(current_models, record.name)
+                if current_models is not None else None)
+            if current_record is None or current_record.digest != record.digest:
+                raise _OllamaGovernanceError(
+                    f"the Ollama manifest changed before the {label}")
+
+            processes = ollama.processes()
+            residency_error = _ollama_residency_error(
+                processes,
+                allowed_name=record.name,
+                allowed_digest=expected_digest,
+                allowed_context=safe,
+            )
+            if residency_error is not None:
+                raise _OllamaGovernanceError(residency_error)
+            resident = bool(processes)
+            before = ollama_evidence.capture_memory_snapshot()
+            headroom_error = ollama_evidence.live_headroom_refusal_reason(
+                before, config, resident=resident)
+            if headroom_error is not None:
+                raise _OllamaGovernanceError(
+                    f"live Ollama admission refused: {headroom_error}")
+
+            if resident:
+                live_error = ollama_evidence.live_residency_refusal_reason(
+                    before, processes[0], config, safe)
+                if live_error is not None:
+                    raise _OllamaGovernanceError(
+                        "resident Ollama target does not match reusable evidence: "
+                        f"{live_error}")
+
+            if not resident:
+                warmed = ollama.warm_for_run(record.name, safe)
+                if not isinstance(warmed, dict) or warmed.get("done") is not True:
+                    raise _OllamaGovernanceError(
+                        "Ollama couldn't confirm the governed warm request")
+                if ollama.runtime_authority(endpoint) != authority:
+                    raise _OllamaGovernanceError(
+                        "Ollama runtime authority changed during warmup")
+                processes = ollama.processes()
+                residency_error = _ollama_residency_error(
+                    processes,
+                    allowed_name=record.name,
+                    allowed_digest=expected_digest,
+                    allowed_context=safe,
+                    require_target=True,
+                )
+                if residency_error is not None:
+                    raise _OllamaGovernanceError(residency_error)
+                warm_snapshot = ollama_evidence.capture_memory_snapshot()
+                live_error = ollama_evidence.live_residency_refusal_reason(
+                    warm_snapshot, processes[0], config, safe)
+                if live_error is not None:
+                    raise _OllamaGovernanceError(
+                        f"Ollama warmup did not match reusable evidence: {live_error}")
+
+            yield
+
+            if ollama.runtime_authority(endpoint) != authority:
+                raise _OllamaGovernanceError(
+                    f"Ollama runtime authority changed during the {label}; no result shown")
+            final_models = ollama.inventory()
+            final_record = (
+                ollama.find_model(final_models, record.name)
+                if final_models is not None else None)
+            if final_record is None or final_record.digest != record.digest:
+                raise _OllamaGovernanceError(
+                    f"the Ollama manifest changed during the {label}; no result shown")
+            final_processes = ollama.processes()
+            residency_error = _ollama_residency_error(
+                final_processes,
+                allowed_name=record.name,
+                allowed_digest=expected_digest,
+                allowed_context=safe,
+                require_target=True,
+            )
+            if residency_error is not None:
+                raise _OllamaGovernanceError(
+                    f"Ollama residency changed during the {label}; no result shown: "
+                    f"{residency_error}")
+            final_snapshot = ollama_evidence.capture_memory_snapshot()
+            live_error = ollama_evidence.live_residency_refusal_reason(
+                final_snapshot, final_processes[0], config, safe)
+            if live_error is not None:
+                raise _OllamaGovernanceError(
+                    f"Ollama walls changed during the {label}; no result shown: {live_error}")
+
+
 def _render_run_ollama(
     c: Console,
     model: str,
@@ -2491,7 +2605,6 @@ def _render_run_ollama(
     safe = row["safe_context"]
     config = row["config"]
     artifact_id = row["artifact_id"]
-    expected_digest = artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
 
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Run {record.name} through Ollama at ≤{safe} ctx?"):
@@ -2506,91 +2619,14 @@ def _render_run_ollama(
 
     result = None
     try:
-        with locking.ollama_setup_lock(endpoint.url, record.name):
-            with activity.track("running", record.name):
-                if ollama.runtime_authority(endpoint) != authority:
-                    return err("Ollama runtime authority changed before the run")
-                current_models = ollama.inventory()
-                current_record = (
-                    ollama.find_model(current_models, record.name)
-                    if current_models is not None else None)
-                if current_record is None or current_record.digest != record.digest:
-                    return err("the Ollama manifest changed before the run")
-
-                processes = ollama.processes()
-                residency_error = _ollama_residency_error(
-                    processes,
-                    allowed_name=record.name,
-                    allowed_digest=expected_digest,
-                    allowed_context=safe,
-                )
-                if residency_error is not None:
-                    return err(residency_error)
-                resident = bool(processes)
-                before = ollama_evidence.capture_memory_snapshot()
-                headroom_error = ollama_evidence.live_headroom_refusal_reason(
-                    before, config, resident=resident)
-                if headroom_error is not None:
-                    return err(f"live Ollama admission refused: {headroom_error}")
-
-                if resident:
-                    live_error = ollama_evidence.live_residency_refusal_reason(
-                        before, processes[0], config, safe)
-                    if live_error is not None:
-                        return err(f"resident Ollama target does not match reusable evidence: "
-                                   f"{live_error}")
-
-                if not resident:
-                    warmed = ollama.warm_for_run(record.name, safe)
-                    if not isinstance(warmed, dict) or warmed.get("done") is not True:
-                        return err("Ollama couldn't confirm the governed warm request")
-                    if ollama.runtime_authority(endpoint) != authority:
-                        return err("Ollama runtime authority changed during warmup")
-                    processes = ollama.processes()
-                    residency_error = _ollama_residency_error(
-                        processes,
-                        allowed_name=record.name,
-                        allowed_digest=expected_digest,
-                        allowed_context=safe,
-                        require_target=True,
-                    )
-                    if residency_error is not None:
-                        return err(residency_error)
-                    warm_snapshot = ollama_evidence.capture_memory_snapshot()
-                    live_error = ollama_evidence.live_residency_refusal_reason(
-                        warm_snapshot, processes[0], config, safe)
-                    if live_error is not None:
-                        return err(f"Ollama warmup did not match reusable evidence: {live_error}")
-
-                result = ollama.generate_for_run(
-                    record.name, prompt, safe, max_tokens)
-
-                if ollama.runtime_authority(endpoint) != authority:
-                    return err("Ollama runtime authority changed during the run; no result shown")
-                final_models = ollama.inventory()
-                final_record = (
-                    ollama.find_model(final_models, record.name)
-                    if final_models is not None else None)
-                if final_record is None or final_record.digest != record.digest:
-                    return err("the Ollama manifest changed during the run; no result shown")
-                final_processes = ollama.processes()
-                residency_error = _ollama_residency_error(
-                    final_processes,
-                    allowed_name=record.name,
-                    allowed_digest=expected_digest,
-                    allowed_context=safe,
-                    require_target=True,
-                )
-                if residency_error is not None:
-                    return err(f"Ollama residency changed during the run; no result shown: "
-                               f"{residency_error}")
-                final_snapshot = ollama_evidence.capture_memory_snapshot()
-                live_error = ollama_evidence.live_residency_refusal_reason(
-                    final_snapshot, final_processes[0], config, safe)
-                if live_error is not None:
-                    return err(f"Ollama walls changed during the run; no result shown: "
-                               f"{live_error}")
+        with _governed_ollama_request(
+                endpoint, authority, record, safe, config, artifact_id,
+                activity_kind="running", label="run"):
+            result = ollama.generate_for_run(
+                record.name, prompt, safe, max_tokens)
     except locking.OllamaSetupBusy as exc:
+        return err(str(exc))
+    except _OllamaGovernanceError as exc:
         return err(str(exc))
     except (SystemExit, Exception) as exc:
         return err(f"Ollama run failed: {exc}")
