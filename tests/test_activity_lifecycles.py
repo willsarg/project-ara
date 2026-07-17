@@ -794,13 +794,9 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
 
     def load(_name, keep_alive=-1, **_k):
         nonlocal loaded
-        if keep_alive is None:
-            _assert_activity("serving", "base:model")
-            calls.append("load-temporary")
-        else:
-            assert not list(activity_registry.glob("*.json"))
-            assert len(list((activity_registry / "serving").glob("*.json"))) == 1
-            calls.append("pin")
+        assert keep_alive is None
+        _assert_activity("serving", "base:model")
+        calls.append("load-temporary")
         loaded = True
         return {"done": True}
 
@@ -829,7 +825,7 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     monkeypatch.setattr(cli.activity, "record_ollama_serving", record)
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
-    assert calls == ["verify", "create", "load-temporary", "verify", "record", "pin"]
+    assert calls == ["verify", "create", "load-temporary", "verify", "record"]
 
     monkeypatch.setattr(cli.ollama, "ps", lambda: [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,

@@ -2897,6 +2897,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # Ollama measurements are valid only for the exact Ollama manifest that was measured. Even another
 # llama.cpp-class runtime can allocate differently, so cross-runtime ceilings never transfer.
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
+_OLLAMA_DERIVED_POLICY_VERSION = "ollama-derived-v2"
 
 
 def _ollama_governed_endpoint() -> tuple[ollama.OllamaEndpoint, str | None]:
@@ -3411,7 +3412,7 @@ def _ollama_pick_best(
 
 def _governed_name(model: str, *, artifact_id: str | None = None,
                    context: int | None = None) -> str:
-    """Return a deterministic Ollama name bound to model manifest and governed context.
+    """Return a deterministic Ollama name bound to policy, manifest, and governed context.
 
     The two-argument form is retained for internal probe-name compatibility only.
     """
@@ -3420,7 +3421,8 @@ def _governed_name(model: str, *, artifact_id: str | None = None,
         ascii_safe = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "-"
                              for ch in model.lower()).strip("-._") or "model"
         digest = hashlib.sha256(
-            f"{model}\0{artifact_id}\0{context}".encode("utf-8")).hexdigest()[:24]
+            f"{_OLLAMA_DERIVED_POLICY_VERSION}\0{model}\0{artifact_id}\0{context}".encode(
+                "utf-8")).hexdigest()[:24]
         return f"ara-{ascii_safe[:40]}-ctx{context}-{digest}"
     return safe + "-ara"
 
@@ -3844,13 +3846,12 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                         return setup_err(
                             f"{model}'s Ollama manifest changed during setup — refusing to load it")
 
-                # 5. Load under daemon policy while setup is temporary. Only proven, durably owned
-                # residency is pinned indefinitely below.
+                # 5. Load under the daemon's cache/eviction policy. ARA verifies this handoff now;
+                # it does not force indefinite residency or claim to govern later cold reloads.
                 if _ollama_artifact_id(served) != served_artifact_id:
                     return err(f"governed model {served!r} changed before load — refusing mutable "
                                "identity; ARA did not unload or delete it")
-                keep_alive = -1 if already_owned else None
-                if ollama.load(served, keep_alive=keep_alive) is None:
+                if ollama.load(served, keep_alive=None) is None:
                     return setup_err(f"couldn't load the governed model {served!r} on Ollama")
                 expected_served_digest = served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
                 processes = ollama.processes()
@@ -3875,11 +3876,6 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                     return setup_err(
                         f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: "
                         f"{exc}")
-                if ollama.load(served, keep_alive=-1) is None:
-                    return err(
-                        f"couldn't confirm indefinite residency for governed model {served!r}; "
-                        "the exact ownership record and manifest were preserved because the "
-                        "Ollama request outcome is unknown — retry the same `ara serve` command")
     except locking.OllamaSetupBusy as exc:
         return err(str(exc))
     except BaseException:
@@ -3904,12 +3900,21 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                           "base_artifact_id": base_artifact_id,
                           "served_artifact_id": served_artifact_id,
                           "auto_selected": auto_selected, "stale_ceiling": stale_ceiling,
+                          "handoff": {
+                              "claim": "verified_point_in_time",
+                              "policy_version": _OLLAMA_DERIVED_POLICY_VERSION,
+                              "runtime_version": authority.server_version,
+                              "server_instance_id": authority.server_instance_id,
+                              "continuous_admission": False,
+                              "future_reload": "ollama_daemon_policy",
+                          },
                           "openai_base_url": endpoint}, indent=2))
         return 0
     c.emit()
     c.emit(c.field("serving", f"{served}  ({model} @ {safe} ctx, {source})"))
     c.emit(c.field("endpoint", f"{endpoint}  (OpenAI-compatible)"))
     c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
+    c.emit(c.field("validity", "verified now · later reloads follow Ollama daemon policy"))
     if spilled is True:
         c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
     c.emit()

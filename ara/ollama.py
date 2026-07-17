@@ -602,10 +602,11 @@ def delete(name: str, timeout: float = 30.0) -> bool:
         return False
 
 
-def load(name: str, keep_alive: int | None = -1, timeout: float = 300.0) -> dict | None:
+def load(name: str, keep_alive: int | None = None, timeout: float = 300.0) -> dict | None:
     """Warm-load ``name`` into memory via an empty-prompt ``POST /api/generate`` (so it appears
-    in ``ps`` for verification). ``-1`` holds it until stopped; ``None`` omits ``keep_alive`` so
-    the daemon's configured policy applies. Returns the response dict, or ``None`` on failure."""
+    in ``ps`` for verification). The default omits ``keep_alive`` so the daemon's configured
+    cache/eviction policy applies; ``-1`` remains available to explicit callers. Returns the
+    response dict, or ``None`` on failure."""
     payload = {"model": name, "prompt": "", "stream": False}
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive

@@ -8875,7 +8875,7 @@ def test_serve_refuses_additional_model_appearing_after_load(make_console, monke
     assert "other" in buf.getvalue() and "strict admission" in buf.getvalue()
 
 
-def test_serve_stages_daemon_policy_then_pins_only_after_recording_ownership(
+def test_serve_uses_daemon_keep_alive_policy_without_final_pin(
         make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
     calls = []
@@ -8895,7 +8895,6 @@ def test_serve_stages_daemon_policy_then_pins_only_after_recording_ownership(
     assert calls == [
         ("load", _serve_name(), None),
         ("record",),
-        ("load", _serve_name(), -1),
     ]
 
 
@@ -8923,14 +8922,14 @@ def test_serve_strict_admission_failure_never_expires_shared_runner(
     assert deleted == [_serve_name()]
 
 
-def test_serve_failed_final_pin_preserves_handed_off_ownership_without_expiring_runner(
+def test_serve_records_handoff_without_a_second_load(
         make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
     loads = []
 
     def load(name, keep_alive=-1, timeout=300.0):
         loads.append((name, keep_alive))
-        return {"done": True} if keep_alive is None else None
+        return {"done": True}
 
     monkeypatch.setattr(cli.ollama, "load", load)
     monkeypatch.setattr(cli.activity, "record_ollama_serving", lambda **_fields: None)
@@ -8939,28 +8938,24 @@ def test_serve_failed_final_pin_preserves_handed_off_ownership_without_expiring_
     )
     c, buf = make_console()
 
-    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
-    assert "couldn't confirm indefinite residency" in buf.getvalue()
-    assert "request outcome is unknown" in buf.getvalue()
-    assert loads == [(_serve_name(), None), (_serve_name(), -1)]
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert "indefinite" not in buf.getvalue()
+    assert loads == [(_serve_name(), None)]
 
 
-def test_serve_interrupt_during_final_pin_preserves_handed_off_ownership(
+def test_serve_interrupt_on_lock_exit_preserves_recorded_handoff(
         make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
-    loads = 0
 
-    def load(*_args, **_kwargs):
-        nonlocal loads
-        loads += 1
-        if loads == 2:
-            raise KeyboardInterrupt
-        return {"done": True}
+    @contextlib.contextmanager
+    def interrupted_after_handoff(*_args):
+        yield
+        raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.locking, "ollama_setup_lock", interrupted_after_handoff)
     monkeypatch.setattr(cli.activity, "record_ollama_serving", lambda **_fields: None)
     monkeypatch.setattr(
-        cli.ollama, "delete", lambda *_args: pytest.fail("deleted after ownership handoff"))
+        cli.ollama, "delete", lambda *_args: pytest.fail("deleted recorded handoff"))
     c, buf = make_console()
 
     with pytest.raises(KeyboardInterrupt):
@@ -9213,6 +9208,14 @@ def test_governed_name_is_content_addressed_by_manifest_and_context():
     assert cli._governed_name(
         "Org/Model:latest", artifact_id="ollama-manifest-sha256:" + "b" * 64,
         context=8192) != name
+
+
+def test_governed_name_is_content_addressed_by_policy_version(monkeypatch):
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    before = cli._governed_name("Org/Model:latest", artifact_id=artifact, context=8192)
+    monkeypatch.setattr(cli, "_OLLAMA_DERIVED_POLICY_VERSION", "ollama-derived-v-next")
+    after = cli._governed_name("Org/Model:latest", artifact_id=artifact, context=8192)
+    assert after != before
 
 
 def test_governed_name_hash_prevents_slug_collisions():

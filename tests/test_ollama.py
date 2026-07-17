@@ -719,7 +719,7 @@ def test_create_false_on_non_success_status(monkeypatch):
 # --------------------------------------------------------------------------- #
 # load — warm-load + hold
 # --------------------------------------------------------------------------- #
-def test_load_generates_empty_prompt_with_keepalive(monkeypatch):
+def test_load_generates_empty_prompt_under_daemon_keepalive_policy(monkeypatch):
     seen = {}
 
     def fake_post(path, payload, timeout):
@@ -730,11 +730,10 @@ def test_load_generates_empty_prompt_with_keepalive(monkeypatch):
     assert ollama.load("x-ara") == {"done": True}
     assert seen["path"] == "/api/generate"
     assert seen["payload"]["model"] == "x-ara"
-    assert seen["payload"]["keep_alive"] == -1
-    assert seen["payload"]["prompt"] == ""
+    assert seen["payload"] == {"model": "x-ara", "prompt": "", "stream": False}
 
 
-def test_load_can_defer_keepalive_to_daemon_policy(monkeypatch):
+def test_load_can_explicitly_request_indefinite_keepalive(monkeypatch):
     seen = {}
 
     def fake_post(path, payload, timeout):
@@ -742,9 +741,9 @@ def test_load_can_defer_keepalive_to_daemon_policy(monkeypatch):
         return {"done": True}
 
     monkeypatch.setattr(ollama, "_post_json", fake_post)
-    assert ollama.load("x-ara", keep_alive=None) == {"done": True}
+    assert ollama.load("x-ara", keep_alive=-1) == {"done": True}
     assert seen["path"] == "/api/generate"
-    assert seen["payload"] == {"model": "x-ara", "prompt": "", "stream": False}
+    assert seen["payload"]["keep_alive"] == -1
 
 
 # --------------------------------------------------------------------------- #
