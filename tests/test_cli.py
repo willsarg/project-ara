@@ -4035,35 +4035,27 @@ def test_cleanup_ollama_probe_reports_delete_failure(monkeypatch):
         "probe", "ollama-manifest-sha256:" + "b" * 64)
 
 
-def test_cleanup_ollama_model_refuses_retargeted_manifest(monkeypatch):
+def test_delete_exact_ollama_model_refuses_retargeted_manifest(monkeypatch):
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
     monkeypatch.setattr(cli.ollama, "load",
                         lambda *_a, **_k: pytest.fail("unloaded retargeted model"))
-    error = cli._cleanup_ollama_model(
-        "model", label="governed model", delete=True,
-        expected_artifact_id="ollama-manifest-sha256:" + "b" * 64)
-    assert "identity changed" in error and "refused unload and delete" in error
-
-
-def test_cleanup_ollama_model_refuses_retarget_before_delete(monkeypatch):
-    digests = iter(["b" * 64, "c" * 64])
-    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: next(digests))
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
     monkeypatch.setattr(cli.ollama, "delete",
                         lambda *_a, **_k: pytest.fail("deleted retargeted model"))
-    error = cli._cleanup_ollama_model(
-        "model", label="governed model", delete=True,
+    error = cli._delete_exact_ollama_model(
+        "model", label="governed",
         expected_artifact_id="ollama-manifest-sha256:" + "b" * 64)
     assert "identity changed" in error and "refused delete" in error
 
 
-def test_cleanup_ollama_model_reports_delete_failure(monkeypatch):
-    monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: {})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [])
+def test_delete_exact_ollama_model_reports_delete_failure_without_expiring_runner(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    monkeypatch.setattr(cli.ollama, "load",
+                        lambda *_a, **_k: pytest.fail("expired shared runner"))
+    monkeypatch.setattr(cli.ollama, "ps", lambda: pytest.fail("polled shared runner"))
     monkeypatch.setattr(cli.ollama, "delete", lambda _name: False)
-    assert "delete governed model" in cli._cleanup_ollama_model(
-        "model", label="governed model", delete=True)
+    assert "delete governed model" in cli._delete_exact_ollama_model(
+        "model", label="governed",
+        expected_artifact_id="ollama-manifest-sha256:" + "b" * 64)
 
 
 def _local_ollama_model(name, **fields):
@@ -7896,7 +7888,7 @@ def test_serve_refuses_when_loaded_manifest_digest_differs_from_created_manifest
     _wire_serve(monkeypatch, ps_rows=rows, characterization={
         "safe_context": 8192, "artifact_id": "ollama-manifest-sha256:" + "a" * 64})
     cleaned = []
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
                         lambda name, **_k: cleaned.append(name) or None)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
@@ -7909,11 +7901,11 @@ def test_serve_passes_verified_digest_into_failure_cleanup(make_console, monkeyp
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
     cleanup = {}
 
-    def capture(name, *, label, delete, expected_artifact_id=None):
+    def capture(name, *, label, expected_artifact_id):
         cleanup.update(name=name, expected=expected_artifact_id)
         return None
 
-    monkeypatch.setattr(cli, "_cleanup_ollama_model", capture)
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model", capture)
     c, _ = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert cleanup == {"name": _serve_name(), "expected": _SERVE_DERIVED_ARTIFACT}
@@ -7964,7 +7956,7 @@ def test_serve_does_not_cleanup_when_derived_manifest_retargets_before_failure(
         lambda name: "a" * 64 if name == "qwen3:0.6b" else next(served_reads),
     )
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
                         lambda *_a, **_k: pytest.fail("retargeted manifest deleted"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
@@ -7980,7 +7972,7 @@ def test_serve_does_not_cleanup_when_manifest_becomes_unverifiable_after_load_fa
         lambda name: "a" * 64 if name == "qwen3:0.6b" else next(served_reads),
     )
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
                         lambda *_a, **_k: pytest.fail("cleaned unverifiable manifest"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
@@ -8023,8 +8015,8 @@ def test_serve_interrupt_after_create_cleans_up_then_propagates(make_console, mo
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli.ollama, "load", load)
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
-                        lambda name, *, label, delete, expected_artifact_id=None:
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
+                        lambda name, *, label, expected_artifact_id:
                         cleaned.append((name, expected_artifact_id)) or None)
     c, _ = make_console()
     with pytest.raises(KeyboardInterrupt):
@@ -8035,12 +8027,12 @@ def test_serve_interrupt_after_create_cleans_up_then_propagates(make_console, mo
 def test_serve_interrupt_reports_cleanup_failure(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: (_ for _ in ()).throw(SystemExit(2)))
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
-                        lambda *_a, **_k: "couldn't verify unload")
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
+                        lambda *_a, **_k: "couldn't delete governed model")
     c, buf = make_console()
     with pytest.raises(SystemExit):
         cli.render_serve(c, "qwen3:0.6b", ctx=8192)
-    assert "cleanup failed" in buf.getvalue() and "verify unload" in buf.getvalue()
+    assert "cleanup failed" in buf.getvalue() and "delete governed model" in buf.getvalue()
 
 
 def test_serve_refuses_name_appearing_at_final_collision_check(make_console, monkeypatch):
@@ -8116,6 +8108,99 @@ def test_serve_refuses_additional_model_appearing_after_load(make_console, monke
     assert "other" in buf.getvalue() and "strict admission" in buf.getvalue()
 
 
+def test_serve_stages_daemon_policy_then_pins_only_after_recording_ownership(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    calls = []
+
+    def load(name, keep_alive=-1, timeout=300.0):
+        calls.append(("load", name, keep_alive))
+        return {"done": True}
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(
+        cli.activity, "record_ollama_serving",
+        lambda **_fields: calls.append(("record",)),
+    )
+    c, _ = make_console()
+
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 0
+    assert calls == [
+        ("load", _serve_name(), None),
+        ("record",),
+        ("load", _serve_name(), -1),
+    ]
+
+
+def test_serve_strict_admission_failure_never_expires_shared_runner(
+        make_console, monkeypatch):
+    rows = [*_SERVE_LOADED, {
+        "name": "other:latest", "digest": "c" * 64, "context_length": 4096,
+        "size": 50, "size_vram": 50,
+    }]
+    _wire_serve(monkeypatch, ps_rows=rows)
+    loads = []
+    deleted = []
+
+    def load(name, keep_alive=-1, timeout=300.0):
+        loads.append((name, keep_alive))
+        return {"done": True}
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "strict admission" in buf.getvalue()
+    assert loads == [(_serve_name(), None)]
+    assert deleted == [_serve_name()]
+
+
+def test_serve_failed_final_pin_preserves_handed_off_ownership_without_expiring_runner(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    loads = []
+
+    def load(name, keep_alive=-1, timeout=300.0):
+        loads.append((name, keep_alive))
+        return {"done": True} if keep_alive is None else None
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.activity, "record_ollama_serving", lambda **_fields: None)
+    monkeypatch.setattr(
+        cli.ollama, "delete", lambda *_args: pytest.fail("deleted after ownership handoff"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
+    assert "couldn't confirm indefinite residency" in buf.getvalue()
+    assert "request outcome is unknown" in buf.getvalue()
+    assert loads == [(_serve_name(), None), (_serve_name(), -1)]
+
+
+def test_serve_interrupt_during_final_pin_preserves_handed_off_ownership(
+        make_console, monkeypatch):
+    _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
+    loads = 0
+
+    def load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        if loads == 2:
+            raise KeyboardInterrupt
+        return {"done": True}
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.activity, "record_ollama_serving", lambda **_fields: None)
+    monkeypatch.setattr(
+        cli.ollama, "delete", lambda *_args: pytest.fail("deleted after ownership handoff"))
+    c, buf = make_console()
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.render_serve(c, "qwen3:0.6b", ctx=8192)
+    assert "preserved the exact ownership record" in buf.getvalue()
+
+
 def test_serve_load_failure_cannot_reuse_stale_ps_row(make_console, monkeypatch):
     _wire_serve(monkeypatch, ps_rows=_SERVE_LOADED)
     cleanup_started = []
@@ -8133,7 +8218,7 @@ def test_serve_load_failure_cannot_reuse_stale_ps_row(make_console, monkeypatch)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     assert "couldn't load" in buf.getvalue()
-    assert cleanup_started == [_serve_name()]
+    assert cleanup_started == []
     assert deleted == [_serve_name()]
 
 
@@ -8204,7 +8289,7 @@ def test_serve_owned_manifest_failure_does_not_cleanup_user_state(make_console, 
                                        served_artifact_id=_SERVE_DERIVED_ARTIFACT)],
     )
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "_cleanup_ollama_model",
+    monkeypatch.setattr(cli, "_delete_exact_ollama_model",
                         lambda *_a, **_k: pytest.fail("owned model cleaned up"))
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
@@ -8214,12 +8299,11 @@ def test_serve_owned_manifest_failure_does_not_cleanup_user_state(make_console, 
 def test_serve_reports_cleanup_failure(make_console, monkeypatch):
     _wire_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "load", lambda *_a, **_k: None)
-    snapshots = iter([[], None])
-    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: next(snapshots))
+    monkeypatch.setattr(cli.ollama, "delete", lambda *_a: False)
     c, buf = make_console()
     assert cli.render_serve(c, "qwen3:0.6b", ctx=8192) == 1
     out = buf.getvalue()
-    assert "cleanup also failed" in out and "verify" in out
+    assert "cleanup also failed" in out and "delete governed model" in out
 
 
 def test_serve_unverifiable_ps_cleans_up_derived_model(make_console, monkeypatch):

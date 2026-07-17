@@ -729,21 +729,28 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     _wire_ollama_serve(monkeypatch)
     calls = []
     loaded = False
+    setup_phase = True
 
     def create(*_a, **_k):
         _assert_activity("serving", "base:model")
         calls.append("create")
         return True
 
-    def load(*_a, **_k):
+    def load(_name, keep_alive=-1, **_k):
         nonlocal loaded
-        _assert_activity("serving", "base:model")
-        calls.append("load")
+        if keep_alive is None:
+            _assert_activity("serving", "base:model")
+            calls.append("load-temporary")
+        else:
+            assert not list(activity_registry.glob("*.json"))
+            assert len(list((activity_registry / "serving").glob("*.json"))) == 1
+            calls.append("pin")
         loaded = True
         return {"done": True}
 
     def verify(*_a, **_k):
-        _assert_activity("serving", "base:model")
+        if setup_phase:
+            _assert_activity("serving", "base:model")
         calls.append("verify")
         if not loaded:
             return []
@@ -753,9 +760,12 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     real_record = activity.record_ollama_serving
 
     def record(**fields):
+        nonlocal setup_phase
         assert activity.snapshot() == []
         calls.append("record")
-        return real_record(**fields)
+        path = real_record(**fields)
+        setup_phase = False
+        return path
 
     monkeypatch.setattr(cli.ollama, "create", create)
     monkeypatch.setattr(cli.ollama, "load", load)
@@ -763,7 +773,7 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     monkeypatch.setattr(cli.activity, "record_ollama_serving", record)
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
-    assert calls == ["verify", "create", "load", "verify", "record"]
+    assert calls == ["verify", "create", "load-temporary", "verify", "record", "pin"]
 
     monkeypatch.setattr(cli.ollama, "ps", lambda: [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
@@ -885,7 +895,7 @@ def test_ollama_serve_declined_consent_never_claims_activity(
     assert activity.snapshot() == []
 
 
-def test_ollama_manifest_failure_unloads_untrackable_service(
+def test_ollama_manifest_failure_deletes_manifest_without_expiring_runner(
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
@@ -907,8 +917,9 @@ def test_ollama_manifest_failure_unloads_untrackable_service(
     c, buf = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 1
     assert "ownership could not be recorded" in buf.getvalue()
-    assert "unloaded" in buf.getvalue()
-    assert unloading == [_ollama_served_name()] and deleted == [_ollama_served_name()]
+    assert "without expiring its runner" in buf.getvalue()
+    assert unloading == [] and loaded == [_ollama_served_name()]
+    assert deleted == [_ollama_served_name()]
     assert activity.snapshot() == []
 
 
@@ -934,7 +945,9 @@ def test_ollama_manifest_validation_failure_is_honest_json_not_raw_exception(
     assert cli.render_serve(c, "base:model", ctx=4096, as_json=True) == 1
     assert json.loads(capsys.readouterr().out) == {
         "error": f"{_ollama_served_name()} loaded at 4096 ctx, but ARA ownership could not "
-                 "be recorded: invalid identity; unloaded the untracked service"}
+                 "be recorded: invalid identity; deleted the untracked manifest without "
+                 "expiring its runner"}
+    assert unloading == [] and loaded == [_ollama_served_name()]
     assert activity.snapshot() == []
 
 

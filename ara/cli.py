@@ -2661,42 +2661,18 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
 
 def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
     """Delete one exact probe manifest without expiring its potentially shared Ollama runner."""
-    if _ollama_artifact_id(probe) != expected_artifact_id:
-        return "probe manifest identity changed; refused delete"
-    if not ollama.delete(probe):
-        return "couldn't delete probe model"
+    return _delete_exact_ollama_model(
+        probe, label="probe", expected_artifact_id=expected_artifact_id)
+
+
+def _delete_exact_ollama_model(name: str, *, label: str,
+                               expected_artifact_id: str) -> str | None:
+    """Delete one exact manifest without changing its potentially shared runner's residency."""
+    if _ollama_artifact_id(name) != expected_artifact_id:
+        return f"{label} manifest identity changed; refused delete"
+    if not ollama.delete(name):
+        return f"couldn't delete {label} model"
     return None
-
-
-def _cleanup_ollama_model(name: str, *, label: str, delete: bool,
-                          expected_artifact_id: str | None = None) -> str | None:
-    """Unload an ARA-created Ollama model, verify absence, and optionally delete its manifest."""
-    if (expected_artifact_id is not None
-            and _ollama_artifact_id(name) != expected_artifact_id):
-        return f"{label} manifest identity changed; refused unload and delete"
-    errors = []
-    if ollama.load(name, keep_alive=0) is None:
-        errors.append(f"couldn't request {label} unload")
-    absent = False
-    for attempt in range(10):
-        entries = ollama.ps()
-        if entries is None:
-            errors.append(f"couldn't verify {label} unload")
-            break
-        if _find_loaded(entries, name) is None:
-            absent = True
-            break
-        if attempt < 9:
-            time.sleep(0.1)
-    if not absent and not any("verify" in error for error in errors):
-        errors.append(f"{label} is still resident after unload")
-    if absent and delete:
-        if (expected_artifact_id is not None
-                and _ollama_artifact_id(name) != expected_artifact_id):
-            errors.append(f"{label} manifest identity changed; refused delete")
-        elif not ollama.delete(name):
-            errors.append(f"couldn't delete {label} model")
-    return "; ".join(errors) if errors else None
 
 
 def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int:
@@ -3187,6 +3163,15 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                    "create-if-absent operation; omit --name to use ARA's content-addressed name.")
 
     served_artifact_id = owned_item.served_artifact_id if owned_item else None
+    ownership_recorded = False
+
+    ownership_fields = {
+        "served_name": served,
+        "model": model,
+        "context": safe,
+        "endpoint": endpoint_base,
+        "base_artifact_id": base_artifact_id,
+    }
 
     def setup_err(msg: str) -> int:
         if already_owned:
@@ -3195,85 +3180,96 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                 or _ollama_artifact_id(served) != served_artifact_id):
             return err(msg + "; ownership of the derived manifest is unverified, so ARA did not "
                        "unload or delete it")
-        cleanup = _cleanup_ollama_model(
-            served, label="governed model", delete=True,
-            expected_artifact_id=served_artifact_id)
+        cleanup = _delete_exact_ollama_model(
+            served, label="governed", expected_artifact_id=served_artifact_id)
         if cleanup:
             msg += f"; cleanup also failed: {cleanup}"
         else:
-            msg += "; unloaded the untracked service"
+            msg += "; deleted the untracked manifest without expiring its runner"
         return err(msg)
 
     setup_activity = nullcontext() if already_owned else activity.track("serving", model)
     create_confirmed = False
     try:
-        with locking.ollama_setup_lock(endpoint_base, served), setup_activity:
-            allowed_digest = (served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
-                              if already_owned and served_artifact_id is not None else None)
-            residency_error = _ollama_residency_error(
-                ollama.processes(),
-                allowed_name=served if already_owned else None,
-                allowed_digest=allowed_digest,
-                allowed_context=safe if already_owned else None)
-            if residency_error is not None:
-                return err(residency_error)
+        with locking.ollama_setup_lock(endpoint_base, served):
+            with setup_activity:
+                allowed_digest = (served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+                                  if already_owned and served_artifact_id is not None else None)
+                residency_error = _ollama_residency_error(
+                    ollama.processes(),
+                    allowed_name=served if already_owned else None,
+                    allowed_digest=allowed_digest,
+                    allowed_context=safe if already_owned else None)
+                if residency_error is not None:
+                    return err(residency_error)
+                if not already_owned:
+                    latest_models = ollama.inventory()
+                    if latest_models is None:
+                        return err("couldn't recheck Ollama model names before creating the governed "
+                                   "model — refusing to risk a collision.")
+                    if ollama.find_model(latest_models, served) is not None:
+                        return err(f"Ollama model {served!r} appeared before ARA could create it — "
+                                   "refusing to overwrite or unload it.")
+                    if not ollama.create(served, model, safe):
+                        return err(f"couldn't confirm creation of governed model {served!r}; no "
+                                   "load or destructive cleanup was attempted because ownership "
+                                   "is unknown.")
+                    create_confirmed = True
+                    served_artifact_id = _ollama_artifact_id(served)
+                    if served_artifact_id is None:
+                        return err(f"created {served!r}, but couldn't identify its Ollama manifest; "
+                                   "refusing to load or destructively clean up unknown ownership.")
+                    if _ollama_artifact_id(model) != base_artifact_id:
+                        return setup_err(
+                            f"{model}'s Ollama manifest changed during setup — refusing to load it")
+
+                # 5. Load under daemon policy while setup is temporary. Only proven, durably owned
+                # residency is pinned indefinitely below.
+                if _ollama_artifact_id(served) != served_artifact_id:
+                    return err(f"governed model {served!r} changed before load — refusing mutable "
+                               "identity; ARA did not unload or delete it")
+                keep_alive = -1 if already_owned else None
+                if ollama.load(served, keep_alive=keep_alive) is None:
+                    return setup_err(f"couldn't load the governed model {served!r} on Ollama")
+                expected_served_digest = served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+                processes = ollama.processes()
+                residency_error = _ollama_residency_error(
+                    processes, allowed_name=served, allowed_digest=expected_served_digest,
+                    allowed_context=safe, require_target=True)
+                if residency_error is not None:
+                    return setup_err(residency_error)
+                process = processes[0]
+                residency_verified = True
+                spilled = process.size_vram_bytes < process.size_bytes
+
             if not already_owned:
-                latest_models = ollama.inventory()
-                if latest_models is None:
-                    return err("couldn't recheck Ollama model names before creating the governed "
-                               "model — refusing to risk a collision.")
-                if ollama.find_model(latest_models, served) is not None:
-                    return err(f"Ollama model {served!r} appeared before ARA could create it — "
-                               "refusing to overwrite or unload it.")
-                if not ollama.create(served, model, safe):
-                    return err(f"couldn't confirm creation of governed model {served!r}; no load "
-                               "or destructive cleanup was attempted because ownership is unknown.")
-                create_confirmed = True
-                served_artifact_id = _ollama_artifact_id(served)
-                if served_artifact_id is None:
-                    return err(f"created {served!r}, but couldn't identify its Ollama manifest; "
-                               "refusing to load or destructively clean up unknown ownership.")
                 if _ollama_artifact_id(model) != base_artifact_id:
                     return setup_err(
-                        f"{model}'s Ollama manifest changed during setup — refusing to load it")
-
-            # 5. load + verify the ceiling took — never hand back an ungoverned endpoint (Rule #1)
-            if _ollama_artifact_id(served) != served_artifact_id:
-                return err(f"governed model {served!r} changed before load — refusing mutable "
-                           "identity; ARA did not unload or delete it")
-            if ollama.load(served) is None:
-                return setup_err(f"couldn't load the governed model {served!r} on Ollama")
-            expected_served_digest = served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
-            processes = ollama.processes()
-            residency_error = _ollama_residency_error(
-                processes, allowed_name=served, allowed_digest=expected_served_digest,
-                allowed_context=safe, require_target=True)
-            if residency_error is not None:
-                return setup_err(residency_error)
-            process = processes[0]
-            residency_verified = True
-            spilled = process.size_vram_bytes < process.size_bytes
-
-        if not already_owned:
-            if _ollama_artifact_id(model) != base_artifact_id:
-                return setup_err(
-                    f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
-            try:
-                activity.record_ollama_serving(
-                    served_name=served, model=model, context=safe, endpoint=endpoint_base,
-                    base_artifact_id=base_artifact_id,
-                    served_artifact_id=served_artifact_id)
-            except (OSError, ValueError) as exc:
-                return setup_err(
-                    f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: {exc}")
+                        f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
+                try:
+                    activity.record_ollama_serving(
+                        **ownership_fields, served_artifact_id=served_artifact_id)
+                    ownership_recorded = True
+                except (OSError, ValueError) as exc:
+                    return setup_err(
+                        f"{served} loaded at {safe} ctx, but ARA ownership could not be recorded: "
+                        f"{exc}")
+                if ollama.load(served, keep_alive=-1) is None:
+                    return err(
+                        f"couldn't confirm indefinite residency for governed model {served!r}; "
+                        "the exact ownership record and manifest were preserved because the "
+                        "Ollama request outcome is unknown — retry the same `ara serve` command")
     except locking.OllamaSetupBusy as exc:
         return err(str(exc))
     except BaseException:
-        if (create_confirmed and served_artifact_id is not None
+        if ownership_recorded:
+            c.emit(c.style(
+                "warn", "  setup was interrupted after ownership handoff; ARA preserved the "
+                "exact ownership record and governed manifest"))
+        elif (create_confirmed and served_artifact_id is not None
                 and _ollama_artifact_id(served) == served_artifact_id):
-            cleanup = _cleanup_ollama_model(
-                served, label="governed model", delete=True,
-                expected_artifact_id=served_artifact_id)
+            cleanup = _delete_exact_ollama_model(
+                served, label="governed", expected_artifact_id=served_artifact_id)
             if cleanup:
                 c.emit(c.style("warn", f"  interrupted setup cleanup failed: {cleanup}"))
         raise
