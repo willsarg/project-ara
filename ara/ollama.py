@@ -52,6 +52,19 @@ class OllamaModel:
         return (alias,) if alias is not None else ()
 
 
+@dataclass(frozen=True)
+class OllamaProcess:
+    """One resident model from a coherent ``GET /api/ps`` safety snapshot."""
+
+    name: str
+    model: str | None = None
+    digest: str | None = None
+    size_bytes: int | None = None
+    size_vram_bytes: int | None = None
+    context_length: int | None = None
+    expires_at: str | None = None
+
+
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -198,6 +211,32 @@ def manifest_digest(name: str, timeout: float = 2.0) -> str | None:
     models = inventory(timeout)
     model = find_model(models, name) if models is not None else None
     return model.digest if model is not None else None
+
+
+def processes(timeout: float = 2.0) -> list[OllamaProcess] | None:
+    """Parse one coherent ``GET /api/ps`` snapshot into typed resident-model records."""
+    rows = ps(timeout)
+    if rows is None:
+        return None
+    result: list[OllamaProcess] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        digest = row.get("digest")
+        result.append(OllamaProcess(
+            name=name,
+            model=_optional_string(row.get("model")),
+            digest=(digest if isinstance(digest, str)
+                    and _MANIFEST_DIGEST.fullmatch(digest) else None),
+            size_bytes=_nonnegative_int(row.get("size")),
+            size_vram_bytes=_nonnegative_int(row.get("size_vram")),
+            context_length=_positive_int(row.get("context_length")),
+            expires_at=_optional_string(row.get("expires_at")),
+        ))
+    return result
 
 
 def ps(timeout: float = 2.0) -> list[dict] | None:

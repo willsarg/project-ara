@@ -2614,22 +2614,17 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
                     and _ollama_artifact_id(model) != base_artifact_id):
                 raise RuntimeError("base manifest changed during probe creation")
         ollama.load(probe)
-        entry = _find_loaded(ollama.ps() or [], probe, expected_context=ctx)
-        loaded_ctx = entry.get("context_length") if entry is not None else None
-        if (entry is None or not isinstance(loaded_ctx, int)
-                or isinstance(loaded_ctx, bool) or loaded_ctx <= 0
-                or loaded_ctx != ctx
-                or (probe_artifact_id is not None
-                    and entry.get("digest") != probe_artifact_id.removeprefix(
-                        _OLLAMA_ARTIFACT_PREFIX))):  # governance or identity slipped
-            points.append({"context": ctx, "fit": False})
-            break
-        size, vram = entry.get("size"), entry.get("size_vram")
-        residency_verified = (
-            isinstance(size, int) and not isinstance(size, bool) and size > 0
-            and isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0
-        )
-        fit = residency_verified and vram >= size
+        processes = ollama.processes()
+        expected_digest = (probe_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+                           if probe_artifact_id is not None else None)
+        residency_error = _ollama_residency_error(
+            processes, allowed_name=probe, allowed_digest=expected_digest,
+            allowed_context=ctx, require_target=True)
+        if residency_error is not None:
+            raise RuntimeError(residency_error)
+        process = processes[0]
+        size, vram = process.size_bytes, process.size_vram_bytes
+        fit = vram >= size
         points.append({"context": ctx, "fit": fit, "size": size, "size_vram": vram})
         if not fit:                                   # hit/failed to verify the wall — stop safely
             break
@@ -2711,6 +2706,9 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     provenance: dict = {}
     try:
         with locking.ollama_setup_lock(ollama.base_url(), probe):
+            residency_error = _ollama_residency_error(ollama.processes())
+            if residency_error is not None:
+                return err(residency_error)
             latest_models = ollama.inventory()
             if latest_models is None:
                 return err("couldn't recheck Ollama model names before characterization — "
@@ -2808,6 +2806,47 @@ def _find_loaded(entries: list[dict], served: str, *,
                   and m["context_length"] > 0
                   and m["context_length"] == expected_context), None)
     return valid if valid is not None else (matches[0] if matches else None)
+
+
+def _ollama_residency_error(
+        processes: list[ollama.OllamaProcess] | None, *,
+        allowed_name: str | None = None,
+        allowed_digest: str | None = None,
+        allowed_context: int | None = None,
+        require_target: bool = False) -> str | None:
+    """Return a strict admission refusal, or ``None`` for an admissible snapshot.
+
+    Empty residency is admissible before setup. The only non-empty admissible state is one exact,
+    fully described target supplied by the caller. A post-load check sets ``require_target`` so an
+    empty snapshot also fails closed.
+    """
+    if processes is None:
+        if require_target:
+            return "couldn't inspect Ollama residency safely after load"
+        return ("couldn't inspect Ollama residency safely — ARA refused to create or load "
+                "a model")
+    if not processes:
+        if require_target:
+            return f"expected Ollama model {json.dumps(allowed_name)} is not resident after load"
+        return None
+    names = ", ".join(json.dumps(process.name) for process in processes)
+    refusal = (f"resident Ollama model(s) {names} block strict admission; "
+               "ARA did not unload them")
+    if len(processes) != 1 or allowed_name is None:
+        return refusal
+    process = processes[0]
+    accepted_names = {allowed_name, allowed_name + ":latest"}
+    verified = (
+        process.name in accepted_names
+        and process.digest == allowed_digest
+        and process.context_length == allowed_context
+        and isinstance(process.size_bytes, int) and not isinstance(process.size_bytes, bool)
+        and process.size_bytes > 0
+        and isinstance(process.size_vram_bytes, int)
+        and not isinstance(process.size_vram_bytes, bool)
+        and process.size_vram_bytes >= 0
+    )
+    return None if verified else refusal
 
 
 def _free_port() -> int:
@@ -3126,6 +3165,15 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     create_confirmed = False
     try:
         with locking.ollama_setup_lock(endpoint_base, served), setup_activity:
+            allowed_digest = (served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+                              if already_owned and served_artifact_id is not None else None)
+            residency_error = _ollama_residency_error(
+                ollama.processes(),
+                allowed_name=served if already_owned else None,
+                allowed_digest=allowed_digest,
+                allowed_context=safe if already_owned else None)
+            if residency_error is not None:
+                return err(residency_error)
             if not already_owned:
                 latest_models = ollama.inventory()
                 if latest_models is None:
@@ -3152,27 +3200,16 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                            "identity; ARA did not unload or delete it")
             if ollama.load(served) is None:
                 return setup_err(f"couldn't load the governed model {served!r} on Ollama")
-            entries = ollama.ps()
-            if entries is None:
-                return setup_err(f"couldn't verify {served} through Ollama's process inventory")
-            entry = _find_loaded(entries, served, expected_context=safe)
-            if entry is None:
-                return setup_err(f"{served} didn't load — Ollama may be out of memory")
-            served_ctx = entry.get("context_length")
-            if (not isinstance(served_ctx, int) or isinstance(served_ctx, bool)
-                    or served_ctx <= 0 or served_ctx != safe):
-                return setup_err(
-                    f"governance failed: Ollama served {served_ctx} ctx, not {safe} — refusing")
             expected_served_digest = served_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
-            if entry.get("digest") != expected_served_digest:
-                return setup_err(
-                    f"governance failed: Ollama loaded a different manifest for {served!r}")
-            size, vram = entry.get("size"), entry.get("size_vram")
-            residency_verified = (
-                isinstance(size, int) and not isinstance(size, bool) and size > 0
-                and isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0
-            )
-            spilled = vram < size if residency_verified else None
+            processes = ollama.processes()
+            residency_error = _ollama_residency_error(
+                processes, allowed_name=served, allowed_digest=expected_served_digest,
+                allowed_context=safe, require_target=True)
+            if residency_error is not None:
+                return setup_err(residency_error)
+            process = processes[0]
+            residency_verified = True
+            spilled = process.size_vram_bytes < process.size_bytes
 
         if not already_owned:
             if _ollama_artifact_id(model) != base_artifact_id:
@@ -3229,9 +3266,6 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
     c.emit(c.field("use it", f"export OPENAI_BASE_URL={endpoint}"))
     if spilled is True:
         c.emit(c.style("warn", "  note: partially offloaded (size_vram < size) — expect it slow."))
-    elif not residency_verified:
-        c.emit(c.style("warn", "  note: Ollama did not report verifiable residency; spill status "
-                               "is unknown and no measured ceiling was recorded."))
     elif recorded_measured:
         c.emit(c.style("dim", "  recorded a measured ceiling — future serves skip the estimate."))
     c.emit()

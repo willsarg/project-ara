@@ -725,6 +725,7 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
         make_console, monkeypatch, activity_registry):
     _wire_ollama_serve(monkeypatch)
     calls = []
+    loaded = False
 
     def create(*_a, **_k):
         _assert_activity("serving", "base:model")
@@ -732,13 +733,17 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
         return True
 
     def load(*_a, **_k):
+        nonlocal loaded
         _assert_activity("serving", "base:model")
         calls.append("load")
+        loaded = True
         return {"done": True}
 
     def verify(*_a, **_k):
         _assert_activity("serving", "base:model")
         calls.append("verify")
+        if not loaded:
+            return []
         return [{"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
                  "size": 10, "size_vram": 10, "digest": "b" * 64}]
 
@@ -755,7 +760,7 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     monkeypatch.setattr(cli.activity, "record_ollama_serving", record)
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
-    assert calls == ["create", "load", "verify", "record"]
+    assert calls == ["verify", "create", "load", "verify", "record"]
 
     monkeypatch.setattr(cli.ollama, "ps", lambda: [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
@@ -774,7 +779,7 @@ def test_ollama_reserve_same_live_identity_never_duplicates_status(
         **_ollama_artifact_fields())
     loaded = [{"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
                "size": 10, "size_vram": 10, "digest": "b" * 64}]
-    monkeypatch.setattr(cli.ollama, "ps", lambda: loaded)
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: loaded)
 
     def create(*_a, **_k):
         found = activity.snapshot()
@@ -880,13 +885,17 @@ def test_ollama_manifest_failure_unloads_untrackable_service(
     _wire_ollama_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     unloading = []
+    loaded = []
     deleted = []
-    monkeypatch.setattr(cli.ollama, "load",
-                        lambda name, keep_alive=-1:
-                        unloading.append(name) or {} if keep_alive == 0 else {"done": True})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
+
+    def load(name, keep_alive=-1):
+        (unloading if keep_alive == 0 else loaded).append(name)
+        return {} if keep_alive == 0 else {"done": True}
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: ([] if unloading or not loaded else [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
-         "size": 10, "size_vram": 10, "digest": "b" * 64}])
+         "size": 10, "size_vram": 10, "digest": "b" * 64}]))
     monkeypatch.setattr(cli.ollama, "delete", lambda name: deleted.append(name) or True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(OSError("disk full")))
@@ -903,12 +912,16 @@ def test_ollama_manifest_validation_failure_is_honest_json_not_raw_exception(
     _wire_ollama_serve(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     unloading = []
-    monkeypatch.setattr(cli.ollama, "load",
-                        lambda name, keep_alive=-1:
-                        unloading.append(name) or {} if keep_alive == 0 else {"done": True})
-    monkeypatch.setattr(cli.ollama, "ps", lambda: [] if unloading else [
+    loaded = []
+
+    def load(name, keep_alive=-1):
+        (unloading if keep_alive == 0 else loaded).append(name)
+        return {} if keep_alive == 0 else {"done": True}
+
+    monkeypatch.setattr(cli.ollama, "load", load)
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: ([] if unloading or not loaded else [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,
-         "size": 10, "size_vram": 10, "digest": "b" * 64}])
+         "size": 10, "size_vram": 10, "digest": "b" * 64}]))
     monkeypatch.setattr(cli.ollama, "delete", lambda _name: True)
     monkeypatch.setattr(cli.activity, "record_ollama_serving",
                         lambda **_fields: (_ for _ in ()).throw(ValueError("invalid identity")))

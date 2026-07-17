@@ -37,9 +37,8 @@ def _lock_path() -> Path:
     return db._db_path().parent / "measurement.lock"
 
 
-def _ollama_lock_path(endpoint: str, served_name: str) -> Path:
-    identity = f"{endpoint}\0{served_name}".encode("utf-8")
-    suffix = hashlib.sha256(identity).hexdigest()[:24]
+def _ollama_lock_path(endpoint: str) -> Path:
+    suffix = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:24]
     return db._db_path().parent / f"ollama-setup-{suffix}.lock"
 
 
@@ -97,19 +96,19 @@ def measurement_lock():
 
 @contextmanager
 def ollama_setup_lock(endpoint: str, served_name: str):
-    """Serialize setup of one Ollama model identity across local ARA processes.
+    """Serialize all Ollama admission and setup on one endpoint across local ARA processes.
 
-    The lock is non-blocking and process-scoped. It closes ARA's same-host collision-check/create
-    race; Ollama clients that do not use ARA remain outside this advisory lock.
+    The lock is non-blocking and process-scoped. Ollama clients that do not use ARA remain outside
+    this advisory lock. ``served_name`` remains for call compatibility and user-facing context.
     """
-    path = _ollama_lock_path(endpoint, served_name)
+    path = _ollama_lock_path(endpoint)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         if not _acquire(fd):
             raise OllamaSetupBusy(
-                f"another ARA process is setting up Ollama model {served_name!r} — retry after "
-                "that setup finishes."
+                f"another ARA process is using this Ollama endpoint while setting up "
+                f"{served_name!r} — retry after that setup finishes."
             )
         try:
             yield

@@ -306,8 +306,53 @@ def test_manifest_digest_none_when_inventory_unreachable(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# ps — loaded models
+# processes / ps — typed safety snapshot plus raw compatibility view
 # --------------------------------------------------------------------------- #
+def test_processes_parses_current_shape(monkeypatch):
+    digest = "c" * 64
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [{
+        "name": "qwen3:0.6b",
+        "model": "qwen3:0.6b",
+        "digest": digest,
+        "size": 600_000_000,
+        "size_vram": 500_000_000,
+        "context_length": 8192,
+        "expires_at": "2026-07-17T12:00:00Z",
+    }]})
+
+    assert ollama.processes() == [ollama.OllamaProcess(
+        name="qwen3:0.6b",
+        model="qwen3:0.6b",
+        digest=digest,
+        size_bytes=600_000_000,
+        size_vram_bytes=500_000_000,
+        context_length=8192,
+        expires_at="2026-07-17T12:00:00Z",
+    )]
+
+
+def test_processes_keeps_malformed_optional_fields_unknown(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": [
+        {"name": "valid", "model": 4, "digest": "bad", "size": True,
+         "size_vram": -1, "context_length": 0, "expires_at": 7},
+        {"name": ""}, {"name": 5}, "bad",
+    ]})
+
+    assert ollama.processes() == [ollama.OllamaProcess(name="valid")]
+
+
+def test_processes_none_when_unreachable_or_root_malformed(monkeypatch):
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: None)
+    assert ollama.processes() is None
+    monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": {}})
+    assert ollama.processes() is None
+
+
+def test_processes_defensively_drops_non_dict_ps_rows(monkeypatch):
+    monkeypatch.setattr(ollama, "ps", lambda _timeout: ["bad", {"name": "valid"}])
+    assert ollama.processes() == [ollama.OllamaProcess(name="valid")]
+
+
 def test_ps_returns_dicts(monkeypatch):
     rows = [{"name": "a", "context_length": 8192, "size": 10, "size_vram": 10}]
     monkeypatch.setattr(ollama, "_get_json", lambda p, t: {"models": rows})

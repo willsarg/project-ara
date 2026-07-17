@@ -82,15 +82,18 @@ def test_posix_busy_maps_oserror_to_measurement_busy(tmp_path, monkeypatch):
             pass
 
 
-def test_ollama_setup_lock_excludes_same_identity_but_not_another(
+def test_ollama_setup_lock_excludes_all_models_on_same_endpoint(
         tmp_path, monkeypatch):
     monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "ara.db"))
     endpoint = "http://127.0.0.1:11434"
     with locking.ollama_setup_lock(endpoint, "ara-model-a"):
-        with pytest.raises(locking.OllamaSetupBusy, match="ara-model-a"):
+        with pytest.raises(locking.OllamaSetupBusy, match="Ollama"):
             with locking.ollama_setup_lock(endpoint, "ara-model-a"):
                 pass
-        with locking.ollama_setup_lock(endpoint, "ara-model-b"):
+        with pytest.raises(locking.OllamaSetupBusy, match="Ollama"):
+            with locking.ollama_setup_lock(endpoint, "ara-model-b"):
+                pass
+        with locking.ollama_setup_lock("http://127.0.0.1:22468", "ara-model-b"):
             pass
     with locking.ollama_setup_lock(endpoint, "ara-model-a"):
         pass
