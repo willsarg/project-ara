@@ -3612,14 +3612,10 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
 
     The ceiling is **baked into a content-addressed derived model**: a plain ``/v1`` request reloads
     the base model at its *default* context, blowing past the safe wall (measured 2026-06-26), so
-    governing per-request isn't enough. The ceiling is *measured* (a llama.cpp-class
-    characterization), *explicit* (``--ctx``), or — when nothing is measured — a conservative
-    engine-free *estimate* from the model's own ``/api/show`` architecture, always labelled by its
-    true source and never a silent guess (Rule #1/#3). A missing model is pulled rather than refused,
-    so a fresh model serves in one command. After load it verifies the ceiling actually took before
-    returning an endpoint. Specs 2026-06-26-ara-serve-governed-endpoint,
-    2026-07-04-ara-serve-one-command-estimated-ceiling. ``--engine mlx`` routes to the governed MLX
-    server instead (spec 2026-06-28)."""
+    governing per-request isn't enough. Handoff requires exact reusable measured evidence;
+    ``--ctx`` may lower that ceiling but cannot replace it, and missing models are never pulled
+    implicitly. After load ARA verifies the ceiling before returning a point-in-time endpoint
+    contract. ``--engine mlx`` routes to the governed MLX server instead (spec 2026-06-28)."""
     def err(msg: str) -> int:
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
@@ -3685,26 +3681,11 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
             c.emit(c.style("dim", "  auto-selected ") + c.style("accent", model)
                    + c.style("dim", " (best fit in your Ollama store)"))
 
-    # 2b. named model: ensure it's in the store — pull it if missing (get out of the way)
+    # 2b. named model: serving never acquires weights; installation remains an explicit user act.
     record = ollama.find_model(models, model)
     if record is None:
-        if name is not None:
-            return err("a new custom --name cannot be created safely because Ollama has no atomic "
-                       "create-if-absent operation; omit --name to use ARA's content-addressed "
-                       "name.")
-        if not as_json:
-            c.emit(c.style("dim", f"  pulling {model} …"))
-        if not ollama.pull(model):
-            return err(f"couldn't pull {model} into Ollama — check the model name.")
-        models = ollama.inventory()
-        if models is None:
-            return err(f"pulled {model}, but couldn't re-read Ollama's model inventory.")
-        record = ollama.find_model(models, model)
-        if record is None:
-            return err(f"Ollama reported a successful pull for {model}, but the model isn't in "
-                       "its inventory — refusing ambiguous identity.")
-        if not as_json:
-            c.emit(c.style("dim", "  pulled."))
+        return err(f"{model} isn't in the configured Ollama store — install it there explicitly, "
+                   f"then run `ara characterize {model} --engine ollama`")
 
     model = record.name
     if (support_error := ollama.initial_governed_model_error(record)) is not None:
@@ -3714,40 +3695,21 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
         return err(f"couldn't identify {model}'s Ollama manifest — refusing to serve mutable "
                    "weights without artifact provenance.")
 
-    # 3. resolve the safe ceiling — measured or conservatively estimated; an explicit value is
-    # accepted only within that bound.
+    # 3. Resolve exact reusable measured evidence. An analytic estimate is comparison-only and an
+    # explicit context may lower, but never mint, handoff authority.
+    with db.connected() as con:
+        found = _ollama_safe_ceiling(con, profile.machine_key(), record, authority)
+    if found is None:
+        return err(f"no reusable measured ceiling for {model} on this Ollama runtime — run "
+                   f"`ara characterize {model} --engine ollama` first")
     if ctx is not None:
-        # Rule #1 gate: explicit --ctx must not exceed the measured or conservatively estimated
-        # bound for this exact manifest on this machine.
-        with db.connected() as con:
-            found = _ollama_safe_ceiling(
-                con, profile.machine_key(), record, authority)
-        bound = found or _ollama_estimated_ceiling(model, record=record)
-        if bound is None:
-            return err(f"no measured or estimated safe bound for {model} — refusing --ctx {ctx}; "
-                       f"run `ara characterize {model}` first.")
-        if ctx > bound[0]:
-            label = "measured safe ceiling" if bound[1] == "measured" else "estimated safe bound"
-            return err(f"--ctx {ctx} exceeds the {label} {bound[0]} for {model} — refusing "
+        if ctx > found[0]:
+            return err(f"--ctx {ctx} exceeds the measured safe ceiling {found[0]} for {model} — refusing "
                        "(Rule #1: never exceed the memory wall).")
         safe, source = ctx, "requested"
-        ceiling_measured_at = None           # explicit --ctx, not a stored ceiling
+        ceiling_measured_at = found[2]
     else:
-        with db.connected() as con:
-            found = _ollama_safe_ceiling(
-                con, profile.machine_key(), record, authority)
-        # No measurement yet → fall back to a conservative engine-free ESTIMATE (labelled as such,
-        # never as measured — Rule #3), so a fresh model still serves safely in one command.
-        if found is None:
-            found = _ollama_estimated_ceiling(model, record=record)
-        if found is None:
-            return err(f"couldn't determine a safe ceiling for {model} — run "
-                       f"`ara characterize {model}` to measure one.")
         safe, source, ceiling_measured_at = found
-        if source == "estimated" and not as_json:
-            c.emit(c.style("dim", "  ceiling ") + c.style("accent", "estimated")
-                   + c.style("dim", " — run ") + c.style("accent", f"ara characterize {model}")
-                   + c.style("dim", " for a measured one"))
 
     stale_ceiling = _stale_ceiling_note(c, model, ceiling_measured_at, as_json=as_json)
     # consent — serve creates + holds a model in memory
@@ -3881,9 +3843,32 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                 residency_verified = True
                 spilled = process.size_vram_bytes < process.size_bytes
 
-            if _ollama_artifact_id(model) != base_artifact_id:
-                return setup_err(
-                    f"{model}'s Ollama manifest changed during setup — refusing stale ownership")
+                # 6. Exercise the public protocol ARA is about to hand off, then re-attest every
+                # authority that makes the point-in-time claim true. The /v1 request itself may
+                # load or replace a runner, so the earlier /api/ps observation is not sufficient.
+                if not ollama.openai_completion_probe(served):
+                    return setup_err(
+                        f"{served!r} did not satisfy the OpenAI /v1 completion contract")
+                if ollama.runtime_authority(endpoint_authority) != authority:
+                    return setup_err(
+                        "Ollama runtime changed during OpenAI contract verification — refusing "
+                        "stale ownership")
+                if _ollama_artifact_id(model) != base_artifact_id:
+                    return setup_err(
+                        f"{model}'s Ollama manifest changed during OpenAI contract verification")
+                if _ollama_artifact_id(served) != served_artifact_id:
+                    return err(
+                        f"governed model {served!r} changed during OpenAI contract verification; "
+                        "ARA did not unload or delete it")
+                processes = ollama.processes()
+                residency_error = _ollama_residency_error(
+                    processes, allowed_name=served, allowed_digest=expected_served_digest,
+                    allowed_context=safe, require_target=True)
+                if residency_error is not None:
+                    return setup_err(residency_error)
+                process = processes[0]
+                spilled = process.size_vram_bytes < process.size_bytes
+
             try:
                 activity.record_ollama_serving(
                     **ownership_fields, served_artifact_id=served_artifact_id)
@@ -3907,12 +3892,13 @@ def render_serve(c: Console, model: str | None = None, *, ctx: int | None = None
                 c.emit(c.style("warn", f"  interrupted setup cleanup failed: {cleanup}"))
         raise
 
-    # 6. the handoff — connection info, then ARA exits (the model stays served)
+    # 7. the handoff — connection info, then ARA exits (the model stays served)
     endpoint = endpoint_base + "/v1"
     if as_json:
         print(json.dumps({"endpoint": endpoint, "model": served, "base_model": model,
                           "served_context": safe, "ceiling_source": source, "spilled": spilled,
                           "residency_verified": residency_verified,
+                          "openai_contract_verified": True,
                           "base_artifact_id": base_artifact_id,
                           "served_artifact_id": served_artifact_id,
                           "auto_selected": auto_selected, "stale_ceiling": stale_ceiling,

@@ -782,6 +782,45 @@ def test_probe_generate_fails_closed_on_missing_or_incomplete_response(monkeypat
 
 
 # --------------------------------------------------------------------------- #
+# OpenAI compatibility — prove the exact derived model works through /v1
+# --------------------------------------------------------------------------- #
+def test_openai_completion_probe_requests_one_token_from_exact_model(monkeypatch):
+    seen = {}
+
+    def fake_post(path, payload, timeout):
+        seen.update(path=path, payload=payload, timeout=timeout)
+        return {"choices": [{"text": "x", "finish_reason": "length"}]}
+
+    monkeypatch.setattr(ollama, "_post_json", fake_post)
+
+    assert ollama.openai_completion_probe("qwen3-ara-deadbeef:latest") is True
+    assert seen == {
+        "path": "/v1/completions",
+        "payload": {
+            "model": "qwen3-ara-deadbeef:latest",
+            "prompt": "ARA",
+            "max_tokens": 1,
+            "stream": False,
+        },
+        "timeout": 300.0,
+    }
+
+
+@pytest.mark.parametrize("response", [
+    None,
+    {},
+    {"choices": "wrong"},
+    {"choices": []},
+    {"choices": ["wrong"]},
+    {"choices": [{}]},
+    {"choices": [{"text": 1}]},
+])
+def test_openai_completion_probe_fails_closed_on_malformed_contract(monkeypatch, response):
+    monkeypatch.setattr(ollama, "_post_json", lambda *_args: response)
+    assert ollama.openai_completion_probe("x-ara") is False
+
+
+# --------------------------------------------------------------------------- #
 # governed run — warm + buffered native generation
 # --------------------------------------------------------------------------- #
 def test_warm_for_run_uses_the_governed_runner_options_without_keepalive(monkeypatch):

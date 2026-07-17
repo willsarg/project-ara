@@ -701,6 +701,7 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
         ),
     )
     monkeypatch.setattr(cli.ollama, "version", lambda: "1.0")
+    monkeypatch.setattr(cli.ollama, "openai_completion_probe", lambda _name: True)
     monkeypatch.setattr(cli.ollama, "ps", lambda _timeout=2.0: [])
     monkeypatch.setattr(cli.ollama, "tags", lambda: ["base:model"])
     monkeypatch.setattr(
@@ -825,7 +826,7 @@ def test_ollama_serve_temporary_activity_hands_off_to_persistent_without_overlap
     monkeypatch.setattr(cli.activity, "record_ollama_serving", record)
     c, _ = make_console()
     assert cli.render_serve(c, "base:model", ctx=4096) == 0
-    assert calls == ["verify", "create", "load-temporary", "verify", "record"]
+    assert calls == ["verify", "create", "load-temporary", "verify", "verify", "record"]
 
     monkeypatch.setattr(cli.ollama, "ps", lambda: [
         {"name": f"{_ollama_served_name()}:latest", "context_length": 4096,

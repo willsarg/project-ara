@@ -553,9 +553,11 @@ def ps(timeout: float = 2.0) -> list[dict] | None:
 
 
 def pull(name: str, timeout: float = 600.0) -> bool:
-    """Fetch *name* into the local Ollama store via ``POST /api/pull`` (non-streamed). ``True`` on
-    success. This is ``serve``'s get-out-of-the-way step — an uninstalled model is pulled rather
-    than refused, so ``ara serve <model>`` is one command. (Streamed progress is a follow-up.)"""
+    """Fetch *name* into the local Ollama store via ``POST /api/pull`` (non-streamed).
+
+    This primitive is intentionally separate from governed serving: acquisition requires its own
+    explicit consent, while ``ara serve`` only uses already-installed, measured artifacts.
+    """
     data = _post_json("/api/pull", {"model": name, "stream": False}, timeout)
     return bool(data and data.get("status") == "success")
 
@@ -632,6 +634,32 @@ def probe_generate(name: str, num_ctx: int, timeout: float = 300.0) -> bool:
         timeout,
     )
     return bool(data and data.get("done") is True)
+
+
+def openai_completion_probe(name: str, timeout: float = 300.0) -> bool:
+    """Prove *name* responds through Ollama's OpenAI-compatible completion contract.
+
+    The one-token request is deliberately sent to the exact derived model that ARA will hand off.
+    Serving re-attests runtime, manifest, residency, and context after this call, so a syntactically
+    valid response alone is never treated as sufficient safety authority.
+    """
+    data = _post_json(
+        "/v1/completions",
+        {
+            "model": name,
+            "prompt": "ARA",
+            "max_tokens": 1,
+            "stream": False,
+        },
+        timeout,
+    )
+    if not isinstance(data, dict):
+        return False
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    return isinstance(first, dict) and isinstance(first.get("text"), str)
 
 
 def warm_for_run(name: str, num_ctx: int, timeout: float = 300.0) -> dict | None:
