@@ -29,8 +29,14 @@ REQUIRED = ["characterize", "safe_limits", "calibrate", "calibration_model_cache
 SAFE_LIMITS_KEYS = {"device", "total_gb", "wall_gb", "safe_budget_gb", "margin_gb",
                     "headroom_gb", "swap_free_gb", "overhead_gb", "calibrated", "calibrated_at"}
 
-_FACTS = {"device": "Test Device", "total_gb": 48.0, "wall_gb": 40.0, "safe_budget_gb": 36.0,
-          "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0}
+_FACTS = {
+    "device": "Test Device", "memory_unit": "GiB",
+    "memory_size_bytes": 48 * 1024 ** 3,
+    "recommended_working_set_bytes": 40 * 1024 ** 3,
+    "max_buffer_length_bytes": 32 * 1024 ** 3,
+    "total_gb": 48.0, "wall_gb": 40.0, "safe_budget_gb": 36.0,
+    "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0,
+}
 
 
 def _seam_apple(monkeypatch):

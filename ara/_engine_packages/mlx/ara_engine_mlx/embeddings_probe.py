@@ -15,7 +15,7 @@ import json
 import subprocess
 import sys
 
-from . import config, db, profiles
+from . import config, db, profiles, units
 from .system import read_limits, sample_settled_baseline
 
 DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
@@ -33,12 +33,12 @@ NUM_HEADS = 12
 
 # Cold-start OVER-estimate (sum over all layers as if global): a safe upper bound that only
 # ever gates the first tiny cells, since the sweep ramps seq from the smallest value.
-A_COLD = NUM_LAYERS * HIDDEN_SIZE * 2 / 1e9   # GB per (batch*seq)
-B_COLD = NUM_LAYERS * NUM_HEADS * 2 / 1e9     # GB per (batch*seq^2)
+A_COLD = NUM_LAYERS * HIDDEN_SIZE * 2 / units.BYTES_PER_GIB  # GiB per (batch*seq)
+B_COLD = NUM_LAYERS * NUM_HEADS * 2 / units.BYTES_PER_GIB  # GiB per (batch*seq^2)
 
 # Physical one-layer FLOOR (lower bound: >=1 layer's attention + residual resident at peak).
-A_FLOOR = HIDDEN_SIZE * 2 / 1e9
-B_FLOOR = NUM_HEADS * 2 / 1e9
+A_FLOOR = HIDDEN_SIZE * 2 / units.BYTES_PER_GIB
+B_FLOOR = NUM_HEADS * 2 / units.BYTES_PER_GIB
 
 
 def _default_event(_event: dict) -> None:
@@ -185,8 +185,8 @@ def sweep(con, run_id: int, model: str, batches=None, seqs=None, repeats: int = 
     live = sample_settled_baseline()
     if live + model_base >= threshold:
         on_event({"event": "preflight_abort",
-                  "note": (f"host pressure {live:.2f} GB + model seed {model_base} GB "
-                           f">= threshold {threshold:.2f} GB")})
+                  "note": (f"host pressure {live:.2f} GiB + model seed {model_base} GiB "
+                           f">= threshold {threshold:.2f} GiB")})
         return {"model": model, "run_id": run_id, "n_cells_measured": 0,
                 "n_cells_skipped": 0, "aborted": True}
 

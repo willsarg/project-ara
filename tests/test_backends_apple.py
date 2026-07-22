@@ -23,14 +23,14 @@ def _fake_worker(monkeypatch, fn):
                         type("E", (), {"run_worker": staticmethod(fn)}))
 
 
-# The engine facts the MLX `device limits` worker returns (ARA overlays its own fields).
-# The MLX engine denominates memory in DECIMAL GB (bytes / 1e9) except swap (already binary GiB);
-# apple.safe_limits converts to ARA's binary-GiB contract at this boundary.
+# The v2 MLX worker returns binary GiB plus exact byte authority.
 _LIMITS_FACTS = {
+    "memory_unit": "GiB", "memory_size_bytes": 48 * 1024 ** 3,
+    "recommended_working_set_bytes": 40 * 1024 ** 3,
+    "max_buffer_length_bytes": 32 * 1024 ** 3,
     "device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
     "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0,
 }
-_DEC = 1e9 / (1024 ** 3)     # decimal-GB value × _DEC = the same bytes in binary GiB
 
 
 def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
@@ -44,30 +44,32 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
     m = apple.safe_limits()
     assert calls == [("apple", ["-m", "ara_engine_mlx.device", "limits"])]
     assert m["device"] == "Apple M4 Pro"
-    assert m["total_gb"] == pytest.approx(48.0 * _DEC)
-    assert m["wall_gb"] == pytest.approx(40.0 * _DEC)
-    assert m["swap_free_gb"] == 2.0        # MLX reports swap in GiB already — passes through
+    assert m["total_gb"] == 48.0
+    assert m["wall_gb"] == 40.0
+    assert m["memory_unit"] == "GiB"
+    assert m["recommended_working_set_bytes"] == 40 * 1024 ** 3
+    assert m["swap_free_gb"] == 2.0
     # no stored calibration in the engine — ARA overlays it from its own store
     assert m["calibrated"] is False
     assert m["overhead_gb"] is None
     assert m["calibrated_at"] is None
 
 
-def test_safe_limits_converts_mlx_decimal_to_gib_preserving_margin(monkeypatch):
-    """MLX wall/budget values are decimal GB (bytes/1e9); ARA's contract is binary GiB. The boundary
-    conversion must NOT scale the absolute safety margin (a blind × factor would shrink it ~7%,
-    an unsafe direction): safe_budget is re-derived as converted wall − margin, and headroom as
-    safe_budget − converted wired footprint.
-
-    Slug: 2026-07-02-analytic-units-gib
-    """
+def test_safe_limits_accepts_v2_gib_worker_contract(monkeypatch):
     _fake_worker(monkeypatch, lambda name, argv: dict(_LIMITS_FACTS))
     m = apple.safe_limits()
-    wall = 40.0 * _DEC
-    assert m["margin_gb"] == 4.0                                  # policy constant, not scaled
-    assert m["safe_budget_gb"] == pytest.approx(wall - 4.0)       # margin preserved exactly
-    wired = (36.0 - 28.0) * _DEC                                  # MLX wired = safe − headroom
-    assert m["headroom_gb"] == pytest.approx((wall - 4.0) - wired)
+    assert m["margin_gb"] == 4.0
+    assert m["safe_budget_gb"] == 36.0
+    assert m["headroom_gb"] == 28.0
+
+
+def test_safe_limits_rejects_legacy_decimal_worker(monkeypatch):
+    legacy = {key: value for key, value in _LIMITS_FACTS.items()
+              if key not in {"memory_unit", "memory_size_bytes",
+                             "recommended_working_set_bytes", "max_buffer_length_bytes"}}
+    _fake_worker(monkeypatch, lambda name, argv: legacy)
+    with pytest.raises(engine_env.EngineEnvError, match="GiB v2"):
+        apple.safe_limits()
 
 
 def test_calibration_model_cached_true(monkeypatch):
@@ -160,10 +162,7 @@ def test_calibrate_surfaces_effective_overhead(monkeypatch):
     }, calls)
     m = apple.calibrate("org/calib-model")
     assert m["device"] == "Apple M4 Pro"               # carries fresh limits …
-    # effective = max(default 6, measured 5), converted from MLX decimal GB to binary GiB
-    # (it is subtracted from the GiB wall, so it must share the wall's units).
-    # Slug: 2026-07-02-analytic-units-gib
-    assert m["overhead_gb"] == pytest.approx(6.0 * _DEC)
+    assert m["overhead_gb"] == 6.0
     assert m["calibrated"] is True
     assert m["calibration"]["n_points"] == 4           # … plus what it measured (engine-raw)
     assert ["-m", "ara_engine_mlx.device", "calibrate", "org/calib-model"] in calls

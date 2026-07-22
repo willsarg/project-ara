@@ -23,11 +23,13 @@ from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
+from . import units
+
 HUB = os.path.expanduser("~/.cache/huggingface/hub")
 UNBOUNDED_CUSTOM_CACHE_TYPES = {"qwen3_5", "qwen3_5_text"}
 
 # Measured: the OS-wired slope is dominated by the prefill transient, ~5x the analytic
-# fp16 KV-cache slope (Gemma: analytic 0.0143 vs measured 0.070 GB/1k). For UNCHARACTERIZED
+# fp16 KV-cache slope (Gemma: analytic 0.0143 vs measured 0.070 GiB/1k). For UNCHARACTERIZED
 # models we apply this multiplier so estimates stay conservative.
 PREFILL_SPIKE_MULT = 5.0
 
@@ -75,10 +77,10 @@ class ModelInfo:
         return self.kv_bytes_per_token(None)
 
     def estimated_slope_gb_per_k(self, kv_bits: int | None = None) -> float:
-        """Conservative os-wired slope estimate (GB per 1k tokens) for an UNcharacterized
+        """Conservative os-wired slope estimate (GiB per 1k tokens) for an UNcharacterized
         model: steady-state KV growth (at the given ``kv_bits``) scaled by the prefill-spike
         multiplier. Defaults to fp16."""
-        kv_slope = self.kv_bytes_per_token(kv_bits) * 1000 / 1e9
+        kv_slope = self.kv_bytes_per_token(kv_bits) * 1000 / units.BYTES_PER_GIB
         return kv_slope * PREFILL_SPIKE_MULT
 
     def as_dict(self) -> dict:
@@ -199,7 +201,7 @@ def weights_gb(hf_id: str) -> float | None:
     local = _local_snapshot(hf_id)
     if local is not None:
         weight_bytes = _snapshot_weight_bytes(local)
-        return weight_bytes / 1e9 if weight_bytes is not None else None
+        return units.bytes_to_gib(weight_bytes) if weight_bytes is not None else None
     blobs = os.path.join(_cache_dir(hf_id), "blobs")
     total = 0
     for f in glob.glob(os.path.join(blobs, "*")):
@@ -207,7 +209,7 @@ def weights_gb(hf_id: str) -> float | None:
             continue
         # weights only — skip tokenizer/json blobs by size heuristic is unreliable; sum all
         total += os.path.getsize(f)
-    return total / 1e9
+    return units.bytes_to_gib(total)
 
 
 def _read_raw_config(hf_id: str) -> dict | None:

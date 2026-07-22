@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from . import system
 
-# Headroom (GB) reserved for loading Kokoro-82M (bf16 weights + Metal init) before a run is
+# Headroom (GiB) reserved for loading Kokoro-82M (bf16 weights + Metal init) before a run is
 # cleared to start. Conservative for an ~82M-param model.
 MODEL_WEIGHT_EST_GB = 0.5
 

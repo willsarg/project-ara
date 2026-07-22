@@ -180,7 +180,7 @@ def test_cuda_audit_is_unknown_without_host_capability(monkeypatch):
 
 
 def test_mlx_audit_reports_visible_metal_device(monkeypatch):
-    _installed(monkeypatch, schema="ara-engine-mlx:ara_engine_mlx:v1")
+    _installed(monkeypatch, schema="ara-engine-mlx:ara_engine_mlx:v2")
     monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {
         "kind": "mlx",
         "package_version": "0.32.0",
@@ -384,7 +384,7 @@ def test_cuda_audit_rejects_cpu_torch_and_no_visible_device(monkeypatch):
 
 
 def test_mlx_audit_reports_failed_gpu_operation(monkeypatch):
-    _installed(monkeypatch, schema="ara-engine-mlx:ara_engine_mlx:v1")
+    _installed(monkeypatch, schema="ara-engine-mlx:ara_engine_mlx:v2")
     monkeypatch.setattr(engine_audit, "_probe", lambda *_args: {
         "kind": "mlx", "package_version": "0.32.0", "metal_available": False,
         "gpu_count": 0, "operation_ok": False, "device": None,

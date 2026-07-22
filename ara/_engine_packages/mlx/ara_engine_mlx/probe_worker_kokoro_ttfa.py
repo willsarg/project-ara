@@ -14,6 +14,8 @@ import statistics
 import time
 import sys
 
+from . import units
+
 BASE_TEXT = (
     "The MLX framework is an array framework for machine learning research on Apple Silicon, "
     "brought to you by Apple's machine learning research team. MLX is designed by machine learning "
@@ -78,8 +80,8 @@ def main() -> None:
         print(json.dumps({
             "status": "error",
             "note": (f"Pre-flight aborted: settled baseline + "
-                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GB model-load headroom would reach "
-                     f"the safe threshold ({threshold:.2f} GB); model not loaded."),
+                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GiB model-load headroom would reach "
+                     f"the safe threshold ({threshold:.2f} GiB); model not loaded."),
         }), flush=True)
         sys.exit(0)
 
@@ -116,7 +118,7 @@ def main() -> None:
         if kokoro_safety.over_threshold(threshold):
             print(json.dumps({
                 "status": "safeguard_triggered",
-                "note": f"Active memory safeguard: OS-wired memory reached the safe threshold ({threshold:.2f} GB)."
+                "note": f"Active memory safeguard: OS-wired memory reached the safe threshold ({threshold:.2f} GiB)."
             }), flush=True)
             break
 
@@ -156,7 +158,7 @@ def main() -> None:
             if kokoro_safety.over_threshold(threshold):
                 print(json.dumps({
                     "status": "safeguard_triggered",
-                    "note": f"Active memory safeguard before non-streaming pass: OS-wired memory reached the safe threshold ({threshold:.2f} GB)."
+                    "note": f"Active memory safeguard before non-streaming pass: OS-wired memory reached the safe threshold ({threshold:.2f} GiB)."
                 }), flush=True)
                 success = False
                 break
@@ -179,7 +181,7 @@ def main() -> None:
             run_totals.append(total)
             run_ratios.append(total / ttfa)
             run_chunk_durs.append(chunk_dur)
-            run_peaks.append(mx.get_peak_memory() / 1e9)  # GB
+            run_peaks.append(units.bytes_to_gib(mx.get_peak_memory()))
 
         if not success:
             continue

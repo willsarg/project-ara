@@ -26,8 +26,8 @@ DEFAULT_FIXED_OVERHEAD_GB = 1.0
 def machine_key() -> tuple[str, int, int]:
     """(device_name, total_ram_bytes, macos_major) identifying the current machine.
 
-    total RAM is read in BYTES from mx.device_info()['memory_size'] (SystemLimits.total_gb
-    is already divided by 1e9, so it can't supply a stable integer key).
+    Total RAM is read in bytes from ``mx.device_info()['memory_size']`` so the key never
+    reconstructs exact authority from a floating-point GiB value.
     """
     import mlx.core as mx
     d = mx.device_info()

@@ -34,8 +34,8 @@ def main() -> None:
         print(json.dumps({
             "status": "error",
             "note": (f"Pre-flight aborted: settled baseline + "
-                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GB model-load headroom would reach "
-                     f"the safe threshold ({threshold:.2f} GB); model not loaded."),
+                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GiB model-load headroom would reach "
+                     f"the safe threshold ({threshold:.2f} GiB); model not loaded."),
         }), flush=True)
         sys.exit(0)
 
@@ -90,7 +90,7 @@ def main() -> None:
         if kokoro_safety.over_threshold(threshold):
             print(json.dumps({
                 "status": "safeguard_triggered",
-                "note": f"Active memory safeguard {stage}: OS-wired memory reached the safe threshold ({threshold:.2f} GB)."
+                "note": f"Active memory safeguard {stage}: OS-wired memory reached the safe threshold ({threshold:.2f} GiB)."
             }), flush=True)
             return True
         return False

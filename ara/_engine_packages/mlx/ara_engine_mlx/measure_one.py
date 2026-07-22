@@ -24,7 +24,7 @@ import sys
 from . import models, probe, profiles, system
 
 # Repeat each rung in fresh processes and take the median: a single prefill peak lands
-# between sampler windows (±~1GB jitter), so one shot makes ceilings erratic.
+# between sampler windows (±~1GiB jitter), so one shot makes ceilings erratic.
 DEFAULT_REPEATS = 3
 
 
@@ -58,15 +58,15 @@ def safety_gate(info, limits, ctx: int, *, margin_gb: float, overhead_gb: float,
     threshold = limits.safe_threshold_gb(margin_gb)
     est_base = probe.estimate_base_gb(info, limits, overhead_gb)
     if est_base >= threshold:
-        return (f"base estimate {est_base:.2f}GB >= safe budget {threshold:.2f}GB — "
+        return (f"base estimate {est_base:.2f}GiB >= safe budget {threshold:.2f}GiB — "
                 f"won't load")
     model_base = info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
     slope = (measured_slope_gb_per_k if measured_slope_gb_per_k is not None
              else info.estimated_slope_gb_per_k(_effective_kv_bits(info, kv_bits)))
     predicted = live_base + model_base + slope * (ctx / 1000)
     if predicted >= threshold:
-        return (f"predicted {predicted:.2f}GB at {ctx} tok >= safe budget "
-                f"{threshold:.2f}GB")
+        return (f"predicted {predicted:.2f}GiB at {ctx} tok >= safe budget "
+                f"{threshold:.2f}GiB")
     return None
 
 

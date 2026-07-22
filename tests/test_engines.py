@@ -56,6 +56,7 @@ def test_catalog_has_only_canonical_public_engine_keys():
 
 def test_mlx_catalog_declares_the_native_import_package():
     assert engines.ENGINES["mlx"]["import_package"] == "ara_engine_mlx"
+    assert engines.ENGINES["mlx"]["env_schema"] == "ara-engine-mlx:ara_engine_mlx:v2"
 
 
 def test_cuda_catalog_declares_the_native_package_contract():
@@ -144,7 +145,7 @@ def test_is_installed_true_when_env_exists(monkeypatch):
     monkeypatch.setattr(
         engines.engine_env,
         "stamped_schema",
-        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v2",
     )
     assert engines.is_installed("mlx") is True
 
@@ -193,7 +194,7 @@ def test_is_installed_false_when_engine_was_built_by_an_older_ara(monkeypatch):
     monkeypatch.setattr(
         engines.engine_env,
         "stamped_schema",
-        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v2",
     )
     monkeypatch.setattr(engines.engine_env, "stamped_version", lambda name: "0.1.1")
     monkeypatch.setattr(engines, "_ara_version", lambda: "0.1.2")
@@ -420,7 +421,7 @@ def test_install_already_present_is_noop(monkeypatch):
     monkeypatch.setattr(
         engines.engine_env,
         "stamped_schema",
-        lambda name: "ara-engine-mlx:ara_engine_mlx:v1",
+        lambda name: "ara-engine-mlx:ara_engine_mlx:v2",
     )
     created = []
     monkeypatch.setattr(engines.engine_env, "create", lambda *a, **k: created.append(a))
@@ -444,7 +445,7 @@ def test_install_stamps_env_with_current_version(monkeypatch):
     )
     assert engines.install("mlx").status == "installed"
     assert seen["version"] == "3.1.4"
-    assert seen["schema"] == "ara-engine-mlx:ara_engine_mlx:v1"
+    assert seen["schema"] == "ara-engine-mlx:ara_engine_mlx:v2"
     assert seen["expected_import"] == "ara_engine_mlx"
 
 
@@ -473,7 +474,7 @@ def test_install_reinstalls_on_stamp_mismatch(monkeypatch):
     assert created == {
         "name": "apple",
         "version": "2.0.0",
-        "schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "schema": "ara-engine-mlx:ara_engine_mlx:v2",
         "expected_import": "ara_engine_mlx",
     }
 

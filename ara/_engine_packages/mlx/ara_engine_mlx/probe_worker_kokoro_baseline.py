@@ -2,9 +2,9 @@
 # Copyright 2026 Will Sarg
 """Kokoro TTS active synthesis memory baseline benchmark worker.
 
-Measures the OS-wired memory overhead (GB) of a short warm synthesis over the idle
+Measures the OS-wired memory overhead (GiB) of a short warm synthesis over the idle
 baseline. NOTE: this is only the floor — Kokoro's footprint is NOT static; it grows with
-utterance length (longer output audio allocates more) and with concurrency (~GB per
+utterance length (longer output audio allocates more) and with concurrency (~GiB per
 concurrent call). See the synthesis and batch benchmarks for the scaling curves.
 Prints JSON lines to stdout.
 """
@@ -30,9 +30,9 @@ def main() -> None:
     if not safe:
         print(json.dumps({
             "status": "error",
-            "note": (f"Pre-flight aborted: settled baseline ({baseline_gb:.2f} GB) + "
-                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GB model-load headroom would reach "
-                     f"the safe threshold ({threshold:.2f} GB); model not loaded."),
+            "note": (f"Pre-flight aborted: settled baseline ({baseline_gb:.2f} GiB) + "
+                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GiB model-load headroom would reach "
+                     f"the safe threshold ({threshold:.2f} GiB); model not loaded."),
         }), flush=True)
         sys.exit(0)
 

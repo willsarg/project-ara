@@ -61,7 +61,7 @@ def resolve_speed(speed: str, repeats: int | None = None) -> tuple[list[int], in
         raise ValueError(f"unknown speed preset: {speed!r} "
                          f"(choose from {', '.join(SPEED_PRESETS)})")
     return list(preset["ramp"]), preset["repeats"] if repeats is None else repeats
-# rough base-footprint estimate (GB): weights resident + fixed overhead, on top of the
+# rough base-footprint estimate (GiB): weights resident + fixed overhead, on top of the
 # live system baseline. Calibrated loosely on Gemma/Qwen; refined as more models run.
 # profiles.py is the source of truth for these cold-start defaults; aliased here for
 # backward references (tests / readers). Do not redefine — change them in profiles.py.
@@ -163,7 +163,7 @@ def _summarize_worker_error(stderr: str) -> str:
 def _measure_rung(py: str, hf_id: str, ctx: int, kv_bits, repeats: int, *, verbose, log):
     """Run a rung `repeats` times in fresh processes; return the MEDIAN high-water.
 
-    Each prefill can land its peak between sampler windows (±~1GB jitter), so a single run
+    Each prefill can land its peak between sampler windows (±~1GiB jitter), so a single run
     makes ceilings look erratic. The median of N isolated runs is the textbook smoother.
     Returns a dict with median os_wired/delta/mlx_peak, or the first failure dict / None.
     """
@@ -264,12 +264,12 @@ def characterize(hf_id: str, *, margin_gb: float | None = None, ramp=None,
                 "run_id": run_id}
 
     if est >= wall:
-        return _refuse(f"estimated base {est:.2f}GB >= hard wall {wall:.2f}GB — "
+        return _refuse(f"estimated base {est:.2f}GiB >= hard wall {wall:.2f}GiB — "
                        f"cannot load without breaching the wall. Never probe.", "hopeless")
     if est >= threshold:
         if not allow_min_probe:
-            return _refuse(f"estimated base {est:.2f}GB >= safe threshold {threshold:.2f}GB "
-                           f"(but < wall {wall:.2f}GB). Borderline — re-run with --min-probe "
+            return _refuse(f"estimated base {est:.2f}GiB >= safe threshold {threshold:.2f}GiB "
+                           f"(but < wall {wall:.2f}GiB). Borderline — re-run with --min-probe "
                            f"to measure the true base with a supervised 512-token probe.",
                            "borderline")
         # supervised minimal probe: deep in the safe zone, replaces the blind guess
@@ -290,7 +290,7 @@ def characterize(hf_id: str, *, margin_gb: float | None = None, ramp=None,
                                         "delta_gb": true_delta, "peak_gb": m["mlx_peak_gb"],
                                         "repeats": 1, "spread_gb": 0.0})
         if true_abs >= threshold:
-            return _refuse(f"measured base {true_abs:.2f}GB >= threshold {threshold:.2f}GB "
+            return _refuse(f"measured base {true_abs:.2f}GiB >= threshold {threshold:.2f}GiB "
                            f"— genuinely too tight, not just a pessimistic estimate.",
                            "borderline")
         xs_k.append(MIN_PROBE_CTX / 1000)
@@ -442,11 +442,11 @@ def _calibrate_one(hf_id: str, *, margin_gb: float, repeats: int, prior_overhead
     est = estimate_base_gb(info, limits, prior_overhead_gb)
     if est >= threshold:
         _abort(
-            f"[calibrate] estimated base {est:.2f}GB >= threshold {threshold:.2f}GB — "
+            f"[calibrate] estimated base {est:.2f}GiB >= threshold {threshold:.2f}GiB — "
             f"machine too loaded or model too large to calibrate safely. Free memory or "
             f"pass a smaller --model.",
-            f"estimated load ({est:.2f} GB) is at/over the safe budget "
-            f"({threshold:.2f} GB) — the machine is too loaded, or this model is too "
+            f"estimated load ({est:.2f} GiB) is at/over the safe budget "
+            f"({threshold:.2f} GiB) — the machine is too loaded, or this model is too "
             f"big, to calibrate safely.", kind="memory")
 
     factor, overhead = profiles.DEFAULT_RESIDENT_FACTOR, prior_overhead_gb
@@ -467,11 +467,11 @@ def _calibrate_one(hf_id: str, *, margin_gb: float, repeats: int, prior_overhead
         predicted = live_base + model_base + slope * (ctx / 1000)
         if predicted >= threshold:
             _abort(
-                f"[calibrate] predicted {predicted:.2f}GB (live {live_base:.2f} + model "
+                f"[calibrate] predicted {predicted:.2f}GiB (live {live_base:.2f} + model "
                 f"{model_base:.2f} + slope {slope:.4f}*{ctx/1000:.1f}k) >= threshold "
-                f"{threshold:.2f}GB before rung {ctx}; aborting (free memory and retry).",
-                f"predicted {predicted:.2f} GB at {ctx:,} tok would reach the safe budget "
-                f"({threshold:.2f} GB) before measuring — aborting before any risk.",
+                f"{threshold:.2f}GiB before rung {ctx}; aborting (free memory and retry).",
+                f"predicted {predicted:.2f} GiB at {ctx:,} tok would reach the safe budget "
+                f"({threshold:.2f} GiB) before measuring — aborting before any risk.",
                 kind="memory")
         m = _measure_rung(py, hf_id, ctx, kv_bits, repeats, verbose=verbose, log=log)
         if m is None or m.get("status") != "ok":

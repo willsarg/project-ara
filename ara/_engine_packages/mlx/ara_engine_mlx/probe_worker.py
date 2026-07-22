@@ -17,6 +17,8 @@ import subprocess
 import threading
 import time
 
+from . import units
+
 
 def _should_abort(wired_gb: float, limit_gb: float | None) -> bool:
     """Watchdog trip: has live wired memory reached the hard limit? (None = off.)"""
@@ -31,7 +33,7 @@ def _wired_gb() -> float:
             page_size = int(line.split()[-2])
         if "Pages wired down" in line:
             wired = int(line.split()[-1].strip("."))
-    return wired * page_size / 1e9
+    return units.bytes_to_gib(wired * page_size)
 
 
 def main() -> None:
@@ -43,7 +45,7 @@ def main() -> None:
     ap.add_argument("--quantized-kv-start", type=int, default=5000)
     ap.add_argument("--max-tokens", type=int, default=8)
     ap.add_argument("--abort-wired-gb", type=float, default=None,
-                    help="watchdog: kill the probe if live wired memory reaches this (GB)")
+                    help="watchdog: kill the probe if live wired memory reaches this (GiB)")
     args = ap.parse_args()
 
     import mlx.core as mx
@@ -62,7 +64,7 @@ def main() -> None:
             if _should_abort(w, args.abort_wired_gb):
                 print(json.dumps({
                     "hf_id": args.hf_id, "context": args.context, "status": "aborted",
-                    "note": f"watchdog: wired {w:.2f}GB >= limit {args.abort_wired_gb:.2f}GB",
+                    "note": f"watchdog: wired {w:.2f}GiB >= limit {args.abort_wired_gb:.2f}GiB",
                     "os_wired_gb": round(w, 3)}), flush=True)
                 os._exit(3)
             time.sleep(0.05)
@@ -104,8 +106,9 @@ def main() -> None:
     stop[0] = True
     result.update(
         status="ok",
-        mlx_peak_gb=round(mx.get_peak_memory() / 1e9, 3),
-        mlx_true_gb=round((mx.get_active_memory() + mx.get_cache_memory()) / 1e9, 3),
+        mlx_peak_gb=round(units.bytes_to_gib(mx.get_peak_memory()), 3),
+        mlx_true_gb=round(units.bytes_to_gib(
+            mx.get_active_memory() + mx.get_cache_memory()), 3),
         os_wired_gb=round(hi[0], 3),
     )
     print(json.dumps(result), flush=True)

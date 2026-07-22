@@ -7,7 +7,7 @@ cell never contaminates the high-water reading. Prints one JSON line.
 
 Usage:
     python -m ara_engine_mlx.probe_worker_embeddings --model <id> --batch B --seq S \
-        [--repeats N] [--margin GB]
+        [--repeats N] [--margin GiB]
 
 Import convention: modules are imported (not their members) so tests can patch
 `mlx_embeddings.load`, `mx.*`, and `system.*` on these shared module objects.
@@ -23,10 +23,10 @@ import time
 
 import mlx.core as mx
 
-from . import system
+from . import system, units
 
-# Headroom (GB) the worker reserves for loading the model weights before allocating
-# activations. Conservative for a ModernBERT-base bf16 (~0.3 GB weights + overhead).
+# Headroom (GiB) the worker reserves for loading the model weights before allocating
+# activations. Conservative for a ModernBERT-base bf16 (~0.3 GiB weights + overhead).
 MODEL_WEIGHT_EST_GB = 0.6
 
 try:
@@ -49,9 +49,9 @@ def main() -> None:
     if limits.wired_now_gb + MODEL_WEIGHT_EST_GB >= threshold:
         print(json.dumps({
             "status": "error",
-            "note": (f"Pre-flight aborted: wired {limits.wired_now_gb:.2f} GB + "
-                     f"weight headroom {MODEL_WEIGHT_EST_GB} GB >= threshold "
-                     f"{threshold:.2f} GB. Model not loaded."),
+            "note": (f"Pre-flight aborted: wired {limits.wired_now_gb:.2f} GiB + "
+                     f"weight headroom {MODEL_WEIGHT_EST_GB} GiB >= threshold "
+                     f"{threshold:.2f} GiB. Model not loaded."),
         }), flush=True)
         sys.exit(0)
 
@@ -100,7 +100,7 @@ def main() -> None:
             out = model(input_ids, attention_mask=attention_mask)
             mx.eval(out.last_hidden_state)
             compute_times.append(time.perf_counter() - t0)
-            peaks.append(mx.get_peak_memory() / 1e9)
+            peaks.append(units.bytes_to_gib(mx.get_peak_memory()))
     finally:
         stop[0] = True
         t.join(timeout=0.2)

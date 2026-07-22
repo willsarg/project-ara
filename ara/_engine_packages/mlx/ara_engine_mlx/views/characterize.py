@@ -27,12 +27,12 @@ def render_header(console, data: dict) -> None:
     c.emit(c.style("dim", "  measuring how much context fits — probing upward from "
                           "small, never into the danger zone."))
     c.emit()
-    c.emit(c.field("safe budget", f"{data['safe_budget_gb']:.2f} GB",
-                   f"crash wall {data['wall_gb']:.2f} GB − margin"))
-    c.emit(c.field("memory now", f"{data['baseline_gb']:.2f} GB",
+    c.emit(c.field("safe budget", f"{data['safe_budget_gb']:.2f} GiB",
+                   f"crash wall {data['wall_gb']:.2f} GiB − margin"))
+    c.emit(c.field("memory now", f"{data['baseline_gb']:.2f} GiB",
                    "wired before the model loads (your starting point)"))
-    c.emit(c.field("pre-flight est", f"{data['est_gb']:.2f} GB",
-                   f"rough load footprint from {data['weights_gb']:.1f} GB of weights"))
+    c.emit(c.field("pre-flight est", f"{data['est_gb']:.2f} GiB",
+                   f"rough load footprint from {data['weights_gb']:.1f} GiB of weights"))
     c.emit()
 
 
@@ -51,8 +51,8 @@ def render_rung(console, data: dict) -> None:
         "  " + c.glyph("ok") + " "
         + c.style("value", f"{data['ctx']:>6,} tok")
         + c.style("dim", "   ")
-        + c.style("metric", f"{data['os_wired_gb']:.2f} GB wired")
-        + c.style("dim", f"   (+{data['delta_gb']:.2f} GB vs base, "
+        + c.style("metric", f"{data['os_wired_gb']:.2f} GiB wired")
+        + c.style("dim", f"   (+{data['delta_gb']:.2f} GiB vs base, "
                          f"median of {data['repeats']})")
     )
 
@@ -66,8 +66,8 @@ def render_stop(console, data: dict) -> None:
     c.emit(
         "  " + c.style("warn", "■")
         + c.style("value", f" ceiling reached")
-        + c.style("dim", f" — {data['ctx']:,} tok would need ~{data['predicted_gb']:.2f} GB, "
-                         f"over the {data['safe_budget_gb']:.2f} GB budget. Stopping safely.")
+        + c.style("dim", f" — {data['ctx']:,} tok would need ~{data['predicted_gb']:.2f} GiB, "
+                         f"over the {data['safe_budget_gb']:.2f} GiB budget. Stopping safely.")
     )
 
 
@@ -78,16 +78,16 @@ def render_refusal(console, data: dict) -> None:
     """
     model = _short(data["model"])
     if data["kind"] == "hopeless":
-        why = [f"Its estimated load footprint ({data['est_gb']:.2f} GB) meets or "
-               f"exceeds the crash wall ({data['wall_gb']:.2f} GB) — it can't load "
+        why = [f"Its estimated load footprint ({data['est_gb']:.2f} GiB) meets or "
+               f"exceeds the crash wall ({data['wall_gb']:.2f} GiB) — it can't load "
                f"without risking a hard lock, so we never probe it."]
         tries = [
             ("huggingface.co/mlx-community", "browse for a smaller / more-quantized build"),
             ("ara models recommend", "see what does fit right now"),
         ]
     else:  # borderline
-        why = [f"Its estimated load footprint ({data['est_gb']:.2f} GB) is above the "
-               f"safe budget ({data['threshold_gb']:.2f} GB) but below the wall — the "
+        why = [f"Its estimated load footprint ({data['est_gb']:.2f} GiB) is above the "
+               f"safe budget ({data['threshold_gb']:.2f} GiB) but below the wall — the "
                f"estimate may just be pessimistic."]
         tries = [
             (f"ara characterize {model} --engine mlx --min-probe",

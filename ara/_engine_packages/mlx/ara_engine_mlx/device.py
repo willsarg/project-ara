@@ -15,7 +15,7 @@ import argparse
 import json
 import sys
 
-from . import config, probe, system
+from . import config, probe, system, units
 from .ui import Console
 
 
@@ -27,6 +27,10 @@ def limits(margin_gb: float | None = None) -> dict:
     safe = s.safe_threshold_gb(margin)
     return {
         "device": s.device,
+        "memory_unit": units.MEMORY_UNIT,
+        "memory_size_bytes": s.memory_size_bytes,
+        "recommended_working_set_bytes": s.recommended_working_set_bytes,
+        "max_buffer_length_bytes": s.max_buffer_length_bytes,
         "total_gb": s.total_gb,
         "wall_gb": s.wall_gb,
         "safe_budget_gb": safe,

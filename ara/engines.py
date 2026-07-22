@@ -54,7 +54,7 @@ ENGINES: dict[str, dict] = {
         "caution": "Apple-only; the MLX runtime can be large but is installed only on demand.",
         "available": True,
         "source_dir": "_engine_packages/mlx",
-        "env_schema": "ara-engine-mlx:ara_engine_mlx:v1",
+        "env_schema": "ara-engine-mlx:ara_engine_mlx:v2",
         "import_package": "ara_engine_mlx",
         "source_env": "ARA_MLX_SOURCE",
         "legacy_source_env": "ARA_WMX_SOURCE",
