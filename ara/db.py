@@ -815,7 +815,8 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
                           decode_context: int | None = None,
                           config: dict | None = None,
                           artifact_id: str | None = None,
-                          evidence: dict | None = None) -> None:
+                          evidence: dict | None = None,
+                          characterization_evidence: dict | None = None) -> None:
     stored_config = {} if config is None else config
     identity = _characterization_identity(
         engine, model_id, artifact_id, stored_config)
@@ -838,7 +839,9 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
         (machine_key, identity["runtime"], identity["backend"], identity["artifact_id"],
          identity["config_key"], model_id, identity["legacy_engine"], safe_context,
          decode_context, json.dumps(stored_config, sort_keys=True), json.dumps(points),
-         _compact_json(evidence), identity["artifact_confidence"], identity["reusable"],
+         _compact_json(characterization_evidence if characterization_evidence is not None
+                       else evidence),
+         identity["artifact_confidence"], identity["reusable"],
          measured_at or _now()))
     con.commit()
 
