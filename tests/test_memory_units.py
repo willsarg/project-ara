@@ -33,4 +33,3 @@ def test_gib_to_bytes_rejects_invalid_values(value) -> None:
 def test_bytes_to_gib_rejects_non_byte_counts(value) -> None:
     with pytest.raises(ValueError, match="non-negative integer"):
         memory_units.bytes_to_gib(value)
-
