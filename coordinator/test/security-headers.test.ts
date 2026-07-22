@@ -53,5 +53,8 @@ describe("security headers (next.config.ts)", () => {
   it("does not disturb the existing build config (standalone output, sqlite external)", () => {
     expect(nextConfig.output).toBe("standalone");
     expect(nextConfig.serverExternalPackages).toEqual(["better-sqlite3"]);
+    expect(nextConfig.outputFileTracingIncludes).toEqual({
+      "/*": ["./node_modules/@img/sharp-libvips-*/lib/**/*"],
+    });
   });
 });

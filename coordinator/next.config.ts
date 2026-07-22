@@ -39,6 +39,12 @@ const nextConfig: NextConfig = {
   output: "standalone",
   // better-sqlite3 is a native module — keep it external so Next doesn't try to bundle the .node binding.
   serverExternalPackages: ["better-sqlite3"],
+  // Next 16.2's file tracer sees sharp 0.35's platform package but misses its native libvips
+  // payload. Include the installed platform's library explicitly so the standalone image can load
+  // sharp; the wildcard remains portable across macOS/Linux, CPU architectures, and libc variants.
+  outputFileTracingIncludes: {
+    "/*": ["./node_modules/@img/sharp-libvips-*/lib/**/*"],
+  },
   async headers() {
     return [{ source: "/:path*", headers: SECURITY_HEADERS }];
   },
