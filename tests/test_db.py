@@ -486,6 +486,61 @@ def test_characterizations_for_different_measurement_authorities_coexist(store):
     assert len(rows) == 2
 
 
+def test_v6_authority_values_preserves_already_scoped_row():
+    values = db._v6_authority_values({
+        "environment_key": "mlx-env:a",
+        "authority_key": "mlx-authority:a",
+        "memory_unit": "GiB",
+        "authority_evidence_json": '{"schema":"mlx-memory-authority:v1"}',
+    })
+    assert values == (
+        "mlx-env:a", "mlx-authority:a", "GiB",
+        '{"schema":"mlx-memory-authority:v1"}', False,
+    )
+
+
+def test_machine_key_rekey_preserves_v6_authority_primary_keys(store, monkeypatch):
+    db.upsert_calibration(
+        store, "legacy", "mlx", fixed_overhead_gb=1.0, calibrated_at="t",
+        environment_key="mlx-env:a", authority_key="mlx-authority:a")
+    db.save_characterization(
+        store, "legacy", "mlx", "org/model", safe_context=4096, points=[],
+        artifact_id="hf:org/model@abc:manifest", config={},
+        environment_key="mlx-env:a", authority_key="mlx-authority:a")
+    monkeypatch.setattr(
+        "ara.profile.rekey_legacy_key",
+        lambda key: "current" if key == "legacy" else None,
+    )
+
+    assert db._rekey_legacy(store) == 2
+    assert db.get_calibration(
+        store, "current", "mlx", authority_key="mlx-authority:a") is not None
+    config_key = db.list_characterizations_for_display(
+        store, "current", runtime="mlx", backend="apple")[0]["config_key"]
+    assert db.get_reusable_characterization(
+        store, "current", runtime="mlx", backend="apple",
+        artifact_id="hf:org/model@abc:manifest",
+        config_key=config_key, authority_key="mlx-authority:a") is not None
+
+
+def test_exact_reusable_characterization_filters_by_authority(store):
+    db.save_characterization(
+        store, "m", "mlx", "org/model", safe_context=4096, points=[],
+        artifact_id="hf:org/model@abc:manifest", config={},
+        environment_key="mlx-env:a", authority_key="mlx-authority:a")
+
+    config_key = db.list_characterizations_for_display(
+        store, "m", runtime="mlx", backend="apple")[0]["config_key"]
+    assert db.get_reusable_characterization(
+        store, "m", runtime="mlx", backend="apple",
+        artifact_id="hf:org/model@abc:manifest", config_key=config_key,
+        authority_key="mlx-authority:a") is not None
+    assert db.get_reusable_characterization(
+        store, "m", runtime="mlx", backend="apple",
+        artifact_id="hf:org/model@abc:manifest", config_key=config_key,
+        authority_key="mlx-authority:b") is None
+
+
 def test_engine_reusable_read_selects_matching_config_history(store):
     artifact = "hf:org/model@abcdef0:manifest"
     db.save_characterization(
@@ -636,6 +691,28 @@ def test_old_readonly_calibration_missing_row_returns_none():
     con.close()
 
 
+def test_pre_v6_readonly_calibration_is_history_not_exact_authority():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE calibrations (
+            machine_key TEXT NOT NULL, runtime TEXT NOT NULL, backend TEXT NOT NULL,
+            config_key TEXT NOT NULL, legacy_engine TEXT, fixed_overhead_gb REAL,
+            calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL, evidence_json TEXT,
+            PRIMARY KEY (machine_key, runtime, backend, config_key));
+        INSERT INTO calibrations VALUES
+            ('m','mlx','apple','cal:v1:default','mlx',1.0,'t',16.0,14.0,NULL);
+    """)
+
+    historical = db.get_calibration(con, "m", "mlx")
+    assert historical["authority_key"] == db.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY
+    assert historical["memory_unit"] == "legacy-unit-unknown"
+    assert historical["wall_bytes"] is None
+    assert db.get_calibration(
+        con, "m", "mlx", authority_key="mlx-authority:live") is None
+    con.close()
+
+
 def test_v5_migrates_unknown_target_rows_as_display_only_and_reopens(
         tmp_path, monkeypatch):
     path = tmp_path / "target-schema.db"
@@ -756,6 +833,34 @@ def _v5_measurement_authority_db(tmp_path, monkeypatch, name="measurement-v5.db"
     """)
     con.executescript(db._BENCHMARK_RESULTS_DDL.format(table="benchmark_results"))
     return path, con
+
+
+def test_machine_key_rekey_supports_pre_authority_v5_target_schema(tmp_path, monkeypatch):
+    _path, con = _v5_measurement_authority_db(tmp_path, monkeypatch, "rekey-v5.db")
+    con.row_factory = sqlite3.Row
+    con.execute(
+        "CREATE TABLE profiles (machine_key TEXT, profile_json TEXT, captured_at TEXT)")
+    con.execute(
+        "INSERT INTO calibrations VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("legacy", "mlx", "apple", "cal:v1:default", "mlx", 1.0, "t",
+         16.0, 14.0, None),
+    )
+    con.execute(
+        "INSERT INTO characterizations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("legacy", "mlx", "apple", "hf:org/m@abc", "cfg", "org/m", "mlx",
+         4096, None, "{}", "[]", None, "manifest_hash", 1, "t"),
+    )
+    monkeypatch.setattr(
+        "ara.profile.rekey_legacy_key",
+        lambda key: "current" if key == "legacy" else None,
+    )
+
+    assert db._rekey_legacy(con) == 2
+    assert con.execute(
+        "SELECT machine_key FROM calibrations").fetchone()[0] == "current"
+    assert con.execute(
+        "SELECT machine_key FROM characterizations").fetchone()[0] == "current"
+    con.close()
 
 
 def test_v6_migration_preserves_history_and_marks_old_mlx_units_unknown(

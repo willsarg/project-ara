@@ -28,7 +28,7 @@ def render_header(console, data: dict) -> None:
                           "small, never into the danger zone."))
     c.emit()
     c.emit(c.field("safe budget", f"{data['safe_budget_gb']:.2f} GiB",
-                   f"crash wall {data['wall_gb']:.2f} GiB − margin"))
+                   f"Metal working-set limit {data['wall_gb']:.2f} GiB − margin"))
     c.emit(c.field("memory now", f"{data['baseline_gb']:.2f} GiB",
                    "wired before the model loads (your starting point)"))
     c.emit(c.field("pre-flight est", f"{data['est_gb']:.2f} GiB",
@@ -79,8 +79,8 @@ def render_refusal(console, data: dict) -> None:
     model = _short(data["model"])
     if data["kind"] == "hopeless":
         why = [f"Its estimated load footprint ({data['est_gb']:.2f} GiB) meets or "
-               f"exceeds the crash wall ({data['wall_gb']:.2f} GiB) — it can't load "
-               f"without risking a hard lock, so we never probe it."]
+               f"exceeds the Metal working-set limit ({data['wall_gb']:.2f} GiB) — ARA "
+               f"cannot prove a safe launch, so we never probe it."]
         tries = [
             ("huggingface.co/mlx-community", "browse for a smaller / more-quantized build"),
             ("ara models recommend", "see what does fit right now"),
@@ -123,9 +123,9 @@ def render_summary(console, data: dict) -> None:
     c.emit(c.style("good", f"✓ {model} is safe to run up to "
                            f"~{data['safe_ctx']:,} tokens of context."))
     c.emit(c.field("safe context", f"~{data['safe_ctx']:,} tok",
-                   "guaranteed to stay under the crash wall"))
-    c.emit(c.field("hard wall", f"~{data['hard_wall_ctx']:,} tok",
-                   "where memory would actually hit the wall"))
+                   "measured to stay under ARA's safe budget"))
+    c.emit(c.field("boundary context", f"~{data['hard_wall_ctx']:,} tok",
+                   "projection at the Metal working-set limit"))
     c.emit(c.field("fit quality", f"R²={data['r2']}",
                    f"from {data['n_points']} measured points"))
     c.emit(c.next_block([

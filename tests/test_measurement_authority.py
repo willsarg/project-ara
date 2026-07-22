@@ -96,6 +96,11 @@ def test_mlx_environment_fails_closed_when_required_fact_is_unknown(monkeypatch)
     assert authority.current_environment("mlx") is None
 
 
+def test_mlx_environment_fails_closed_when_policy_is_not_an_integer(monkeypatch) -> None:
+    _darwin(monkeypatch, wired="not-an-integer")
+    assert authority.current_environment("mlx") is None
+
+
 def test_mlx_environment_fails_closed_off_darwin(monkeypatch) -> None:
     monkeypatch.setattr(authority.platform, "system", lambda: "Linux")
     assert authority.current_environment("mlx") is None
@@ -147,8 +152,57 @@ def test_mlx_measurement_authority_rejects_rounded_or_ambiguous_facts(monkeypatc
             "mlx", limits, environment=environment) is None
 
 
+def test_mlx_measurement_authority_requires_environment(monkeypatch) -> None:
+    monkeypatch.setattr(authority, "current_environment", lambda _engine: None)
+    assert authority.measurement_authority("mlx", _LIMITS) is None
+
+
 def test_non_mlx_measurement_authority_preserves_existing_scope() -> None:
     result = authority.measurement_authority("cpu", {})
     assert result is not None
     assert result.key == authority.UNSCOPED_AUTHORITY_KEY
     assert result.environment_key == authority.UNSCOPED_ENVIRONMENT_KEY
+
+
+def test_current_measurement_authority_reads_live_mlx_limits(monkeypatch) -> None:
+    _darwin(monkeypatch)
+    monkeypatch.setattr(authority, "_mlx_limits", lambda: dict(_LIMITS))
+
+    result = authority.current_measurement_authority("mlx")
+
+    assert result is not None
+    assert result.evidence["memory"]["recommended_working_set_bytes"] == 19_069_665_280
+
+
+def test_mlx_limits_delegates_to_apple_backend(monkeypatch) -> None:
+    monkeypatch.setattr("ara.backends.apple.safe_limits", lambda: {"live": True})
+    assert authority._mlx_limits() == {"live": True}
+
+
+def test_current_measurement_authority_requires_environment(monkeypatch) -> None:
+    monkeypatch.setattr(authority, "current_environment", lambda _engine: None)
+    assert authority.current_measurement_authority("mlx") is None
+
+
+def test_current_measurement_authority_fails_closed_when_worker_fails(monkeypatch) -> None:
+    _darwin(monkeypatch)
+
+    def fail():
+        raise RuntimeError("worker unavailable")
+
+    monkeypatch.setattr(authority, "_mlx_limits", fail)
+    assert authority.current_measurement_authority("mlx") is None
+
+
+def test_measurement_status_distinguishes_current_stale_and_legacy(monkeypatch) -> None:
+    _darwin(monkeypatch)
+    current = authority.measurement_authority(
+        "mlx", _LIMITS, environment=authority.current_environment("mlx"))
+    assert current is not None
+
+    assert authority.measurement_status({"authority_key": current.key}, current) == "current"
+    assert authority.measurement_status({"authority_key": "older"}, current) == "stale"
+    assert authority.measurement_status({
+        "authority_key": authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY,
+    }, current) == "legacy-unit-unknown"
+    assert authority.measurement_status({}, None) == "unknown"

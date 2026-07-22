@@ -4,7 +4,7 @@
 
 Strategy:
   1. Pre-flight: estimate base footprint from weights.
-       * estimate >= hard wall  -> HARD REFUSE (hopeless; e.g. the 27B). Never probe.
+       * estimate >= Metal working-set limit -> HARD REFUSE (hopeless; e.g. the 27B). Never probe.
        * estimate >= threshold  -> borderline. Refuse UNLESS allow_min_probe, in which
          case run ONE supervised 512-token probe (deep in the safe zone) to replace the
          blind guess with ground truth, then decide.
@@ -14,7 +14,7 @@ Strategy:
      This isolates the model's footprint from background noise (browsers, IDEs, etc.).
   4. Before every rung, predict its ABSOLUTE peak = live_baseline + (model_base + slope*c)
      and STOP if it would cross the safe threshold.
-  5. Solve for the safe ceiling and hard wall against a reference baseline.
+  5. Solve for the safe ceiling and boundary projection against a reference baseline.
 """
 from __future__ import annotations
 
@@ -264,8 +264,9 @@ def characterize(hf_id: str, *, margin_gb: float | None = None, ramp=None,
                 "run_id": run_id}
 
     if est >= wall:
-        return _refuse(f"estimated base {est:.2f}GiB >= hard wall {wall:.2f}GiB — "
-                       f"cannot load without breaching the wall. Never probe.", "hopeless")
+        return _refuse(f"estimated base {est:.2f}GiB >= Metal working-set limit "
+                       f"{wall:.2f}GiB — ARA cannot prove a safe launch. Never probe.",
+                       "hopeless")
     if est >= threshold:
         if not allow_min_probe:
             return _refuse(f"estimated base {est:.2f}GiB >= safe threshold {threshold:.2f}GiB "

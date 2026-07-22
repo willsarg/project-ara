@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 
 # Core, engine-free helpers — safe to import at module load and patchable in tests.
-from ara import calibration, db, engine_env
+from ara import calibration, db, engine_env, measurement_authority
 from ara.contracts import driver
 from ara.engine_env import EngineEnvError
 
@@ -26,7 +26,8 @@ DEVICE_MODULE = "ara_engine_mlx.device"
 CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
 _MLX_V2_BYTES = (
-    "memory_size_bytes", "recommended_working_set_bytes", "max_buffer_length_bytes")
+    "memory_size_bytes", "recommended_working_set_bytes", "max_buffer_length_bytes",
+    "safe_budget_bytes")
 
 
 def _validate_gib_facts(facts: dict) -> dict:
@@ -139,8 +140,10 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
     calibration for the MLX engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
+    current = measurement_authority.current_measurement_authority("mlx")
     with db.connected() as con:
-        stored = calibration.get_calibration(con, "mlx")
+        stored = (calibration.get_calibration(
+            con, "mlx", authority_key=current.key) if current is not None else None)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -166,7 +169,13 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
-def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -> dict:
+def characterize(
+    model: str,
+    *,
+    progress: bool = False,
+    kv_quant: str = "f16",
+    fixed_overhead_gb: float | None = None,
+) -> dict:
     """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver`` (the
@@ -179,7 +188,10 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
     ``progress`` is accepted for interface symmetry with the cpu backend but has no effect
     here: the HF download bar already ran in-process during the pre-fetch step.
     """
-    margin, overhead = _budget_params()
+    if fixed_overhead_gb is None:
+        margin, overhead = _budget_params()
+    else:
+        margin, overhead = DEFAULT_MARGIN_GB, fixed_overhead_gb
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(

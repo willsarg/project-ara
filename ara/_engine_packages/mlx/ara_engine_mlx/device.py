@@ -20,8 +20,7 @@ from .ui import Console
 
 
 def limits(margin_gb: float | None = None) -> dict:
-    """The memory wall + safe budget as a plain dict (engine facts only; ARA overlays the
-    rest — its stored overhead/calibration)."""
+    """The Metal working-set limit + safe budget (engine facts only; ARA adds history)."""
     s = system.read_limits()
     margin = config.margin_gb(margin_gb)
     safe = s.safe_threshold_gb(margin)
@@ -31,6 +30,7 @@ def limits(margin_gb: float | None = None) -> dict:
         "memory_size_bytes": s.memory_size_bytes,
         "recommended_working_set_bytes": s.recommended_working_set_bytes,
         "max_buffer_length_bytes": s.max_buffer_length_bytes,
+        "safe_budget_bytes": units.gib_to_bytes(safe),
         "total_gb": s.total_gb,
         "wall_gb": s.wall_gb,
         "safe_budget_gb": safe,
@@ -41,7 +41,7 @@ def limits(margin_gb: float | None = None) -> dict:
 
 
 def calibrate(model: str | None, margin_gb: float | None = None) -> dict:
-    """Run the MLX engine's crash-safe cold-start calibration; return what it measured (ARA persists it).
+    """Run the MLX engine's guarded cold-start calibration; return what it measured (ARA persists it).
     The interactive console is routed to stderr so stdout stays JSON-only."""
     return probe.calibrate(model, margin_gb=margin_gb,
                            console=Console.from_args(stream=sys.stderr))

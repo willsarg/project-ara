@@ -66,11 +66,11 @@ def safety_gate(info, limits, ctx: int, *, margin_gb: float, overhead_gb: float,
     threshold = limits.safe_threshold_gb(margin_gb)
     base = live_base + _model_base_gb(info, overhead_gb, weight_quant)
     if base >= threshold:
-        return f"base estimate {base:.2f}GB >= safe budget {threshold:.2f}GB — won't load"
+        return f"base estimate {base:.2f}GiB >= safe budget {threshold:.2f}GiB — won't load"
     slope = info.estimated_slope_gb_per_k(_effective_kv_bits(info, kv_bits))
     predicted = base + slope * (ctx / 1000)
     if predicted >= threshold:
-        return f"predicted {predicted:.2f}GB at {ctx} tok >= safe budget {threshold:.2f}GB"
+        return f"predicted {predicted:.2f}GiB at {ctx} tok >= safe budget {threshold:.2f}GiB"
     return None
 
 

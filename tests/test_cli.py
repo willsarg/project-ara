@@ -28,6 +28,22 @@ def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(
         cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: _matched_engine_audit())
 
+    def current_authority(engine):
+        if cli.engine_identity.canonical_engine(engine) == "mlx":
+            return types.SimpleNamespace(
+                key="mlx-memory-authority:test",
+                environment_key="mlx-environment:test",
+                evidence={"schema": "mlx-memory-authority:v1"},
+            )
+        return types.SimpleNamespace(
+            key=cli.measurement_authority.UNSCOPED_AUTHORITY_KEY,
+            environment_key=cli.measurement_authority.UNSCOPED_ENVIRONMENT_KEY,
+            evidence={"schema": "unscoped-authority:v1", "scope": "unscoped"},
+        )
+
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority", current_authority)
+
 
 def _raise_input(exc):
     """A fake builtins.input that raises — for EOF/Ctrl-C at the prompt."""
@@ -51,8 +67,8 @@ def stub_pythons(monkeypatch):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("v,dec,out", [
     (None, 0, "unknown"),
-    (12.0, 0, "12 GB"),
-    (12.34, 1, "12.3 GB"),
+    (12.0, 0, "12 GiB"),
+    (12.34, 1, "12.3 GiB"),
 ])
 def test_fmt_gb(v, dec, out):
     assert cli._fmt_gb(v, dec) == out
@@ -66,6 +82,25 @@ def test_fmt_gb(v, dec, out):
 ])
 def test_fmt_size(gb, out):
     assert cli._fmt_size(gb) == out
+
+
+def test_measurement_authority_error_covers_all_evidence_states(monkeypatch):
+    current = _current_memory_authority("authority:current")
+    assert "cannot verify" in cli._measurement_authority_error(
+        {}, None, "org/m", "mlx")
+    assert cli._measurement_authority_error(None, current, "org/m", "mlx") is None
+    assert cli._measurement_authority_error({}, current, "org/m", "mlx") is None
+    assert cli._measurement_authority_error(
+        {"authority_key": current.key}, current, "org/m", "mlx") is None
+    assert "predates exact GiB" in cli._measurement_authority_error(
+        {"authority_key": cli.measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY},
+        current, "org/m", "mlx")
+    assert "differs" in cli._measurement_authority_error(
+        {"authority_key": "authority:old"}, current, "org/m", "mlx")
+    monkeypatch.setattr(
+        cli.measurement_authority, "measurement_status", lambda _row, _current: "unknown")
+    assert "no verifiable" in cli._measurement_authority_error(
+        {"authority_key": "authority:odd"}, current, "org/m", "mlx")
 
 
 # --------------------------------------------------------------------------- #
@@ -1090,17 +1125,17 @@ def test_main_verbose_flag_sets_console(monkeypatch):
 def test_landing_hardware_apple_shows_unified_memory_and_gpu_cores():
     # Apple: memory is the unified pool ARA governs; GPU shown by core count.
     assert cli._landing_hardware("Apple M4 Pro", "apple", 24.0, 16, None) == [
-        "Apple M4 Pro", "24 GB unified memory", "16-core GPU"]
+        "Apple M4 Pro", "24 GiB unified memory", "16-core GPU"]
 
 
 def test_landing_hardware_cpu_shows_plain_ram_no_gpu():
     assert cli._landing_hardware("Intel i7", "cpu", 32.0, None, None) == [
-        "Intel i7", "32 GB RAM"]
+        "Intel i7", "32 GiB RAM"]
 
 
 def test_landing_hardware_cuda_names_the_discrete_gpu():
     assert cli._landing_hardware("Ryzen 9", "cuda", 32.0, None, "NVIDIA RTX 4090") == [
-        "Ryzen 9", "32 GB RAM", "NVIDIA RTX 4090"]
+        "Ryzen 9", "32 GiB RAM", "NVIDIA RTX 4090"]
 
 
 def test_landing_hardware_omits_memory_when_unknown():
@@ -1117,7 +1152,7 @@ def test_render_landing_supported(make_console, monkeypatch):
     cli.render_landing(c)
     out = buf.getvalue()
     assert "ara" in out and "Apple M4 Pro" in out
-    assert "24 GB unified memory" in out and "16-core GPU" in out   # hardware, in plain terms
+    assert "24 GiB unified memory" in out and "16-core GPU" in out
     assert "ara-engine-mlx" not in out and "backend apple" not in out    # no internal jargon on the line
     assert "FIRST RUN" in out
     assert "detect" in out and "status" in out and "profile" in out
@@ -1139,7 +1174,7 @@ def test_render_landing_cpu_fallback_notes_no_gpu(make_console, monkeypatch):
     c, buf = make_console()
     cli.render_landing(c)
     out = buf.getvalue()
-    assert "32 GB RAM" in out                  # plain 'RAM' label off Apple
+    assert "32 GiB RAM" in out                 # plain 'RAM' label off Apple
     assert "no accelerator auto-selected" in out and "ara install --engine cpu" in out
     assert "CPU fallback" not in out
     assert "bartowski/SmolLM2-135M-Instruct-GGUF" in out and "--engine cpu" in out
@@ -1305,7 +1340,7 @@ def test_render_detect_nvidia_accel(make_console, monkeypatch, stub_pythons):
     c, buf = make_console()
     cli.render_detect(c)
     out = buf.getvalue()
-    assert "RTX 4090" in out and "24 GB VRAM" in out and "SM 8.9" in out
+    assert "RTX 4090" in out and "24 GiB VRAM" in out and "SM 8.9" in out
     assert "CUDA 12.4" in out and "driver 550.00" in out
     assert "interpreters on this machine" not in out  # count == 1 → no pointer line
     assert "(x" not in out  # single GPU → no "(xN)" multiplicity suffix
@@ -1503,8 +1538,8 @@ def test_profile_estimated_budget_mirrors_wall(make_console, monkeypatch, set_pl
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "36.0 GB" in out          # Apple working set: 0.75 × 48
-    assert "34.0 GB" in out          # safe budget: wall − 2 GB margin
+    assert "36.0 GiB" in out          # Apple working set: 0.75 × 48
+    assert "34.0 GiB" in out          # safe budget: boundary − 2 GiB margin
 
 
 def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
@@ -1515,6 +1550,9 @@ def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
     assert payload["basis"] == "estimated"
     assert payload["calibrated"] is False
     assert payload["safe_budget_gb"] == 48.0 * 0.75 - 2.0
+    assert payload["memory_unit"] == "GiB"
+    assert payload["wall_bytes"] is None and payload["safe_budget_bytes"] is None
+    assert payload["authority_status"] == "unknown"
 
 
 def test_profile_explicit_cpu_uses_system_ram_on_cuda_host(
@@ -1549,24 +1587,23 @@ def test_profile_text_handles_unknown_memory(make_console, monkeypatch, set_plat
     assert cli.render_profile(c, engine="cpu") == 0
     out = buf.getvalue()
     assert "Unknown CPU · unknown" in out
-    assert "crash wall unknown" in " ".join(out.split())
+    assert "memory wall unknown" in " ".join(out.split())
 
 
-def test_profile_reports_measured_wall_after_calibration(make_console, monkeypatch, set_platform, store):
-    # Spec 2026-06-23-capability-pipeline: once a measured wall is stored for the detected engine,
-    # profile reports the MEASURED numbers (labelled), not the heuristic.
+def test_profile_keeps_mlx_history_display_only(make_console, monkeypatch, set_platform, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
-    c, buf = make_console()
+    c, buf = make_console(verbose=True)
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "41.3 GB" in out and "39.3 GB" in out      # the measured wall + budget
-    assert "not calibrated" not in out                # not an estimate anymore
+    assert "41.3 GiB" in out and "display only" in out
+    assert "36.0 GiB" in out and "34.0 GiB" in out
+    assert "estimated" in out
 
 
-def test_profile_json_reports_measured_basis(monkeypatch, set_platform, capsys, store):
+def test_profile_json_reports_historical_mlx_authority(monkeypatch, set_platform, capsys, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
@@ -1574,9 +1611,11 @@ def test_profile_json_reports_measured_basis(monkeypatch, set_platform, capsys, 
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["basis"] == "measured"
-    assert payload["calibrated"] is True
-    assert payload["wall_gb"] == 41.3 and payload["safe_budget_gb"] == 39.3
+    assert payload["basis"] == "estimated"
+    assert payload["calibrated"] is False
+    assert payload["wall_gb"] == 36.0 and payload["safe_budget_gb"] == 34.0
+    assert payload["authority_status"] == "historical-unverified"
+    assert payload["historical_measurement"]["wall_gb"] == 41.3
 
 
 def test_profile_reads_legacy_calibration_without_migrating(
@@ -1610,8 +1649,10 @@ def test_profile_reads_legacy_calibration_without_migrating(
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["engine"] == "mlx"
-    assert payload["basis"] == "measured"
-    assert payload["wall_gb"] == 41.3
+    assert payload["basis"] == "estimated"
+    assert payload["wall_gb"] == 36.0
+    assert payload["historical_measurement"]["wall_gb"] == 41.3
+    assert payload["authority_status"] == "historical-unverified"
     with sqlite3.connect(path) as check:
         assert check.execute("PRAGMA user_version").fetchone()[0] == 2
         assert check.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
@@ -1628,9 +1669,8 @@ def test_profile_uncalibrated_stays_estimated(monkeypatch, set_platform, capsys,
     assert payload["basis"] == "estimated" and payload["calibrated"] is False
 
 
-def test_profile_footer_drops_estimated_when_measured(make_console, monkeypatch, set_platform, store):
-    # Spec 2026-06-23-capability-pipeline: once a wall is measured, the header reads (measured),
-    # so the footer must NOT contradict it with the "estimated —" framing.
+def test_profile_footer_keeps_estimated_for_unverified_mlx_history(
+        make_console, monkeypatch, set_platform, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
@@ -1638,9 +1678,8 @@ def test_profile_footer_drops_estimated_when_measured(make_console, monkeypatch,
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "estimated" not in out                       # header is (measured); footer must agree
-    assert "ara characterize <model>" in out            # still nudges to measure more models
-    assert "a model's real ceiling" in out
+    assert "estimated" in out
+    assert "ara characterize <model>" in out
 
 
 def test_profile_footer_keeps_estimated_when_uncalibrated(make_console, monkeypatch, set_platform, store):
@@ -1652,6 +1691,23 @@ def test_profile_footer_keeps_estimated_when_uncalibrated(make_console, monkeypa
     out = buf.getvalue()
     assert "estimated — run " in out
     assert "ara characterize <model>" in out
+
+
+def test_profile_non_mlx_measurement_is_current_and_drives_footer(
+        make_console, monkeypatch, set_platform, store):
+    _wire_profile(
+        monkeypatch, set_platform,
+        _machine(backend="cpu", ram_total_gb=32.0, chip="Test CPU"))
+    cli.calibration.save_calibration(
+        store, "cpu", fixed_overhead_gb=0.5,
+        wall_gb=30.0, safe_budget_gb=28.0)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cpu") == 0
+    out = buf.getvalue()
+    assert "30.0 GiB" in out
+    assert "to measure a model's real ceiling" in out
+    assert "estimated — run" not in out
 
 
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
@@ -1848,8 +1904,8 @@ def test_emit_limits_verbose_measured_shows_calibration_and_analytic_baseline(ma
     ))
     out = " ".join(buf.getvalue().split())
     assert "provenance stored measurement calibrated 2026-07-02T19:25:54+00:00" in out
-    assert "analytic wall 36.0 GB before measured correction" in out
-    assert "analytic budget 34.0 GB before measured correction" in out
+    assert "analytic wall 36.0 GiB before measured correction" in out
+    assert "analytic budget 34.0 GiB before measured correction" in out
 
 
 def test_emit_limits_verbose_measured_keeps_missing_provenance_unknown(make_console):
@@ -1914,7 +1970,7 @@ def test_gpu_line_shows_gtt_shared_pool_for_apu(make_console):
     c, buf = make_console()
     cli._gpu_line(c, g)
     out = buf.getvalue()
-    assert "carveout" in out and "GTT" in out and "24 GB" in out
+    assert "carveout" in out and "GTT" in out and "24 GiB" in out
 
 
 def test_gpu_line_discrete_gpu_shows_no_gtt(make_console):
@@ -1923,7 +1979,7 @@ def test_gpu_line_discrete_gpu_shows_no_gtt(make_console):
     c, buf = make_console()
     cli._gpu_line(c, g)
     out = buf.getvalue()
-    assert "8 GB" in out and "GTT" not in out and "carveout" not in out
+    assert "8 GiB" in out and "GTT" not in out and "carveout" not in out
 
 
 def test_render_detect_minimal_non_verbose(make_console, monkeypatch, stub_pythons):
@@ -3060,6 +3116,62 @@ def test_recommend_marks_characterized(make_console, monkeypatch, set_platform):
     assert "characterized" in buf.getvalue()
 
 
+def test_recommend_marks_current_engine_free_characterization(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Known")])
+    current = (12000, "cpu", None, {}, "artifact:org/Known")
+    monkeypatch.setattr(cli, "_best_ceilings", lambda _con: {"org/Known": current})
+    monkeypatch.setattr(
+        cli, "_best_ceiling_history", lambda _con: {"org/Known": current})
+    c, buf = make_console()
+    assert cli.render_recommend(c) == 0
+    assert "characterized here" in buf.getvalue()
+
+
+def test_best_ceilings_accepts_only_current_reusable_engine_free_rows(monkeypatch):
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+
+    def rows(_con, _mk, engine):
+        if engine == "mlx":
+            return [{
+                "model_id": "org/mlx-history", "safe_context": 8192,
+                "reusable": True, "authority_key": "mlx-memory-authority:current",
+            }]
+        if engine == "cpu":
+            return [
+                {
+                    "model_id": "org/current", "safe_context": 4096,
+                    "reusable": True,
+                    "authority_key": cli.db.UNSCOPED_AUTHORITY_KEY,
+                },
+                {
+                    "model_id": "org/current", "safe_context": None,
+                    "reusable": True,
+                    "authority_key": cli.db.UNSCOPED_AUTHORITY_KEY,
+                },
+                {
+                    "model_id": "org/current", "safe_context": 8192,
+                    "reusable": True,
+                    "authority_key": cli.db.UNSCOPED_AUTHORITY_KEY,
+                },
+                {
+                    "model_id": "org/display-only", "safe_context": 8192,
+                    "reusable": False,
+                    "authority_key": cli.db.UNSCOPED_AUTHORITY_KEY,
+                },
+                {
+                    "model_id": "org/stale", "safe_context": 8192,
+                    "reusable": True, "authority_key": "authority:other",
+                },
+            ]
+        return []
+
+    monkeypatch.setattr(cli.db, "list_characterizations", rows)
+
+    assert set(cli._best_ceilings(None)) == {"org/current"}
+
+
 def test_recommend_none_fit(make_console, monkeypatch, set_platform):
     _wire_recommend(monkeypatch, set_platform, [_model_row("org/TooBig", weights_gb=500.0)])
     c, buf = make_console()
@@ -3123,10 +3235,8 @@ def test_recommend_none_ranked_but_unrankable_exist(make_console, monkeypatch, s
     assert "ara profile --model" in out
 
 
-def test_recommend_uses_measured_wall(make_console, monkeypatch, set_platform, store):
-    # Spec 2026-06-23-capability-pipeline: after the detected engine is calibrated, recommend ranks
-    # against the MEASURED budget, not the heuristic. A measured wall that's tighter than the
-    # heuristic must actually bind the fit — proving the measurement drove the math.
+def test_recommend_does_not_govern_from_unverified_mlx_history(
+        make_console, monkeypatch, set_platform, store):
     captured = {}
     real_limits = cli.estimate.limits
 
@@ -3141,8 +3251,7 @@ def test_recommend_uses_measured_wall(make_console, monkeypatch, set_platform, s
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c, buf = make_console()
     assert cli.render_recommend(c) == 0
-    assert captured["measured"] is not None
-    assert captured["measured"]["wall_gb"] == 41.3        # the stored measurement was passed in
+    assert captured["measured"] is None
 
 
 def test_recommend_json(monkeypatch, set_platform, capsys):
@@ -3160,11 +3269,11 @@ def test_recommend_verbose_discloses_budget_provenance(
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c) == 0
     out = " ".join(buf.getvalue().split())
-    assert "provenance wall estimated · mlx · 34.0 GB safe budget" in out
+    assert "provenance wall estimated · mlx · 34.0 GiB safe budget" in out
     assert "catalog 1 cached model · ephemeral read-only scan" in out
 
 
-def test_recommend_verbose_distinguishes_measured_wall_from_analytic_fit(
+def test_recommend_verbose_keeps_mlx_history_out_of_active_fit(
         store, make_console, monkeypatch, set_platform):
     _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small")])
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
@@ -3173,7 +3282,7 @@ def test_recommend_verbose_distinguishes_measured_wall_from_analytic_fit(
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c) == 0
     out = " ".join(buf.getvalue().split())
-    assert "provenance wall measured · mlx · 18.0 GB safe budget" in out
+    assert "provenance wall estimated · mlx · 34.0 GiB safe budget" in out
     assert "estimated — fits this machine" in out
 
 
@@ -3458,6 +3567,44 @@ def test_serve_mlx_explicit_ctx_still_refuses_mismatched_measurement_config(
     assert "different engine settings" in buf.getvalue()
 
 
+def test_serve_mlx_refuses_stale_memory_authority(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    row = {
+        "safe_context": 8000,
+        "config": {},
+        "authority_key": "mlx-memory-authority:old",
+    }
+    _patch_native_characterization(monkeypatch, row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda *_args, **_kwargs: None,
+    )
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
+    assert "live MLX memory authority differs" in buf.getvalue()
+
+
+def test_serve_mlx_refuses_authority_change_immediately_before_start(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    _patch_native_characterization(monkeypatch, {"safe_context": 8000, "config": {}})
+    authorities = iter([
+        _current_memory_authority("authority:before"),
+        _current_memory_authority("authority:after"),
+    ])
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority",
+        lambda _engine: next(authorities))
+    c, buf = make_console()
+
+    assert cli.render_serve(c, "org/m", engine="mlx", assume_yes=True) == 1
+    assert "changed before serve" in buf.getvalue()
+
+
 # --- measured-provenance slope (2026-07-02-mlx-serve-measured-provenance-gate) -- #
 def test_measured_ramp_slope_fits_and_skips_incomplete_points():
     row = {"points": [{"context": 2000, "mem_gb": 1.5},
@@ -3651,6 +3798,80 @@ def test_run_pinned_refuses_display_only_ceiling(make_console, monkeypatch):
 
     assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
     assert "not reusable" in buf.getvalue()
+
+
+def test_run_pinned_refuses_stale_memory_authority(make_console, monkeypatch):
+    stale = {**_CHAR, "authority_key": "mlx-memory-authority:old"}
+    _wire_run(monkeypatch, characterization=stale)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda *_args, **_kwargs: None,
+    )
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", engine="mlx", assume_yes=True) == 1
+    assert "live MLX memory authority differs" in buf.getvalue()
+
+
+def test_run_auto_refuses_stale_memory_authority(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=None)
+    stale = {**_CHAR, "authority_key": "authority:old"}
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: stale if engine == "cpu" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda *_args, **_kwargs: None)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "memory authority differs" in buf.getvalue()
+
+
+def test_run_auto_refuses_authority_change_during_selection(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=None)
+    row = {**_CHAR, "authority_key": cli.db.UNSCOPED_AUTHORITY_KEY}
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: row if engine == "cpu" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda _con, _mk, engine, _model, **_kwargs: row if engine == "cpu" else None)
+    cpu_reads = iter([
+        _current_memory_authority(cli.db.UNSCOPED_AUTHORITY_KEY),
+        _current_memory_authority("authority:changed"),
+    ])
+
+    def authority(engine):
+        if engine == "cpu":
+            return next(cpu_reads)
+        return _current_memory_authority(cli.db.UNSCOPED_AUTHORITY_KEY)
+
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority", authority)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "changed during selection" in buf.getvalue()
+
+
+@pytest.mark.parametrize("change_after_generate", [False, True])
+def test_run_pinned_rechecks_authority_around_execution(
+        make_console, monkeypatch, change_after_generate):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    stable = _current_memory_authority(cli.db.UNSCOPED_AUTHORITY_KEY)
+    changed = _current_memory_authority("authority:changed")
+    reads = iter(
+        [stable, stable, changed] if change_after_generate else [stable, changed])
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority",
+        lambda _engine: next(reads))
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    expected = "changed during the run" if change_after_generate else "changed before the run"
+    assert expected in buf.getvalue()
 
 
 def test_run_refuses_when_artifact_changes_after_auto_selection_before_load(
@@ -5626,6 +5847,14 @@ def test_main_models_id_dispatch(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ara characterize <model> — measure + store a model's ceiling (any engine)
 # --------------------------------------------------------------------------- #
+def _current_memory_authority(key="mlx-memory-authority:test"):
+    return types.SimpleNamespace(
+        key=key,
+        environment_key="mlx-environment:test",
+        evidence={"schema": "mlx-memory-authority:v1"},
+    )
+
+
 def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
@@ -5633,6 +5862,11 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli.staleness, "artifact_identity", lambda _model: "artifact:test")
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
+    monkeypatch.setattr(
+        cli.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: _current_memory_authority(),
+    )
     if characterize is not None:
         # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
         _char = characterize
@@ -5656,6 +5890,55 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
     assert row["artifact_id"] == "artifact:test"
+    assert row["authority_key"] == "mlx-memory-authority:test"
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_render_characterize_refuses_unknown_live_memory_authority(
+        make_console, monkeypatch, capsys, as_json):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda _model: pytest.fail("measurement must not start"),
+    )
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority", lambda _engine: None)
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model", as_json=as_json) == 1
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert "cannot read the live memory authority" in output
+
+
+def test_render_characterize_refuses_authority_changed_during_measurement(
+        make_console, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda model: {
+            "model": model,
+            "safe_context": 8192,
+            "decode_context": None,
+            "points": [[512, 1.0]],
+        },
+    )
+    authorities = iter([
+        _current_memory_authority("mlx-memory-authority:before"),
+        _current_memory_authority("mlx-memory-authority:after"),
+    ])
+    monkeypatch.setattr(
+        cli.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: next(authorities),
+    )
+    monkeypatch.setattr(
+        cli.db,
+        "save_characterization",
+        lambda *_args, **_kwargs: pytest.fail("changed-authority result must not be stored"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+    assert "memory authority" in buf.getvalue()
+    assert "changed during characterization" in buf.getvalue()
 
 
 def test_render_characterize_binds_workload_proof_to_engine_fingerprint(
@@ -5858,6 +6141,31 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     assert row["wall_gb"] == 41.3 and row["safe_budget_gb"] == 39.3
 
 
+def test_characterize_passes_new_calibration_overhead_into_same_mlx_ramp(
+        make_console, monkeypatch):
+    seen = {}
+
+    def characterize(model, *, progress=False, kv_quant="f16", fixed_overhead_gb=None):
+        seen["overhead"] = fixed_overhead_gb
+        return {"model": model, "safe_context": 9000,
+                "decode_context": None, "points": []}
+
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
+        characterize=characterize,
+        calibration_model_cached=lambda m: True,
+        download_calibration_model=lambda m, *, progress=False: None,
+        calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2,
+                           "safe_budget_gb": 15.2},
+    ))
+
+    assert cli.render_characterize(make_console()[0], "org/M") == 0
+    assert seen["overhead"] == 1.7
+
+
 def test_characterize_warns_when_calibration_unavailable(make_console, store, monkeypatch):
     # Honesty (Rule #3): a failed calibration must be surfaced, not silently replaced by the
     # conservative default. The ramp still proceeds; the user is just told it's a fallback.
@@ -5899,8 +6207,8 @@ def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     c, buf = make_console()
     assert cli.render_characterize(c, "org/M") == 0
     out = buf.getvalue()
-    assert "measured wall" in out and "17.2 GB" in out
-    assert "safe budget" in out and "15.2 GB" in out
+    assert "measured wall" in out and "17.2 GiB" in out
+    assert "safe budget" in out and "15.2 GiB" in out
 
 
 def test_characterize_wall_line_without_budget(make_console, store, monkeypatch):
@@ -5920,7 +6228,7 @@ def test_characterize_wall_line_without_budget(make_console, store, monkeypatch)
     c, buf = make_console()
     assert cli.render_characterize(c, "org/M") == 0
     out = buf.getvalue()
-    assert "measured wall" in out and "17.2 GB" in out
+    assert "measured wall" in out and "17.2 GiB" in out
     assert "safe budget" not in out
 
 
@@ -5973,7 +6281,13 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
-    cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=2.0)   # already calibrated
+    cli.calibration.save_calibration(
+        store,
+        "mlx",
+        fixed_overhead_gb=2.0,
+        environment_key="mlx-environment:test",
+        authority_key="mlx-memory-authority:test",
+    )   # already calibrated under the live authority
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
         calibration_model_cached=lambda m: True,
@@ -6133,6 +6447,9 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
         "config": {},
         "calibration_error": "calibration unavailable: boom",
         "calibration_fallback": True,
+        "memory_unit": "GiB",
+        "measurement_authority": "mlx-memory-authority:test",
+        "authority_status": "current",
     }
 
 
@@ -6264,6 +6581,11 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
+    monkeypatch.setattr(
+        cli.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: _current_memory_authority(),
+    )
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: size_gb)
     monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: size_gb)
     monkeypatch.setattr(cli.acquire, "free_disk_gb", lambda: free_gb)
@@ -7278,7 +7600,7 @@ def test_verbose_memory_module_with_some_none_fields(make_console, monkeypatch, 
     cli.render_detect(c)
     out = buf.getvalue()
     assert out.count("module") == 2    # both modules rendered
-    assert "16 GB" in out and "4800 MT/s" in out
+    assert "16 GiB" in out and "4800 MT/s" in out
     assert "Kingston" in out and "B1" in out
     # None fields must be absent
     assert "DIMM" not in out
@@ -7327,7 +7649,7 @@ def test_verbose_memory_module_all_none_then_real(make_console, monkeypatch, stu
     out = buf.getvalue()
     # Only one module row (the real one)
     assert out.count("  module") == 1
-    assert "A2" in out and "8 GB" in out
+    assert "A2" in out and "8 GiB" in out
 
 
 def test_verbose_memory_no_modules_but_slots_known_no_not_reported(
@@ -9995,7 +10317,7 @@ def test_ollama_estimated_ceiling_maps_meta_and_delegates(monkeypatch):
                         lambda lim, meta, w: captured.update(meta=meta, w=w, lim=lim)
                         or {"est_context": 12345})
     assert cli._ollama_estimated_ceiling("qwen3:0.6b") == (12345, "estimated", None)
-    # /api/show model_info → estimator meta, weights in DECIMAL GB (bytes / 1e9)
+    # /api/show model_info → estimator meta, weights in decimal GB; model_fit converts once.
     assert captured["meta"] == {"n_layers": 28, "kv_heads": 8, "head_dim": 128,
                                 "max_context": 40960}
     assert captured["w"] == 0.5
@@ -11335,6 +11657,67 @@ def test_render_benchmark_explicit_refuses_display_only_ceiling(
     assert cli.render_benchmark(
         c, "org/m", use_case="reasoning", engine="mlx", assume_yes=True) == 1
     assert "no reusable measured ceiling" in buf.getvalue()
+
+
+def test_render_benchmark_refuses_stale_memory_authority(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    row = {
+        "safe_context": 8000,
+        "artifact_id": "artifact:test",
+        "authority_key": "mlx-memory-authority:old",
+    }
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_args: row)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda *_args, **_kwargs: None,
+    )
+    c, buf = make_console()
+
+    assert cli.render_benchmark(
+        c, "org/m", use_case="reasoning", engine="mlx", assume_yes=True) == 1
+    assert "live MLX memory authority differs" in buf.getvalue()
+
+
+def test_render_benchmark_auto_refuses_stale_memory_authority(
+        make_console, monkeypatch):
+    _wire_benchmark(monkeypatch)
+    stale = {
+        "safe_context": 8000,
+        "artifact_id": "artifact:test",
+        "authority_key": "mlx-memory-authority:old",
+    }
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: stale if engine == "mlx" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine",
+        lambda *_args, **_kwargs: None)
+    c, buf = make_console()
+
+    assert cli.render_benchmark(
+        c, "org/m", use_case="reasoning", assume_yes=True) == 1
+    assert "live MLX memory authority differs" in buf.getvalue()
+
+
+@pytest.mark.parametrize("change_after_benchmark", [False, True])
+def test_render_benchmark_rechecks_authority_around_execution(
+        make_console, monkeypatch, change_after_benchmark):
+    _wire_benchmark(monkeypatch)
+    stable = _current_memory_authority("mlx-memory-authority:test")
+    changed = _current_memory_authority("mlx-memory-authority:changed")
+    reads = iter(
+        [stable, stable, changed] if change_after_benchmark else [stable, changed])
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority",
+        lambda _engine: next(reads))
+    c, buf = make_console()
+
+    assert cli.render_benchmark(
+        c, "org/m", use_case="reasoning", engine="mlx", assume_yes=True) == 1
+    expected = ("changed during the benchmark" if change_after_benchmark
+                else "changed before the benchmark")
+    assert expected in buf.getvalue()
 
 
 def test_render_benchmark_refuses_ceiling_measured_with_nondefault_config(

@@ -280,7 +280,7 @@ def test_public_docs_and_search_guidance_use_canonical_surface_and_uv_only():
     assert "`ara models search" in docs
     assert "`ara detect --runtime" in docs
     assert "macOS" in docs and "CPU + MLX" in docs
-    assert "Windows" in docs and "8 GB NVIDIA Turing GPU" in docs
+    assert "Windows" in docs and "8 GiB NVIDIA Turing GPU" in docs
     assert "Linux" in docs and "CPU" in docs
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")

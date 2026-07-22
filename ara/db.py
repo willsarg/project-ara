@@ -930,15 +930,31 @@ def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
     clauses = ["machine_key=?", "runtime=?", "backend=?", "config_key=?"]
     values = [machine_key, runtime, backend, config_key or targets.calibration_config_key()]
     if authority_key is not None:
+        if "authority_key" not in columns:
+            # A pre-v6 read-only store has no exact authority to match. It remains useful as
+            # display history, but must never satisfy an authority-scoped operational lookup.
+            return None
         clauses.append("authority_key=?")
         values.append(authority_key)
+    authority_order = ", authority_key DESC" if "authority_key" in columns else ""
     row = con.execute(
         f"SELECT * FROM calibrations WHERE {' AND '.join(clauses)} "  # noqa: S608
-        "ORDER BY calibrated_at DESC, authority_key DESC LIMIT 1",
+        f"ORDER BY calibrated_at DESC{authority_order} LIMIT 1",
         values).fetchone()
     if row is None:
         return None
     result = dict(row)
+    if "authority_key" not in columns:
+        environment, authority, unit, evidence_json, _display_only = (
+            _v6_authority_values(result))
+        result.update(
+            environment_key=environment,
+            authority_key=authority,
+            memory_unit=unit,
+            wall_bytes=None,
+            safe_budget_bytes=None,
+            authority_evidence_json=evidence_json,
+        )
     result["engine"] = result.get("legacy_engine") or canonical
     result["evidence"] = _json_object(result.get("evidence_json"))
     result["authority_evidence"] = _json_object(

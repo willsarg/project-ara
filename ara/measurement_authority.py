@@ -143,3 +143,41 @@ def measurement_authority(
         environment_key=environment.key,
         evidence=evidence,
     )
+
+
+def _mlx_limits() -> dict:
+    from ara.backends.apple import safe_limits
+
+    return safe_limits()
+
+
+def current_measurement_authority(engine: str) -> MeasurementAuthority | None:
+    """Read the exact authority governing a measurement taken now.
+
+    Non-MLX engines retain their explicit unscoped authority. MLX reads its device-limit worker;
+    failures are unknown and therefore cannot authorize reuse.
+    """
+    canonical = canonical_engine(engine)
+    environment = current_environment(canonical or engine)
+    if environment is None:
+        return None
+    if canonical != "mlx":
+        return measurement_authority(canonical or engine, {}, environment=environment)
+    try:
+        limits = _mlx_limits()
+    except (Exception, SystemExit):
+        return None
+    return measurement_authority("mlx", limits, environment=environment)
+
+
+def measurement_status(
+    row: dict,
+    current: MeasurementAuthority | None,
+) -> str:
+    """Classify stored evidence relative to a live authority read."""
+    stored = row.get("authority_key")
+    if stored == LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY:
+        return "legacy-unit-unknown"
+    if current is None or not isinstance(stored, str):
+        return "unknown"
+    return "current" if stored == current.key else "stale"

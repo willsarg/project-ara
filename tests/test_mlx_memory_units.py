@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ara._engine_packages.mlx.ara_engine_mlx import models, probe_worker, system, units
+from ara._engine_packages.mlx.ara_engine_mlx import device, models, probe_worker, system, units
 
 
 def test_mlx_worker_bytes_to_gib_matches_exact_metal_values() -> None:
@@ -53,6 +53,27 @@ def test_device_limits_preserves_exact_bytes_and_derives_gib(monkeypatch) -> Non
         "wall_gb": 17.760009765625,
         "max_buffer_gb": pytest.approx(8.381903171539307),
     }
+
+
+def test_safe_budget_preserves_exact_binary_margin(monkeypatch) -> None:
+    limits = system.SystemLimits(
+        device="Apple M4 Pro",
+        memory_size_bytes=25_769_803_776,
+        recommended_working_set_bytes=19_069_665_280,
+        max_buffer_length_bytes=9_000_000_000,
+        total_gb=24.0,
+        wall_gb=17.760009765625,
+        max_buffer_gb=8.381903171539307,
+        swap_free_gb=2.0,
+        wired_now_gb=4.0,
+    )
+    monkeypatch.setattr(device.system, "read_limits", lambda: limits)
+    monkeypatch.setattr(device.config, "margin_gb", lambda value: 2.0)
+
+    result = device.limits()
+
+    assert result["safe_budget_bytes"] == 16_922_181_632
+    assert result["safe_budget_gb"] == 15.760009765625
 
 
 def test_mach_wired_memory_is_binary_gib(monkeypatch) -> None:

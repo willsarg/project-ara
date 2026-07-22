@@ -53,7 +53,7 @@ def main() -> None:
 
     # sample OS-wired memory continuously; report the high-water mark. If a watchdog limit
     # is set and live wired reaches it (the pre-flight prediction was wrong), abort NOW —
-    # dying frees the wired memory before it can reach the crash wall (L5, last defense).
+    # dying frees the wired memory before it can cross ARA's guarded boundary (L5, last defense).
     hi = [0.0]
     stop = [False]
 

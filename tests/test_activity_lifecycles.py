@@ -634,7 +634,12 @@ def test_benchmark_click_acquires_measurement_lock_before_tracking(monkeypatch):
 
 def _wire_mlx_serve_characterization(monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    row = {"safe_context": 4096, "measured_at": None, "points": []}
+    authority = types.SimpleNamespace(key="mlx-authority:test")
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority",
+        lambda _engine: authority)
+    row = {"safe_context": 4096, "measured_at": None, "points": [],
+           "authority_key": authority.key}
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)

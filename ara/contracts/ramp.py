@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """The ramp contract: fit memory-vs-context, solve for the safe context ceiling.
 
-For hardware with a hard memory wall (Apple, CUDA, ROCm, …), a model's footprint grows
+For memory-bounded accelerators (Apple, CUDA, ROCm, …), a model's footprint grows
 ~linearly with context as the KV cache fills. ARA owns this methodology so the number means
 the same thing on every ramp-class backend; engines only supply safe ``(context, memory)``
 measurements. Preserves the predecessor MLX engine's proven fit (least-squares ``y = a + b·x``, x in thousands
@@ -26,13 +26,13 @@ class RampError(ValueError):
 class Fit:
     """A fitted memory curve: ``mem_gb = intercept_gb + slope_gb_per_k · (ctx/1000)``."""
     intercept_gb: float    # memory extrapolated to zero context (model + OS base)
-    slope_gb_per_k: float  # GB added per 1000 tokens of context
+    slope_gb_per_k: float  # GiB added per 1000 tokens of context
     r2: float              # goodness of fit, 0..1
     n_points: int
 
 
 def fit(points: list[tuple[int, float]]) -> Fit:
-    """Least-squares fit of memory (GB) against context (tokens) from safe measurements.
+    """Least-squares fit of memory (GiB) against context (tokens) from safe measurements.
 
     *points* are ``(context_tokens, mem_gb)``. Needs at least two points at two distinct
     contexts, else a line is undetermined — raises :class:`RampError`.
@@ -130,7 +130,7 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
 
     Two regimes produce the ceiling. If no rung ever aborts, the model grows gently and the
     fitted line extrapolates the ceiling (capped at the model's window). If a rung **aborts**
-    (engine L4/L5 veto, or ARA's L2), that abort is a hard wall — extrapolating past it would
+    (engine L4/L5 veto, or ARA's L2), that abort is a measured upper bound — extrapolating past it would
     claim unsafe contexts are safe — so the ramp bisects ``[highest safe, abort)`` and reports
     the highest *confirmed-safe* context (always memory-bound). A single safe measurement with
     no abort is still a real lower bound and is reported as the ceiling, not discarded.
@@ -214,7 +214,7 @@ def plan_next(schedule: list[int], measured, base_gb: float,
 
 
 def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2):
-    """Analytic fp16 KV-cache growth, GB per 1000 tokens, from model metadata.
+    """Analytic fp16 KV-cache growth, GiB per 1000 tokens, from model metadata.
 
     2 (K and V) · n_layers · kv_heads · head_dim · kv_dtype_bytes bytes per token. Returns None
     if any dimension is missing or zero (can't estimate). Uses TOTAL n_layers (over-counts KV for
@@ -227,8 +227,8 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
     trace confirmed binary GiB is correct here. At the sole ``decode_ceiling`` call site
     (estimate.model_fit), the budget is binary GiB on every backend — RAM is ``vm.total/1024³``
     and CUDA VRAM is nvidia-smi MiB ``/1024`` — and the two decimal leaks feeding it (the
-    weights intercept, on-disk bytes/1e9; the MLX engine's measured wall) are now converted at their
-    boundaries (estimate.model_fit; backends/apple). test_analytic_kv_slope_uses_binary_gib_
+    weights intercept, on-disk bytes/1e9) are converted at their boundaries
+    (estimate.model_fit). test_analytic_kv_slope_uses_binary_gib_
     not_decimal_gb pins this. Slug 2026-07-02-analytic-units-gib.
     """
     if not (n_layers and kv_heads and head_dim):
