@@ -328,13 +328,13 @@ def test_render_doctor_verbose_reports_store_details(
 
     out = buf.getvalue()
     assert f"database             {db._db_path()}" in out
-    assert "schema version       5" in out
+    assert "schema version       6" in out
 
     c = cli.Console.from_env(verbose=True)
     assert cli.render_doctor(c, as_json=True) == 0
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
-    assert out_json["schema_version"] == 5
+    assert out_json["schema_version"] == 6
 
 
 def test_render_doctor_text_reports_ollama_findings(
