@@ -763,7 +763,8 @@ def _upsert_model_artifact(
         resolved_revision: str | None = None, manifest_hash: str | None = None,
         size_bytes: int | None = None, format: str | None = None,
         quantization: str | None = None, facts: dict | None = None,
-        evidence: dict | None = None, observed_at: str | None = None) -> None:
+        evidence: dict | None = None, observed_at: str | None = None,
+        preserve_existing_evidence: bool = False) -> None:
     con.execute(
         "INSERT INTO model_artifacts "
         "(artifact_id,logical_model_id,artifact_source,resolved_revision,manifest_hash,"
@@ -773,10 +774,12 @@ def _upsert_model_artifact(
         "resolved_revision=excluded.resolved_revision,manifest_hash=excluded.manifest_hash,"
         "size_bytes=excluded.size_bytes,format=excluded.format,quantization=excluded.quantization,"
         "artifact_confidence=excluded.artifact_confidence,facts_json=excluded.facts_json,"
-        "evidence_json=excluded.evidence_json,observed_at=excluded.observed_at",
+        "evidence_json=CASE WHEN ? THEN COALESCE(excluded.evidence_json,"
+        "model_artifacts.evidence_json) ELSE excluded.evidence_json END,"
+        "observed_at=excluded.observed_at",
         (artifact_id, logical_model_id, artifact_source, resolved_revision, manifest_hash,
          size_bytes, format, quantization, artifact_confidence, _compact_json(facts),
-         _compact_json(evidence), observed_at or _now()),
+         _compact_json(evidence), observed_at or _now(), preserve_existing_evidence),
     )
 
 
@@ -815,7 +818,8 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
                           decode_context: int | None = None,
                           config: dict | None = None,
                           artifact_id: str | None = None,
-                          evidence: dict | None = None) -> None:
+                          evidence: dict | None = None,
+                          characterization_evidence: dict | None = None) -> None:
     stored_config = {} if config is None else config
     identity = _characterization_identity(
         engine, model_id, artifact_id, stored_config)
@@ -823,6 +827,7 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
     _upsert_model_artifact(
         con, identity["artifact_id"], model_id, artifact_source=artifact_source,
         artifact_confidence=identity["artifact_confidence"], evidence=evidence,
+        preserve_existing_evidence=evidence is None,
     )
     con.execute(
         "INSERT INTO characterizations "
@@ -838,7 +843,9 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
         (machine_key, identity["runtime"], identity["backend"], identity["artifact_id"],
          identity["config_key"], model_id, identity["legacy_engine"], safe_context,
          decode_context, json.dumps(stored_config, sort_keys=True), json.dumps(points),
-         _compact_json(evidence), identity["artifact_confidence"], identity["reusable"],
+         _compact_json(characterization_evidence if characterization_evidence is not None
+                       else evidence),
+         identity["artifact_confidence"], identity["reusable"],
          measured_at or _now()))
     con.commit()
 

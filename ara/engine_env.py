@@ -41,17 +41,19 @@ class EngineEnvError(RuntimeError):
 
 
 def _run(cmd: list[str], *, input: str | None = None,
-         stream: bool = False) -> tuple[int, str, str]:
+         stream: bool = False, timeout: float | None = None) -> tuple[int, str, str]:
     """Run a command, return (returncode, stdout, stderr). The one external boundary.
 
     ``stream=False`` (default): capture both stdout and stderr, return all three.
     ``stream=True``: capture stdout only; stderr passes through live to the terminal
     (so HF download bars show). Returns ``(rc, stdout, "")``.
     """
+    timeout_kw = {"timeout": timeout} if timeout is not None else {}
     if stream:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True, input=input)
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=None, text=True, input=input, **timeout_kw)
         return proc.returncode, proc.stdout or "", ""
-    proc = subprocess.run(cmd, capture_output=True, text=True, input=input)
+    proc = subprocess.run(cmd, capture_output=True, text=True, input=input, **timeout_kw)
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
@@ -269,3 +271,29 @@ def run_worker(name: str, args: list[str], *, input: str | None = None,
     if line is None:
         raise EngineEnvError(f"worker {name!r} emitted no JSON")
     return json.loads(line)
+
+
+def run_python_json(name: str, code: str, *, timeout: float = 30.0) -> dict:
+    """Run a bounded isolated Python probe in engine *name* and return one JSON object.
+
+    Unlike a model worker this accepts source directly, which keeps small Doctor probes out of
+    every independently packaged engine. ``-I`` prevents the working directory or ``PYTHONPATH``
+    from spoofing engine imports. Runtime logs may precede the object; only a ``{``-prefixed line
+    is accepted as the protocol response.
+    """
+    cmd = [str(python_path(name)), "-I", "-c", code]
+    try:
+        rc, out, err = _run(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise EngineEnvError(
+            f"engine probe {name!r} timed out after {timeout:g} seconds") from exc
+    if rc != 0:
+        raise EngineEnvError(f"engine probe {name!r} exited {rc}: {err.strip()}")
+    line = next((ln for ln in out.splitlines() if ln.lstrip().startswith("{")), None)
+    if line is None:
+        raise EngineEnvError(f"engine probe {name!r} emitted no JSON object")
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise EngineEnvError(f"engine probe {name!r} emitted invalid JSON: {exc}") from exc
+    return payload

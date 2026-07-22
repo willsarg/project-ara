@@ -464,6 +464,27 @@ def test_characterization_records_artifact_provenance(store):
     assert artifact["evidence"] == {"digest_source": "api"}
 
 
+def test_characterization_without_artifact_evidence_preserves_existing_provenance(store):
+    artifact_id = "local-gguf:/models/m.gguf:stat:1"
+    db.upsert_model_artifact(
+        store, artifact_id, "local/m", artifact_source="local",
+        artifact_confidence="strong", evidence={"source": "snapshot"},
+    )
+
+    db.save_characterization(
+        store, "m", "cpu", "local/m", safe_context=4096, points=[],
+        artifact_id=artifact_id,
+        characterization_evidence={"engine": {"fingerprint": "sha256:build"}},
+    )
+
+    artifact = db.get_model_artifact(store, artifact_id)
+    assert artifact["evidence"] == {"source": "snapshot"}
+    characterization = db.get_characterization(store, "m", "cpu", "local/m")
+    assert characterization["evidence"] == {
+        "engine": {"fingerprint": "sha256:build"},
+    }
+
+
 def test_model_artifact_api_round_trips_all_facts_and_missing(store):
     assert db.get_model_artifact(store, "missing") is None
     db.upsert_model_artifact(

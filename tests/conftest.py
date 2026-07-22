@@ -41,6 +41,7 @@ def _isolate_runtime_state(tmp_path_factory, monkeypatch):
     root = tmp_path_factory.mktemp("ara-state")
     monkeypatch.setenv("ARA_DB_PATH", str(root / "ara.db"))
     monkeypatch.setenv("ARA_ACTIVITY_DIR", str(root / "activity"))
+    monkeypatch.setenv("ARA_ENGINES_DIR", str(root / "engines"))
 
 
 @pytest.fixture

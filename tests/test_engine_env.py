@@ -124,6 +124,21 @@ def test_run_stream_true_returns_empty_err(monkeypatch):
     assert err == ""
 
 
+def test_run_passes_explicit_timeout_to_subprocess(monkeypatch):
+    seen = {}
+
+    class P:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, *, capture_output, text, input, timeout):
+        seen["timeout"] = timeout
+        return P()
+
+    monkeypatch.setattr(engine_env.subprocess, "run", fake_run)
+    assert engine_env._run(["probe"], timeout=7) == (0, "", "")
+    assert seen == {"timeout": 7}
+
+
 # --------------------------------------------------------------------------- #
 # path resolution
 # --------------------------------------------------------------------------- #
@@ -491,6 +506,61 @@ def test_run_worker_stream_true_no_json_still_raises(engines_root, monkeypatch):
                         lambda cmd, *, input=None, stream=False: (0, "logs only, no json", ""))
     with pytest.raises(engine_env.EngineEnvError, match="no JSON"):
         engine_env.run_worker("apple", ["-m", "w"], stream=True)
+
+
+# --------------------------------------------------------------------------- #
+# run_python_json — bounded no-model runtime probes used by Doctor
+# --------------------------------------------------------------------------- #
+def test_run_python_json_uses_isolated_engine_interpreter(engines_root, monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, *, input=None, stream=False, timeout=None):
+        seen.update(cmd=cmd, timeout=timeout)
+        return 0, 'log line\n{"available": true}\n', ""
+
+    monkeypatch.setattr(engine_env, "_run", fake_run)
+
+    assert engine_env.run_python_json("cuda", "print('probe')", timeout=12) == {
+        "available": True,
+    }
+    assert seen == {
+        "cmd": [str(engine_env.python_path("cuda")), "-I", "-c", "print('probe')"],
+        "timeout": 12,
+    }
+
+
+def test_run_python_json_reports_timeout_as_engine_error(engines_root, monkeypatch):
+    def fake_run(*_args, **_kwargs):
+        raise engine_env.subprocess.TimeoutExpired(["python"], 5)
+
+    monkeypatch.setattr(engine_env, "_run", fake_run)
+
+    with pytest.raises(engine_env.EngineEnvError, match="timed out after 5 seconds"):
+        engine_env.run_python_json("cpu", "pass", timeout=5)
+
+
+def test_run_python_json_rejects_non_object_payload(engines_root, monkeypatch):
+    monkeypatch.setattr(
+        engine_env, "_run", lambda *_args, **_kwargs: (0, "[1, 2, 3]\n", ""))
+
+    with pytest.raises(engine_env.EngineEnvError, match="emitted no JSON object"):
+        engine_env.run_python_json("cpu", "pass")
+
+
+def test_run_python_json_reports_nonzero_with_stderr(engines_root, monkeypatch):
+    monkeypatch.setattr(
+        engine_env, "_run", lambda *_args, **_kwargs: (9, "", "library missing"))
+
+    with pytest.raises(engine_env.EngineEnvError, match="exited 9: library missing"):
+        engine_env.run_python_json("cpu", "pass")
+
+
+def test_run_python_json_rejects_invalid_json_object(engines_root, monkeypatch):
+    monkeypatch.setattr(
+        engine_env, "_run", lambda *_args, **_kwargs: (0, "{not-json}\n", ""))
+
+    with pytest.raises(engine_env.EngineEnvError, match="emitted invalid JSON"):
+        engine_env.run_python_json("cpu", "pass")
 
 
 # --------------------------------------------------------------------------- #

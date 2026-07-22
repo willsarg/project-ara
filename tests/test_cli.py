@@ -25,6 +25,8 @@ def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: _matched_engine_audit())
 
 
 def _raise_input(exc):
@@ -111,8 +113,9 @@ def _capture_dispatch(monkeypatch):
                         lambda c, rest, token=None, as_json=False:
                         (rec.update(node=rest[1:], node_token=token) or 0))
     monkeypatch.setattr(cli, "render_doctor",
-                        lambda c, rekey=False, as_json=False:
-                        (rec.update(doctor=True, doctor_rekey=rekey, doctor_json=as_json) or 0))
+                        lambda c, rekey=False, engines=False, as_json=False:
+                        (rec.update(doctor=True, doctor_rekey=rekey,
+                                    doctor_engines=engines, doctor_json=as_json) or 0))
     return rec
 
 
@@ -193,6 +196,12 @@ def test_main_doctor_rekey_flag(monkeypatch):
     assert rec["doctor_rekey"] is True and rec["doctor_json"] is True
 
 
+def test_main_doctor_engines_flag(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    assert _run_main(monkeypatch, ["doctor", "--engines", "--json"]) == 0
+    assert rec["doctor_engines"] is True and rec["doctor_json"] is True
+
+
 def test_doctor_help_explains_its_purpose(capsys):
     assert cli.main(["--help"]) == 0
     root_help = capsys.readouterr().out
@@ -203,6 +212,7 @@ def test_doctor_help_explains_its_purpose(capsys):
     assert ("Show how ARA identifies this machine, count records stored for it, and report records "
             "under other machine identities.") in " ".join(doctor_help.split())
     assert "Rewrite legacy machine identity keys in ARA's database." in doctor_help
+    assert "Load installed engine runtimes without loading a model" in doctor_help
 
 
 def test_benchmark_help_explains_its_purpose_and_safety_contract(capsys):
@@ -340,6 +350,74 @@ def test_render_doctor_text_reports_ollama_findings(
     out = buf.getvalue()
     assert "OLLAMA" in out and "legacy ownership" in out
     assert "old:latest" in out
+
+
+def _matched_engine_audit():
+    return {
+        "key": "cpu", "backend": "cpu", "package": "llama.cpp",
+        "package_version": "0.3.34", "device": None,
+        "installation": {"status": "matched", "detail": "engine stamps match"},
+        "build": {"status": "matched", "detail": "build reports host NEON"},
+        "runtime": {"status": "matched", "detail": "llama.cpp runtime loaded"},
+        "workload": {"status": "verified", "detail": "characterize verified this build"},
+        "capabilities": {}, "fingerprint": "engine:v1:sha256:abc", "findings": [],
+    }
+
+
+def test_render_doctor_engines_json_includes_no_model_audit(
+        store, monkeypatch, capsys, doctor_ollama_clean):
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    cli.db.save_characterization(
+        store, "ara1|C|G|32|Linux", "cpu", "org/model", safe_context=8192,
+        points=[], evidence={"engine": {"fingerprint": "engine:v1:sha256:abc"}})
+    seen = {}
+
+    def audit_installed(*, host_features, characterization_rows):
+        seen.update(host_features=host_features, rows=characterization_rows)
+        return [_matched_engine_audit()]
+
+    monkeypatch.setattr(cli.detect, "_cpu_features", lambda: ["AVX2"])
+    monkeypatch.setattr(cli.engine_audit, "audit_installed", audit_installed)
+
+    assert cli.render_doctor(cli.Console.from_env(), engines=True, as_json=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["engines"] == [_matched_engine_audit()]
+    assert seen["host_features"] == ["AVX2"]
+    assert seen["rows"][0]["safe_context"] == 8192
+
+
+def test_render_doctor_engines_text_separates_evidence_dimensions(
+        store, monkeypatch, make_console, doctor_ollama_clean):
+    monkeypatch.setattr(cli.engine_audit, "audit_installed", lambda **_kwargs: [
+        _matched_engine_audit(),
+        {**_matched_engine_audit(), "key": "vulkan", "package": "llama.cpp (Vulkan)",
+         "build": {"status": "mismatch", "detail": "Vulkan backend is not registered"},
+         "runtime": {"status": "mismatch", "detail": "GPU offload device is unavailable"},
+         "workload": {"status": "not_verified", "detail": "run characterize"},
+         "findings": [{"code": "backend_missing", "severity": "warning",
+                       "detail": "installed build does not report Vulkan"}]},
+    ])
+    c, buf = make_console()
+
+    assert cli.render_doctor(c, engines=True) == 0
+
+    out = buf.getvalue()
+    assert "INSTALLED ENGINES" in out
+    assert "cpu  0.3.34" in out
+    assert "build matched" in out and "workload verified" in out
+    assert "vulkan  0.3.34" in out and "build mismatch" in out
+    assert "installed build does not report Vulkan" in out
+
+
+def test_render_doctor_engines_text_reports_no_installed_environments(
+        store, monkeypatch, make_console, doctor_ollama_clean):
+    monkeypatch.setattr(cli.engine_audit, "audit_installed", lambda **_kwargs: [])
+    c, buf = make_console()
+
+    assert cli.render_doctor(c, engines=True) == 0
+
+    assert "INSTALLED ENGINES" in buf.getvalue()
+    assert "none installed" in buf.getvalue()
 
 
 def test_ollama_doctor_reports_stale_legacy_and_unowned_artifacts(monkeypatch):
@@ -2438,6 +2516,59 @@ def test_render_install_json(monkeypatch, capsys):
     assert out["status"] == "installed" and out["key"] == "mlx" and rc == 0
 
 
+def test_render_install_runs_no_model_verification_after_fresh_install(
+        make_console, monkeypatch):
+    _stub_install(monkeypatch, "cpu", "installed")
+    audit = _matched_engine_audit()
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda key, **_kwargs: audit)
+    c, buf = make_console()
+
+    assert cli.render_install(c, engine="cpu") == 0
+
+    assert "verified installed engine" in buf.getvalue()
+    assert "build matched" in buf.getvalue()
+
+
+def test_render_install_json_includes_verification(monkeypatch, capsys):
+    _stub_install(monkeypatch, "cpu", "refreshed")
+    audit = _matched_engine_audit()
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda key, **_kwargs: audit)
+
+    assert cli.render_install(cli.Console.from_env(), engine="cpu", as_json=True) == 0
+
+    assert json.loads(capsys.readouterr().out)["verification"] == audit
+
+
+def test_render_install_already_json_does_not_claim_fresh_verification(monkeypatch, capsys):
+    _stub_install(monkeypatch, "cpu", "already")
+
+    assert cli.render_install(cli.Console.from_env(), engine="cpu", as_json=True) == 0
+
+    assert "verification" not in json.loads(capsys.readouterr().out)
+
+
+def test_render_install_surfaces_verification_findings(make_console, monkeypatch):
+    _stub_install(monkeypatch, "vulkan", "installed")
+    audit = {
+        **_matched_engine_audit(),
+        "key": "vulkan",
+        "build": {"status": "mismatch", "detail": "Vulkan backend missing"},
+        "runtime": {"status": "mismatch", "detail": "no offload device"},
+        "findings": [{
+            "code": "backend_missing", "severity": "warning",
+            "detail": "installed build does not report Vulkan",
+        }],
+    }
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: audit)
+    c, buf = make_console()
+
+    assert cli.render_install(c, engine="vulkan") == 0
+
+    assert "build mismatch · runtime mismatch" in buf.getvalue()
+    assert "backend missing — installed build does not report Vulkan" in buf.getvalue()
+
+
 def test_render_install_json_legacy_source_warning_keeps_stdout_clean(monkeypatch, capsys):
     monkeypatch.delenv("ARA_MLX_SOURCE", raising=False)
     monkeypatch.setenv("ARA_WMX_SOURCE", "../legacy-wmx-suite")
@@ -2448,11 +2579,16 @@ def test_render_install_json_legacy_source_warning_keeps_stdout_clean(monkeypatc
         return cli.engines.InstallResult(key, "installed")
 
     monkeypatch.setattr(cli.engines, "install", fake_install)
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: _matched_engine_audit())
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_install(c, engine="mlx", as_json=True) == 0
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"key": "mlx", "status": "installed", "detail": ""}
+    payload = json.loads(captured.out)
+    assert {key: payload[key] for key in ("key", "status", "detail")} == {
+        "key": "mlx", "status": "installed", "detail": ""}
+    assert payload["verification"] == _matched_engine_audit()
     assert captured.err == "ara: ARA_WMX_SOURCE is deprecated; use ARA_MLX_SOURCE\n"
 
 
@@ -5520,6 +5656,86 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
     assert row["artifact_id"] == "artifact:test"
+
+
+def test_render_characterize_binds_workload_proof_to_engine_fingerprint(
+        make_console, store, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda model: {
+            "model": model, "safe_context": 8192,
+            "decode_context": None, "points": [[512, 1.0]],
+        })
+    audit = _matched_engine_audit()
+    seen = []
+
+    def audit_engine(key, *, host_features):
+        seen.append({"key": key, "host_features": host_features})
+        return audit
+
+    monkeypatch.setattr(cli.detect, "_cpu_features", lambda: ["NEON"])
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", audit_engine)
+
+    assert cli.render_characterize(make_console()[0], "org/Model") == 0
+
+    row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
+    assert row["evidence"] == cli.engine_audit.characterization_evidence(audit)
+    assert cli.db.get_model_artifact(store, "artifact:test")["evidence"] is None
+    assert seen == [
+        {"key": "mlx", "host_features": ["NEON"]},
+        {"key": "mlx", "host_features": ["NEON"]},
+    ]
+
+
+def test_render_characterize_refuses_engine_changed_during_measurement(
+        make_console, monkeypatch):
+    calls = []
+
+    def characterize(model):
+        assert calls == ["engine:v1:sha256:before"]
+        return {
+            "model": model, "safe_context": 8192,
+            "decode_context": None, "points": [[512, 1.0]],
+        }
+
+    _wire_characterize(monkeypatch, characterize=characterize)
+    reports = []
+    for fingerprint in ("engine:v1:sha256:before", "engine:v1:sha256:after"):
+        reports.append({**_matched_engine_audit(), "fingerprint": fingerprint})
+
+    def audit_engine(*_args, **_kwargs):
+        report = reports.pop(0)
+        calls.append(report["fingerprint"])
+        return report
+
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", audit_engine)
+    monkeypatch.setattr(
+        cli.db, "save_characterization",
+        lambda *_args, **_kwargs: pytest.fail("changed-engine result must not be stored"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+
+    assert calls == ["engine:v1:sha256:before", "engine:v1:sha256:after"]
+    assert "engine build changed during characterization" in buf.getvalue()
+
+
+def test_render_characterize_refuses_unidentifiable_engine_build(
+        make_console, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda _model: pytest.fail("characterize must not run"),
+    )
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine",
+        lambda *_args, **_kwargs: {**_matched_engine_audit(), "fingerprint": None},
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+
+    assert "cannot identify the installed engine build" in buf.getvalue()
 
 
 def test_render_characterize_loads_immutable_pinned_artifact(

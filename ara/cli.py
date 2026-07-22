@@ -22,7 +22,8 @@ from pathlib import Path
 
 import click
 
-from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_identity, engines, estimate, hub,
+from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine_audit,
+                 engine_identity, engines, estimate, hub,
                  hub_server,
                  hf_auth, locking, mlx, ollama, ollama_evidence, profile, calibration, pythons, scoring, serialize,
                  staleness, versions)
@@ -1654,10 +1655,19 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
+        host_features = detect._cpu_features()
+        engine_report_before = engine_audit.audit_engine(
+            sel.engine_key, host_features=host_features)
+        if engine_report_before.get("fingerprint") is None:
+            msg = "cannot identify the installed engine build — result not stored"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return 1
         try:
             with _pinned_model_for_plan(
                     evidence_model, artifact_id_before, prefetch_size) as pinned_model:
                 result = bk.characterize(pinned_model, progress=progress, **fa_kw)
+            engine_report_after = engine_audit.audit_engine(
+                sel.engine_key, host_features=host_features)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
             msg = f"characterization failed: {exc}"
             # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
@@ -1693,11 +1703,18 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"the artifact for {model} changed during characterization — result not stored"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
+    if (engine_report_after.get("fingerprint") is None
+            or engine_report_after["fingerprint"] != engine_report_before["fingerprint"]):
+        msg = "engine build changed during characterization — result not stored"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    engine_evidence = engine_audit.characterization_evidence(engine_report_after)
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  evidence_model, safe_context=ceiling, points=result["points"],
                                  decode_context=result.get("decode_context"),
-                                 config=measured_config, artifact_id=artifact_id)
+                                 config=measured_config, artifact_id=artifact_id,
+                                 characterization_evidence=engine_evidence)
         canonical_model_id = scoring.canonical_model_id(evidence_model)
         if evidence_model != canonical_model_id:
             catalog.remember_variant(
@@ -4414,9 +4431,15 @@ def render_install(c: Console, *, engine: str = "auto", refresh: bool = False,
         return 1
 
     result = engines.install(key, refresh=refresh)
+    verification = None
+    if result.status in {"installed", "refreshed"}:
+        verification = engine_audit.audit_engine(
+            key, host_features=detect._cpu_features())
     if as_json:
-        print(json.dumps({"key": result.key, "status": result.status,
-                          "detail": result.detail}))
+        payload = {"key": result.key, "status": result.status, "detail": result.detail}
+        if verification is not None:
+            payload["verification"] = verification
+        print(json.dumps(payload))
         return 0 if result.status in _INSTALL_OK else 1
 
     pkg = engines.ENGINES[key]["package"]
@@ -4432,6 +4455,15 @@ def render_install(c: Console, *, engine: str = "auto", refresh: bool = False,
         c.emit(c.style("bad", f"  installing {pkg} failed:"))
         c.emit(c.style("dim", f"  {result.detail}"))
     if result.status in _INSTALL_OK:
+        if verification is not None:
+            build = verification["build"]["status"]
+            runtime = verification["runtime"]["status"]
+            role = "good" if build == runtime == "matched" else "warn"
+            c.emit(c.style(role, "  verified installed engine")
+                   + c.style("dim", f" · build {build} · runtime {runtime}"))
+            for finding in verification["findings"]:
+                c.emit(c.style("warn", f"    {finding['code'].replace('_', ' ')}")
+                       + c.style("dim", f" — {finding['detail']}"))
         model = engines.ENGINES[key]["smoke_model"]
         c.emit(c.style("dim", "  next: ")
                + c.style("accent", f"ara characterize {model} --engine {key}"))
@@ -4930,13 +4962,15 @@ def _ollama_doctor_report() -> dict:
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
 
 
-def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> int:
+def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
+                  as_json: bool = False) -> int:
     """``ara doctor``: this machine's identity (``machine_key``) and the count of stored records
     keyed to it, so a user can see at a glance whether ARA still recognises the box. With
     ``--rekey``, first migrate any lingering legacy (byte-exact) machine_keys to the versioned
     GiB-rounded form and report how many rows moved (the manual counterpart to the automatic
     one-time migration). Rows under *other* keys are counted separately, never folded in (Rule #3).
-    Spec 2026-07-04-machine-key-stabilization."""
+    ``--engines`` explicitly loads each installed engine runtime (but no model), checking the
+    installed build and one minimal device operation. Spec 2026-07-04-machine-key-stabilization."""
     mk = profile.machine_key()
     path = db._db_path()
     try:
@@ -4947,17 +4981,24 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
             other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
                                     (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
             schema_version = con.execute("PRAGMA user_version").fetchone()[0]
+            characterization_rows = (db.list_characterizations_for_display(con, mk)
+                                     if engines else [])
     except (OSError, sqlite3.Error) as exc:
         msg = f"database problem at {path}: {exc}"
         print(json.dumps({"error": msg, "database": str(path)})) if as_json \
             else c.emit(c.style("bad", f"  {msg}"))
         return 1
     ollama_report = _ollama_doctor_report()
+    engine_reports = (engine_audit.audit_installed(
+        host_features=detect._cpu_features(), characterization_rows=characterization_rows)
+        if engines else None)
     if as_json:
         out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other,
                      "ollama": ollama_report}
         if rekey:
             out["rekeyed_rows"] = rekeyed
+        if engine_reports is not None:
+            out["engines"] = engine_reports
         if c.verbose:
             out.update(database=str(path), schema_version=schema_version)
         print(json.dumps(out))
@@ -4981,6 +5022,22 @@ def render_doctor(c: Console, *, rekey: bool = False, as_json: bool = False) -> 
                    + c.style("dim", f" — {finding['detail']}"))
     elif c.verbose:
         c.emit(c.style("dim", "    Ollama ownership: no findings"))
+    if engine_reports is not None:
+        c.emit(c.section("  INSTALLED ENGINES"))
+        if not engine_reports:
+            c.emit(c.style("dim", "    none installed"))
+        for report in engine_reports:
+            version = f"  {report['package_version']}" if report["package_version"] else ""
+            c.emit(c.style("accent", f"    {report['key']}{version}"))
+            for dimension in ("installation", "build", "runtime", "workload"):
+                fact = report[dimension]
+                role = ("good" if fact["status"] in {"matched", "verified"}
+                        else "warn" if fact["status"] in {"mismatch", "stale"} else "dim")
+                c.emit(c.style(role, f"      {dimension} {fact['status']}")
+                       + c.style("dim", f" — {fact['detail']}"))
+            for finding in report["findings"]:
+                c.emit(c.style("warn", f"      {finding['code'].replace('_', ' ')}")
+                       + c.style("dim", f" — {finding['detail']}"))
     return 0
 
 
@@ -5482,9 +5539,10 @@ def _click_install(ctx: click.Context, engine_arg: str | None, engine_option: st
 
     Decision guide: ara install --engine --help
     """
-    return render_install(_mark_json(ctx, as_json),
-                          engine=_selected_engine(engine_arg, engine_option),
-                          refresh=refresh, as_json=as_json)
+    with locking.measurement_lock():
+        return render_install(_mark_json(ctx, as_json),
+                              engine=_selected_engine(engine_arg, engine_option),
+                              refresh=refresh, as_json=as_json)
 
 
 @_click_cli.command("uninstall", context_settings=_HELP_SETTINGS)
@@ -5501,8 +5559,9 @@ def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: 
 
     Keeps models, the shared uv cache, ARA's database and characterizations, and other engines.
     """
-    return render_uninstall(_mark_json(ctx, as_json),
-                            engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
+    with locking.measurement_lock():
+        return render_uninstall(_mark_json(ctx, as_json),
+                                engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
 
 
 @_click_cli.command(
@@ -5512,12 +5571,16 @@ def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: 
 )
 @click.option("--rekey", is_flag=True,
               help="Rewrite legacy machine identity keys in ARA's database.")
+@click.option("--engines", "audit_engines", is_flag=True,
+              help="Load installed engine runtimes without loading a model, then verify them.")
 @_json_verbose_options
 @click.pass_context
-def _click_doctor(ctx: click.Context, rekey: bool, verbose: bool, as_json: bool) -> int:
+def _click_doctor(ctx: click.Context, rekey: bool, audit_engines: bool,
+                  verbose: bool, as_json: bool) -> int:
     """Show how ARA identifies this machine, count records stored for it, and report records
     under other machine identities."""
-    return render_doctor(_mark_json(ctx, as_json), rekey=rekey, as_json=as_json)
+    return render_doctor(
+        _mark_json(ctx, as_json), rekey=rekey, engines=audit_engines, as_json=as_json)
 
 
 @_click_cli.group("hf", no_args_is_help=False, context_settings=_HELP_SETTINGS)
