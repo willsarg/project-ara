@@ -25,6 +25,8 @@ def _stable_test_artifact(monkeypatch):
     monkeypatch.setattr(cli.staleness, "artifact_size_gb", lambda _model: 1.0)
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: _matched_engine_audit())
 
 
 def _raise_input(exc):
@@ -5665,10 +5667,10 @@ def test_render_characterize_binds_workload_proof_to_engine_fingerprint(
             "decode_context": None, "points": [[512, 1.0]],
         })
     audit = _matched_engine_audit()
-    seen = {}
+    seen = []
 
     def audit_engine(key, *, host_features):
-        seen.update(key=key, host_features=host_features)
+        seen.append({"key": key, "host_features": host_features})
         return audit
 
     monkeypatch.setattr(cli.detect, "_cpu_features", lambda: ["NEON"])
@@ -5679,7 +5681,61 @@ def test_render_characterize_binds_workload_proof_to_engine_fingerprint(
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["evidence"] == cli.engine_audit.characterization_evidence(audit)
     assert cli.db.get_model_artifact(store, "artifact:test")["evidence"] is None
-    assert seen == {"key": "mlx", "host_features": ["NEON"]}
+    assert seen == [
+        {"key": "mlx", "host_features": ["NEON"]},
+        {"key": "mlx", "host_features": ["NEON"]},
+    ]
+
+
+def test_render_characterize_refuses_engine_changed_during_measurement(
+        make_console, monkeypatch):
+    calls = []
+
+    def characterize(model):
+        assert calls == ["engine:v1:sha256:before"]
+        return {
+            "model": model, "safe_context": 8192,
+            "decode_context": None, "points": [[512, 1.0]],
+        }
+
+    _wire_characterize(monkeypatch, characterize=characterize)
+    reports = []
+    for fingerprint in ("engine:v1:sha256:before", "engine:v1:sha256:after"):
+        reports.append({**_matched_engine_audit(), "fingerprint": fingerprint})
+
+    def audit_engine(*_args, **_kwargs):
+        report = reports.pop(0)
+        calls.append(report["fingerprint"])
+        return report
+
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", audit_engine)
+    monkeypatch.setattr(
+        cli.db, "save_characterization",
+        lambda *_args, **_kwargs: pytest.fail("changed-engine result must not be stored"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+
+    assert calls == ["engine:v1:sha256:before", "engine:v1:sha256:after"]
+    assert "engine build changed during characterization" in buf.getvalue()
+
+
+def test_render_characterize_refuses_unidentifiable_engine_build(
+        make_console, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda _model: pytest.fail("characterize must not run"),
+    )
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine",
+        lambda *_args, **_kwargs: {**_matched_engine_audit(), "fingerprint": None},
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+
+    assert "cannot identify the installed engine build" in buf.getvalue()
 
 
 def test_render_characterize_loads_immutable_pinned_artifact(

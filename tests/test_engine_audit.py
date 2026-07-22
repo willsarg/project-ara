@@ -114,6 +114,71 @@ def test_cuda_audit_requires_a_live_cuda_operation(monkeypatch):
     assert report["findings"][-1]["code"] == "runtime_operation_failed"
 
 
+def test_cuda_audit_rejects_build_without_host_architecture(monkeypatch):
+    _installed(monkeypatch, schema="ara-engine-cuda:ara_engine_cuda:v1")
+    monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {
+        "kind": "torch_cuda",
+        "package_version": "2.9.0+cu128",
+        "cuda_build": "12.8",
+        "arch_list": ["sm_80", "sm_86"],
+        "available": True,
+        "operation_ok": False,
+        "device": "NVIDIA RTX 2080",
+        "capability": "7.5",
+        "error": "no kernel image is available",
+    })
+
+    report = engine_audit.audit_engine("cuda")
+
+    assert report["build"]["status"] == "mismatch"
+    assert "SM 7.5" in report["build"]["detail"]
+    assert {finding["code"] for finding in report["findings"]} == {
+        "cuda_arch_unsupported", "runtime_operation_failed",
+    }
+
+
+def test_cuda_audit_accepts_ptx_forward_compatibility(monkeypatch):
+    _installed(monkeypatch, schema="ara-engine-cuda:ara_engine_cuda:v1")
+    monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {
+        "kind": "torch_cuda",
+        "package_version": "2.9.0+cu128",
+        "cuda_build": "12.8",
+        "arch_list": ["sm_80", "compute_80"],
+        "available": True,
+        "operation_ok": False,
+        "device": "NVIDIA RTX 4090",
+        "capability": "8.9",
+        "error": "driver initialization failed",
+    })
+
+    report = engine_audit.audit_engine("cuda")
+
+    assert report["build"] == {
+        "status": "matched",
+        "detail": "CUDA build includes PTX compatible with host SM 8.9",
+    }
+
+
+def test_cuda_audit_is_unknown_without_host_capability(monkeypatch):
+    _installed(monkeypatch, schema="ara-engine-cuda:ara_engine_cuda:v1")
+    monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {
+        "kind": "torch_cuda",
+        "package_version": "2.9.0+cu128",
+        "cuda_build": "12.8",
+        "arch_list": ["sm_80"],
+        "available": False,
+        "operation_ok": False,
+        "device": None,
+        "capability": None,
+        "error": None,
+    })
+
+    report = engine_audit.audit_engine("cuda")
+
+    assert report["build"]["status"] == "unknown"
+    assert report["build"]["detail"] == "host CUDA capability is unavailable"
+
+
 def test_mlx_audit_reports_visible_metal_device(monkeypatch):
     _installed(monkeypatch, schema="ara-engine-mlx:ara_engine_mlx:v1")
     monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {
@@ -292,7 +357,7 @@ def test_cuda_audit_accepts_live_operation(monkeypatch):
     _installed(monkeypatch, schema="ara-engine-cuda:ara_engine_cuda:v1")
     monkeypatch.setattr(engine_audit, "_probe", lambda *_args: {
         "kind": "torch_cuda", "package_version": "2.9.0+cu128", "cuda_build": "12.8",
-        "arch_list": ["sm_75"], "available": True, "operation_ok": True,
+        "arch_list": ["sm_80"], "available": True, "operation_ok": True,
         "device": "RTX 2080", "capability": "7.5", "error": None,
     })
 

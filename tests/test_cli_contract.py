@@ -85,6 +85,11 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: {
+        "key": "mlx", "package_version": "0.32.0",
+        "build": {"status": "matched"}, "runtime": {"status": "matched"},
+        "fingerprint": "engine:v1:sha256:contract",
+    })
     monkeypatch.setattr(cli.engines, "install",
                         lambda key, **kw: cli.engines.InstallResult(key, "installed"))
     monkeypatch.setattr(cli.engines, "uninstall",

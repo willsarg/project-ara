@@ -1655,10 +1655,19 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
+        host_features = detect._cpu_features()
+        engine_report_before = engine_audit.audit_engine(
+            sel.engine_key, host_features=host_features)
+        if engine_report_before.get("fingerprint") is None:
+            msg = "cannot identify the installed engine build — result not stored"
+            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+            return 1
         try:
             with _pinned_model_for_plan(
                     evidence_model, artifact_id_before, prefetch_size) as pinned_model:
                 result = bk.characterize(pinned_model, progress=progress, **fa_kw)
+            engine_report_after = engine_audit.audit_engine(
+                sel.engine_key, host_features=host_features)
         except (SystemExit, Exception) as exc:   # engine may refuse/abort/OOM-guard
             msg = f"characterization failed: {exc}"
             # Rule #3 (Honesty): under --json a consumer parses stdout — emit a structured error, never
@@ -1694,9 +1703,12 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"the artifact for {model} changed during characterization — result not stored"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
-    engine_report = engine_audit.audit_engine(
-        sel.engine_key, host_features=detect._cpu_features())
-    engine_evidence = engine_audit.characterization_evidence(engine_report)
+    if (engine_report_after.get("fingerprint") is None
+            or engine_report_after["fingerprint"] != engine_report_before["fingerprint"]):
+        msg = "engine build changed during characterization — result not stored"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    engine_evidence = engine_audit.characterization_evidence(engine_report_after)
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  evidence_model, safe_context=ceiling, points=result["points"],
@@ -5527,9 +5539,10 @@ def _click_install(ctx: click.Context, engine_arg: str | None, engine_option: st
 
     Decision guide: ara install --engine --help
     """
-    return render_install(_mark_json(ctx, as_json),
-                          engine=_selected_engine(engine_arg, engine_option),
-                          refresh=refresh, as_json=as_json)
+    with locking.measurement_lock():
+        return render_install(_mark_json(ctx, as_json),
+                              engine=_selected_engine(engine_arg, engine_option),
+                              refresh=refresh, as_json=as_json)
 
 
 @_click_cli.command("uninstall", context_settings=_HELP_SETTINGS)
@@ -5546,8 +5559,9 @@ def _click_uninstall(ctx: click.Context, engine_arg: str | None, engine_option: 
 
     Keeps models, the shared uv cache, ARA's database and characterizations, and other engines.
     """
-    return render_uninstall(_mark_json(ctx, as_json),
-                            engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
+    with locking.measurement_lock():
+        return render_uninstall(_mark_json(ctx, as_json),
+                                engine=_selected_engine(engine_arg, engine_option), as_json=as_json)
 
 
 @_click_cli.command(

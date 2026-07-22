@@ -116,6 +116,11 @@ def _wire_characterize(monkeypatch, backend):
                         lambda _model, **_kwargs: "artifact:test")
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: {
+        "key": "cpu", "package_version": "0.3.34",
+        "build": {"status": "matched"}, "runtime": {"status": "matched"},
+        "fingerprint": "engine:v1:sha256:test",
+    })
 
 
 @pytest.mark.parametrize("cached,expected_downloads", [(True, []), (False, ["org/model"])])
@@ -417,6 +422,33 @@ def test_characterize_click_acquires_measurement_lock_before_tracking(monkeypatc
     result = CliRunner().invoke(cli._click_cli, ["characterize", "org/model"])
     assert result.exit_code == 0
     assert order == ["lock-enter", "track-enter", "render", "track-exit", "lock-exit"]
+
+
+@pytest.mark.parametrize(
+    ("command", "renderer"),
+    [(["install", "cpu"], "render_install"),
+     (["uninstall", "cpu"], "render_uninstall")],
+)
+def test_engine_mutation_clicks_acquire_measurement_lock(monkeypatch, command, renderer):
+    order = []
+
+    @contextlib.contextmanager
+    def locked():
+        order.append("lock-enter")
+        yield
+        order.append("lock-exit")
+
+    def render(*_args, **_kwargs):
+        order.append("render")
+        return 0
+
+    monkeypatch.setattr(cli.locking, "measurement_lock", locked)
+    monkeypatch.setattr(cli, renderer, render)
+
+    result = CliRunner().invoke(cli._click_cli, command)
+
+    assert result.exit_code == 0
+    assert order == ["lock-enter", "render", "lock-exit"]
 
 
 def _wire_benchmark(monkeypatch, backend):

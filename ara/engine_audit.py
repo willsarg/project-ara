@@ -159,6 +159,34 @@ def _llama_device(system_info: str, expected: str) -> str | None:
     return name.group(1).strip() if name else None
 
 
+def _cuda_build_status(probe: dict[str, Any]) -> tuple[dict[str, str], dict[str, str] | None]:
+    if not probe.get("cuda_build"):
+        return (_status("mismatch", "PyTorch is not a CUDA build"),
+                _finding("backend_missing", "installed PyTorch has no CUDA runtime"))
+    capability = re.fullmatch(r"(\d+)\.(\d+)", str(probe.get("capability") or ""))
+    if capability is None:
+        return _status("unknown", "host CUDA capability is unavailable"), None
+    capability_code = int(capability.group(1)) * 10 + int(capability.group(2))
+    capability_label = f"{capability.group(1)}.{capability.group(2)}"
+    architectures = {str(value).lower() for value in probe.get("arch_list") or []}
+    if f"sm_{capability_code}" in architectures:
+        return _status(
+            "matched", f"CUDA build includes host SM {capability_label}"), None
+    ptx_codes = [
+        int(match.group(1))
+        for architecture in architectures
+        if (match := re.fullmatch(r"compute_(\d+)", architecture)) is not None
+    ]
+    if any(code <= capability_code for code in ptx_codes):
+        return _status(
+            "matched", f"CUDA build includes PTX compatible with host SM {capability_label}"), None
+    if probe.get("operation_ok") is True:
+        return _status(
+            "matched", f"CUDA build executed successfully on host SM {capability_label}"), None
+    detail = f"CUDA build does not include host SM {capability_label} or compatible PTX"
+    return _status("mismatch", detail), _finding("cuda_arch_unsupported", detail)
+
+
 def _workload_status(fingerprint: str | None, rows: list[dict]) -> dict[str, str]:
     measured = [row for row in rows if row.get("safe_context") is not None]
     if not measured:
@@ -262,12 +290,9 @@ def audit_engine(key: str, *, host_features: list[str] | None = None,
                     "accelerator_unavailable", f"{expected} GPU offload is not available"))
             report["device"] = _llama_device(info, expected)
     elif kind == "torch_cuda":
-        if probe.get("cuda_build"):
-            report["build"] = _status(
-                "matched", f"PyTorch was built for CUDA {probe['cuda_build']}")
-        else:
-            report["build"] = _status("mismatch", "PyTorch is not a CUDA build")
-            findings.append(_finding("backend_missing", "installed PyTorch has no CUDA runtime"))
+        report["build"], build_finding = _cuda_build_status(probe)
+        if build_finding is not None:
+            findings.append(build_finding)
         report["device"] = probe.get("device")
         if probe.get("available") is True and probe.get("operation_ok") is True:
             report["runtime"] = _status("matched", "a CUDA tensor operation completed")
