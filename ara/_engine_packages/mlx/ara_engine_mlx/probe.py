@@ -127,6 +127,8 @@ def _terminate_process_group(proc) -> None:
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
+    except AttributeError:
+        proc.terminate()
     except ProcessLookupError:
         pass
     try:
@@ -136,6 +138,8 @@ def _terminate_process_group(proc) -> None:
         pass
     try:
         os.killpg(proc.pid, signal.SIGKILL)
+    except AttributeError:
+        proc.kill()
     except ProcessLookupError:
         pass
     proc.wait()
