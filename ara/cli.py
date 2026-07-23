@@ -3180,6 +3180,7 @@ def _render_run_ollama(
     prompt: str | None,
     assume_yes: bool,
     as_json: bool,
+    ctx: int | None,
     max_tokens: int,
     flash_attn: bool,
     flash_attn_optin: bool,
@@ -3238,10 +3239,17 @@ def _render_run_ollama(
         return err(f"{record.name}'s Ollama characterization is display-only ({reason}); "
                    f"re-characterize it on this server before run")
     row = assessment.reusable
-    safe = row["safe_context"]
+    characterized_ceiling = row["safe_context"]
+    if ctx is not None and (msg := _ctx_gate_msg(
+            ctx, characterized_ceiling, record.name)):
+        return err(msg)
+    effective_context = ctx if ctx is not None else characterized_ceiling
+    safe = effective_context
     config = row["config"]
     artifact_id = row["artifact_id"]
 
+    if not as_json:
+        _emit_run_context(c, characterized_ceiling, effective_context)
     if not as_json and not assume_yes and sys.stdin.isatty():
         if not _confirm(f"Run {record.name} through Ollama at ≤{safe} ctx?"):
             c.emit(c.style("dim", "  skipped."))
@@ -3299,7 +3307,9 @@ def _render_run_ollama(
         "backend": backend,
         "placement": placement,
         "artifact_id": artifact_id,
-        "safe_context": safe,
+        "safe_context": characterized_ceiling,
+        "characterized_ceiling": characterized_ceiling,
+        "effective_context": effective_context,
         "completion": completion,
         "stop_reason": stop_reason,
         "usage": {
@@ -3324,8 +3334,19 @@ def _render_run_ollama(
     return 0
 
 
+def _emit_run_context(c: Console, characterized_ceiling: int,
+                      effective_context: int) -> None:
+    if c.verbose:
+        c.emit(c.field("characterized ceiling", f"{characterized_ceiling:,} tokens"))
+        c.emit(c.field(
+            "effective context",
+            f"{effective_context:,} tokens"
+            + (" · user-lowered" if effective_context < characterized_ceiling else ""),
+        ))
+
+
 def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str | None = None,
-               assume_yes: bool = False, as_json: bool = False,
+               ctx: int | None = None, assume_yes: bool = False, as_json: bool = False,
                max_tokens: int = RUN_MAX_TOKENS, flash_attn: bool = True,
                flash_attn_optin: bool = False, kv_quant: str = "f16",
                weight_quant: str = "none", prefill_chunk: int | None = None) -> int:
@@ -3337,6 +3358,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
 
+    if ctx is not None and ctx <= 0:
+        return err("--ctx must be a positive integer")
     if engine == "ollama":
         return _render_run_ollama(
             c,
@@ -3344,6 +3367,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             prompt=prompt,
             assume_yes=assume_yes,
             as_json=as_json,
+            ctx=ctx,
             max_tokens=max_tokens,
             flash_attn=flash_attn,
             flash_attn_optin=flash_attn_optin,
@@ -3580,6 +3604,11 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                            f"selection — re-run: ara characterize {model} --engine {engine_key}")
             selected_authority_key = selected_authority.key
 
+    characterized_ceiling = safe
+    if ctx is not None and (msg := _ctx_gate_msg(ctx, characterized_ceiling, model)):
+        return err(msg)
+    effective_context = ctx if ctx is not None else characterized_ceiling
+    safe = effective_context
     stale_ceiling = _stale_ceiling_note(
         c, evidence_model, ceiling_measured_at, as_json=as_json)
     lever_err = _unsupported_lever_error(backend, kv_quant=kv_quant, flash_attn=flash_attn,
@@ -3601,6 +3630,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
                    f"re-run: ara characterize {model}")
 
+    if not as_json:
+        _emit_run_context(c, characterized_ceiling, effective_context)
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
     # --yes or a non-tty (scripts/--json) proceed straight to the governed run.
     if not as_json and not assume_yes and sys.stdin.isatty():
@@ -3651,7 +3682,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err("run failed: engine returned an invalid completion")
     if as_json:
         print(json.dumps({"model": model, "engine": engine_key,
-                          "safe_context": safe, "stale_ceiling": stale_ceiling,
+                          "safe_context": characterized_ceiling,
+                          "characterized_ceiling": characterized_ceiling,
+                          "effective_context": effective_context,
+                          "stale_ceiling": stale_ceiling,
                           "completion": completion}, indent=2))
         return 0
     c.emit()
@@ -5947,14 +5981,16 @@ def _click_recommend(ctx: click.Context, use_case: str | None,
 @click.argument("prompt", nargs=-1)
 @click.option("--prompt-file", type=click.Path(path_type=Path), metavar="PATH",
               help="Read a UTF-8 prompt from PATH (maximum 1 MiB).")
+@click.option("--ctx", "run_ctx", type=click.IntRange(min=1), metavar="N",
+              help="Lower context cap; never above the measured safe ceiling.")
 @_run_engine_option
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_generation_options
 @_json_verbose_options
 @click.pass_context
 def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...],
-               prompt_file: Path | None, engine: str | None, assume_yes: bool,
-               max_tokens: int, kv_quant: str, weight_quant: str,
+               prompt_file: Path | None, run_ctx: int | None, engine: str | None,
+               assume_yes: bool, max_tokens: int, kv_quant: str, weight_quant: str,
                prefill_chunk: int | None, chunked_prefill: bool, no_flash_attn: bool,
                flash_attn: bool, verbose: bool, as_json: bool) -> int:
     """Generate one governed completion under MODEL's characterized safe ceiling.
@@ -5976,7 +6012,7 @@ def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...],
             c.emit(c.style("bad", f"  {exc}"))
         return 1
     return render_run(
-        c, model, prompt=resolved_prompt, engine=engine,
+        c, model, prompt=resolved_prompt, engine=engine, ctx=run_ctx,
         assume_yes=assume_yes, as_json=as_json, max_tokens=max_tokens,
         flash_attn=not no_flash_attn,
         flash_attn_optin=flash_attn, kv_quant=kv_quant, weight_quant=weight_quant,
