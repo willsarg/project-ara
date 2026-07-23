@@ -69,6 +69,29 @@ def _authority(**changes):
     return replace(authority, **changes)
 
 
+def test_methodology_and_runtime_fingerprint_are_versioned_stable_and_scoped():
+    authority = _authority(configured_inputs=(
+        ("OLLAMA_KEEP_ALIVE", "2m"),
+        ("OLLAMA_KV_CACHE_TYPE", "q8_0"),
+    ))
+
+    assert evidence.CHARACTERIZATION_METHODOLOGY_KEY.startswith(
+        "methodology:v1:sha256:")
+    fingerprint = evidence.runtime_fingerprint(authority)
+    assert fingerprint.startswith("engine:v1:sha256:")
+    assert evidence.runtime_fingerprint(authority) == fingerprint
+    assert evidence.runtime_fingerprint(replace(
+        authority,
+        configured_inputs=tuple(reversed(authority.configured_inputs)),
+    )) == fingerprint
+    assert evidence.runtime_fingerprint(replace(
+        authority, server_version="0.30.11")) != fingerprint
+    assert evidence.runtime_fingerprint(replace(
+        authority, server_instance_id="99:999.0:/usr/bin/ollama")) != fingerprint
+    assert evidence.runtime_fingerprint(replace(
+        authority, issue="listener_unattributed")) is None
+
+
 def _model(**changes):
     model = ollama.OllamaModel(
         name="qwen3:0.6b",
@@ -142,8 +165,8 @@ def _complete_characterization(store, *, authority=None, model=None):
         points=[point],
         artifact_id="ollama-manifest-sha256:" + model.digest,
         config=config,
-        methodology_key="methodology:ollama-physical-walls-v1",
-        engine_fingerprint="engine:ollama-runtime-test",
+        methodology_key=evidence.CHARACTERIZATION_METHODOLOGY_KEY,
+        engine_fingerprint=evidence.runtime_fingerprint(authority),
     )
     return model, authority
 
@@ -209,6 +232,30 @@ def test_assessment_separates_display_row_from_strict_reusable_row(store):
     assert assessment.display["safe_context"] == 4096
     assert assessment.reusable is assessment.display
     assert assessment.reason is None
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "reason"),
+    [
+        ("methodology_key", "methodology:v1:sha256:old", "methodology_mismatch"),
+        ("engine_fingerprint", "engine:v1:sha256:old", "runtime_fingerprint_mismatch"),
+    ],
+)
+def test_assessment_rejects_methodology_or_runtime_fingerprint_drift(
+        store, column, value, reason):
+    model, authority = _complete_characterization(store)
+    store.execute(
+        f"UPDATE characterizations SET {column}=? WHERE machine_key='machine'",
+        (value,),
+    )
+    store.commit()
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == reason
 
 
 def test_assessment_keeps_size_only_preflight_history_display_only(store):
@@ -282,6 +329,32 @@ def test_assessment_selects_exact_artifact_when_newer_history_coexists(store):
     assert assessment.reusable["safe_context"] == 4096
 
 
+def test_assessment_prefers_current_identity_over_newer_mismatched_history(store):
+    model, authority = _complete_characterization(store)
+    current = db.get_characterization(store, "machine", "ollama", model.name)
+    db.save_characterization(
+        store,
+        "machine",
+        "ollama",
+        model.name,
+        safe_context=2048,
+        points=current["points"],
+        artifact_id=current["artifact_id"],
+        config=current["config"],
+        measured_at="9999-01-01T00:00:00+00:00",
+        methodology_key="methodology:v1:sha256:old",
+        engine_fingerprint=current["engine_fingerprint"],
+    )
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.reason is None
+    assert assessment.reusable["safe_context"] == 4096
+    assert assessment.reusable["methodology_key"] == (
+        evidence.CHARACTERIZATION_METHODOLOGY_KEY)
+
+
 def test_legacy_characterization_stays_displayable_but_is_not_reusable(store):
     model = _model()
     db.save_characterization(
@@ -339,6 +412,20 @@ def test_reuse_requires_complete_current_runtime_authority(store):
 
     assessment = evidence.assess_characterization(
         store, "machine", model, _authority(issue="listener_unattributed"))
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == "runtime_authority_incomplete"
+
+
+def test_reuse_refuses_runtime_without_fingerprintable_endpoint(store):
+    model, authority = _complete_characterization(store)
+    endpoint = ollama.OllamaEndpoint(None, "loopback")
+    changed = replace(authority, endpoint=endpoint)
+    _rewrite_characterization_config(store, endpoint_authority=None)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, changed)
 
     assert assessment.display is not None
     assert assessment.reusable is None

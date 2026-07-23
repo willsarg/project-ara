@@ -4175,6 +4175,10 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     authority, authority_error = _ollama_runtime_authority(endpoint)
     if authority_error:
         return err(authority_error)
+    engine_fingerprint = ollama_evidence.runtime_fingerprint(authority)
+    if engine_fingerprint is None:
+        return err("Ollama runtime identity is incomplete; refusing characterization without "
+                   "a stable engine fingerprint.")
     models = ollama.inventory()
     if models is None:
         return err("couldn't list Ollama models — is the server reachable?")
@@ -4269,12 +4273,18 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None,
-                                 artifact_id=artifact_id, config=config)
+                                 artifact_id=artifact_id, config=config,
+                                 methodology_key=(
+                                     ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY),
+                                 engine_fingerprint=engine_fingerprint)
     if as_json:
         print(json.dumps({"model": model, "engine": "ollama", "safe_context": best,
                           "source": "measured", "max_context": max_ctx,
                           "preload_admission": ollama_evidence.ADMISSION_METHODOLOGY,
-                          "watchdog": ollama_evidence.WATCHDOG_STATUS}))
+                          "watchdog": ollama_evidence.WATCHDOG_STATUS,
+                          "methodology_key": (
+                              ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY),
+                          "engine_fingerprint": engine_fingerprint}))
         return 0
     c.emit(c.style(
         "warn",

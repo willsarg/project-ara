@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import platform
 import shutil
 import subprocess
@@ -12,7 +14,7 @@ from typing import Any
 
 import psutil
 
-from ara import db, hardware, ollama
+from ara import db, hardware, methodology, ollama
 
 
 _MIB = 1024 ** 2
@@ -25,6 +27,73 @@ _MODEL_RESIDENCY_NUMERATOR = 5
 _MODEL_RESIDENCY_DENOMINATOR = 4
 _KV_ELEMENT_BYTES = 4
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
+
+CHARACTERIZATION_METHODOLOGY = {
+    "schema": "ollama-characterization-methodology:v1",
+    "ramp_contract": "direct-context-only:v1",
+    "schedule_policy": "2048-doubling-plus-model-maximum:v1",
+    "repeats": 1,
+    "probe_protocol": "derived-manifest-one-token-residency:v1",
+    "model_identity": "ollama-manifest-sha256:v1",
+    "runtime_authority": "exact-listener-instance-version-and-config:v1",
+    "parallelism_policy": "configured-maximum-one:v1",
+    "placement_evidence": "ollama-ps-plus-physical-walls:v1",
+    "preload_admission": ADMISSION_METHODOLOGY,
+    "model_residency_bound": {
+        "numerator": _MODEL_RESIDENCY_NUMERATOR,
+        "denominator": _MODEL_RESIDENCY_DENOMINATOR,
+    },
+    "kv_element_bytes": _KV_ELEMENT_BYTES,
+    "runtime_overhead_bytes": RUNTIME_OVERHEAD_BYTES,
+    "reserve_bytes": {
+        "system": SYSTEM_MARGIN_BYTES,
+        "accelerator": ACCELERATOR_MARGIN_BYTES,
+    },
+    "watchdog": WATCHDOG_STATUS,
+}
+CHARACTERIZATION_METHODOLOGY_KEY = methodology.key(
+    CHARACTERIZATION_METHODOLOGY)
+
+
+def runtime_fingerprint(authority: ollama.OllamaRuntimeAuthority) -> str | None:
+    """Hash the exact observable Ollama daemon identity and governed configuration."""
+
+    if (
+        authority.issue is not None
+        or authority.endpoint.scope != "loopback"
+        or not isinstance(authority.endpoint.url, str)
+        or not authority.endpoint.url
+        or not isinstance(authority.server_version, str)
+        or not authority.server_version
+        or not isinstance(authority.server_instance_id, str)
+        or not authority.server_instance_id
+        or authority.configured_num_parallel != 1
+        or not isinstance(authority.configured_num_parallel_authority, str)
+        or not authority.configured_num_parallel_authority
+        or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(value, str) for value in item)
+            for item in authority.configured_inputs
+        )
+    ):
+        return None
+    payload = {
+        "schema": "ollama-runtime-fingerprint:v1",
+        "endpoint": authority.endpoint.url,
+        "server_version": authority.server_version,
+        "server_instance_id": authority.server_instance_id,
+        "listener_pid": authority.listener_pid,
+        "listener_bind_host": authority.listener_bind_host,
+        "configured_inputs": sorted(
+            [list(item) for item in authority.configured_inputs]),
+        "configured_num_parallel": authority.configured_num_parallel,
+        "configured_num_parallel_authority": (
+            authority.configured_num_parallel_authority),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()
+    return "engine:v1:sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -210,6 +279,7 @@ def assess_characterization(
         _OLLAMA_ARTIFACT_PREFIX + model.digest if model.digest is not None else None)
     artifact_rows = [row for row in rows if row.get("artifact_id") == expected_artifact]
     candidates = artifact_rows or rows
+    expected_fingerprint = runtime_fingerprint(authority)
 
     def current_authority(row: dict[str, Any]) -> bool:
         config = row.get("config")
@@ -220,11 +290,18 @@ def assess_characterization(
                 and config.get("configured_inputs") == dict(authority.configured_inputs))
 
     row = max(candidates, key=lambda item: (
+        (
+            current_authority(item)
+            and item.get("methodology_key") == CHARACTERIZATION_METHODOLOGY_KEY
+            and item.get("engine_fingerprint") == expected_fingerprint
+        ),
         current_authority(item), item.get("measured_at") or "",
         item.get("config_key") or ""))
     config = row.get("config")
     if not isinstance(config, dict) or config.get("methodology") != "ollama-physical-walls-v1":
         return _display_only(row, "methodology_missing_or_unsupported")
+    if row.get("methodology_key") != CHARACTERIZATION_METHODOLOGY_KEY:
+        return _display_only(row, "methodology_mismatch")
     if ollama.initial_governed_model_error(model) is not None:
         return _display_only(row, "unsupported_model_cell")
     if expected_artifact is None or row.get("artifact_id") != expected_artifact:
@@ -302,6 +379,10 @@ def assess_characterization(
         return _display_only(row, "wall_evidence_incomplete")
     if not _admission_evidence_complete(config, point):
         return _display_only(row, "preload_admission_evidence_incomplete")
+    if expected_fingerprint is None:
+        return _display_only(row, "runtime_authority_incomplete")
+    if row.get("engine_fingerprint") != expected_fingerprint:
+        return _display_only(row, "runtime_fingerprint_mismatch")
     if not row.get("reusable"):
         return _display_only(row, "storage_evidence_not_reusable")
     return CharacterizationAssessment(row, row, None)

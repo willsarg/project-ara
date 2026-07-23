@@ -813,6 +813,20 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
         "measured_at": None,
         "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
         "reusable": True,
+        "methodology_key": (
+            cli.ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY),
+        "engine_fingerprint": cli.ollama_evidence.runtime_fingerprint(
+            cli.ollama.OllamaRuntimeAuthority(
+                endpoint=cli.ollama.OllamaEndpoint(
+                    "http://127.0.0.1:11434", "loopback"),
+                server_version="0.30.10",
+                server_instance_id="42:1234.500000:/usr/bin/ollama",
+                listener_pid=42,
+                listener_bind_host="127.0.0.1",
+                configured_num_parallel=1,
+                configured_num_parallel_authority="exact_version_default",
+            ),
+        ),
         "points": [point],
         "config": {
             "methodology": "ollama-physical-walls-v1",

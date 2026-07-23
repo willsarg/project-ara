@@ -6001,9 +6001,17 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
     assert out["safe_context"] == 4096 and out["source"] == "measured" and out["engine"] == "ollama"
     assert out["preload_admission"] == "context-aware-conservative-v1"
     assert out["watchdog"] == "unavailable-external-daemon"
+    assert out["methodology_key"] == cli.ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY
     with cli.db.connected() as con:
         row = cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")
+        authority = cli.ollama.runtime_authority(
+            cli.ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"))
+        expected_fingerprint = cli.ollama_evidence.runtime_fingerprint(authority)
         assert row["safe_context"] == 4096
+        assert row["reusable"] is True
+        assert row["methodology_key"] == (
+            cli.ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY)
+        assert row["engine_fingerprint"] == expected_fingerprint
         assert row["artifact_id"] == "ollama-manifest-sha256:" + "a" * 64
         assert row["config"]["methodology"] == "ollama-physical-walls-v1"
         assert row["config"]["runtime_version"] == "0.30.10"
@@ -6025,6 +6033,14 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
         assert row["config"]["characterization_probe_context"] == 8192
         assert row["config"]["preload_admission"] == admission.as_dict()
         assert row["config"]["watchdog"] == "unavailable-external-daemon"
+        assessment = cli.ollama_evidence.assess_characterization(
+            con,
+            "mk",
+            _local_ollama_model("qwen3:0.6b", digest="a" * 64),
+            authority,
+        )
+        assert assessment.reusable is not None
+        assert assessment.reusable["safe_context"] == 4096
 
 
 def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, capsys):
@@ -10053,6 +10069,17 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
                 "watchdog": cli.ollama_evidence.WATCHDOG_STATUS,
             },
         }
+    if characterization is not None:
+        authority = cli.ollama.runtime_authority(
+            cli.ollama.OllamaEndpoint(
+                "http://127.0.0.1:11434", "loopback"))
+        characterization = {
+            "methodology_key": (
+                cli.ollama_evidence.CHARACTERIZATION_METHODOLOGY_KEY),
+            "engine_fingerprint": (
+                cli.ollama_evidence.runtime_fingerprint(authority)),
+            **characterization,
+        }
     monkeypatch.setattr(
         cli.db, "list_characterizations_for_display",
         lambda *_a, **_k: [] if characterization is None else [characterization],
@@ -11744,6 +11771,31 @@ def test_characterize_ollama_refuses_display_only_runtime_before_inventory(
 
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "another process" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_unfingerprintable_runtime_before_inventory(
+        make_console, monkeypatch):
+    endpoint = cli.ollama.OllamaEndpoint(
+        "http://127.0.0.1:11434", "loopback")
+    monkeypatch.setattr(
+        cli.ollama,
+        "runtime_authority",
+        lambda _endpoint: cli.ollama.OllamaRuntimeAuthority(
+            endpoint=endpoint,
+            server_version="0.30.10",
+            server_instance_id=None,
+            configured_num_parallel=1,
+            configured_num_parallel_authority="exact_version_default",
+        ),
+    )
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda *_a, **_k: pytest.fail("read inventory without a stable fingerprint"))
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+
+    assert "stable engine fingerprint" in buf.getvalue()
 
 
 def test_ollama_safe_ceiling_uses_only_the_reusable_assessment(monkeypatch):
