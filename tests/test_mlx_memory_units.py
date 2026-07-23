@@ -169,7 +169,7 @@ def test_terminate_process_group_falls_back_without_killpg(monkeypatch) -> None:
             if timeout is not None:
                 raise probe.subprocess.TimeoutExpired("worker", timeout)
 
-    monkeypatch.delattr(probe.os, "killpg")
+    monkeypatch.delattr(probe.os, "killpg", raising=False)
 
     probe._terminate_process_group(Process())
 
