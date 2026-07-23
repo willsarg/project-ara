@@ -2165,7 +2165,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         cache_con.row_factory = sqlite3.Row
         cache_con.executescript(db.SCHEMA)
         stack.callback(cache_con.close)
-        catalog.scan(cache_con)            # ephemeral snapshot of the local cache
+        _, unresolved_models = catalog.scan_with_unresolved(
+            cache_con)                     # ephemeral snapshot of the local cache
         evidence_con = (stack.enter_context(db.connected_readonly())
                         if db._db_path().is_file() else cache_con)
         for durable in catalog.all_models(evidence_con):
@@ -2201,7 +2202,11 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         best = _best_ceilings(evidence_con)  # current without crossing the engine seam
 
         recs = []
-        explanations = []
+        explanations = ([{
+            "model_id": model_id,
+            "status": "unrankable",
+            "reason": "artifact_unresolved",
+        } for model_id in unresolved_models] if explain else [])
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
         models = catalog.all_models(cache_con)
         for row in models:

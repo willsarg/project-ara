@@ -3408,6 +3408,7 @@ def _wire_recommend(monkeypatch, set_platform, models, machine=None):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "scan_with_unresolved", lambda con: (0, []))
     monkeypatch.setattr(cli.catalog, "all_models", lambda con: models)
     monkeypatch.setattr(cli.db, "list_characterizations", lambda con, mk, e: [])
     monkeypatch.setattr(cli.staleness, "artifact_identity",
@@ -3496,6 +3497,27 @@ def test_recommend_explain_json_accounts_for_every_cached_model(
     assert by_model["org/UnknownSize"]["reason"] == "size_unknown"
     assert by_model["org/UnknownArchitecture"]["status"] == "unrankable"
     assert by_model["org/UnknownArchitecture"]["reason"] == "architecture_unknown"
+
+
+def test_recommend_explain_reports_cached_model_with_unresolved_artifact(
+        monkeypatch, set_platform, tmp_path, capsys):
+    set_platform("Darwin", "arm64")
+    machine = _machine(backend="cpu", ram_total_gb=48.0, chip="Test CPU")
+    monkeypatch.setattr(cli.detect, "machine", lambda: machine)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: machine.backend)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "_hf_cache_models", lambda: ["org/Unresolved"])
+    monkeypatch.setattr(cli.catalog, "describe", lambda _model_id: None)
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "missing.sqlite"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == [{
+        "model_id": "org/Unresolved",
+        "status": "unrankable",
+        "reason": "artifact_unresolved",
+    }]
 
 
 def test_recommend_explain_reports_unknown_budget(
