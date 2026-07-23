@@ -110,7 +110,11 @@ class _FakeEngine:
         self.measured.append(ctx)
         if self.refuse_at is not None and ctx >= self.refuse_at:
             return {"context": ctx, "refused": True, "reason": "engine veto"}
-        return {"context": ctx, "mem_gb": self.intercept + self.slope * (ctx / 1000)}
+        return _measurement(
+            ctx,
+            self.intercept + self.slope * (ctx / 1000),
+            ram_budget=self.est["ram_budget_gb"],
+        )
 
 
 def _patch(monkeypatch, fake, vram_margin=1.0, ram_margin=2.0):
@@ -135,11 +139,45 @@ class _StreamCaptureFakeEngine:
         if "--preflight" in argv:
             return dict(self.est)
         ctx = int(argv[2])
-        return {"context": ctx, "mem_gb": self.intercept + self.slope * (ctx / 1000)}
+        return _measurement(
+            ctx,
+            self.intercept + self.slope * (ctx / 1000),
+            ram_budget=self.est["ram_budget_gb"],
+        )
 
 
 _EST = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 20.0,
-        "max_context": 4000, "ref_baseline_gb": 0.0}
+        "max_context": 4000, "ref_baseline_gb": 0.0,
+        "n_layers": 32, "fit_layers": 16,
+        "vram_budget_gb": 8.0, "ram_budget_gb": 20.0,
+        "fit_dimension": "ram_absolute", "memory_unit": "GiB"}
+
+
+def _measurement(context, absolute_ram, *, ram_budget=20.0):
+    return {
+        "context": context,
+        "mem_gb": absolute_ram,
+        "telemetry": {
+            "schema": "cuda-gguf-two-wall-telemetry:v1",
+            "fit_dimension": "ram_absolute",
+            "unit": "GiB",
+            "gpu_layers": 16,
+            "vram": {"observed_gb": 4.0, "budget_gb": 8.0},
+            "ram": {
+                "observed_buffers_gb": absolute_ram - 1.0,
+                "baseline_gb": 1.0,
+                "observed_absolute_gb": absolute_ram,
+                "budget_gb": ram_budget,
+            },
+            "provenance": {
+                "source": "llama.cpp-load-log",
+                "aggregation": "median",
+                "repeat_count": 3,
+                "vram_buffer_lines": 3,
+                "ram_buffer_lines": 2,
+            },
+        },
+    }
 
 
 def test_characterize_progress_true_passes_stream_true_to_run_worker(monkeypatch):
@@ -182,12 +220,23 @@ def test_characterize_passes_kv_dtype_bytes_2_0_to_driver(monkeypatch):
     assert seen["kv_dtype_bytes"] == 2.0
 
 
+def test_characterization_methodology_names_dimension_bound_two_wall_protocol():
+    descriptor = cuda_gguf.characterization_methodology()
+
+    assert descriptor["worker_protocol"] == "ara-cuda-gguf-llama-measurement:v2"
+    assert descriptor["telemetry_failure_policy"] == (
+        "dimension-bound-two-wall-fail-closed:v2")
+
+
 # --------------------------------------------------------------------------- #
 # characterize — drives the shared driver over the cuda_gguf env
 # --------------------------------------------------------------------------- #
 def test_characterize_drives_shared_driver_over_cuda_gguf_env(monkeypatch):
     est = {"base_gb": 5.0, "slope_gb_per_k": 1.0, "budget_gb": 36.0,
-           "max_context": 16000, "ref_baseline_gb": 0.0}
+           "max_context": 16000, "ref_baseline_gb": 0.0,
+           "n_layers": 32, "fit_layers": 16,
+           "vram_budget_gb": 8.0, "ram_budget_gb": 36.0,
+           "fit_dimension": "ram_absolute", "memory_unit": "GiB"}
     fake = _FakeEngine(est)
     _patch(monkeypatch, fake)
     r = cuda_gguf.characterize("org/model")
@@ -195,7 +244,10 @@ def test_characterize_drives_shared_driver_over_cuda_gguf_env(monkeypatch):
     assert r["safe_context"] == 16_000
     assert r["binding"] == "context_window"
     assert all(c <= 16000 for c in fake.measured)
-    assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
+    assert r["points"][0]["mem_gb"] == 7.0
+    assert r["points"][0]["measurement_dimension"] == "ram_absolute"
+    assert r["points"][0]["memory_unit"] == "GiB"
+    assert r["points"][0]["telemetry"]["vram"]["observed_gb"] == 4.0
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):

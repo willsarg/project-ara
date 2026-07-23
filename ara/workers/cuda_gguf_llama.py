@@ -11,9 +11,10 @@ Self-contained (never imports ``ara``; ``llama_cpp`` only inside functions), lik
 workers — so its novel pure logic (the per-layer split, the K auto-fit, the two-wall gate, the
 load-log buffer parse, the partial-offload honest check) is unit-testable in ARA's venv
 (tests/test_workers_cuda_gguf_llama.py). It mirrors the canonical worker contract so ARA's
-engine-agnostic driver treats it like the others, but reports two budgets and certifies the real
-footprint from llama.cpp's **parseable load log** (CUDA0 buffers → VRAM, CPU_Mapped/CPU KV → RAM),
-not RSS (mmap leaves offloaded pages in the page cache → RSS lies).
+engine-agnostic driver treats it like the others. The scalar fit is explicitly absolute system
+RAM; every point also reports the separately governed VRAM wall. Both observations come from
+llama.cpp's **parseable load log** (CUDA0 buffers → VRAM, CPU_Mapped/CPU KV → RAM), not RSS
+(mmap leaves offloaded pages in the page cache → RSS lies).
 
 Design: Designs/specs/2026-06-29-cuda-gguf-hybrid-two-wall-engine.md.
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
@@ -77,6 +79,13 @@ KV_BYTES_F16 = 2
 RESIDENT_FACTOR = 1.0
 # Fixed CUDA-context/compute floor (cuBLAS + kernels), ≈1516 MiB per the oobabooga empirical fit.
 CUDA_FLOOR_GB = 1.5
+TWO_WALL_SCHEMA = "cuda-gguf-two-wall-telemetry:v1"
+FIT_DIMENSION = "ram_absolute"
+MEMORY_UNIT = "GiB"
+
+
+class BufferTelemetryError(ValueError):
+    """llama.cpp's load log did not prove both CUDA-GGUF memory walls."""
 
 
 # --------------------------------------------------------------------------- #
@@ -227,28 +236,71 @@ def _governed_chat_completion(llm, prompt: str, max_tokens: int,
 
 def parse_offloaded(stderr: str) -> tuple[int, int] | None:
     """Parse ``offloaded K/N layers to GPU`` → (K, N), or None if absent (CPU-only / fallback)."""
-    m = re.search(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers\s+to\s+GPU", stderr)
-    return (int(m.group(1)), int(m.group(2))) if m else None
+    matches = re.findall(
+        r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers\s+to\s+GPU", stderr)
+    if len(matches) != 1:
+        return None
+    return int(matches[0][0]), int(matches[0][1])
 
 
 def parse_cuda_device(stderr: str) -> dict | None:
     """Parse llama.cpp's CUDA device line ``... Device 0: <name>, ...`` → {name}, or None."""
-    m = re.search(r"Device\s+\d+:\s*([^,\n]+)", stderr)
-    return {"name": m.group(1).strip()} if m else None
+    matches = re.findall(r"Device\s+\d+:\s*([^,\n]+)", stderr)
+    return {"name": matches[0].strip()} if len(matches) == 1 else None
 
 
 def parse_cuda_buffers(stderr: str) -> dict:
     """The post-load TRUTH from the load log. Sum every ``CUDA0 … buffer size = N MiB`` line into
     the VRAM side and every ``CPU[_Mapped] … buffer size = N MiB`` line into the RAM side (weights +
-    KV + compute). Returns ``{vram_gb, ram_gb}``. Trusted over RSS (mmap page-cache lies)."""
-    def _sum(pattern: str) -> float:
-        return sum(float(x) for x in re.findall(pattern, stderr))
-    vram_mib = _sum(r"CUDA0[^\n=]*buffer size\s*=\s*([\d.]+)\s*MiB")
-    ram_mib = _sum(r"CPU(?:_Mapped)?[^\n=]*buffer size\s*=\s*([\d.]+)\s*MiB")
-    return {"vram_gb": round(vram_mib / 1024, 4), "ram_gb": round(ram_mib / 1024, 4)}
+    KV + compute). Missing, malformed, multi-device, non-finite, and zero-total evidence is
+    rejected instead of being silently converted to zero."""
+    relevant = [
+        line for line in stderr.splitlines()
+        if "buffer size" in line and re.search(r"\b(?:CUDA\d+|CPU(?:_Mapped)?)\b", line)
+    ]
+    pattern = re.compile(
+        r"\b(CUDA(\d+)|CPU(?:_Mapped)?)\b[^\n=]*buffer size\s*=\s*(\S+)\s*MiB\b")
+    values = {"vram": [], "ram": []}
+    for line in relevant:
+        match = pattern.search(line)
+        if match is None:
+            raise BufferTelemetryError(
+                "incomplete buffer telemetry: malformed buffer line")
+        device, cuda_index, raw_value = match.groups()
+        if cuda_index is not None and cuda_index != "0":
+            raise BufferTelemetryError(
+                "ambiguous buffer telemetry: expected exactly CUDA device 0")
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise BufferTelemetryError(
+                "buffer telemetry values must be finite non-negative numbers") from exc
+        if not math.isfinite(value) or value < 0:
+            raise BufferTelemetryError(
+                "buffer telemetry values must be finite non-negative numbers")
+        values["vram" if device.startswith("CUDA") else "ram"].append(value)
+    if not values["vram"] or not values["ram"]:
+        raise BufferTelemetryError(
+            "incomplete buffer telemetry: both VRAM and RAM buffer lines are required")
+    vram_mib = sum(values["vram"])
+    ram_mib = sum(values["ram"])
+    if vram_mib <= 0 or ram_mib <= 0:
+        raise BufferTelemetryError(
+            "incomplete buffer telemetry: both wall observations must be positive")
+    return {
+        "vram_gb": round(vram_mib / 1024, 4),
+        "ram_gb": round(ram_mib / 1024, 4),
+        "vram_buffer_lines": len(values["vram"]),
+        "ram_buffer_lines": len(values["ram"]),
+    }
 
 
-def offload_ok_partial(device: dict | None, offloaded: tuple[int, int] | None) -> str | None:
+def offload_ok_partial(
+    device: dict | None,
+    offloaded: tuple[int, int] | None,
+    *,
+    expected_gpu_layers: int | None = None,
+) -> str | None:
     """Honest-offload guard (Rule #3). PARTIAL (0 < K ≤ N) on a real CUDA device is the expected
     hybrid state — accepted (unlike Vulkan, which demands full offload). Refuse the
     silent-CPU-fallback (#2079): no offload line at all, K==0, or a software device."""
@@ -256,12 +308,93 @@ def offload_ok_partial(device: dict | None, offloaded: tuple[int, int] | None) -
         return ("GPU offload not active (no 'offloaded N/M layers to GPU' line — the CUDA "
                 "llama.cpp wheel may have fallen back to CPU, see abetlen #2079)")
     k, _n = offloaded
+    if device is None or not isinstance(device.get("name"), str) or not device["name"].strip():
+        return "CUDA device identity is missing or ambiguous"
     if k == 0:
         return "model ran on CPU (0 layers offloaded) — not a hybrid run"
-    name = (device or {}).get("name", "") or ""
+    if k > _n:
+        return f"contradictory offload telemetry ({k}/{_n} layers)"
+    if expected_gpu_layers is not None and k != expected_gpu_layers:
+        return (
+            f"offload telemetry reports {k} GPU layers but ARA requested "
+            f"{expected_gpu_layers}"
+        )
+    name = device["name"]
     if "llvmpipe" in name.lower() or "software" in name.lower():
         return f"refusing a software rasterizer device ({name!r}) — not a real CUDA GPU"
     return None
+
+
+def _finite_nonnegative(value, label: str, *, positive: bool = False) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or (positive and value == 0)
+    ):
+        qualifier = "positive " if positive else ""
+        raise BufferTelemetryError(
+            f"{label} must be a finite {qualifier}number")
+    return float(value)
+
+
+def two_wall_measurement(gpu_layers: int, buffers: dict, budgets: dict) -> dict:
+    """Bind the scalar fit to absolute RAM while preserving both measured walls."""
+
+    if not isinstance(gpu_layers, int) or isinstance(gpu_layers, bool) or gpu_layers <= 0:
+        raise BufferTelemetryError("gpu_layers must be a positive integer")
+    vram = _finite_nonnegative(buffers.get("vram_gb"), "measured VRAM", positive=True)
+    ram_buffers = _finite_nonnegative(
+        buffers.get("ram_gb"), "measured RAM buffers", positive=True)
+    ram_baseline = _finite_nonnegative(
+        budgets.get("ram_used_gb"), "RAM baseline")
+    vram_budget = _finite_nonnegative(
+        budgets.get("vram_budget_gb"), "VRAM budget", positive=True)
+    ram_budget = _finite_nonnegative(
+        budgets.get("ram_budget_gb"), "RAM budget", positive=True)
+    vram_lines = buffers.get("vram_buffer_lines")
+    ram_lines = buffers.get("ram_buffer_lines")
+    if (
+        not isinstance(vram_lines, int)
+        or isinstance(vram_lines, bool)
+        or vram_lines <= 0
+        or not isinstance(ram_lines, int)
+        or isinstance(ram_lines, bool)
+        or ram_lines <= 0
+    ):
+        raise BufferTelemetryError(
+            "buffer telemetry provenance needs positive line counts")
+    ram_absolute = round(ram_baseline + ram_buffers, 4)
+    if vram >= vram_budget:
+        raise BufferTelemetryError(
+            f"measured VRAM {vram:.2f}GiB >= safe budget {vram_budget:.2f}GiB")
+    if ram_absolute >= ram_budget:
+        raise BufferTelemetryError(
+            f"measured RAM {ram_absolute:.2f}GiB >= safe budget {ram_budget:.2f}GiB")
+    return {
+        "mem_gb": ram_absolute,
+        "telemetry": {
+            "schema": TWO_WALL_SCHEMA,
+            "fit_dimension": FIT_DIMENSION,
+            "unit": MEMORY_UNIT,
+            "gpu_layers": gpu_layers,
+            "vram": {"observed_gb": vram, "budget_gb": vram_budget},
+            "ram": {
+                "observed_buffers_gb": ram_buffers,
+                "baseline_gb": ram_baseline,
+                "observed_absolute_gb": ram_absolute,
+                "budget_gb": ram_budget,
+            },
+            "provenance": {
+                "source": "llama.cpp-load-log",
+                "aggregation": "single",
+                "repeat_count": 1,
+                "vram_buffer_lines": vram_lines,
+                "ram_buffer_lines": ram_lines,
+            },
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -352,19 +485,20 @@ def preflight(model: str, *, vram_margin_gb: float, ram_margin_gb: float) -> dic
     weights = _model_weights_gb(gguf)
     n = n_layers_from(meta)
     slope = kv_slope_gb_per_k(meta)
-    live = _used_ram_gb()
     win = max_context_from(meta)
     k = fit_layers(n, weights, slope, min(win, 4000), b["vram_budget_gb"])
     return {
-        "base_gb": round(live + ram_estimate(k, n, weights, slope, 0, 0.0), 4),
-        "ref_baseline_gb": round(live, 4),
+        "base_gb": round(
+            b["ram_used_gb"] + ram_estimate(k, n, weights, slope, 0, 0.0), 4),
+        "ref_baseline_gb": 0.0,
         "slope_gb_per_k": slope,
-        "budget_gb": b["ram_budget_gb"],   # the driver ramps ctx on the RAM wall (the binding one
-                                           # as K shrinks at high ctx); the worker guards VRAM per rung
+        "budget_gb": b["ram_budget_gb"],
         "n_layers": n,
         "fit_layers": k,
         "vram_budget_gb": b["vram_budget_gb"],
         "ram_budget_gb": b["ram_budget_gb"],
+        "fit_dimension": FIT_DIMENSION,
+        "memory_unit": MEMORY_UNIT,
         "max_context": win,
     }
 
@@ -380,7 +514,7 @@ def _gate(gguf: str, meta: dict, ctx: int, vram_margin_gb: float,
     weights = _model_weights_gb(gguf)
     n = n_layers_from(meta)
     slope = kv_slope_gb_per_k(meta)
-    live = _used_ram_gb()
+    live = b["ram_used_gb"]
     k = fit_layers(n, weights, slope, ctx, b["vram_budget_gb"])
     reason = two_wall_gate(k, n, weights, slope, ctx, vram_budget_gb=b["vram_budget_gb"],
                            ram_budget_gb=b["ram_budget_gb"], live_base_gb=live)
@@ -401,16 +535,25 @@ def _load(gguf: str, ctx: int, n_gpu_layers: int):
     return llm, buf.getvalue()
 
 
-def _verify_offload(stderr: str, b: dict) -> str | None:
+def _verify_offload(
+    stderr: str,
+    b: dict,
+    *,
+    expected_gpu_layers: int,
+) -> str | None:
     """Honest-offload (Rule #3) + measured two-wall check (L2) from the load log."""
-    reason = offload_ok_partial(parse_cuda_device(stderr), parse_offloaded(stderr))
+    reason = offload_ok_partial(
+        parse_cuda_device(stderr),
+        parse_offloaded(stderr),
+        expected_gpu_layers=expected_gpu_layers,
+    )
     if reason is not None:
         return reason
-    m = parse_cuda_buffers(stderr)
-    if m["vram_gb"] >= b["vram_budget_gb"]:
-        return f"measured VRAM {m['vram_gb']:.2f}GiB >= safe budget {b['vram_budget_gb']:.2f}GiB"
-    if m["ram_gb"] + b.get("ram_used_gb", 0.0) >= b["ram_budget_gb"]:
-        return f"measured RAM {m['ram_gb']:.2f}GiB >= safe budget {b['ram_budget_gb']:.2f}GiB"
+    try:
+        m = parse_cuda_buffers(stderr)
+        two_wall_measurement(expected_gpu_layers, m, b)
+    except BufferTelemetryError as exc:
+        return str(exc)
     return None
 
 
@@ -426,15 +569,41 @@ def run(model: str, ctx: int, *, vram_margin_gb: float, ram_margin_gb: float,
     if isinstance(gated, dict):
         return gated
     k, b = gated
-    vrams = []
+    measurements = []
     for _ in range(max(1, repeats)):
         llm, stderr = _load(gguf, ctx, k)
-        bad = _verify_offload(stderr, b)
+        bad = _verify_offload(stderr, b, expected_gpu_layers=k)
         if bad is not None:
             return _refused(ctx, bad)
-        vrams.append(parse_cuda_buffers(stderr)["vram_gb"])
+        try:
+            measurements.append(two_wall_measurement(
+                k, parse_cuda_buffers(stderr), b))
+        except BufferTelemetryError as exc:
+            return _refused(ctx, str(exc))
         del llm
-    return {"context": ctx, "gpu_layers": k, "mem_gb": round(statistics.median(vrams), 3)}
+    vram_observations = [
+        item["telemetry"]["vram"]["observed_gb"] for item in measurements]
+    ram_buffer_observations = [
+        item["telemetry"]["ram"]["observed_buffers_gb"] for item in measurements]
+    line_counts_vram = [
+        item["telemetry"]["provenance"]["vram_buffer_lines"] for item in measurements]
+    line_counts_ram = [
+        item["telemetry"]["provenance"]["ram_buffer_lines"] for item in measurements]
+    aggregate = two_wall_measurement(
+        k,
+        {
+            "vram_gb": statistics.median(vram_observations),
+            "ram_gb": statistics.median(ram_buffer_observations),
+            "vram_buffer_lines": min(line_counts_vram),
+            "ram_buffer_lines": min(line_counts_ram),
+        },
+        b,
+    )
+    aggregate["telemetry"]["provenance"].update(
+        aggregation="median",
+        repeat_count=len(measurements),
+    )
+    return {"context": ctx, "gpu_layers": k, **aggregate}
 
 
 def generate(model: str, ctx: int, prompt: str, *, vram_margin_gb: float, ram_margin_gb: float,
@@ -449,7 +618,7 @@ def generate(model: str, ctx: int, prompt: str, *, vram_margin_gb: float, ram_ma
         return gated
     k, b = gated
     llm, stderr = _load(gguf, ctx, k)
-    bad = _verify_offload(stderr, b)
+    bad = _verify_offload(stderr, b, expected_gpu_layers=k)
     if bad is not None:
         return _refused(ctx, bad)
     # create_chat_completion applies the GGUF's embedded chat template (instruct models need it —
@@ -474,7 +643,7 @@ def benchmark(model: str, ctx: int, prompts: list, *, vram_margin_gb: float, ram
         return gated
     k, b = gated
     llm, stderr = _load(gguf, ctx, k)
-    bad = _verify_offload(stderr, b)
+    bad = _verify_offload(stderr, b, expected_gpu_layers=k)
     if bad is not None:
         return _refused(ctx, bad)
     results = []

@@ -12,6 +12,8 @@ Slug: 2026-06-29-cuda-gguf-hybrid
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from ara.workers import cuda_gguf_llama as w
@@ -82,6 +84,8 @@ def test_two_wall_gate_refuses_on_ram_wall():
 # RSS is unreliable (mmap page cache); the load-log buffer lines are trusted.
 # --------------------------------------------------------------------------- #
 _LOG = (
+    "ggml_cuda_init: found 1 CUDA devices:\n"
+    "  Device 0: NVIDIA GeForce RTX 2070, compute capability 7.5\n"
     "load_tensors: offloaded 18/32 layers to GPU\n"
     "load_tensors:        CUDA0 model buffer size =  4608.00 MiB\n"
     "load_tensors:   CPU_Mapped model buffer size =  3584.00 MiB\n"
@@ -103,9 +107,35 @@ def test_parse_cuda_buffers_sums_ram_side():
     assert b["ram_gb"] == round(3696 / 1024, 4)
 
 
-def test_parse_cuda_buffers_zero_when_absent():
-    b = w.parse_cuda_buffers("nothing to see here\n")
-    assert b == {"vram_gb": 0.0, "ram_gb": 0.0}
+def test_parse_cuda_buffers_records_line_provenance():
+    b = w.parse_cuda_buffers(_LOG)
+    assert b["vram_buffer_lines"] == 3
+    assert b["ram_buffer_lines"] == 2
+
+
+@pytest.mark.parametrize(
+    "log",
+    [
+        "nothing to see here\n",
+        "load_tensors: CUDA0 model buffer size = 100 MiB\n",
+        "load_tensors: CPU_Mapped model buffer size = 100 MiB\n",
+        "load_tensors: CUDA1 model buffer size = 100 MiB\n"
+        "load_tensors: CPU_Mapped model buffer size = 100 MiB\n",
+    ],
+)
+def test_parse_cuda_buffers_refuses_missing_or_ambiguous_walls(log):
+    with pytest.raises(w.BufferTelemetryError, match="buffer telemetry"):
+        w.parse_cuda_buffers(log)
+
+
+@pytest.mark.parametrize("value", ["NaN", "inf", "-1"])
+def test_parse_cuda_buffers_refuses_nonfinite_or_negative_values(value):
+    log = (
+        f"load_tensors: CUDA0 model buffer size = {value} MiB\n"
+        "load_tensors: CPU_Mapped model buffer size = 100 MiB\n"
+    )
+    with pytest.raises(w.BufferTelemetryError, match="finite non-negative"):
+        w.parse_cuda_buffers(log)
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +147,11 @@ def test_offload_ok_partial_accepts_partial_offload():
     assert w.offload_ok_partial({"name": "NVIDIA GeForce RTX 2070"}, (18, 32)) is None
 
 
+def test_offload_ok_partial_refuses_missing_device_identity():
+    reason = w.offload_ok_partial(None, (18, 32))
+    assert reason and "device identity" in reason
+
+
 def test_offload_ok_partial_refuses_when_no_offload_line():
     reason = w.offload_ok_partial(None, None)
     assert reason and "not active" in reason
@@ -126,6 +161,117 @@ def test_offload_ok_partial_refuses_when_zero_layers_offloaded():
     # K==0 ran entirely on CPU (the silent-CPU-fallback, #2079) → not a hybrid run
     reason = w.offload_ok_partial({"name": "NVIDIA …"}, (0, 32))
     assert reason and "ran on CPU" in reason
+
+
+def test_verify_offload_refuses_ram_bound_vram_bound_and_contradictory_logs():
+    ram_bound = {
+        "vram_budget_gb": 8.0,
+        "ram_used_gb": 2.0,
+        "ram_budget_gb": 5.0,
+    }
+    vram_bound = {**ram_bound, "vram_budget_gb": 4.0, "ram_budget_gb": 20.0}
+
+    assert "measured RAM" in w._verify_offload(_LOG, ram_bound, expected_gpu_layers=18)
+    assert "measured VRAM" in w._verify_offload(_LOG, vram_bound, expected_gpu_layers=18)
+    assert "requested 17" in w._verify_offload(
+        _LOG, {**ram_bound, "ram_budget_gb": 20.0}, expected_gpu_layers=17)
+
+
+def test_verify_offload_refuses_incomplete_buffer_telemetry():
+    log = (
+        "Device 0: NVIDIA GeForce RTX 2070, compute capability 7.5\n"
+        "offloaded 18/32 layers to GPU\n"
+    )
+    assert "buffer telemetry" in w._verify_offload(
+        log,
+        {"vram_budget_gb": 8.0, "ram_used_gb": 2.0, "ram_budget_gb": 20.0},
+        expected_gpu_layers=18,
+    )
+
+
+def test_run_reports_absolute_ram_fit_and_both_walls_with_provenance(monkeypatch):
+    budgets = {
+        "vram_budget_gb": 8.0,
+        "ram_used_gb": 2.0,
+        "ram_budget_gb": 20.0,
+    }
+    monkeypatch.setattr(w, "_resolve_gguf", lambda _model: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda _path: {})
+    monkeypatch.setattr(w, "_gate", lambda *_args: (18, budgets))
+    monkeypatch.setattr(w, "_load", lambda *_args: (object(), _LOG))
+
+    point = w.run("org/m", 4096, vram_margin_gb=1.0, ram_margin_gb=2.0, repeats=1)
+
+    ram_absolute = round(2.0 + round(3696 / 1024, 4), 4)
+    assert point["mem_gb"] == ram_absolute
+    assert point["telemetry"] == {
+        "schema": "cuda-gguf-two-wall-telemetry:v1",
+        "fit_dimension": "ram_absolute",
+        "unit": "GiB",
+        "gpu_layers": 18,
+        "vram": {
+            "observed_gb": round(5056 / 1024, 4),
+            "budget_gb": 8.0,
+        },
+        "ram": {
+            "observed_buffers_gb": round(3696 / 1024, 4),
+            "baseline_gb": 2.0,
+            "observed_absolute_gb": ram_absolute,
+            "budget_gb": 20.0,
+        },
+        "provenance": {
+            "source": "llama.cpp-load-log",
+            "aggregation": "median",
+            "repeat_count": 1,
+            "vram_buffer_lines": 3,
+            "ram_buffer_lines": 2,
+        },
+    }
+
+
+def test_preflight_binds_shared_fit_to_absolute_ram_budget(monkeypatch):
+    meta = {
+        "general.architecture": "qwen3",
+        "qwen3.block_count": 32,
+        "qwen3.embedding_length": 4096,
+        "qwen3.attention.head_count": 32,
+        "qwen3.attention.head_count_kv": 8,
+        "qwen3.context_length": 8192,
+    }
+    budgets = {
+        "vram_budget_gb": 8.0,
+        "ram_used_gb": 2.0,
+        "ram_budget_gb": 20.0,
+    }
+    monkeypatch.setattr(w, "_resolve_gguf", lambda _model: "/x.gguf")
+    monkeypatch.setattr(w, "_read_meta", lambda _path: meta)
+    monkeypatch.setattr(w, "_budgets", lambda *_args: budgets)
+    monkeypatch.setattr(w, "_model_weights_gb", lambda _path: 8.0)
+    monkeypatch.setattr(
+        w, "_used_ram_gb", lambda: pytest.fail("read a second RAM baseline"))
+
+    estimate = w.preflight("org/m", vram_margin_gb=1.0, ram_margin_gb=2.0)
+
+    assert estimate["fit_dimension"] == "ram_absolute"
+    assert estimate["memory_unit"] == "GiB"
+    assert estimate["ref_baseline_gb"] == 0.0
+    assert estimate["budget_gb"] == estimate["ram_budget_gb"] == 20.0
+    assert estimate["base_gb"] >= budgets["ram_used_gb"]
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf])
+def test_two_wall_payload_never_emits_nonfinite_observations(value):
+    with pytest.raises(w.BufferTelemetryError, match="finite"):
+        w.two_wall_measurement(
+            18,
+            {
+                "vram_gb": value,
+                "ram_gb": 1.0,
+                "vram_buffer_lines": 1,
+                "ram_buffer_lines": 1,
+            },
+            {"vram_budget_gb": 8.0, "ram_used_gb": 2.0, "ram_budget_gb": 20.0},
+        )
 
 
 def test_governed_max_tokens_reused_unchanged():
@@ -151,7 +297,7 @@ def test_benchmark_governs_rendered_template_tokens(monkeypatch):
     monkeypatch.setattr(w, "_resolve_gguf", lambda _m: "/x.gguf")
     monkeypatch.setattr(w, "_read_meta", lambda _p: {})
     monkeypatch.setattr(w, "_gate", lambda *_a: (4, {"vram_gb": 1.0, "ram_gb": 1.0}))
-    monkeypatch.setattr(w, "_verify_offload", lambda *_a: None)
+    monkeypatch.setattr(w, "_verify_offload", lambda *_a, **_k: None)
 
     class _Llama:
         def create_completion(self, *, prompt, max_tokens, **_kw):

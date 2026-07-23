@@ -32,6 +32,137 @@ def test_parse_preserves_optional_telemetry_for_success_and_refusal():
     assert refused.telemetry == telemetry
 
 
+def _two_wall_payload():
+    return {
+        "context": 4096,
+        "mem_gb": 6.0,
+        "telemetry": {
+            "schema": "cuda-gguf-two-wall-telemetry:v1",
+            "fit_dimension": "ram_absolute",
+            "unit": "GiB",
+            "gpu_layers": 16,
+            "vram": {"observed_gb": 4.0, "budget_gb": 8.0},
+            "ram": {
+                "observed_buffers_gb": 5.0,
+                "baseline_gb": 1.0,
+                "observed_absolute_gb": 6.0,
+                "budget_gb": 20.0,
+            },
+            "provenance": {
+                "source": "llama.cpp-load-log",
+                "aggregation": "median",
+                "repeat_count": 3,
+                "vram_buffer_lines": 3,
+                "ram_buffer_lines": 2,
+            },
+        },
+    }
+
+
+def test_parse_accepts_dimension_bound_two_wall_measurement():
+    measured = worker.parse(_two_wall_payload())
+
+    assert measured.mem_gb == 6.0
+    assert measured.telemetry["vram"]["observed_gb"] == 4.0
+    assert measured.telemetry["ram"]["observed_absolute_gb"] == 6.0
+
+
+def test_two_wall_measurement_rejects_contradictory_fit_and_ram_components():
+    payload = _two_wall_payload()
+    payload["mem_gb"] = 7.0
+    with pytest.raises(worker.WorkerProtocolError, match="RAM fit value"):
+        worker.parse(payload)
+
+    payload = _two_wall_payload()
+    payload["telemetry"]["ram"]["observed_absolute_gb"] = 7.0
+    with pytest.raises(worker.WorkerProtocolError, match="components"):
+        worker.parse(payload)
+
+
+def test_two_wall_measurement_rejects_missing_wall_and_unsafe_observation():
+    payload = _two_wall_payload()
+    del payload["telemetry"]["vram"]["observed_gb"]
+    with pytest.raises(worker.WorkerProtocolError, match="VRAM missing"):
+        worker.parse(payload)
+
+    payload = _two_wall_payload()
+    payload["telemetry"]["vram"]["observed_gb"] = 8.0
+    with pytest.raises(worker.WorkerProtocolError, match="at/over"):
+        worker.parse(payload)
+
+
+def test_two_wall_measurement_rejects_invalid_provenance():
+    payload = _two_wall_payload()
+    payload["telemetry"]["provenance"]["source"] = "rss"
+    with pytest.raises(worker.WorkerProtocolError, match="source"):
+        worker.parse(payload)
+
+    payload = _two_wall_payload()
+    payload["telemetry"]["provenance"]["repeat_count"] = 0
+    with pytest.raises(worker.WorkerProtocolError, match="repeat_count"):
+        worker.parse(payload)
+
+
+def _set_nested(payload, path, value):
+    target = payload["telemetry"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("vram", "observed_gb"), "four", "numeric"),
+        (("vram", "observed_gb"), math.nan, "finite positive"),
+        (("ram", "baseline_gb"), -1.0, "finite number"),
+        (("fit_dimension",), "vram", "fit_dimension"),
+        (("unit",), "GB", "unit"),
+        (("gpu_layers",), "16", "gpu_layers"),
+        (("gpu_layers",), True, "gpu_layers"),
+        (("gpu_layers",), 0, "gpu_layers"),
+        (("vram",), [], "objects"),
+        (("ram",), [], "objects"),
+        (("provenance",), [], "objects"),
+        (("provenance", "aggregation"), "mean", "aggregation"),
+        (("provenance", "repeat_count"), "3", "repeat_count"),
+        (("provenance", "repeat_count"), True, "repeat_count"),
+        (("provenance", "vram_buffer_lines"), 0, "vram_buffer_lines"),
+        (("provenance", "ram_buffer_lines"), False, "ram_buffer_lines"),
+    ],
+)
+def test_two_wall_measurement_rejects_malformed_fields(path, value, message):
+    payload = _set_nested(_two_wall_payload(), path, value)
+
+    with pytest.raises(worker.WorkerProtocolError, match=message):
+        worker.parse(payload)
+
+
+def test_two_wall_measurement_rejects_unknown_fields_and_schema():
+    payload = _two_wall_payload()
+    payload["telemetry"]["future"] = True
+    with pytest.raises(worker.WorkerProtocolError, match="unknown field"):
+        worker.parse(payload)
+
+    payload = _two_wall_payload()
+    payload["telemetry"]["schema"] = "cuda-gguf-two-wall-telemetry:v0"
+    with pytest.raises(worker.WorkerProtocolError, match="schema"):
+        worker.validate_two_wall_telemetry(
+            payload["telemetry"], payload["mem_gb"])
+
+
+def test_two_wall_measurement_rejects_preflight_budget_contradiction():
+    payload = _two_wall_payload()
+
+    with pytest.raises(worker.WorkerProtocolError, match="budget contradicts preflight"):
+        worker.validate_two_wall_telemetry(
+            payload["telemetry"],
+            payload["mem_gb"],
+            expected_ram_budget_gb=21.0,
+        )
+
+
 def test_parse_rejects_non_object_telemetry():
     with pytest.raises(worker.WorkerProtocolError, match="telemetry"):
         worker.parse({"context": 4096, "mem_gb": 8.2, "telemetry": []})

@@ -38,6 +38,47 @@ def _linear(intercept: float, slope_per_k: float):
                                "mem_gb": intercept + slope_per_k * (ctx / 1000)}
 
 
+def _two_wall_est(**changes):
+    extension = {
+        "n_layers": 32,
+        "fit_layers": 16,
+        "vram_budget_gb": 8.0,
+        "ram_budget_gb": 36.0,
+        "fit_dimension": "ram_absolute",
+        "memory_unit": "GiB",
+    }
+    extension.update(changes)
+    return _est(**extension)
+
+
+def _two_wall_measure(_model, context):
+    absolute_ram = 5.0 + context / 1000
+    return {
+        "context": context,
+        "mem_gb": absolute_ram,
+        "telemetry": {
+            "schema": "cuda-gguf-two-wall-telemetry:v1",
+            "fit_dimension": "ram_absolute",
+            "unit": "GiB",
+            "gpu_layers": 16,
+            "vram": {"observed_gb": 4.0, "budget_gb": 8.0},
+            "ram": {
+                "observed_buffers_gb": absolute_ram - 1.0,
+                "baseline_gb": 1.0,
+                "observed_absolute_gb": absolute_ram,
+                "budget_gb": 36.0,
+            },
+            "provenance": {
+                "source": "llama.cpp-load-log",
+                "aggregation": "median",
+                "repeat_count": 3,
+                "vram_buffer_lines": 3,
+                "ram_buffer_lines": 2,
+            },
+        },
+    }
+
+
 def test_drives_ramp_and_shapes_result():
     # memory would allow ~31k, but the model's window is 16k → capped, window-bound
     est = _est(max_context=16000)
@@ -147,16 +188,25 @@ def test_degenerate_window_never_probes_above_it():
         pytest.param({"error": ""}, "error", id="empty-error"),
         pytest.param({"error": "not cached", "base_gb": 1.0}, "base_gb",
                      id="mixed-error-and-estimate"),
-        pytest.param(_est(n_layers=0, fit_layers=0, vram_budget_gb=8.0,
-                          ram_budget_gb=36.0), "n_layers", id="zero-layers"),
-        pytest.param(_est(n_layers=32, fit_layers=33, vram_budget_gb=8.0,
-                          ram_budget_gb=36.0), "fit_layers", id="too-many-fit-layers"),
-        pytest.param(_est(n_layers=32, fit_layers=16, vram_budget_gb=math.nan,
-                          ram_budget_gb=36.0), "vram_budget_gb", id="nan-vram-budget"),
-        pytest.param(_est(n_layers=32, fit_layers=16, vram_budget_gb=8.0,
-                          ram_budget_gb=35.0), "ram_budget_gb",
+        pytest.param(_two_wall_est(n_layers=0, fit_layers=0),
+                     "n_layers", id="zero-layers"),
+        pytest.param(_two_wall_est(fit_layers=33),
+                     "fit_layers", id="too-many-fit-layers"),
+        pytest.param(_two_wall_est(vram_budget_gb=math.nan),
+                     "vram_budget_gb", id="nan-vram-budget"),
+        pytest.param(_two_wall_est(ram_budget_gb=35.0), "ram_budget_gb",
                      id="ram-budget-disagrees-with-driver-budget"),
-        pytest.param(_est(n_layers=32), "fit_layers", id="partial-cuda-gguf-extension"),
+        pytest.param(_two_wall_est(fit_dimension="vram"),
+                     "fit_dimension", id="wrong-fit-dimension"),
+        pytest.param(_two_wall_est(memory_unit="GB"),
+                     "memory_unit", id="wrong-memory-unit"),
+        pytest.param(_two_wall_est(ref_baseline_gb=1.0),
+                     "ref_baseline_gb", id="absolute-fit-with-baseline"),
+        pytest.param(
+            _est(n_layers=32, fit_dimension="ram_absolute", memory_unit="GiB"),
+            "fit_layers",
+            id="partial-cuda-gguf-extension",
+        ),
     ],
 )
 def test_rejects_malformed_preflight_before_dispatch(payload, field):
@@ -186,18 +236,36 @@ def test_rejects_non_object_preflight_before_dispatch():
 
 
 def test_accepts_the_known_cuda_gguf_preflight_extension():
-    est = _est(
-        n_layers=32,
-        fit_layers=16,
-        vram_budget_gb=8.0,
-        ram_budget_gb=36.0,
-    )
+    est = _two_wall_est()
 
     result = driver.characterize(
         "org/model", preflight=lambda _model: est,
-        measure=_linear(5.0, 1.0), schedule=[2000, 4000])
+        measure=_two_wall_measure, schedule=[2000, 4000])
 
     assert result["direct_context"] == 4000
+    assert result["points"][0]["measurement_dimension"] == "ram_absolute"
+    assert result["points"][0]["memory_unit"] == "GiB"
+    assert result["points"][0]["telemetry"]["vram"]["observed_gb"] == 4.0
+
+
+def test_cuda_gguf_fit_rejects_missing_or_contradictory_two_wall_telemetry():
+    with pytest.raises(worker.WorkerProtocolError, match="two-wall telemetry"):
+        driver.characterize(
+            "org/model",
+            preflight=lambda _model: _two_wall_est(),
+            measure=lambda _model, context: {"context": context, "mem_gb": 7.0},
+            schedule=[2000, 4000],
+        )
+
+    contradictory = _two_wall_measure("org/model", 2000)
+    contradictory["mem_gb"] += 1.0
+    with pytest.raises(worker.WorkerProtocolError, match="RAM fit value"):
+        driver.characterize(
+            "org/model",
+            preflight=lambda _model: _two_wall_est(),
+            measure=lambda _model, _context: contradictory,
+            schedule=[2000, 4000],
+        )
 
 
 def test_none_when_preflight_errors():

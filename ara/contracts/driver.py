@@ -71,9 +71,21 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
         if m.context != ctx:
             raise worker.WorkerProtocolError(
                 f"worker context mismatch: requested {ctx}, returned {m.context}")
-        # L2 (independent of L1's prediction): mem_gb is the model DELTA, so the ACTUAL
-        # absolute footprint is ref_baseline + delta. If that reached the budget, stop
-        # escalating and don't trust higher contexts — even though L1 predicted it safe.
+        if not m.refused and est.fit_dimension is not None:
+            if (
+                not isinstance(m.telemetry, dict)
+                or m.telemetry.get("schema") != worker.CUDA_GGUF_TWO_WALL_SCHEMA
+            ):
+                raise worker.WorkerProtocolError(
+                    "CUDA-GGUF measurement needs complete two-wall telemetry")
+            worker.validate_two_wall_telemetry(
+                m.telemetry,
+                m.mem_gb,
+                expected_ram_budget_gb=est.ram_budget_gb,
+            )
+        # L2 (independent of L1's prediction): single-wall workers report a model delta and
+        # pair it with ref_baseline; CUDA-GGUF explicitly reports absolute RAM with a zero
+        # baseline. Either way, the selected dimension is compared only with its own budget.
         if not m.refused and m.mem_gb is not None \
                 and est.ref_baseline_gb + m.mem_gb >= est.budget_gb:
             return worker.Measurement(context=ctx, mem_gb=None, refused=True,
@@ -98,6 +110,9 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     points = []
     for context, mem_gb in res.points:
         point = {"context": context, "mem_gb": mem_gb}
+        if est.fit_dimension is not None:
+            point["measurement_dimension"] = est.fit_dimension
+            point["memory_unit"] = est.memory_unit
         if context in res.telemetry:
             point["telemetry"] = res.telemetry[context]
         points.append(point)
@@ -118,6 +133,9 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     if methodology_descriptor is not None:
         out["methodology"] = methodology_descriptor
         out["methodology_key"] = methodology.key(methodology_descriptor)
+    if est.fit_dimension is not None:
+        out["fit_dimension"] = est.fit_dimension
+        out["memory_unit"] = est.memory_unit
     if res.safe_context is None:
         # Surface the stop reason and budget numbers so callers can explain the null — e.g.
         # "all contexts predicted over safe budget" — rather than silently emitting bare null.

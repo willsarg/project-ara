@@ -230,6 +230,8 @@ until that path has passed ARA's full suite and live CPU integration on Intel ma
 the governed memory boundary and use an in-worker watchdog to abort a probe as usage approaches the
 limit. Each native engine governs against the right boundary — physical RAM (CPU; swap is reported
 but never counted), MLX's live Metal working-set limit (Apple), or VRAM (CUDA).
+CUDA-GGUF keeps both system RAM and VRAM as direct gates; its fitted curve is explicitly absolute
+system RAM, while every point records the separately checked VRAM observation and both budgets.
 
 Ollama is an external daemon, so ARA cannot provide a trustworthy active watchdog after a load
 begins. Before **each** Ollama probe, ARA instead fails closed unless it can conservatively bound

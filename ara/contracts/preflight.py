@@ -31,6 +31,8 @@ class Estimate:
     fit_layers: int | None = None
     vram_budget_gb: float | None = None
     ram_budget_gb: float | None = None
+    fit_dimension: str | None = None
+    memory_unit: str | None = None
 
 
 _CORE_FIELDS = {
@@ -45,6 +47,8 @@ _CUDA_GGUF_FIELDS = {
     "fit_layers",
     "vram_budget_gb",
     "ram_budget_gb",
+    "fit_dimension",
+    "memory_unit",
 }
 
 
@@ -116,6 +120,7 @@ def parse(payload: object) -> Estimate | PreflightError:
 
     n_layers = fit_layers = None
     vram_budget_gb = ram_budget_gb = None
+    fit_dimension = memory_unit = None
     if extension:
         n_layers = _integer(payload, "n_layers", positive=True)
         fit_layers = _integer(payload, "fit_layers", positive=False)
@@ -127,6 +132,17 @@ def parse(payload: object) -> Estimate | PreflightError:
         if not math.isclose(ram_budget_gb, budget_gb, rel_tol=0.0, abs_tol=1e-9):
             raise PreflightProtocolError(
                 "preflight 'ram_budget_gb' must equal the driver's 'budget_gb'")
+        fit_dimension = payload["fit_dimension"]
+        if fit_dimension != "ram_absolute":
+            raise PreflightProtocolError(
+                "preflight 'fit_dimension' must be 'ram_absolute'")
+        memory_unit = payload["memory_unit"]
+        if memory_unit != "GiB":
+            raise PreflightProtocolError(
+                "preflight 'memory_unit' must be 'GiB'")
+        if ref_baseline_gb != 0.0:
+            raise PreflightProtocolError(
+                "preflight 'ref_baseline_gb' must be zero for absolute RAM fitting")
 
     return Estimate(
         base_gb=base_gb,
@@ -138,4 +154,6 @@ def parse(payload: object) -> Estimate | PreflightError:
         fit_layers=fit_layers,
         vram_budget_gb=vram_budget_gb,
         ram_budget_gb=ram_budget_gb,
+        fit_dimension=fit_dimension,
+        memory_unit=memory_unit,
     )

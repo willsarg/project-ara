@@ -143,9 +143,9 @@ def characterization_methodology(*, vram_margin_gb: float | None = None,
             "vram": round(vram_margin_gb * 1024 ** 3),
             "ram": round(ram_margin_gb * 1024 ** 3),
         },
-        worker_protocol="ara-cuda-gguf-llama-measurement:v1",
+        worker_protocol="ara-cuda-gguf-llama-measurement:v2",
         sampling_interval_ms=0,
-        telemetry_failure_policy="preflight-and-postload-two-wall:v1",
+        telemetry_failure_policy="dimension-bound-two-wall-fail-closed:v2",
         watchdog_stop_rule="either-wall-gte-budget:v1")
 
 
@@ -157,7 +157,9 @@ def characterize(model: str, *, progress: bool = False,
     adapter supplies only the cuda_gguf specifics — the isolated ``cuda_gguf`` env, the built-in
     ``cuda_gguf_llama`` worker, budget params, and the schedule. Crash-safety is layered: the
     driver gates each rung (L1 + L2), and the worker refuses-before-load (L4) / aborts mid-probe
-    (L5). Returns ``{model, safe_context, points}``.
+    (L5). The shared scalar fit is explicitly bound to absolute system RAM; every successful
+    point also persists the independently checked VRAM observation and both budgets with GiB
+    units and load-log provenance. Returns ``{model, safe_context, points}``.
 
     ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible.
     ``kv_dtype_bytes`` is fixed at 2.0 (fp16) — the worker does not expose KV quantization.
