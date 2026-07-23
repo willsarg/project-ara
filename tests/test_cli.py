@@ -1865,11 +1865,64 @@ def test_profile_json_emits_unknown_apple_budget(monkeypatch, set_platform, caps
     assert payload["authority_status"] == "unknown"
     assert payload["current_governed_budget"] == {
         "status": "unknown",
+        "reason": "no_current_budget",
         "wall_bytes": None,
         "wall_gib": None,
         "safe_budget_bytes": None,
         "safe_budget_gib": None,
     }
+
+
+def test_profile_json_reports_insufficient_memory_without_a_fit_verdict(
+        monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=1.0, chip="Tiny CPU"))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda _model: dict(
+                            n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _model: 0.1)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cpu", model="org/tiny") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_budget_gb"] == 0.0
+    assert payload["current_governed_budget"]["status"] == "insufficient"
+    assert payload["current_governed_budget"]["reason"] == "insufficient_memory"
+    assert payload["model_fit"]["fits"] is None
+    assert payload["model_fit"]["reason"] == "insufficient_memory"
+
+
+def test_profile_text_reports_insufficient_memory_without_characterize_hint(
+        make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=1.0, chip="Tiny CPU"))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda _model: dict(
+                            n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda _model: 0.1)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cpu", model="org/tiny") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "insufficient memory" in out
+    assert "unknown — insufficient memory" in out
+    assert "won't fit" not in out
+    assert "ara characterize org/tiny" not in out
+
+
+def test_profile_text_reports_insufficient_memory_without_a_model(
+        make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=1.0, chip="Tiny CPU"))
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cpu") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "insufficient memory" in out
+    assert "ara characterize <model>" not in out
 
 
 def test_profile_explicit_cpu_uses_system_ram_on_cuda_host(
@@ -2064,6 +2117,28 @@ def test_profile_keeps_exact_non_mlx_calibration_unverified_without_engine_audit
     assert payload["wall_gb"] == 32.0
     assert payload["authority_status"] == "historical-unverified"
     assert payload["historical_measurement"]["engine_fingerprint"] == _TEST_ENGINE_FP
+
+
+def test_profile_labels_invalid_stored_measurement_without_using_it(
+        monkeypatch, set_platform, capsys, store):
+    _wire_profile(
+        monkeypatch, set_platform,
+        _machine(backend="cpu", ram_total_gb=32.0, chip="Test CPU"))
+    cli.calibration.save_calibration(
+        store, "cpu", fixed_overhead_gb=0.5,
+        wall_gb=8.0, safe_budget_gb=12.0,
+        engine_fingerprint=_TEST_ENGINE_FP)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, engine="cpu", as_json=True) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "estimated"
+    assert payload["wall_gb"] == 32.0
+    assert payload["safe_budget_gb"] == 30.0
+    history = payload["historical_measurement"]
+    assert history["measurement_status"] == "invalid"
+    assert history["measurement_reason"] == "safe_budget_exceeds_wall"
 
 
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):

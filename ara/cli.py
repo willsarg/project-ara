@@ -1144,7 +1144,12 @@ def _emit_limits(c: Console, m: dict) -> None:
     # The tag must match the data source: a measured wall reads as measured; without one it's
     # honestly flagged as an uncalibrated estimate. Spec 2026-06-23-capability-pipeline.
     measured = m.get("basis") == "measured"
-    tag = "  (measured)" if measured else "  (estimated — not calibrated)"
+    insufficient = m.get("budget_reason") == "insufficient_memory"
+    tag = (
+        "  (insufficient memory)" if insufficient
+        else "  (measured)" if measured
+        else "  (estimated — not calibrated)"
+    )
     c.emit()
     c.emit(c.section("  SAFE LIMITS") + c.style("dim", tag))
     if m.get("engine"):
@@ -1155,8 +1160,12 @@ def _emit_limits(c: Console, m: dict) -> None:
                   if m.get("engine") == "mlx" else "the effective allocation boundary")
     c.emit(c.field(wall_label, _fmt_gb(m["wall_gb"], 1),
                    wall_gloss, value_role="bad"))
+    safe_gloss = (
+        f"the observed wall does not exceed ARA's {m['margin_gb']:.0f} GiB reserve"
+        if insufficient else f"boundary − {m['margin_gb']:.0f} GiB margin"
+    )
     c.emit(c.field("safe budget", _fmt_gb(m["safe_budget_gb"], 1),
-                   f"boundary − {m['margin_gb']:.0f} GiB margin", value_role="good"))
+                   safe_gloss, value_role="bad" if insufficient else "good"))
     if c.verbose:
         if measured:
             calibrated_at = m.get("calibrated_at") or "unknown"
@@ -5340,6 +5349,8 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     c.emit()
     if fit is not None and fit["reason"] == "size_unknown":
         tag = "  (unknown — model size unavailable)"
+    elif fit is not None and fit["reason"] == "insufficient_memory":
+        tag = "  (unknown — insufficient memory)"
     elif lim.get("safe_budget_gb") is None:
         tag = "  (unknown — no current budget)"
     else:
@@ -5359,6 +5370,8 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
         detail = (
             "model size is unavailable"
             if fit["reason"] == "size_unknown"
+            else "the observed memory wall does not exceed ARA's safety reserve"
+            if fit["reason"] == "insufficient_memory"
             else "no current governed memory budget"
         )
         c.emit(c.field("verdict", "unknown", detail, value_role="warn"))
@@ -5379,6 +5392,13 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
         prefix = "  current budget unknown — run "
     elif fit["reason"] == "size_unknown":
         prefix = "  model size unknown — run "
+    elif fit["reason"] == "insufficient_memory":
+        c.emit(c.style(
+            "warn",
+            "  insufficient memory for an analytic model-fit assessment",
+        ))
+        c.emit()
+        return
     else:
         prefix = "  estimated — run "
     c.emit(c.style("dim", prefix) + c.style("accent", f"ara characterize {model}")
@@ -5426,6 +5446,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     if historical is not None:
         wall_bytes = historical.get("wall_bytes")
         safe_budget_bytes = historical.get("safe_budget_bytes")
+        historical_validation_error = estimate.measurement_validation_error(historical)
         historical_measurement = {
             **historical,
             "metal_recommendation_bytes": wall_bytes,
@@ -5435,6 +5456,9 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
             "ara_policy_budget_gib": (
                 safe_budget_bytes / estimate.GIB if safe_budget_bytes is not None else None),
             "authority_status": authority_status,
+            "measurement_status": (
+                "invalid" if historical_validation_error is not None else "valid"),
+            "measurement_reason": historical_validation_error,
         }
     lim.update(
         memory_unit="GiB",
@@ -5443,7 +5467,8 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         measurement_authority=authority_key,
         authority_status=authority_status,
         current_governed_budget={
-            "status": "unknown" if lim["safe_budget_gb"] is None else lim["basis"],
+            "status": lim["budget_status"],
+            "reason": lim["budget_reason"],
             "wall_bytes": (measured or {}).get("wall_bytes"),
             "wall_gib": lim["wall_gb"],
             "safe_budget_bytes": (measured or {}).get("safe_budget_bytes"),
@@ -5467,7 +5492,13 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     else:
         # Profile never audits an engine build, so it can only report an analytic estimate or an
         # unknown current budget; stored measurements remain display-only history.
-        if lim["basis"] == "unknown":
+        if lim["budget_reason"] == "insufficient_memory":
+            c.emit(c.style(
+                "warn",
+                "  insufficient memory — the observed wall does not exceed ARA's "
+                f"{lim['margin_gb']:.0f} GiB safety reserve",
+            ))
+        elif lim["basis"] == "unknown":
             c.emit(c.style("dim", "  current budget unknown — run ")
                    + c.style("accent", "ara characterize <model>")
                    + c.style("dim", " to measure a governed ceiling"))

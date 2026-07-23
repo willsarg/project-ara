@@ -9,6 +9,8 @@ measures the real ceiling. See Spec 2026-06-23-capability-pipeline.
 """
 from __future__ import annotations
 
+import math
+
 from ara.contracts import ramp
 
 # ARA policy (not engine-measured): the analytic safety margin below a known wall.
@@ -18,6 +20,58 @@ MARGIN_GB = 2.0
 # Weight sizes arrive as DECIMAL GB (on-disk bytes / 1e9, the disk-space denomination) and are
 # converted at the model_fit boundary. Slug 2026-07-02-analytic-units-gib.
 GIB = 1024 ** 3
+MEASUREMENT_BYTE_TOLERANCE = 1
+
+
+def _nonnegative_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def measurement_validation_error(measured: dict) -> str | None:
+    """Return the first invariant violated by stored memory evidence, or ``None`` when valid."""
+    wall = measured.get("wall_gb")
+    safe = measured.get("safe_budget_gb")
+    if wall is None:
+        return "missing_wall_gb"
+    if not _nonnegative_number(wall):
+        return "invalid_wall_gb"
+    if safe is None:
+        return "missing_safe_budget_gb"
+    if not _nonnegative_number(safe):
+        return "invalid_safe_budget_gb"
+    if safe > wall:
+        return "safe_budget_exceeds_wall"
+
+    wall_bytes = measured.get("wall_bytes")
+    safe_bytes = measured.get("safe_budget_bytes")
+    if wall_bytes is not None and (
+            not isinstance(wall_bytes, int) or isinstance(wall_bytes, bool) or wall_bytes < 0):
+        return "invalid_wall_bytes"
+    if safe_bytes is not None and (
+            not isinstance(safe_bytes, int) or isinstance(safe_bytes, bool) or safe_bytes < 0):
+        return "invalid_safe_budget_bytes"
+    if wall_bytes is not None and safe_bytes is not None and safe_bytes > wall_bytes:
+        return "safe_budget_bytes_exceed_wall_bytes"
+    if (wall_bytes is not None
+            and abs(wall * GIB - wall_bytes) > MEASUREMENT_BYTE_TOLERANCE):
+        return "wall_bytes_mismatch"
+    if (safe_bytes is not None
+            and abs(safe * GIB - safe_bytes) > MEASUREMENT_BYTE_TOLERANCE):
+        return "safe_budget_bytes_mismatch"
+    return None
+
+
+def _budget_status(safe_budget, basis: str) -> tuple[str, str | None]:
+    if safe_budget is None:
+        return "unknown", "no_current_budget"
+    if safe_budget <= 0:
+        return "insufficient", "insufficient_memory"
+    return basis, None
 
 
 def limits(machine, measured: dict | None = None, *, sharded: bool = False,
@@ -51,7 +105,15 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
         total = machine.ram_total_gb
         device = machine.chip
         wall = None if selected_backend == "apple" else total
-    safe_budget = wall - MARGIN_GB if wall is not None else None
+    if not _nonnegative_number(total):
+        total = None
+    if not _nonnegative_number(wall):
+        wall = None
+    safe_budget = max(wall - MARGIN_GB, 0.0) if wall is not None else None
+    basis = "unknown" if selected_backend == "apple" else "estimated"
+    budget_status, budget_reason = _budget_status(safe_budget, basis)
+    measurement_reason = (
+        measurement_validation_error(measured) if measured is not None else None)
     out = {
         "device": device,
         "physical_memory_bytes": getattr(machine, "physical_memory_bytes", None),
@@ -64,12 +126,17 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
         "swap_free_gb": machine.swap_gb,
         "calibrated": False,
         "calibrated_at": None,
-        "basis": "unknown" if selected_backend == "apple" else "estimated",
+        "basis": basis,
+        "budget_status": budget_status,
+        "budget_reason": budget_reason,
+        "measurement_status": (
+            "absent" if measured is None else "invalid" if measurement_reason else "valid"),
+        "measurement_reason": measurement_reason,
     }
     # A real measurement for this machine + engine wins over the heuristic — but only when it
     # actually carries a wall (older/partial calibration rows fall back to the estimate honestly).
     measured_wall = (measured or {}).get("wall_gb")
-    if measured_wall is not None:
+    if measured is not None and measurement_reason is None:
         if wall is not None:
             out["estimated_wall_gb"] = wall
             out["estimated_safe_budget_gb"] = safe_budget
@@ -78,6 +145,8 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
         out["calibrated"] = True
         out["calibrated_at"] = (measured or {}).get("calibrated_at")
         out["basis"] = "measured"
+        out["budget_status"], out["budget_reason"] = _budget_status(
+            out["safe_budget_gb"], out["basis"])
     return out
 
 
@@ -105,6 +174,12 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     if budget is None:
         fits = None
         reason = "no_current_budget"
+    elif not _nonnegative_number(budget):
+        fits = None
+        reason = "invalid_budget"
+    elif budget == 0:
+        fits = None
+        reason = "insufficient_memory"
     elif weights_gib is None:
         fits = None
         reason = "size_unknown"

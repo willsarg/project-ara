@@ -113,6 +113,24 @@ def test_limits_missing_ram_is_unknown():
     assert lim["safe_budget_gb"] is None
 
 
+@pytest.mark.parametrize(
+    ("wall_gb", "safe_budget_gb", "budget_status", "budget_reason"),
+    [
+        (0.0, 0.0, "insufficient", "insufficient_memory"),
+        (1.0, 0.0, "insufficient", "insufficient_memory"),
+        (estimate.MARGIN_GB, 0.0, "insufficient", "insufficient_memory"),
+        (estimate.MARGIN_GB + 1.0, 1.0, "estimated", None),
+    ],
+)
+def test_limits_never_returns_negative_analytic_capacity(
+        wall_gb, safe_budget_gb, budget_status, budget_reason):
+    lim = estimate.limits(_machine(backend="cpu", ram_total_gb=wall_gb))
+
+    assert lim["safe_budget_gb"] == safe_budget_gb
+    assert lim["budget_status"] == budget_status
+    assert lim["budget_reason"] == budget_reason
+
+
 # --- the Rule #1 gate is cgroup-honest: the wall source is clamped for containers --------- #
 def _clamped_ram_total_gb(monkeypatch, *, system, phys_gb, cgroup_gb=None):
     """Drive the core RAM-total source (hardware._psutil_totals) under a mocked host + cgroup, and
@@ -203,6 +221,81 @@ def test_limits_apple_no_measured_is_unknown():
     assert "estimated_wall_gb" not in lim
 
 
+@pytest.mark.parametrize(
+    ("measured", "reason"),
+    [
+        ({"wall_gb": True, "safe_budget_gb": 4.0}, "invalid_wall_gb"),
+        ({"wall_gb": "8", "safe_budget_gb": 4.0}, "invalid_wall_gb"),
+        ({"wall_gb": float("nan"), "safe_budget_gb": 4.0}, "invalid_wall_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": True}, "invalid_safe_budget_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": "4"}, "invalid_safe_budget_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": float("inf")}, "invalid_safe_budget_gb"),
+        ({"wall_gb": -1.0, "safe_budget_gb": 0.0}, "invalid_wall_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": -1.0}, "invalid_safe_budget_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": 9.0}, "safe_budget_exceeds_wall"),
+        ({"wall_gb": None, "safe_budget_gb": None}, "missing_wall_gb"),
+        ({"wall_gb": 8.0, "safe_budget_gb": None}, "missing_safe_budget_gb"),
+    ],
+)
+def test_limits_rejects_invalid_measured_scalars_and_uses_analytic_fallback(measured, reason):
+    lim = estimate.limits(
+        _machine(backend="cpu", ram_total_gb=16.0), measured=measured)
+
+    assert lim["basis"] == "estimated"
+    assert lim["calibrated"] is False
+    assert lim["wall_gb"] == 16.0
+    assert lim["safe_budget_gb"] == 14.0
+    assert lim["measurement_status"] == "invalid"
+    assert lim["measurement_reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"wall_bytes": True}, "invalid_wall_bytes"),
+        ({"safe_budget_bytes": -1}, "invalid_safe_budget_bytes"),
+        ({"wall_bytes": 8 * estimate.GIB, "safe_budget_bytes": 7 * estimate.GIB + 2},
+         "safe_budget_bytes_mismatch"),
+        ({"wall_bytes": 8 * estimate.GIB + 2}, "wall_bytes_mismatch"),
+        ({"wall_bytes": 8 * estimate.GIB, "safe_budget_bytes": 9 * estimate.GIB},
+         "safe_budget_bytes_exceed_wall_bytes"),
+    ],
+)
+def test_limits_rejects_invalid_measured_byte_evidence(overrides, reason):
+    measured = {
+        "wall_gb": 8.0,
+        "safe_budget_gb": 7.0,
+        "wall_bytes": 8 * estimate.GIB,
+        "safe_budget_bytes": 7 * estimate.GIB,
+        **overrides,
+    }
+
+    lim = estimate.limits(
+        _machine(backend="apple", ram_total_gb=16.0), measured=measured)
+
+    assert lim["basis"] == "unknown"
+    assert lim["wall_gb"] is None
+    assert lim["safe_budget_gb"] is None
+    assert lim["measurement_status"] == "invalid"
+    assert lim["measurement_reason"] == reason
+
+
+def test_limits_accepts_consistent_exact_byte_measurement():
+    measured = {
+        "wall_gb": 8.0,
+        "safe_budget_gb": 6.0,
+        "wall_bytes": 8 * estimate.GIB,
+        "safe_budget_bytes": 6 * estimate.GIB,
+    }
+
+    lim = estimate.limits(
+        _machine(backend="apple", ram_total_gb=16.0), measured=measured)
+
+    assert lim["basis"] == "measured"
+    assert lim["measurement_status"] == "valid"
+    assert lim["measurement_reason"] is None
+
+
 # --- model_fit: check the model's context limit --------------------------- #
 _META = dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192)
 
@@ -248,6 +341,24 @@ def test_model_fit_without_current_budget_is_unknown():
     assert fit["est_context"] is None
     assert fit["binding"] is None
     assert fit["reason"] == "no_current_budget"
+
+
+def test_model_fit_with_zero_capacity_is_insufficient_not_an_ordinary_nonfit():
+    fit = estimate.model_fit({"safe_budget_gb": 0.0}, _META, weights_gb=4.0)
+
+    assert fit["fits"] is None
+    assert fit["est_context"] is None
+    assert fit["binding"] is None
+    assert fit["reason"] == "insufficient_memory"
+
+
+def test_model_fit_with_invalid_capacity_is_unknown():
+    fit = estimate.model_fit({"safe_budget_gb": float("nan")}, _META, weights_gb=4.0)
+
+    assert fit["fits"] is None
+    assert fit["est_context"] is None
+    assert fit["binding"] is None
+    assert fit["reason"] == "invalid_budget"
 
 
 def test_model_fit_without_size_or_current_budget_reports_budget_unknown():
