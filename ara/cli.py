@@ -1807,7 +1807,8 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             return rc
         with db.connected() as cal_con:
             stored_calibration = calibration.get_calibration(
-                cal_con, sel.engine_key, authority_key=authority_before.key)
+                cal_con, sel.engine_key, authority_key=authority_before.key,
+                engine_fingerprint=engine_report_before["fingerprint"])
             if hasattr(bk, "calibrate") and stored_calibration is None:
                 if not as_json:
                     c.emit(c.style("dim", f"  calibrating {sel.engine_key} … (first run on this machine)"))
@@ -1841,11 +1842,19 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(c.style("dim", f"  characterizing {model} … (loads the model on the device)"))
         fa_kw = _kv_fa_kwargs(sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                               kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
-        if (sel.backend == "apple" and pending_calibration is not None
-                and pending_calibration.get("overhead_gb") is not None
-                and "fixed_overhead_gb" in inspect.signature(
-                    bk.characterize).parameters):
-            fa_kw["fixed_overhead_gb"] = pending_calibration["overhead_gb"]
+        characterize_parameters = inspect.signature(bk.characterize).parameters
+        effective_overhead = (
+            pending_calibration.get("overhead_gb")
+            if pending_calibration is not None
+            else stored_calibration.get("fixed_overhead_gb")
+            if stored_calibration is not None
+            else None
+        )
+        if (effective_overhead is not None
+                and "fixed_overhead_gb" in characterize_parameters):
+            fa_kw["fixed_overhead_gb"] = effective_overhead
+        if "engine_fingerprint" in characterize_parameters:
+            fa_kw["engine_fingerprint"] = engine_report_before["fingerprint"]
         _flash_sdpa_note(c, bk, sel.backend, flash_attn_optin, as_json)
         artifact_id_before = _artifact_identity_for_plan(evidence_model, prefetch_size)
         if artifact_id_before is None:
@@ -1934,6 +1943,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                 wall_bytes=pending_calibration.get("recommended_working_set_bytes"),
                 safe_budget_bytes=pending_calibration.get("safe_budget_bytes"),
                 authority_evidence=authority_after.evidence,
+                engine_fingerprint=engine_fingerprint,
             )
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  evidence_model, safe_context=ceiling, points=result["points"],
@@ -2196,16 +2206,14 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                 db.upsert_model(
                     cache_con, model_id,
                     **{name: durable.get(name) for name in db._MODEL_COLS})
-        # Mirror profile's engine-free authority rule: MLX history is useful display evidence but
-        # cannot govern fit until an execution command re-reads exact live Metal limits.
+        # Mirror profile's engine-free authority rule: stored calibration history is useful display
+        # evidence but cannot govern fit until an execution command audits the exact engine build.
         selected_engine = "mlx" if engine == "mlx" else engines.for_backend(
             detect.backend_name())
         historical_calibration = (
             calibration.get_calibration(evidence_con, selected_engine)
             if selected_engine is not None else None)
-        measured = (
-            None if engine_identity.canonical_engine(selected_engine) == "mlx"
-            else historical_calibration)
+        measured = None
         if engine == "mlx":
             lim = estimate.limits(
                 detect.machine(), measured=measured,
@@ -2270,9 +2278,12 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                          "measurement_authority": (
                              historical_calibration or {}).get("authority_key"),
                          "authority_status": (
-                             "historical-unverified"
-                             if historical_calibration is not None and measured is None
-                             else "current" if measured is not None else "unknown"),
+                             "legacy-engine-unknown"
+                             if (historical_calibration or {}).get(
+                                 "engine_fingerprint") == db.LEGACY_ENGINE_FINGERPRINT
+                             else "historical-unverified"
+                             if historical_calibration is not None
+                             else "unknown"),
                          "quant": quant, "quant_bits": scoring.quant_bits(quant),
                          "base": scoring.base_key(row["model_id"])})
         if use_case is not None:
@@ -2676,7 +2687,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
                         continue
                 candidates.append((candidate_row["safe_context"], candidate_key,
                                    candidate_backend, candidate_bk, candidate_row,
-                                   current_authority))
+                                   current_authority, engine_fingerprint))
             if not candidates:
                 if authority_errors:
                     return None, authority_errors[0]
@@ -2695,7 +2706,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
                     return None, (f"the {label} isn't installed — run: ara install "
                                   f"--engine {unavailable_key}")
                 return None, f"no measured ceiling for {model} — run: ara characterize {model}"
-            _, key, backend, bk, row, current_authority = max(
+            _, key, backend, bk, row, current_authority, selected_engine_fingerprint = max(
                 candidates, key=lambda candidate: candidate[0])
         else:
             backend, bk = default_backend, default_bk
@@ -2731,6 +2742,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
                               f"ara characterize {model}")
             if row.get("safe_context") is None:
                 return None, f"no measured ceiling for {model} — run: ara characterize {model}"
+            selected_engine_fingerprint = engine_fingerprint
         characterized_artifact_id = row.get("artifact_id")
         if not characterized_artifact_id:
             return None, (f"the measured ceiling for {model} is not bound to an exact artifact — "
@@ -2754,6 +2766,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
         "artifact_id": characterized_artifact_id,
         "evidence_model": evidence_model,
         "measurement_authority": current_authority.key,
+        "engine_fingerprint": selected_engine_fingerprint,
     }, None
 
 
@@ -2801,6 +2814,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     evidence_model = plan["evidence_model"]
     selection_record = plan.get("engine_selection")
     native_authority_key = None if ollama_mode else plan["measurement_authority"]
+    native_engine_fingerprint = (
+        None if ollama_mode else plan["engine_fingerprint"])
     mk = profile.machine_key()
 
     if c.verbose and not as_json and selection_record is not None:
@@ -2829,6 +2844,9 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     # Default max_tokens is the backend's own (256); --max-tokens lifts it so thinking models
     # aren't truncated mid-reasoning (the campaign sets ≥512). Omit the kwarg when unset.
     bench_kw = {} if max_tokens is None else {"max_tokens": max_tokens}
+    if (not ollama_mode
+            and "engine_fingerprint" in inspect.signature(bk.benchmark).parameters):
+        bench_kw["engine_fingerprint"] = native_engine_fingerprint
     effective_generation_cap = max_tokens if max_tokens is not None else 256
     ollama_policy = None
     if ollama_mode:
@@ -3576,6 +3594,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             selected_authority_key = current_authority.key
             ceiling_measured_at = row.get("measured_at")
             characterized_artifact_id = row.get("artifact_id")
+            selected_engine_fingerprint = row.get("engine_fingerprint")
         else:
             # No --engine: scan every engine this model is characterized under on this machine and pick
             # the largest measured ceiling whose backend can actually run (has `generate`). A model
@@ -3723,6 +3742,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             engine_key = max(runnable, key=lambda k: runnable[k][0])
             safe, backend, _, ceiling_measured_at, selected_row, _reusable = runnable[engine_key]
             characterized_artifact_id = selected_row.get("artifact_id")
+            selected_engine_fingerprint = selected_row.get("engine_fingerprint")
             selected_authority = measurement_authority.current_measurement_authority(
                 engine_key)
             if (selected_authority is None
@@ -3775,6 +3795,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         c.emit(c.style("dim", f"  running {model} on {engine_label} … (≤ ~{safe} tokens)"))
     fa_kw = _kv_fa_kwargs(backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
                           kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+    if "engine_fingerprint" in inspect.signature(bk.generate).parameters:
+        fa_kw["engine_fingerprint"] = selected_engine_fingerprint
     _flash_sdpa_note(c, bk, backend, flash_attn_optin, as_json)
     try:
         with activity.track("running", model):
@@ -4715,9 +4737,17 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
         return err(f"the live memory authority for {engine_key} changed before serve — "
                    f"re-run: ara characterize {model} --engine {engine_key}")
     try:
-        proc, url, served_ctx = get_backend("apple").serve(
-            model, port=port, max_context=safe, kv_quant=kv_quant,
-            measured_slope_gb_per_k=measured_slope)
+        mlx_backend = get_backend("apple")
+        serve_kw = {
+            "port": port,
+            "max_context": safe,
+            "kv_quant": kv_quant,
+            "measured_slope_gb_per_k": measured_slope,
+        }
+        if "engine_fingerprint" in inspect.signature(
+                mlx_backend.serve).parameters:
+            serve_kw["engine_fingerprint"] = engine_fingerprint
+        proc, url, served_ctx = mlx_backend.serve(model, **serve_kw)
     except Exception as exc:                       # gate refusal / engine not installed / etc.
         return err(f"couldn't start the MLX server: {exc}")
 
@@ -5310,33 +5340,29 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         return 1
 
     m = detect.machine()
-    # Stored MLX history cannot be proven current without crossing the engine seam to re-read
-    # Metal's exact device limits. Profile stays engine-free, so MLX history is display-only and
-    # the current governed budget remains unknown.
+    # Stored calibration history cannot be proven current without crossing the engine seam to
+    # audit the exact installed build. Profile stays engine-free, so history is display-only.
     measured = None
     historical = None
     if db._db_path().is_file():
         with db.connected_readonly() as con:
             historical = calibration.get_calibration(con, sel.engine_key)
-    if engine_identity.canonical_engine(sel.engine_key) != "mlx":
-        measured = historical
     if historical is None:
         authority_status = "unknown"
         authority_key = None
-    elif engine_identity.canonical_engine(sel.engine_key) == "mlx":
+    else:
         authority_key = historical.get("authority_key")
         authority_status = (
             "legacy-unit-unknown"
             if authority_key in (None, measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY)
+            else "legacy-engine-unknown"
+            if historical.get("engine_fingerprint") == db.LEGACY_ENGINE_FINGERPRINT
             else "historical-unverified"
         )
-    else:
-        authority_key = historical.get("authority_key", db.UNSCOPED_AUTHORITY_KEY)
-        authority_status = "current"
     lim = {"engine": sel.engine_key,
            **estimate.limits(m, measured=measured, backend=sel.backend)}
     historical_measurement = None
-    if historical is not None and measured is None:
+    if historical is not None:
         wall_bytes = historical.get("wall_bytes")
         safe_budget_bytes = historical.get("safe_budget_bytes")
         historical_measurement = {
@@ -5378,13 +5404,9 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     if model is not None:
         _emit_model_fit(c, lim, model)
     else:
-        # The footer must agree with the SAFE LIMITS tag: once the wall is measured, dropping the
-        # "estimated —" framing keeps it honest. Spec 2026-06-23-capability-pipeline.
-        if lim["basis"] == "measured":
-            c.emit(c.style("dim", "  run ")
-                   + c.style("accent", "ara characterize <model>")
-                   + c.style("dim", " to measure a model's real ceiling"))
-        elif lim["basis"] == "unknown":
+        # Profile never audits an engine build, so it can only report an analytic estimate or an
+        # unknown current budget; stored measurements remain display-only history.
+        if lim["basis"] == "unknown":
             c.emit(c.style("dim", "  current budget unknown — run ")
                    + c.style("accent", "ara characterize <model>")
                    + c.style("dim", " to measure a governed ceiling"))

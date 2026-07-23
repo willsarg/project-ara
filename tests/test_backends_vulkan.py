@@ -237,6 +237,31 @@ def test_characterize_drives_shared_driver_over_vulkan_env(monkeypatch):
     assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
 
 
+def test_characterize_accepts_freshly_measured_overhead_without_stored_lookup(
+        monkeypatch):
+    captured = {}
+
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes,
+                          methodology_descriptor):
+        preflight(model)
+        return {"model": model, "safe_context": 1, "points": []}
+
+    def worker(_name, argv, *, stream=False):
+        captured["argv"] = argv
+        return {"base_gb": 3.0, "slope_gb_per_k": 0.1, "budget_gb": 10.0}
+
+    monkeypatch.setattr(vulkan.driver, "characterize", fake_characterize)
+    monkeypatch.setattr(
+        vulkan, "_budget_params", lambda: pytest.fail("stored lookup must be skipped"))
+    monkeypatch.setattr(
+        vulkan, "engine_env",
+        type("E", (), {"run_worker": staticmethod(worker)}))
+
+    vulkan.characterize("org/model", fixed_overhead_gb=1.75)
+
+    assert captured["argv"][captured["argv"].index("--overhead") + 1] == "1.75"
+
+
 def test_characterize_none_when_preflight_errors(monkeypatch):
     fake = _FakeEngine({"error": "Vulkan offload not active"})
     _patch(monkeypatch, fake)
@@ -247,19 +272,38 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
 
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
+    seen = []
     monkeypatch.setattr(vulkan, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(vulkan, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
-                            lambda con, eng: {"fixed_overhead_gb": 5.5})}), raising=False)
-    assert vulkan._budget_params() == (vulkan.DEFAULT_MARGIN_GB, 5.5)
+                            lambda con, eng, **kwargs: seen.append((eng, kwargs))
+                            or {"fixed_overhead_gb": 5.5})}), raising=False)
+    assert vulkan._budget_params(
+        engine_fingerprint="engine:v1:sha256:vulkan") == (
+            vulkan.DEFAULT_MARGIN_GB, 5.5)
+    assert seen == [("vulkan", {
+        "engine_fingerprint": "engine:v1:sha256:vulkan",
+    })]
+
+
+def test_budget_params_does_not_reuse_an_unscoped_engine_build(monkeypatch):
+    monkeypatch.setattr(
+        vulkan.db, "connected",
+        lambda: pytest.fail("unscoped lookup must not read calibration"))
+
+    assert vulkan._budget_params() == (
+        vulkan.DEFAULT_MARGIN_GB, vulkan.DEFAULT_OVERHEAD_GB)
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
     monkeypatch.setattr(vulkan, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(vulkan, "calibration",
-                        type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
+                        type("P", (), {"get_calibration": staticmethod(
+                            lambda con, eng, **kwargs: None)}),
                         raising=False)
-    assert vulkan._budget_params() == (vulkan.DEFAULT_MARGIN_GB, vulkan.DEFAULT_OVERHEAD_GB)
+    assert vulkan._budget_params(
+        engine_fingerprint="engine:v1:sha256:vulkan") == (
+            vulkan.DEFAULT_MARGIN_GB, vulkan.DEFAULT_OVERHEAD_GB)
 
 
 # --------------------------------------------------------------------------- #

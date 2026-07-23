@@ -136,14 +136,17 @@ DEFAULT_MARGIN_GB = 2.0      # safety cushion below the wall (ARA policy)
 DEFAULT_OVERHEAD_GB = 1.0    # fallback cold-start overhead until calibrated
 
 
-def _budget_params() -> tuple[float, float]:
+def _budget_params(*, engine_fingerprint: str | None = None) -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
-    calibration for the MLX engine, or a safe default if uncalibrated."""
+    calibration for the exact MLX engine build, or a safe default if unscoped."""
     overhead = DEFAULT_OVERHEAD_GB
+    if engine_fingerprint is None:
+        return DEFAULT_MARGIN_GB, overhead
     current = measurement_authority.current_measurement_authority("mlx")
     with db.connected() as con:
         stored = (calibration.get_calibration(
-            con, "mlx", authority_key=current.key) if current is not None else None)
+            con, "mlx", authority_key=current.key,
+            engine_fingerprint=engine_fingerprint) if current is not None else None)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -188,6 +191,7 @@ def characterize(
     progress: bool = False,
     kv_quant: str = "f16",
     fixed_overhead_gb: float | None = None,
+    engine_fingerprint: str | None = None,
 ) -> dict:
     """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
@@ -202,7 +206,11 @@ def characterize(
     here: the HF download bar already ran in-process during the pre-fetch step.
     """
     if fixed_overhead_gb is None:
-        margin, overhead = _budget_params()
+        margin, overhead = (
+            _budget_params()
+            if engine_fingerprint is None
+            else _budget_params(engine_fingerprint=engine_fingerprint)
+        )
     else:
         margin, overhead = DEFAULT_MARGIN_GB, fixed_overhead_gb
     return driver.characterize(
@@ -218,7 +226,8 @@ def characterize(
 
 
 def serve(model: str, *, port: int, max_context: int,
-          kv_quant: str = "f16", measured_slope_gb_per_k: float | None = None) -> tuple:
+          kv_quant: str = "f16", measured_slope_gb_per_k: float | None = None,
+          engine_fingerprint: str | None = None) -> tuple:
     """Start a governed MLX server for *model* via ara_engine_mlx.serve, out-of-process.
 
     Spawns the isolated ``apple`` env's python running
@@ -236,7 +245,11 @@ def serve(model: str, *, port: int, max_context: int,
     :func:`engine_env.start_worker_server`. The ceiling passed as *max_context* must
     be the characterized safe ceiling for this machine (Rule #1).
     """
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = ["-m", "ara_engine_mlx.serve", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--port", str(port)]
@@ -264,13 +277,18 @@ DEFAULT_MAX_TOKENS = 256
 
 
 def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
-             kv_quant: str = "f16") -> dict:
+             kv_quant: str = "f16",
+             engine_fingerprint: str | None = None) -> dict:
     """One-shot MLX completion, governed: max_context is the characterized safe ceiling, so the
     worker generates under the wall. Out-of-process in the isolated `apple` env via the engine's
     generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``)
     should match how *model* was characterized. Returns {context, completion} or a refusal
     {refused, reason}. ARA never imports MLX in-process."""
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = ["-m", "ara_engine_mlx.generate", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
@@ -281,7 +299,8 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
 
 
 def benchmark(model: str, prompts: list, *, max_context: int,
-              max_tokens: int = DEFAULT_MAX_TOKENS, kv_quant: str = "f16") -> dict:
+              max_tokens: int = DEFAULT_MAX_TOKENS, kv_quant: str = "f16",
+              engine_fingerprint: str | None = None) -> dict:
     """Multi-prompt MLX benchmark, governed: max_context is the characterized safe ceiling.
 
     Spawns the isolated ``apple`` env's python running
@@ -293,7 +312,11 @@ def benchmark(model: str, prompts: list, *, max_context: int,
     "reason": "..."}``. ARA never imports MLX in-process; max_context is the characterized
     safe ceiling.
     """
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = ["-m", "ara_engine_mlx.benchmark", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]

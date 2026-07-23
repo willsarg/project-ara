@@ -436,9 +436,13 @@ def test_budget_params_uses_stored_calibration(monkeypatch):
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng, **kwargs: engines.append((eng, kwargs))
                             or {"fixed_overhead_gb": 5.5})}), raising=False)
-    margin, overhead = apple._budget_params()
+    margin, overhead = apple._budget_params(
+        engine_fingerprint="engine:v1:sha256:mlx")
     assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, 5.5)
-    assert engines == [("mlx", {"authority_key": "current"})]
+    assert engines == [("mlx", {
+        "authority_key": "current",
+        "engine_fingerprint": "engine:v1:sha256:mlx",
+    })]
 
 
 def test_budget_params_reads_only_the_live_measurement_authority(monkeypatch):
@@ -450,8 +454,10 @@ def test_budget_params_reads_only_the_live_measurement_authority(monkeypatch):
     )
     seen = {}
 
-    def get_calibration(_con, _engine, *, authority_key=None):
+    def get_calibration(
+            _con, _engine, *, authority_key=None, engine_fingerprint=None):
         seen["authority_key"] = authority_key
+        seen["engine_fingerprint"] = engine_fingerprint
         return {"fixed_overhead_gb": 1.25}
 
     monkeypatch.setattr(apple.calibration, "get_calibration", get_calibration)
@@ -461,8 +467,23 @@ def test_budget_params_reads_only_the_live_measurement_authority(monkeypatch):
         lambda: contextlib.nullcontext(None),
     )
 
-    assert apple._budget_params() == (apple.DEFAULT_MARGIN_GB, 1.25)
+    assert apple._budget_params(
+        engine_fingerprint="engine:v1:sha256:mlx") == (
+            apple.DEFAULT_MARGIN_GB, 1.25)
     assert seen["authority_key"] == "mlx-authority:current"
+    assert seen["engine_fingerprint"] == "engine:v1:sha256:mlx"
+
+
+def test_budget_params_does_not_reuse_an_unscoped_engine_build(monkeypatch):
+    monkeypatch.setattr(
+        apple.measurement_authority, "current_measurement_authority",
+        lambda _engine: pytest.fail("unscoped lookup must not read authority"))
+    monkeypatch.setattr(
+        apple.db, "connected",
+        lambda: pytest.fail("unscoped lookup must not read calibration"))
+
+    assert apple._budget_params() == (
+        apple.DEFAULT_MARGIN_GB, apple.DEFAULT_OVERHEAD_GB)
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
@@ -474,7 +495,8 @@ def test_budget_params_falls_back_to_default_overhead(monkeypatch):
                         type("P", (), {"get_calibration": staticmethod(
                             lambda con, eng, **kwargs: None)}),
                         raising=False)
-    margin, overhead = apple._budget_params()
+    margin, overhead = apple._budget_params(
+        engine_fingerprint="engine:v1:sha256:mlx")
     assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, apple.DEFAULT_OVERHEAD_GB)
 
 

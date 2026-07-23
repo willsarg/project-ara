@@ -29,6 +29,8 @@ from ara.measurement_authority import (
     UNSCOPED_ENVIRONMENT_KEY,
 )
 
+LEGACY_ENGINE_FINGERPRINT = "engine:legacy-unknown"
+
 _MODEL_ARTIFACTS_DDL = """
 CREATE TABLE IF NOT EXISTS model_artifacts (
     artifact_id          TEXT PRIMARY KEY,
@@ -64,7 +66,9 @@ CREATE TABLE IF NOT EXISTS {table} (
     wall_bytes        INTEGER,
     safe_budget_bytes INTEGER,
     authority_evidence_json TEXT,
-    PRIMARY KEY (machine_key, runtime, backend, config_key, authority_key)
+    engine_fingerprint TEXT NOT NULL,
+    PRIMARY KEY (machine_key, runtime, backend, config_key, authority_key,
+                 engine_fingerprint)
 );
 """
 
@@ -226,7 +230,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 """ + _MODEL_ARTIFACTS_DDL + _CHARACTERIZATIONS_DDL.format(
     table="characterizations") + _BENCHMARK_RESULTS_DDL.format(table="benchmark_results")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _db_path() -> Path:
@@ -379,6 +383,24 @@ def connect() -> sqlite3.Connection:
             con.close()
             raise
         con.execute("PRAGMA foreign_keys = ON")
+    if con.execute("PRAGMA user_version").fetchone()[0] < 8:
+        rebuild = _calibration_engine_fingerprint_v8_needed(con)
+        if rebuild:
+            _backup_before_calibration_engine_v8(con, path)
+        con.commit()
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if rebuild:
+                _migrate_calibration_engine_fingerprint_v8(con)
+            con.execute("PRAGMA user_version = 8")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.execute("PRAGMA foreign_keys = ON")
+            con.close()
+            raise
+        con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
@@ -484,6 +506,17 @@ def _backup_before_characterization_evidence_v7(
         path,
         suffix=".pre-characterization-evidence-v7.bak",
         validation_label="pre-v7",
+    )
+
+
+def _backup_before_calibration_engine_v8(
+        con: sqlite3.Connection, path: Path) -> None:
+    """Keep one validated SQLite backup before engine-scoping calibration evidence."""
+    _backup_before_migration(
+        con,
+        path,
+        suffix=".pre-calibration-engine-v8.bak",
+        validation_label="pre-v8",
     )
 
 
@@ -752,13 +785,15 @@ def _migrate_measurement_authority_v6(con: sqlite3.Connection) -> None:
             "(machine_key,runtime,backend,config_key,legacy_engine,fixed_overhead_gb,"
             "calibrated_at,wall_gb,safe_budget_gb,evidence_json,environment_key,"
             "authority_key,memory_unit,wall_bytes,safe_budget_bytes,"
-            "authority_evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "authority_evidence_json,engine_fingerprint) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row["machine_key"], row["runtime"], row["backend"], row["config_key"],
                 row.get("legacy_engine"), row.get("fixed_overhead_gb"),
                 row.get("calibrated_at"), row.get("wall_gb"), row.get("safe_budget_gb"),
                 row.get("evidence_json"), environment_key, authority_key, memory_unit,
                 row.get("wall_bytes"), row.get("safe_budget_bytes"), authority_json,
+                LEGACY_ENGINE_FINGERPRINT,
             ),
         )
 
@@ -849,6 +884,40 @@ def _migrate_characterization_evidence_v7(con: sqlite3.Connection) -> None:
         )
     con.execute("DROP TABLE characterizations")
     con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
+
+
+def _calibration_engine_fingerprint_v8_needed(con: sqlite3.Connection) -> bool:
+    columns = {
+        row["name"] for row in con.execute("PRAGMA table_info(calibrations)")}
+    return "engine_fingerprint" not in columns
+
+
+def _migrate_calibration_engine_fingerprint_v8(
+        con: sqlite3.Connection) -> None:
+    """Retain prior calibration as display history without authorizing a new engine build."""
+    rows = [dict(row) for row in con.execute("SELECT * FROM calibrations")]
+    con.execute("DROP TABLE IF EXISTS calibrations_new")
+    con.execute(_CALIBRATIONS_DDL.format(table="calibrations_new"))
+    for row in rows:
+        con.execute(
+            "INSERT INTO calibrations_new "
+            "(machine_key,runtime,backend,config_key,legacy_engine,fixed_overhead_gb,"
+            "calibrated_at,wall_gb,safe_budget_gb,evidence_json,environment_key,"
+            "authority_key,memory_unit,wall_bytes,safe_budget_bytes,"
+            "authority_evidence_json,engine_fingerprint) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["machine_key"], row["runtime"], row["backend"], row["config_key"],
+                row.get("legacy_engine"), row.get("fixed_overhead_gb"),
+                row.get("calibrated_at"), row.get("wall_gb"),
+                row.get("safe_budget_gb"), row.get("evidence_json"),
+                row["environment_key"], row["authority_key"], row["memory_unit"],
+                row.get("wall_bytes"), row.get("safe_budget_bytes"),
+                row.get("authority_evidence_json"), LEGACY_ENGINE_FINGERPRINT,
+            ),
+        )
+    con.execute("DROP TABLE calibrations")
+    con.execute("ALTER TABLE calibrations_new RENAME TO calibrations")
 
 
 def _canonicalize_engine_pk_table(con: sqlite3.Connection, table: str,
@@ -949,6 +1018,8 @@ def _rekey_legacy(con: sqlite3.Connection) -> int:
             pk_rest = ("runtime", "backend", "config_key")
             if "authority_key" in columns:
                 pk_rest = (*pk_rest, "authority_key")
+            if "engine_fingerprint" in columns:
+                pk_rest = (*pk_rest, "engine_fingerprint")
         elif table == "characterizations" and "runtime" in columns:
             pk_rest = ("runtime", "backend", "artifact_id", "config_key")
             if "authority_key" in columns:
@@ -1006,7 +1077,8 @@ def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *
                    authority_key: str = UNSCOPED_AUTHORITY_KEY,
                    memory_unit: str = "GiB", wall_bytes: int | None = None,
                    safe_budget_bytes: int | None = None,
-                   authority_evidence: dict | None = None) -> None:
+                   authority_evidence: dict | None = None,
+                   engine_fingerprint: str = LEGACY_ENGINE_FINGERPRINT) -> None:
     from ara import targets
     runtime, backend, legacy_engine = targets.for_engine(engine)
     config_key = config_key or targets.calibration_config_key()
@@ -1014,9 +1086,11 @@ def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *
         "INSERT INTO calibrations "
         "(machine_key,runtime,backend,config_key,legacy_engine,fixed_overhead_gb,"
         "calibrated_at,wall_gb,safe_budget_gb,evidence_json,environment_key,authority_key,"
-        "memory_unit,wall_bytes,safe_budget_bytes,authority_evidence_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(machine_key,runtime,backend,config_key,authority_key) DO UPDATE SET "
+        "memory_unit,wall_bytes,safe_budget_bytes,authority_evidence_json,"
+        "engine_fingerprint) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(machine_key,runtime,backend,config_key,authority_key,"
+        "engine_fingerprint) DO UPDATE SET "
         "legacy_engine=excluded.legacy_engine, "
         "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at, "
         "wall_gb=excluded.wall_gb, safe_budget_gb=excluded.safe_budget_gb, "
@@ -1027,18 +1101,21 @@ def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *
         (machine_key, runtime, backend, config_key, legacy_engine, fixed_overhead_gb,
          calibrated_at, wall_gb, safe_budget_gb, _compact_json(evidence), environment_key,
          authority_key, memory_unit, wall_bytes, safe_budget_bytes,
-         _compact_json(authority_evidence)))
+         _compact_json(authority_evidence), engine_fingerprint))
     con.commit()
 
 
 def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
                     *, config_key: str | None = None,
-                    authority_key: str | None = None) -> dict | None:
+                    authority_key: str | None = None,
+                    engine_fingerprint: str | None = None) -> dict | None:
     from ara import targets
     from ara.engine_identity import LEGACY_ENGINE_ALIASES
     runtime, backend, canonical = targets.for_engine(engine)
     columns = {row["name"] for row in con.execute("PRAGMA table_info(calibrations)")}
     if "runtime" not in columns:
+        if engine_fingerprint is not None:
+            return None
         storage_keys = [canonical, *(legacy for legacy, replacement
                                      in LEGACY_ENGINE_ALIASES.items()
                                      if replacement == canonical)]
@@ -1052,7 +1129,8 @@ def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
         result = dict(row)
         result.update(runtime=runtime, backend=backend,
                       config_key=targets.calibration_config_key(),
-                      legacy_engine=canonical, evidence_json=None, evidence=None)
+                      legacy_engine=canonical, evidence_json=None, evidence=None,
+                      engine_fingerprint=LEGACY_ENGINE_FINGERPRINT)
         result["engine"] = canonical
         return result
     clauses = ["machine_key=?", "runtime=?", "backend=?", "config_key=?"]
@@ -1064,10 +1142,17 @@ def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
             return None
         clauses.append("authority_key=?")
         values.append(authority_key)
+    if engine_fingerprint is not None:
+        if "engine_fingerprint" not in columns:
+            return None
+        clauses.append("engine_fingerprint=?")
+        values.append(engine_fingerprint)
     authority_order = ", authority_key DESC" if "authority_key" in columns else ""
+    engine_order = (
+        ", engine_fingerprint DESC" if "engine_fingerprint" in columns else "")
     row = con.execute(
         f"SELECT * FROM calibrations WHERE {' AND '.join(clauses)} "  # noqa: S608
-        f"ORDER BY calibrated_at DESC{authority_order} LIMIT 1",
+        f"ORDER BY calibrated_at DESC{authority_order}{engine_order} LIMIT 1",
         values).fetchone()
     if row is None:
         return None
@@ -1083,6 +1168,8 @@ def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
             safe_budget_bytes=None,
             authority_evidence_json=evidence_json,
         )
+    if "engine_fingerprint" not in columns:
+        result["engine_fingerprint"] = LEGACY_ENGINE_FINGERPRINT
     result["engine"] = result.get("legacy_engine") or canonical
     result["evidence"] = _json_object(result.get("evidence_json"))
     result["authority_evidence"] = _json_object(

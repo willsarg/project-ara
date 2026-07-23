@@ -167,6 +167,17 @@ def test_limits_uses_measured_wall_when_supplied():
     assert lim["calibrated_at"] == "2026-07-01T00:00:00Z"
 
 
+def test_limits_preserves_analytic_cpu_wall_alongside_live_measurement():
+    measured = {"wall_gb": 30.0, "safe_budget_gb": 28.0}
+
+    lim = estimate.limits(
+        _machine(backend="cpu", ram_total_gb=32.0), measured=measured)
+
+    assert lim["wall_gb"] == 30.0
+    assert lim["estimated_wall_gb"] == 32.0
+    assert lim["estimated_safe_budget_gb"] == 30.0
+
+
 def test_limits_apple_measurement_does_not_retain_removed_heuristic():
     # An explicitly supplied live measurement can govern, but there is no 75%-of-RAM comparison.
     measured = {"wall_gb": 41.3, "safe_budget_gb": 39.3}

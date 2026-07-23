@@ -57,6 +57,30 @@ def test_calibration_round_trips_exact_measurement_authority(store, monkeypatch)
     assert row["authority_evidence"]["schema"] == "mlx-memory-authority:v1"
 
 
+def test_calibration_round_trips_exact_engine_fingerprint(store, monkeypatch):
+    monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")
+    calibration.save_calibration(
+        store,
+        "cuda",
+        fixed_overhead_gb=0.9,
+        authority_key="authority:cuda",
+        engine_fingerprint="engine:v2:sha256:cuda-a",
+    )
+
+    assert calibration.get_calibration(
+        store,
+        "cuda",
+        authority_key="authority:cuda",
+        engine_fingerprint="engine:v2:sha256:cuda-a",
+    )["fixed_overhead_gb"] == 0.9
+    assert calibration.get_calibration(
+        store,
+        "cuda",
+        authority_key="authority:cuda",
+        engine_fingerprint="engine:v2:sha256:cuda-b",
+    ) is None
+
+
 def test_save_calibration_wall_defaults_none(store, monkeypatch):
     # Existing callers (overhead only) still work — wall columns stay NULL.
     monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")

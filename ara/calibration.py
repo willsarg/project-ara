@@ -20,7 +20,8 @@ def save_calibration(con, engine: str, *, fixed_overhead_gb: float,
                      memory_unit: str = "GiB",
                      wall_bytes: int | None = None,
                      safe_budget_bytes: int | None = None,
-                     authority_evidence: dict | None = None) -> None:
+                     authority_evidence: dict | None = None,
+                     engine_fingerprint: str = db.LEGACY_ENGINE_FINGERPRINT) -> None:
     """Persist this machine's measured overhead for *engine* (and, when known, the measured
     memory wall + safe budget the engine read, so profile/recommend can report reality)."""
     db.upsert_calibration(con, machine_key(), engine,
@@ -32,7 +33,8 @@ def save_calibration(con, engine: str, *, fixed_overhead_gb: float,
                           memory_unit=memory_unit,
                           wall_bytes=wall_bytes,
                           safe_budget_bytes=safe_budget_bytes,
-                          authority_evidence=authority_evidence)
+                          authority_evidence=authority_evidence,
+                          engine_fingerprint=engine_fingerprint)
 
 
 def get_calibration(
@@ -40,7 +42,9 @@ def get_calibration(
     engine: str,
     *,
     authority_key: str | None = None,
+    engine_fingerprint: str | None = None,
 ) -> dict | None:
     """This machine's stored calibration for *engine*, or None if never calibrated."""
     return db.get_calibration(
-        con, machine_key(), engine, authority_key=authority_key)
+        con, machine_key(), engine, authority_key=authority_key,
+        engine_fingerprint=engine_fingerprint)

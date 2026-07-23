@@ -211,22 +211,39 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
 # _budget_params — reads stored calibration overrides, else defaults
 # --------------------------------------------------------------------------- #
 def test_budget_params_uses_stored_calibration_for_both_margins(monkeypatch):
+    seen = []
     monkeypatch.setattr(cuda_gguf, "db",
                         type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(cuda_gguf, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
-                            lambda con, eng: {"vram_margin_gb": 0.5, "ram_margin_gb": 3.0})}),
+                            lambda con, eng, **kwargs: seen.append((eng, kwargs))
+                            or {"vram_margin_gb": 0.5, "ram_margin_gb": 3.0})}),
                         raising=False)
-    assert cuda_gguf._budget_params() == (0.5, 3.0)
+    assert cuda_gguf._budget_params(
+        engine_fingerprint="engine:v1:sha256:cuda-gguf") == (0.5, 3.0)
+    assert seen == [(cuda_gguf.CALIBRATION_ENGINE, {
+        "engine_fingerprint": "engine:v1:sha256:cuda-gguf",
+    })]
+
+
+def test_budget_params_does_not_reuse_an_unscoped_engine_build(monkeypatch):
+    monkeypatch.setattr(
+        cuda_gguf.db, "connected",
+        lambda: pytest.fail("unscoped lookup must not read calibration"))
+
+    assert cuda_gguf._budget_params() == (
+        cuda_gguf.DEFAULT_VRAM_MARGIN_GB, cuda_gguf.DEFAULT_RAM_MARGIN_GB)
 
 
 def test_budget_params_falls_back_to_defaults_when_no_calibration(monkeypatch):
     monkeypatch.setattr(cuda_gguf, "db",
                         type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(cuda_gguf, "calibration",
-                        type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
+                        type("P", (), {"get_calibration": staticmethod(
+                            lambda con, eng, **kwargs: None)}),
                         raising=False)
-    assert cuda_gguf._budget_params() == (
+    assert cuda_gguf._budget_params(
+        engine_fingerprint="engine:v1:sha256:cuda-gguf") == (
         cuda_gguf.DEFAULT_VRAM_MARGIN_GB, cuda_gguf.DEFAULT_RAM_MARGIN_GB)
 
 

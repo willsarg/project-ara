@@ -103,12 +103,16 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     return out
 
 
-def _budget_params() -> tuple[float, float]:
-    """ARA-owned (vram_margin, ram_margin). Margins are policy; stored calibration may override."""
+def _budget_params(*, engine_fingerprint: str | None = None) -> tuple[float, float]:
+    """ARA-owned margins; exact-build calibration may override the policy defaults."""
     vram_margin = DEFAULT_VRAM_MARGIN_GB
     ram_margin = DEFAULT_RAM_MARGIN_GB
-    with db.connected() as con:
-        stored = calibration.get_calibration(con, CALIBRATION_ENGINE)
+    stored = None
+    if engine_fingerprint is not None:
+        with db.connected() as con:
+            stored = calibration.get_calibration(
+                con, CALIBRATION_ENGINE,
+                engine_fingerprint=engine_fingerprint)
     if stored and stored.get("vram_margin_gb") is not None:
         vram_margin = stored["vram_margin_gb"]
     if stored and stored.get("ram_margin_gb") is not None:
@@ -145,7 +149,8 @@ def characterization_methodology(*, vram_margin_gb: float | None = None,
         watchdog_stop_rule="either-wall-gte-budget:v1")
 
 
-def characterize(model: str, *, progress: bool = False) -> dict:
+def characterize(model: str, *, progress: bool = False,
+                 engine_fingerprint: str | None = None) -> dict:
     """Measure *model*'s safe context ceiling on the hybrid GPU+CPU path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this
@@ -157,7 +162,11 @@ def characterize(model: str, *, progress: bool = False) -> dict:
     ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible.
     ``kv_dtype_bytes`` is fixed at 2.0 (fp16) — the worker does not expose KV quantization.
     """
-    vram_margin, ram_margin = _budget_params()
+    vram_margin, ram_margin = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
@@ -177,13 +186,18 @@ DEFAULT_MAX_TOKENS = 256
 
 
 def generate(model: str, prompt: str, *, max_context: int,
-             max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+             max_tokens: int = DEFAULT_MAX_TOKENS,
+             engine_fingerprint: str | None = None) -> dict:
     """One-shot completion on the hybrid GPU+CPU path, governed: ``max_context`` is the
     characterized safe ceiling, so the worker's KV cache is capped under both walls (the worker
     still self-vetoes on both, L4/L5). Out-of-process in the isolated ``cuda_gguf`` env; the
     prompt goes over stdin, never argv. Returns ``{context, gpu_layers, completion}`` or a
     refusal (``{context, refused, reason}``)."""
-    vram_margin, ram_margin = _budget_params()
+    vram_margin, ram_margin = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = [str(WORKER), model, str(max_context), "--generate",
             "--vram-margin", str(vram_margin), "--ram-margin", str(ram_margin),
             "--max-tokens", str(max_tokens)]
@@ -191,14 +205,19 @@ def generate(model: str, prompt: str, *, max_context: int,
 
 
 def benchmark(model: str, prompts: list, *, max_context: int,
-              max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+              max_tokens: int = DEFAULT_MAX_TOKENS,
+              engine_fingerprint: str | None = None) -> dict:
     """Multi-prompt GPU+CPU benchmark, governed: the worker loads the GGUF **once** (K layers
     offloaded, KV capped at ``max_context`` — the characterized safe ceiling) and iterates the
     prompt array, enforcing both walls per item. The prompts go as a JSON array over stdin, never
     argv. Returns the worker dict verbatim: ``{"context": N, "gpu_layers": K, "results": [...]}``
     or a gate refusal. ARA never imports llama.cpp in-process; ``max_context`` is the characterized
     safe ceiling."""
-    vram_margin, ram_margin = _budget_params()
+    vram_margin, ram_margin = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = [str(WORKER), model, str(max_context), "--benchmark",
             "--vram-margin", str(vram_margin), "--ram-margin", str(ram_margin),
             "--max-tokens", str(max_tokens)]

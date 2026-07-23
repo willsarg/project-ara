@@ -97,12 +97,16 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     return out
 
 
-def _budget_params() -> tuple[float, float]:
+def _budget_params(*, engine_fingerprint: str | None = None) -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
-    calibration for the cpu engine, or a safe default if uncalibrated."""
+    calibration for the exact CPU engine build, or a safe default if unscoped."""
     overhead = DEFAULT_OVERHEAD_GB
-    with db.connected() as con:
-        stored = calibration.get_calibration(con, CALIBRATION_ENGINE)
+    stored = None
+    if engine_fingerprint is not None:
+        with db.connected() as con:
+            stored = calibration.get_calibration(
+                con, CALIBRATION_ENGINE,
+                engine_fingerprint=engine_fingerprint)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -130,7 +134,9 @@ def characterization_methodology(*, margin_gb: float | None = None) -> dict:
         watchdog_stop_rule="system-used-gte-budget:v1")
 
 
-def characterize(model: str, *, progress: bool = False) -> dict:
+def characterize(model: str, *, progress: bool = False,
+                 fixed_overhead_gb: float | None = None,
+                 engine_fingerprint: str | None = None) -> dict:
     """Measure *model*'s safe context ceiling on CPU — the thin path, same driver as Apple.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this
@@ -142,7 +148,14 @@ def characterize(model: str, *, progress: bool = False) -> dict:
     ``progress=True`` streams the worker's stderr live so HF's native tqdm bars are visible
     during the GGUF fetch that the CPU worker handles in-process.
     """
-    margin, overhead = _budget_params()
+    if fixed_overhead_gb is None:
+        margin, overhead = (
+            _budget_params()
+            if engine_fingerprint is None
+            else _budget_params(engine_fingerprint=engine_fingerprint)
+        )
+    else:
+        margin, overhead = DEFAULT_MARGIN_GB, fixed_overhead_gb
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
@@ -160,12 +173,17 @@ DEFAULT_MAX_TOKENS = 256
 
 
 def generate(model: str, prompt: str, *, max_context: int,
-             max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+             max_tokens: int = DEFAULT_MAX_TOKENS,
+             engine_fingerprint: str | None = None) -> dict:
     """One-shot completion on CPU, governed: ``max_context`` is the characterized safe ceiling,
     so the worker's KV cache is capped under the wall (the worker still self-vetoes, L4/L5).
     Out-of-process in the isolated ``cpu`` env; the prompt goes over stdin, never argv. Returns
     ``{context, completion}`` or a refusal (``{refused, reason}``)."""
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     return engine_env.run_worker(
         ENV_NAME,
         [str(WORKER), model, str(max_context), "--generate",
@@ -175,14 +193,19 @@ def generate(model: str, prompt: str, *, max_context: int,
 
 
 def benchmark(model: str, prompts: list, *, max_context: int,
-              max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+              max_tokens: int = DEFAULT_MAX_TOKENS,
+              engine_fingerprint: str | None = None) -> dict:
     """Multi-prompt CPU benchmark, governed: the worker loads the GGUF **once** (KV capped at
     ``max_context`` — the characterized safe ceiling) and iterates the prompt array, enforcing the
     ceiling per item. The prompts go as a JSON array over stdin, never argv. Returns the worker
     dict verbatim: ``{"context": N, "results": [...]}`` or a gate refusal ``{"context": N,
     "refused": true, "reason": "..."}``. ARA never imports llama.cpp in-process; ``max_context``
     is the characterized safe ceiling."""
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     return engine_env.run_worker(
         ENV_NAME,
         [str(WORKER), model, str(max_context), "--benchmark",

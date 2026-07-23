@@ -26,7 +26,7 @@ def test_connect_creates_schema(store):
     assert {"calibrations", "models", "characterizations"} <= tables
 
 
-def test_v7_schema_keys_measurements_by_methodology_and_engine(store):
+def test_v8_schema_keys_measurements_by_methodology_and_engine(store):
     calibration_columns = {
         row["name"] for row in store.execute("PRAGMA table_info(calibrations)")}
     characterization_columns = {
@@ -45,10 +45,10 @@ def test_v7_schema_keys_measurements_by_methodology_and_engine(store):
         "environment_key", "authority_key", "memory_unit", "direct_context",
         "fitted_context", "stopped_reason", "methodology_key", "engine_fingerprint",
     } <= characterization_columns
-    assert calibration_pk[-1] == "authority_key"
+    assert calibration_pk[-2:] == ["authority_key", "engine_fingerprint"]
     assert characterization_pk[-3:] == [
         "authority_key", "methodology_key", "engine_fingerprint"]
-    assert store.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert store.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
 def test_save_characterization_persists_direct_fitted_and_methodology(store):
@@ -146,7 +146,7 @@ def test_v7_migration_preserves_legacy_history_but_never_authorizes_it(
     assert unknown["direct_context"] is None and unknown["fitted_context"] == 4096
     assert unknown["engine_fingerprint"] == "engine:legacy-unknown"
     assert unknown["methodology_key"] == "legacy-unknown" and unknown["reusable"] is False
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
     migrated.close()
 
     backup = path.with_name(path.name + ".pre-characterization-evidence-v7.bak")
@@ -251,7 +251,7 @@ def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
     assert db.get_calibration(con, _NEW, "cpu") is not None
     assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
     assert db.get_latest_profile(con, _NEW) is not None
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 8
     assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
 
 
@@ -339,8 +339,8 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     con = db.connect()
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
-    # The migration chain now ends at v6; the single-field key 'm' is not a legacy machine key.
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 7
+    # The migration chain now ends at v8; the single-field key 'm' is not a legacy machine key.
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 8
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
@@ -382,6 +382,137 @@ def test_calibrations_for_different_measurement_authorities_coexist(store):
     assert first["authority_evidence"]["wall"] == "a"
     assert second["wall_bytes"] == 17_179_885_568
     assert store.execute("SELECT COUNT(*) FROM calibrations").fetchone()[0] == 2
+
+
+def test_calibrations_for_different_engine_builds_coexist_and_match_exactly(store):
+    common = {
+        "fixed_overhead_gb": 1.0,
+        "calibrated_at": "t",
+        "environment_key": "env",
+        "authority_key": "authority",
+    }
+    db.upsert_calibration(
+        store, "m", "cuda", **common,
+        engine_fingerprint="engine:v2:sha256:a")
+    db.upsert_calibration(
+        store, "m", "cuda", **{**common, "fixed_overhead_gb": 2.0},
+        engine_fingerprint="engine:v2:sha256:b")
+
+    first = db.get_calibration(
+        store, "m", "cuda", authority_key="authority",
+        engine_fingerprint="engine:v2:sha256:a")
+    second = db.get_calibration(
+        store, "m", "cuda", authority_key="authority",
+        engine_fingerprint="engine:v2:sha256:b")
+    assert first["fixed_overhead_gb"] == 1.0
+    assert second["fixed_overhead_gb"] == 2.0
+    assert store.execute("SELECT COUNT(*) FROM calibrations").fetchone()[0] == 2
+
+
+def test_v8_makes_existing_calibrations_legacy_display_only(
+        tmp_path, monkeypatch):
+    path = tmp_path / "calibration-engine-fingerprint.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE calibrations (
+            machine_key TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            config_key TEXT NOT NULL,
+            legacy_engine TEXT,
+            fixed_overhead_gb REAL,
+            calibrated_at TEXT,
+            wall_gb REAL,
+            safe_budget_gb REAL,
+            evidence_json TEXT,
+            environment_key TEXT NOT NULL,
+            authority_key TEXT NOT NULL,
+            memory_unit TEXT NOT NULL,
+            wall_bytes INTEGER,
+            safe_budget_bytes INTEGER,
+            authority_evidence_json TEXT,
+            PRIMARY KEY (machine_key,runtime,backend,config_key,authority_key)
+        );
+        INSERT INTO calibrations VALUES (
+            'm','torch','cuda','cal:v1:default','cuda',0.9,'t',8.0,7.0,NULL,
+            'env','authority','GiB',NULL,NULL,NULL
+        );
+        PRAGMA user_version = 7;
+    """)
+    con.commit()
+    con.close()
+
+    migrated = db.connect()
+
+    historical = db.get_calibration(migrated, "m", "cuda")
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert historical["engine_fingerprint"] == db.LEGACY_ENGINE_FINGERPRINT
+    assert db.get_calibration(
+        migrated, "m", "cuda", authority_key="authority",
+        engine_fingerprint="engine:v2:sha256:current") is None
+    migrated.close()
+    backup = path.with_name(path.name + ".pre-calibration-engine-v8.bak")
+    assert backup.exists()
+
+
+def test_v8_migration_failure_rolls_back_and_keeps_v7_store(
+        tmp_path, monkeypatch):
+    path = tmp_path / "v8-rollback.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE calibrations (
+            machine_key TEXT NOT NULL, runtime TEXT NOT NULL, backend TEXT NOT NULL,
+            config_key TEXT NOT NULL, legacy_engine TEXT, fixed_overhead_gb REAL,
+            calibrated_at TEXT, wall_gb REAL, safe_budget_gb REAL, evidence_json TEXT,
+            environment_key TEXT NOT NULL, authority_key TEXT NOT NULL,
+            memory_unit TEXT NOT NULL, wall_bytes INTEGER, safe_budget_bytes INTEGER,
+            authority_evidence_json TEXT,
+            PRIMARY KEY (machine_key,runtime,backend,config_key,authority_key)
+        );
+        PRAGMA user_version = 7;
+    """)
+    con.close()
+    monkeypatch.setattr(
+        db, "_migrate_calibration_engine_fingerprint_v8",
+        lambda _con: (_ for _ in ()).throw(RuntimeError("forced v8 failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="forced v8 failure"):
+        db.connect()
+
+    saved = sqlite3.connect(path)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert "engine_fingerprint" not in {
+        row[1] for row in saved.execute("PRAGMA table_info(calibrations)")}
+    saved.close()
+
+
+def test_exact_engine_lookup_rejects_pre_target_calibration_schema():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE calibrations (
+            machine_key TEXT NOT NULL, engine TEXT NOT NULL,
+            fixed_overhead_gb REAL, calibrated_at TEXT,
+            PRIMARY KEY (machine_key, engine)
+        );
+    """)
+
+    assert db.get_calibration(
+        con, "m", "cuda",
+        engine_fingerprint="engine:v2:sha256:current") is None
+
+
+def test_exact_engine_lookup_rejects_pre_v8_calibration_schema():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript(db._CALIBRATIONS_V5_DDL.format(table="calibrations"))
+
+    assert db.get_calibration(
+        con, "m", "cuda",
+        engine_fingerprint="engine:v2:sha256:current") is None
 
 
 # --- measured wall persistence (Spec 2026-06-23-capability-pipeline) ---
@@ -878,7 +1009,7 @@ def test_v5_migrates_unknown_target_rows_as_display_only_and_reopens(
     con.close()
 
     first = db.connect()
-    assert first.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 8
     rows = db.list_characterizations_for_display(
         first, "m", runtime="mystery-runtime", backend="unknown")
     assert len(rows) == 1
@@ -1033,7 +1164,7 @@ def test_v6_migration_preserves_history_and_marks_old_mlx_units_unknown(
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
     mlx = db.get_calibration(migrated, "m", "mlx")
     assert mlx["memory_unit"] == "legacy-unit-unknown"
     assert mlx["wall_gb"] == 16.000015258789062
@@ -1305,7 +1436,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     first = db.connect()
     row = db.get_benchmark_result(first, "m", "org/model", "coding")
-    assert first.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 8
     assert row is not None
     assert row["runtime"] == "mystery-runtime"
     assert row["backend"] == "unknown"
@@ -1317,7 +1448,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     second = db.connect()
     assert second.execute("SELECT COUNT(*) FROM benchmark_results").fetchone()[0] == 1
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 8
     second.close()
     backup = path.with_name(path.name + ".pre-target-cells-v4.bak")
     assert backup.exists()
@@ -1528,7 +1659,7 @@ def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monk
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
     for machine_key, engine, overhead, calibrated_at, wall, budget in calibrations:
         row = db.get_calibration(migrated, machine_key, engine)
         assert (row["fixed_overhead_gb"], row["calibrated_at"], row["wall_gb"],
@@ -1573,7 +1704,7 @@ def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_pa
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
     assert db.get_calibration(migrated, "old", "mlx")["legacy_engine"] == "mlx"
     tie = db.get_calibration(migrated, "tie", "mlx")
     assert tie["engine"] == "mlx" and tie["fixed_overhead_gb"] == 2.0 and tie["wall_gb"] == 22.0
@@ -1624,7 +1755,7 @@ def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monke
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
     before = backup.read_bytes()
     second = db.connect()
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 8
     assert db.get_calibration(second, "m", "mlx")["legacy_engine"] == "mlx"
     second.close()
     assert backup.read_bytes() == before

@@ -119,12 +119,15 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
     return limits
 
 
-def _budget_params() -> tuple[float, float]:
+def _budget_params(*, engine_fingerprint: str | None = None) -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
-    calibration for the CUDA engine, or a safe default if uncalibrated."""
+    calibration for the exact CUDA engine build, or a safe default if unscoped."""
     overhead = DEFAULT_OVERHEAD_GB
-    with db.connected() as con:
-        stored = calibration.get_calibration(con, "cuda")
+    stored = None
+    if engine_fingerprint is not None:
+        with db.connected() as con:
+            stored = calibration.get_calibration(
+                con, "cuda", engine_fingerprint=engine_fingerprint)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -189,7 +192,9 @@ def characterization_methodology(*, margin_gb: float | None = None) -> dict:
 
 def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
                  flash_attn: bool = False, weight_quant: str = "none",
-                 prefill_chunk: int | None = None) -> dict:
+                 prefill_chunk: int | None = None,
+                 fixed_overhead_gb: float | None = None,
+                 engine_fingerprint: str | None = None) -> dict:
     """Measure *model*'s safe VRAM context ceiling on this GPU — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver``; this adapter
@@ -203,7 +208,14 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
     ``progress`` is accepted for interface symmetry with the cpu backend but has no effect
     here: the HF download bar already ran in-process during the pre-fetch step.
     """
-    margin, overhead = _budget_params()
+    if fixed_overhead_gb is None:
+        margin, overhead = (
+            _budget_params()
+            if engine_fingerprint is None
+            else _budget_params(engine_fingerprint=engine_fingerprint)
+        )
+    else:
+        margin, overhead = DEFAULT_MARGIN_GB, fixed_overhead_gb
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
@@ -223,13 +235,18 @@ DEFAULT_MAX_TOKENS = 256
 
 def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
              kv_quant: str = "f16", flash_attn: bool = False, weight_quant: str = "none",
-             prefill_chunk: int | None = None) -> dict:
+             prefill_chunk: int | None = None,
+             engine_fingerprint: str | None = None) -> dict:
     """One-shot CUDA completion, governed: max_context is the characterized safe ceiling, so the
     worker generates under the wall. Out-of-process in the isolated `cuda` env via the native
     generate worker; the prompt goes over stdin, never argv. ``kv_quant`` (default ``"f16"``) and
     ``flash_attn`` (default off → SDPA) should match how *model* was characterized. Returns
     {context, completion} or a refusal {refused, reason}. ARA never imports torch in-process."""
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = ["-m", "ara_engine_cuda.generate", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]
@@ -247,7 +264,8 @@ def generate(model, prompt, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
 
 def benchmark(model, prompts: list, *, max_context, max_tokens=DEFAULT_MAX_TOKENS,
               kv_quant: str = "f16", flash_attn: bool = False, weight_quant: str = "none",
-              prefill_chunk: int | None = None) -> dict:
+              prefill_chunk: int | None = None,
+              engine_fingerprint: str | None = None) -> dict:
     """Load-once multi-prompt CUDA benchmark, governed: ``max_context`` is the characterized safe
     ceiling, so the worker gates each prompt under the wall and loads weights only after a prompt's
     gate passes. Out-of-process in the isolated ``cuda`` env via the native ``benchmark`` worker;
@@ -255,7 +273,11 @@ def benchmark(model, prompts: list, *, max_context, max_tokens=DEFAULT_MAX_TOKEN
     ``weight_quant``/``prefill_chunk`` should match how *model* was characterized. Returns the
     worker dict verbatim — ``{"context": N, "results": [...]}`` or a whole-run refusal
     ``{"context": N, "refused": true, "reason": "..."}``. ARA never imports torch in-process."""
-    margin, overhead = _budget_params()
+    margin, overhead = (
+        _budget_params()
+        if engine_fingerprint is None
+        else _budget_params(engine_fingerprint=engine_fingerprint)
+    )
     argv = ["-m", "ara_engine_cuda.benchmark", model, str(max_context),
             "--margin", str(margin), "--overhead", str(overhead),
             "--max-tokens", str(max_tokens)]

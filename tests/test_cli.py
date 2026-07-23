@@ -312,7 +312,7 @@ def test_render_doctor_json_reports_key_and_counts(
         "status": "healthy",
         "presence": "present",
         "readable": True,
-        "schema_version": 7,
+        "schema_version": 8,
         "schema_supported": True,
         "schema_check": {"status": "passed", "missing_tables": []},
         "quick_check": {"status": "passed", "messages": []},
@@ -637,13 +637,13 @@ def test_render_doctor_verbose_reports_store_details(
 
     out = buf.getvalue()
     assert f"database             {db._db_path()}" in out
-    assert "schema version       7" in out
+    assert "schema version       8" in out
 
     c = cli.Console.from_env(verbose=True)
     assert cli.render_doctor(c, as_json=True) == 0
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
-    assert out_json["schema_version"] == 7
+    assert out_json["schema_version"] == 8
 
 
 def test_render_doctor_text_reports_ollama_findings(
@@ -1915,7 +1915,8 @@ def test_profile_keeps_mlx_history_display_only(make_console, monkeypatch, set_p
                                      wall_gb=17.760009765625,
                                      safe_budget_gb=15.760009765625,
                                      wall_bytes=19_069_665_280,
-                                     safe_budget_bytes=16_922_181_632)
+                                     safe_budget_bytes=16_922_181_632,
+                                     engine_fingerprint=_TEST_ENGINE_FP)
     c, buf = make_console(verbose=True)
     assert cli.render_profile(c) == 0
     out = " ".join(buf.getvalue().split())
@@ -1932,7 +1933,8 @@ def test_profile_json_reports_historical_mlx_authority(monkeypatch, set_platform
                                      wall_gb=17.760009765625,
                                      safe_budget_gb=15.760009765625,
                                      wall_bytes=19_069_665_280,
-                                     safe_budget_bytes=16_922_181_632)
+                                     safe_budget_bytes=16_922_181_632,
+                                     engine_fingerprint=_TEST_ENGINE_FP)
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -2027,21 +2029,41 @@ def test_profile_footer_keeps_unknown_when_uncalibrated(make_console, monkeypatc
     assert "ara characterize <model>" in out
 
 
-def test_profile_non_mlx_measurement_is_current_and_drives_footer(
-        make_console, monkeypatch, set_platform, store):
+def test_profile_keeps_legacy_non_mlx_calibration_display_only(
+        monkeypatch, set_platform, capsys, store):
     _wire_profile(
         monkeypatch, set_platform,
         _machine(backend="cpu", ram_total_gb=32.0, chip="Test CPU"))
     cli.calibration.save_calibration(
         store, "cpu", fixed_overhead_gb=0.5,
         wall_gb=30.0, safe_budget_gb=28.0)
-    c, buf = make_console()
+    c = cli.Console(color=False, stream=sys.stderr)
 
-    assert cli.render_profile(c, engine="cpu") == 0
-    out = buf.getvalue()
-    assert "30.0 GiB" in out
-    assert "to measure a model's real ceiling" in out
-    assert "estimated — run" not in out
+    assert cli.render_profile(c, engine="cpu", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "estimated"
+    assert payload["wall_gb"] == 32.0
+    assert payload["authority_status"] == "legacy-engine-unknown"
+    assert payload["historical_measurement"]["wall_gb"] == 30.0
+
+
+def test_profile_keeps_exact_non_mlx_calibration_unverified_without_engine_audit(
+        monkeypatch, set_platform, capsys, store):
+    _wire_profile(
+        monkeypatch, set_platform,
+        _machine(backend="cpu", ram_total_gb=32.0, chip="Test CPU"))
+    cli.calibration.save_calibration(
+        store, "cpu", fixed_overhead_gb=0.5,
+        wall_gb=30.0, safe_budget_gb=28.0,
+        engine_fingerprint=_TEST_ENGINE_FP)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, engine="cpu", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["basis"] == "estimated"
+    assert payload["wall_gb"] == 32.0
+    assert payload["authority_status"] == "historical-unverified"
+    assert payload["historical_measurement"]["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
@@ -4006,10 +4028,21 @@ def _patch_native_characterization(monkeypatch, row):
 
 
 def _patch_native_characterization_lookup(monkeypatch, lookup):
-    monkeypatch.setattr(cli.db, "get_characterization", lookup)
+    def scoped_lookup(*args):
+        row = lookup(*args)
+        if row is None:
+            return None
+        return {
+            **row,
+            "methodology_key": row.get("methodology_key", _TEST_METHOD_KEY),
+            "engine_fingerprint": row.get("engine_fingerprint", _TEST_ENGINE_FP),
+        }
+
+    monkeypatch.setattr(cli.db, "get_characterization", scoped_lookup)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine",
-        lambda con, mk, engine, model, **_kwargs: lookup(con, mk, engine, model),
+        lambda con, mk, engine, model, **_kwargs: scoped_lookup(
+            con, mk, engine, model),
     )
     monkeypatch.setattr(
         cli, "_current_reuse_identity",
@@ -4095,8 +4128,12 @@ def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_p
         def wait(self):
             captured["waited"] = True
 
-    def _fake_serve(model, *, port, max_context, kv_quant="f16", measured_slope_gb_per_k=None):
-        captured.update(model=model, port=port, max_context=max_context)
+    def _fake_serve(
+            model, *, port, max_context, kv_quant="f16",
+            measured_slope_gb_per_k=None, engine_fingerprint=None):
+        captured.update(
+            model=model, port=port, max_context=max_context,
+            engine_fingerprint=engine_fingerprint)
         return _Proc(), f"http://127.0.0.1:{port}", max_context
 
     monkeypatch.setattr("ara.backends.apple.serve", _fake_serve)
@@ -4105,6 +4142,7 @@ def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_p
                           engine="mlx", assume_yes=True)
     assert rc == 0
     assert captured["max_context"] == 8000 and captured["port"] == 12399
+    assert captured["engine_fingerprint"] == _TEST_ENGINE_FP
     assert captured["waited"] is True                      # foreground: our child IS the server
     assert "OPENAI_BASE_URL=http://127.0.0.1:12399/v1" in buf.getvalue()
 
@@ -4431,6 +4469,25 @@ def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
     assert cli.render_run(c, "org/m", prompt="meaning?") == 0
     assert "the answer is 42" in buf.getvalue()
     assert seen["max_context"] == 8192 and seen["prompt"] == "meaning?"   # governed ceiling
+
+
+def test_run_passes_characterized_engine_fingerprint_to_backend(
+        make_console, monkeypatch):
+    seen = {}
+
+    def gen(
+            model, prompt, *, max_context, max_tokens,
+            engine_fingerprint=None):
+        seen["engine_fingerprint"] = engine_fingerprint
+        return {"context": max_context, "completion": "ok"}
+
+    _wire_run(monkeypatch, characterization=_CHAR, generate=gen, isatty=False)
+    monkeypatch.setattr(
+        cli, "get_backend", lambda _backend=None: types.SimpleNamespace(generate=gen))
+
+    assert cli.render_run(
+        make_console()[0], "org/m", prompt="meaning?", engine="cpu") == 0
+    assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 @pytest.mark.parametrize("requested", [8192, 4096])
@@ -7331,6 +7388,55 @@ def test_characterize_passes_new_calibration_overhead_into_same_mlx_ramp(
     assert seen["overhead"] == 1.7
 
 
+def test_characterize_passes_new_calibration_overhead_into_same_cuda_ramp(
+        make_console, store, monkeypatch):
+    seen = {}
+
+    def characterize(
+            model, *, progress=False, kv_quant="f16", flash_attn=False,
+            weight_quant="none", prefill_chunk=None, fixed_overhead_gb=None,
+            engine_fingerprint=None):
+        seen.update(
+            overhead=fixed_overhead_gb,
+            engine_fingerprint=engine_fingerprint,
+        )
+        return _evidenced_characterization({
+            "model": model,
+            "safe_context": 4096,
+            "decode_context": None,
+            "points": [],
+        })
+
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "CUDA engine"))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda _con, _model: None)
+    monkeypatch.setattr(cli, "get_backend", lambda _backend=None: types.SimpleNamespace(
+        characterize=characterize,
+        calibration_model_cached=lambda _model: True,
+        download_calibration_model=lambda _model, *, progress=False: None,
+        calibrate=lambda: {
+            "overhead_gb": 0.9,
+            "wall_gb": 8.0,
+            "safe_budget_gb": 7.0,
+        },
+    ))
+
+    console, output = make_console()
+    assert cli.render_characterize(
+        console, "org/M", engine="cuda") == 0, output.getvalue()
+
+    assert seen == {
+        "overhead": 0.9,
+        "engine_fingerprint": "engine:v1:sha256:abc",
+    }
+    assert cli.db.get_calibration(
+        store, "mkey", "cuda",
+        engine_fingerprint="engine:v1:sha256:abc",
+    )["fixed_overhead_gb"] == 0.9
+
+
 def test_characterize_warns_when_calibration_unavailable(make_console, store, monkeypatch):
     # Honesty (Rule #3): a failed calibration must be surfaced, not silently replaced by the
     # conservative default. The ramp still proceeds; the user is just told it's a fallback.
@@ -7462,6 +7568,7 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
         fixed_overhead_gb=2.0,
         environment_key="mlx-environment:test",
         authority_key="mlx-memory-authority:test",
+        engine_fingerprint="engine:v1:sha256:abc",
     )   # already calibrated under the live authority
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
             characterize=lambda m, *, progress=False, kv_quant="f16":
@@ -12675,9 +12782,12 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     monkeypatch.setattr(cli.benchmark, "score_probe_set", lambda uc, its, comps: score)
 
     n = len(items)
-    def fake_bench(model, prompts, *, max_context, **kw):
+    def fake_bench(
+            model, prompts, *, max_context, engine_fingerprint=None, **kw):
         saved["backend_model"] = model
-        saved["bench_kw"] = kw          # capture max_tokens threading
+        saved["bench_kw"] = {
+            **kw, "engine_fingerprint": engine_fingerprint,
+        }
         return {
             "context": max_context,
             "results": [{"prompt_index": i, "completion": f"ans{i}"} for i in range(n)],
@@ -13015,7 +13125,7 @@ def test_render_benchmark_happy_path(make_console, monkeypatch):
     saved = _wire_benchmark(monkeypatch, ceiling=8000, score=0.75)
     c, buf = make_console()
     rc = cli.render_benchmark(c, "org/m", use_case="coding", assume_yes=True, exec_consent=True)
-    assert rc == 0
+    assert rc == 0, buf.getvalue()
     assert saved["model"] == "org/m"
     assert saved["use_case"] == "coding"
     assert saved["score"] == 0.75
@@ -13632,6 +13742,16 @@ def test_render_benchmark_threads_max_tokens_to_backend(make_console, monkeypatc
     c, _ = make_console()
     cli.render_benchmark(c, "org/m", use_case="reasoning", assume_yes=True, max_tokens=512)
     assert saved["bench_kw"].get("max_tokens") == 512
+
+
+def test_render_benchmark_passes_characterized_engine_fingerprint_to_backend(
+        make_console, monkeypatch):
+    saved = _wire_benchmark(monkeypatch)
+
+    assert cli.render_benchmark(
+        make_console()[0], "org/m", use_case="reasoning",
+        assume_yes=True) == 0
+    assert saved["bench_kw"]["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 def test_render_benchmark_omits_max_tokens_when_unset(make_console, monkeypatch):

@@ -235,6 +235,29 @@ def test_characterize_drives_ramp_over_engine_env(monkeypatch):
     assert r["points"][0] == {"context": 2000, "mem_gb": 1.4}
 
 
+def test_characterize_accepts_freshly_measured_overhead_without_stored_lookup(
+        monkeypatch):
+    captured = {}
+
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes,
+                          methodology_descriptor):
+        preflight(model)
+        return {"model": model, "safe_context": 1, "points": []}
+
+    def worker(_name, argv):
+        captured["argv"] = argv
+        return {"base_gb": 1.0, "slope_gb_per_k": 0.1, "budget_gb": 7.0}
+
+    monkeypatch.setattr(cuda.driver, "characterize", fake_characterize)
+    monkeypatch.setattr(
+        cuda, "_budget_params", lambda: pytest.fail("stored lookup must be skipped"))
+    _fake_worker(monkeypatch, worker)
+
+    cuda.characterize("org/model", fixed_overhead_gb=0.9)
+
+    assert captured["argv"][captured["argv"].index("--overhead") + 1] == "0.9"
+
+
 def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     _patch_budget(monkeypatch)
     # delta fit: model base 1, slope 0.2; live VRAM baseline 2 GB → ceiling (7-2-1)/0.2 = 20k
@@ -294,14 +317,39 @@ def test_characterize_l2_stops_when_actual_measurement_reaches_budget(monkeypatc
 
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
-    engines = []
+    calls = []
     monkeypatch.setattr(cuda, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(cuda, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
-                            lambda con, eng: engines.append(eng) or {"fixed_overhead_gb": 1.2})}), raising=False)
-    margin, overhead = cuda._budget_params()
+                            lambda con, eng, **kwargs:
+                            calls.append((eng, kwargs)) or {"fixed_overhead_gb": 1.2})}),
+                        raising=False)
+    margin, overhead = cuda._budget_params(
+        engine_fingerprint="engine:v2:sha256:cuda")
     assert (margin, overhead) == (cuda.DEFAULT_MARGIN_GB, 1.2)
-    assert engines == ["cuda"]
+    assert calls == [(
+        "cuda", {"engine_fingerprint": "engine:v2:sha256:cuda"})]
+
+
+def test_budget_params_does_not_reuse_an_unscoped_engine_build(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cuda, "db",
+        type("D", (), {
+            "connected": staticmethod(lambda: contextlib.nullcontext(None)),
+        }))
+    monkeypatch.setattr(
+        cuda, "calibration",
+        type("P", (), {
+            "get_calibration": staticmethod(
+                lambda _con, _eng, **kwargs: calls.append(kwargs) or None),
+        }),
+        raising=False,
+    )
+
+    assert cuda._budget_params() == (
+        cuda.DEFAULT_MARGIN_GB, cuda.DEFAULT_OVERHEAD_GB)
+    assert calls == []
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
