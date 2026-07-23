@@ -1136,10 +1136,10 @@ def test_main_unknown_command_is_click_usage_error(monkeypatch, capsys):
     assert "No such command 'frobnicate'" in captured.err
 
 
-def test_main_version_flag_prints_installed_version(monkeypatch, capsys):
-    from importlib.metadata import version
+def test_main_version_flag_prints_current_ara_version(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_ara_version", lambda: "1.2.3")
     assert _run_main(monkeypatch, ["--version"]) == 0
-    assert capsys.readouterr().out.strip() == version("project-ara")
+    assert capsys.readouterr().out.strip() == "1.2.3"
 
 
 def test_ara_version_falls_back_when_not_installed(monkeypatch):
@@ -1454,6 +1454,8 @@ def test_render_landing_supported(make_console, monkeypatch):
     assert "ara install" in out
     assert "mlx-community/SmolLM-135M-Instruct-4bit" in out
     assert "--engine mlx" in out
+    assert "ara serve <model> --engine mlx" in out
+    assert "through the MLX engine you installed" in out
     assert out.index("detect") < out.index("ara install") < out.index("characterize") < out.index("run mlx-community")
     assert "planned v1 path" not in out and "run is next" not in out
     assert "CPU fallback" not in out
