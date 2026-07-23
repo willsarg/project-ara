@@ -47,8 +47,9 @@ engine_spec = importlib.util.find_spec("ara_engine_cuda")
 engine_root = Path(next(iter(engine_spec.submodule_search_locations))).resolve()
 source_hash = hashlib.sha256()
 for source in sorted(
-        path for path in engine_root.rglob("*.py")
-        if "__pycache__" not in path.parts):
+        (path for path in engine_root.rglob("*.py")
+         if "__pycache__" not in path.parts),
+        key=lambda path: path.relative_to(engine_root).as_posix()):
     source_hash.update(source.relative_to(engine_root).as_posix().encode())
     source_hash.update(b"\0")
     source_hash.update(source.read_bytes())

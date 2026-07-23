@@ -332,6 +332,7 @@ def test_cuda_probe_identity_includes_engine_package_and_installed_source(monkey
     assert 'rglob("*.py")' in seen["code"]
     assert '"__pycache__" not in path.parts' in seen["code"]
     assert "relative_to(engine_root).as_posix()" in seen["code"]
+    assert "key=lambda path: path.relative_to(engine_root).as_posix()" in seen["code"]
     assert "engine_source_digest" in seen["code"] and "hashlib.sha256" in seen["code"]
 
 
