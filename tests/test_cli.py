@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -726,6 +727,8 @@ def test_run_help_explains_governance_and_generation_controls(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "characterized safe ceiling" in out
     assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf, ollama" in out
+    assert "--prompt-file PATH" in out
+    assert "1 MiB" in out and "standard input" in out
     assert "--max-tokens N" in out and "Maximum new tokens" in out
     assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
     assert "Omit tuning options to use ARA's safe defaults" in out
@@ -4506,6 +4509,153 @@ def test_main_run_dispatch(monkeypatch):
     assert rec["run"]["prompt"] == "hello world"
 
 
+def test_main_run_reads_exact_multiline_prompt_from_stdin(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin",
+        io.TextIOWrapper(io.BytesIO(b"first line\nsecond line\n"), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-"]) == 0
+
+    assert rec["run"]["prompt"] == "first line\nsecond line\n"
+
+
+def test_main_run_reads_exact_utf8_prompt_file(monkeypatch, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("first line\ncaf\u00e9\n", encoding="utf-8")
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "--prompt-file", str(prompt_file)]) == 0
+
+    assert rec["run"]["prompt"] == "first line\ncaf\u00e9\n"
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "org/m", "text", "--prompt-file", "prompt.txt"],
+    ["run", "org/m", "-", "extra"],
+])
+def test_main_run_rejects_multiple_prompt_sources_before_dispatch(
+        monkeypatch, capsys, argv):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(monkeypatch, argv) == 2
+
+    assert "run" not in rec
+    assert "prompt" in capsys.readouterr().err.lower()
+
+
+def test_main_run_rejects_empty_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b""), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert json.loads(capsys.readouterr().out)["error"] == "prompt input is empty"
+
+
+def test_main_run_reports_prompt_source_error_in_human_output(
+        monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b" \n"), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-"]) == 1
+
+    assert "run" not in rec
+    assert "prompt input is empty" in capsys.readouterr().out
+
+
+def test_main_run_rejects_unreadable_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+
+    class BrokenInput:
+        def read(self, _limit):
+            raise OSError("stdin unavailable")
+
+    monkeypatch.setattr(cli.sys, "stdin", types.SimpleNamespace(buffer=BrokenInput()))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert "cannot read prompt from standard input" in json.loads(
+        capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_oversized_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin",
+        io.TextIOWrapper(
+            io.BytesIO(b"x" * (cli.RUN_PROMPT_MAX_BYTES + 1)), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert "1 MiB" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_non_utf8_positional_text_before_dispatch(
+        monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "secret-\udcff-prompt", "--json"]) == 1
+
+    assert "run" not in rec
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert "valid UTF-8" in json.loads(output)["error"]
+
+
+def test_main_run_rejects_invalid_utf8_prompt_file_without_echoing_bytes(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_bytes(b"secret-\xff-prompt")
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(prompt_file), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert "valid UTF-8" in json.loads(output)["error"]
+
+
+def test_main_run_rejects_unreadable_prompt_file_before_dispatch(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    missing = tmp_path / "missing.txt"
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(missing), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    assert "cannot read prompt file" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_prompt_larger_than_documented_bound(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "large.txt"
+    prompt_file.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(prompt_file), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    assert "1 MiB" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_main_run_parses_max_tokens(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["run", "org/m", "hello", "--max-tokens", "32"]) == 0
@@ -4516,7 +4666,7 @@ def test_main_run_requires_prompt(monkeypatch, capsys):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["run", "org/m"]) == 2
     assert "run" not in rec
-    assert "Missing argument 'PROMPT...'" in capsys.readouterr().err
+    assert "provide prompt text" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("flag", "value"), [

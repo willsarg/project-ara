@@ -2993,6 +2993,58 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
 
 
 RUN_MAX_TOKENS = 256
+RUN_PROMPT_MAX_BYTES = 1024 * 1024
+
+
+class _RunPromptError(ValueError):
+    """A prompt source could not be read as bounded UTF-8 text."""
+
+
+class _RunPromptUsageError(ValueError):
+    """The command did not identify exactly one prompt source."""
+
+
+def _decode_run_prompt(data: bytes) -> str:
+    if len(data) > RUN_PROMPT_MAX_BYTES:
+        raise _RunPromptError("prompt input exceeds the 1 MiB limit")
+    try:
+        prompt = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _RunPromptError("prompt input must be valid UTF-8") from None
+    if not prompt.strip():
+        raise _RunPromptError("prompt input is empty")
+    return prompt
+
+
+def _resolve_run_prompt(parts: tuple[str, ...], prompt_file: Path | None) -> str:
+    """Resolve exactly one bounded prompt source before the governed run path begins."""
+    if prompt_file is not None and parts:
+        raise _RunPromptUsageError(
+            "prompt text, '-' standard input, and --prompt-file are mutually exclusive")
+    if prompt_file is not None:
+        try:
+            with prompt_file.open("rb") as source:
+                return _decode_run_prompt(source.read(RUN_PROMPT_MAX_BYTES + 1))
+        except OSError as exc:
+            raise _RunPromptError(
+                f"cannot read prompt file {prompt_file}: {exc}") from None
+    if not parts:
+        raise _RunPromptUsageError(
+            "provide prompt text, '-' for standard input, or --prompt-file PATH")
+    if "-" in parts:
+        if parts != ("-",):
+            raise _RunPromptUsageError(
+                "'-' standard input must be the only positional prompt")
+        try:
+            data = sys.stdin.buffer.read(RUN_PROMPT_MAX_BYTES + 1)
+        except OSError as exc:
+            raise _RunPromptError(f"cannot read prompt from standard input: {exc}") from None
+        return _decode_run_prompt(data)
+    try:
+        data = " ".join(parts).encode("utf-8")
+    except UnicodeEncodeError:
+        raise _RunPromptError("prompt input must be valid UTF-8") from None
+    return _decode_run_prompt(data)
 
 
 class _OllamaGovernanceError(RuntimeError):
@@ -5892,25 +5944,39 @@ def _click_recommend(ctx: click.Context, use_case: str | None,
 @_click_cli.command("run", context_settings=_HELP_SETTINGS,
                     epilog='Example:\n  ara run org/model "Explain this" --json')
 @click.argument("model")
-@click.argument("prompt", nargs=-1, required=True)
+@click.argument("prompt", nargs=-1)
+@click.option("--prompt-file", type=click.Path(path_type=Path), metavar="PATH",
+              help="Read a UTF-8 prompt from PATH (maximum 1 MiB).")
 @_run_engine_option
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
 @_generation_options
 @_json_verbose_options
 @click.pass_context
-def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...], engine: str | None,
-               assume_yes: bool, max_tokens: int, kv_quant: str, weight_quant: str,
+def _click_run(ctx: click.Context, model: str, prompt: tuple[str, ...],
+               prompt_file: Path | None, engine: str | None, assume_yes: bool,
+               max_tokens: int, kv_quant: str, weight_quant: str,
                prefill_chunk: int | None, chunked_prefill: bool, no_flash_attn: bool,
                flash_attn: bool, verbose: bool, as_json: bool) -> int:
     """Generate one governed completion under MODEL's characterized safe ceiling.
 
     ARA selects a compatible characterized native engine unless --engine pins one. Pin ollama to
     use the existing local daemon with exact reusable evidence. ARA refuses before loading when
-    requested settings do not match the measurement. Omit tuning options to use ARA's safe
-    defaults.
+    requested settings do not match the measurement. Use '-' to read a UTF-8 prompt from standard
+    input. Omit tuning options to use ARA's safe defaults.
     """
+    c = _mark_json(ctx, as_json)
+    try:
+        resolved_prompt = _resolve_run_prompt(prompt, prompt_file)
+    except _RunPromptUsageError as exc:
+        ctx.fail(str(exc))
+    except _RunPromptError as exc:
+        if as_json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            c.emit(c.style("bad", f"  {exc}"))
+        return 1
     return render_run(
-        _mark_json(ctx, as_json), model, prompt=" ".join(prompt) or None, engine=engine,
+        c, model, prompt=resolved_prompt, engine=engine,
         assume_yes=assume_yes, as_json=as_json, max_tokens=max_tokens,
         flash_attn=not no_flash_attn,
         flash_attn_optin=flash_attn, kv_quant=kv_quant, weight_quant=weight_quant,
