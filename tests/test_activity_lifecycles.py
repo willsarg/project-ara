@@ -786,12 +786,26 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
         "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
         "accelerator_margin_bytes": None,
     }
+    admission = cli.ollama_evidence.preflight_admission(
+        cli.ollama_evidence.MemorySnapshot(
+            24 * 1024 ** 3, 8 * 1024 ** 3, "apple", 1, None, None, True),
+        500_000_000,
+        requested_context=4096,
+        model_info={
+            "general.architecture": "qwen3",
+            "qwen3.block_count": 28,
+            "qwen3.attention.head_count_kv": 8,
+            "qwen3.attention.key_length": 128,
+        },
+    )
+    assert admission.reason is None
     point = {
         "fit": True,
         "context": 4096,
         "requested_context": 4096,
         "effective_per_request_context": 4096,
         "refusal_reasons": [],
+        "preload_admission": admission.as_dict(),
         **wall_evidence,
     }
     characterization = {
@@ -821,6 +835,8 @@ def _wire_ollama_serve(monkeypatch, *, isatty=False):
             "effective_flash_attention": "unknown",
             "configured_scheduler_spread": "unknown",
             "effective_scheduler_spread": "unknown",
+            "preload_admission": admission.as_dict(),
+            "watchdog": cli.ollama_evidence.WATCHDOG_STATUS,
             **wall_evidence,
         },
     }

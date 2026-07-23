@@ -5453,6 +5453,15 @@ def test_ollama_ramp_contexts_schedule():
     assert cli._ollama_ramp_contexts(1000) == [1000]        # below the floor → just the max
 
 
+_OLLAMA_ADMISSION_INFO = {
+    "general.architecture": "qwen3",
+    "qwen3.block_count": 28,
+    "qwen3.attention.head_count_kv": 8,
+    "qwen3.attention.key_length": 128,
+    "qwen3.context_length": 8192,
+}
+
+
 def _ollama_memory_snapshot(*, available_gib=8):
     gib = 1024 ** 3
     return cli.ollama_evidence.MemorySnapshot(
@@ -5477,6 +5486,12 @@ def _wire_ollama_probe(monkeypatch, snapshots=None):
             cli.ollama_evidence, "capture_memory_snapshot", lambda: next(observations))
 
 
+def _measure_ollama(*args, **kwargs):
+    kwargs.setdefault("model_size_bytes", 500_000_000)
+    kwargs.setdefault("model_info", dict(_OLLAMA_ADMISSION_INFO))
+    return cli._ollama_measure_ceiling(*args, **kwargs)
+
+
 def test_ollama_measure_ceiling_finds_the_wall(monkeypatch):
     st = {"ctx": 0}
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: (st.update(ctx=ctx), True)[1])
@@ -5492,7 +5507,7 @@ def test_ollama_measure_ceiling_finds_the_wall(monkeypatch):
     monkeypatch.setattr(cli.ollama, "ps",
                         lambda *_a: [{"name": "pr", "context_length": st["ctx"],
                                   "size": 1000, "size_vram": 1000}])
-    best, points = cli._ollama_measure_ceiling("m", 8192, "pr")
+    best, points = _measure_ollama("m", 8192, "pr")
     assert best == 4096                                     # largest rung with physical margin
     assert [p["fit"] for p in points] == [True, True, False]
     assert points[-1]["refusal_reasons"] == ["system_margin_breached"]
@@ -5506,8 +5521,7 @@ def test_ollama_measure_ceiling_all_rungs_fit(monkeypatch):
     monkeypatch.setattr(cli.ollama, "ps",   # never spills → ramp runs to the top rung
                         lambda *_a: [{"name": "pr", "context_length": st["ctx"],
                                   "size": 1000, "size_vram": 1000}])
-    best, points = cli._ollama_measure_ceiling(
-        "m", 8192, "pr", model_size_bytes=500)
+    best, points = _measure_ollama("m", 8192, "pr")
     assert best == 8192 and all(p["fit"] for p in points)
 
 
@@ -5517,14 +5531,14 @@ def test_ollama_measure_ceiling_accepts_safe_partial_offload(monkeypatch):
     monkeypatch.setattr(cli.ollama, "ps",
                         lambda *_a: [{"name": "pr", "context_length": 2048,
                                   "size": 1000, "size_vram": 400}])
-    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    best, points = _measure_ollama("m", 2048, "pr")
     assert best == 2048 and points[0]["fit"] is True
     assert points[0]["placement"] == "unified"
 
 
 def test_ollama_measure_ceiling_stops_on_create_fail(monkeypatch):
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: False)
-    best, points = cli._ollama_measure_ceiling("m", 4096, "pr")
+    best, points = _measure_ollama("m", 4096, "pr")
     assert best is None and points == []
 
 
@@ -5536,7 +5550,7 @@ def test_ollama_measure_ceiling_records_bounded_generation_failure(monkeypatch):
     monkeypatch.setattr(
         cli.ollama, "processes", lambda: pytest.fail("trusted residency after failed request"))
 
-    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    best, points = _measure_ollama("m", 2048, "pr")
 
     assert best is None
     assert points[0]["refusal_reasons"] == ["generation_failed"]
@@ -5549,11 +5563,11 @@ def test_ollama_measure_ceiling_stops_at_preload_capacity_gate(monkeypatch):
     monkeypatch.setattr(
         cli.ollama, "create", lambda *_a: pytest.fail("created an unsafe probe"))
 
-    best, points = cli._ollama_measure_ceiling(
+    best, points = _measure_ollama(
         "m", 2048, "pr", model_size_bytes=2 * 1024 ** 3)
 
     assert best is None
-    assert points[0]["refusal_reasons"] == ["model_exceeds_available_memory_walls"]
+    assert points[0]["refusal_reasons"] == ["allocation_exceeds_system_wall"]
 
 
 def test_ollama_measure_ceiling_accepts_safe_discrete_partial_offload(monkeypatch):
@@ -5569,7 +5583,7 @@ def test_ollama_measure_ceiling_accepts_safe_discrete_partial_offload(monkeypatc
         "size": 10 * gib, "size_vram": 6 * gib,
     }])
 
-    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    best, points = _measure_ollama("m", 2048, "pr")
 
     assert best == 2048
     assert points[0]["placement"] == "partial_offload"
@@ -5587,7 +5601,7 @@ def test_ollama_measure_ceiling_refuses_runtime_authority_drift(monkeypatch):
     monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: drifted)
 
     with pytest.raises(RuntimeError, match="authority changed"):
-        cli._ollama_measure_ceiling("m", 2048, "pr", authority=authority)
+        _measure_ollama("m", 2048, "pr", authority=authority)
 
 
 def test_ollama_measure_ceiling_refuses_runtime_drift_after_generation(monkeypatch):
@@ -5601,14 +5615,14 @@ def test_ollama_measure_ceiling_refuses_runtime_drift_after_generation(monkeypat
     monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: next(observations))
 
     with pytest.raises(RuntimeError, match="during measurement"):
-        cli._ollama_measure_ceiling("m", 2048, "pr", authority=authority)
+        _measure_ollama("m", 2048, "pr", authority=authority)
 
 
 def test_ollama_measure_ceiling_treats_absent_floor_as_non_fit(monkeypatch):
     _wire_ollama_probe(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: True)
     monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [])
-    best, points = cli._ollama_measure_ceiling("m", 2048, "pr")
+    best, points = _measure_ollama("m", 2048, "pr")
     assert best is None
     assert points[0]["fit"] is False
     assert points[0]["refusal_reasons"] == ["effective_residency_unverified"]
@@ -5631,7 +5645,7 @@ def test_ollama_measure_ceiling_preserves_lower_fit_when_previous_runner_remains
         "size": 10, "size_vram": 10,
     }])
 
-    best, points = cli._ollama_measure_ceiling(
+    best, points = _measure_ollama(
         "base", 4096, "probe",
         base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
         provenance={},
@@ -5649,7 +5663,7 @@ def test_ollama_measure_ceiling_rejects_unexpected_nonempty_residency(monkeypatc
         "name": "pr:latest", "context_length": 1024, "size": 10, "size_vram": 10,
     }])
     with pytest.raises(RuntimeError, match="strict admission"):
-        cli._ollama_measure_ceiling("m", 2048, "pr")
+        _measure_ollama("m", 2048, "pr")
 
 
 @pytest.mark.parametrize("size,vram", [
@@ -5663,7 +5677,7 @@ def test_ollama_measure_ceiling_rejects_unverified_residency(monkeypatch, size, 
         "name": "pr", "context_length": 2048, "size": size, "size_vram": vram,
     }])
     with pytest.raises(RuntimeError, match="strict admission"):
-        cli._ollama_measure_ceiling("m", 2048, "pr")
+        _measure_ollama("m", 2048, "pr")
 
 
 def test_ollama_measure_ceiling_binds_probe_and_base_manifest_before_load(monkeypatch):
@@ -5680,7 +5694,7 @@ def test_ollama_measure_ceiling_binds_probe_and_base_manifest_before_load(monkey
         "size": 10, "size_vram": 10, "digest": "b" * 64,
     }])
     provenance = {}
-    best, points = cli._ollama_measure_ceiling(
+    best, points = _measure_ollama(
         "base", 2048, "probe", base_artifact_id=artifact, provenance=provenance)
     assert best == 2048 and points[0]["fit"] is True and loads == [("probe", 2048)]
     assert provenance == {"created": True,
@@ -5696,7 +5710,7 @@ def test_ollama_measure_ceiling_can_track_probe_without_base_gate(monkeypatch):
         "size": 10, "size_vram": 10, "digest": "b" * 64,
     }])
     provenance = {}
-    best, _points = cli._ollama_measure_ceiling(
+    best, _points = _measure_ollama(
         "base", 2048, "probe", provenance=provenance)
     assert best == 2048 and provenance["artifact_id"].endswith("b" * 64)
 
@@ -5711,7 +5725,7 @@ def test_ollama_measure_ceiling_refuses_retargeted_base_before_probe_load(monkey
     monkeypatch.setattr(cli.ollama, "load",
                         lambda *_a, **_k: pytest.fail("loaded probe from retargeted base"))
     with pytest.raises(RuntimeError, match="changed during probe creation"):
-        cli._ollama_measure_ceiling(
+        _measure_ollama(
             "base", 2048, "probe",
             base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
             provenance={},
@@ -5723,7 +5737,7 @@ def test_ollama_measure_ceiling_refuses_retargeted_base_before_create(monkeypatc
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a: pytest.fail("created from retargeted base"))
     with pytest.raises(RuntimeError, match="changed before probe creation"):
-        cli._ollama_measure_ceiling(
+        _measure_ollama(
             "base", 2048, "probe",
             base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
             provenance={},
@@ -5735,7 +5749,7 @@ def test_ollama_measure_ceiling_requires_probe_identity_without_provenance_dict(
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base" else None)
     with pytest.raises(RuntimeError, match="could not be identified"):
-        cli._ollama_measure_ceiling(
+        _measure_ollama(
             "base", 2048, "probe",
             base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
         )
@@ -5750,7 +5764,7 @@ def test_ollama_measure_ceiling_accepts_verified_probe_without_provenance_dict(m
         "name": "probe:latest", "context_length": 2048,
         "size": 10, "size_vram": 10, "digest": "b" * 64,
     }])
-    best, points = cli._ollama_measure_ceiling(
+    best, points = _measure_ollama(
         "base", 2048, "probe",
         base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
     )
@@ -5769,7 +5783,7 @@ def test_ollama_measure_ceiling_refuses_additional_resident_model(monkeypatch):
          "size": 20, "size_vram": 20},
     ])
     with pytest.raises(RuntimeError, match="strict admission"):
-        cli._ollama_measure_ceiling(
+        _measure_ollama(
             "base", 2048, "probe",
             base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
             provenance={},
@@ -5896,6 +5910,11 @@ def _wire_char_ollama(monkeypatch, *, in_store=True, max_ctx=8192):
             "qwen3:0.6b", digest="a" * 64)] if in_store else []),
     )
     monkeypatch.setattr(cli, "_ollama_max_context", lambda model: max_ctx)
+    monkeypatch.setattr(
+        cli.ollama,
+        "show",
+        lambda _model: {"model_info": dict(_OLLAMA_ADMISSION_INFO)},
+    )
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda model: "a" * 64)
     monkeypatch.setattr(
         cli.ollama_evidence, "capture_memory_snapshot", _ollama_memory_snapshot)
@@ -5926,6 +5945,14 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
             effective_context_per_request=4096),
         4096,
     )
+    admission = cli.ollama_evidence.preflight_admission(
+        snapshot,
+        500_000_000,
+        requested_context=4096,
+        model_info=dict(_OLLAMA_ADMISSION_INFO),
+    )
+    assert admission.reason is None
+    point["preload_admission"] = admission.as_dict()
     monkeypatch.setattr(cli, "_ollama_measure_ceiling", _fake_ollama_measure(
         (4096, [point])))
     c = cli.Console.from_env()
@@ -5934,6 +5961,8 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama", as_json=True) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["safe_context"] == 4096 and out["source"] == "measured" and out["engine"] == "ollama"
+    assert out["preload_admission"] == "context-aware-conservative-v1"
+    assert out["watchdog"] == "unavailable-external-daemon"
     with cli.db.connected() as con:
         row = cli.db.get_characterization(con, "mk", "ollama", "qwen3:0.6b")
         assert row["safe_context"] == 4096
@@ -5956,6 +5985,8 @@ def test_characterize_ollama_measures_and_records(store, monkeypatch, capsys):
         assert row["config"]["characterization_probe_artifact_id"] == (
             "ollama-manifest-sha256:" + "a" * 64)
         assert row["config"]["characterization_probe_context"] == 8192
+        assert row["config"]["preload_admission"] == admission.as_dict()
+        assert row["config"]["watchdog"] == "unavailable-external-daemon"
 
 
 def test_characterize_ollama_accepts_implicit_latest_alias(store, monkeypatch, capsys):
@@ -6076,6 +6107,34 @@ def test_characterize_ollama_refuses_oversized_model_before_probe(
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
     assert "preflight refused" in buf.getvalue()
+
+
+def test_characterize_ollama_refuses_small_model_with_unsafe_context_before_probe(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch, max_ctx=2048)
+    monkeypatch.setattr(
+        cli.ollama,
+        "show",
+        lambda _model: {"model_info": {
+            "general.architecture": "adversarial",
+            "adversarial.block_count": 128,
+            "adversarial.attention.head_count_kv": 128,
+            "adversarial.attention.key_length": 128,
+            "adversarial.context_length": 2048,
+        }},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_ollama_measure_ceiling",
+        lambda *_a, **_k: pytest.fail("loaded context allocation beyond the wall"),
+    )
+
+    c, buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
+    out = buf.getvalue()
+    assert "preflight refused" in out
+    assert "system wall" in out
+    assert "no trustworthy ARA watchdog" in out
 
 
 def test_characterize_ollama_refuses_preexisting_content_addressed_probe(
@@ -6210,6 +6269,7 @@ def test_characterize_ollama_text_reports_measured_ceiling(store, monkeypatch, m
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
     out = buf.getvalue()
     assert "measured ceiling" in out and "4096" in out
+    assert "no active ARA watchdog" in out
 
 
 def test_characterize_ollama_verbose_discloses_runtime_and_model_limit(
@@ -9895,6 +9955,13 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
             and characterization.get("safe_context") is not None
             and "config" not in characterization):
         safe_context = characterization["safe_context"]
+        admission = cli.ollama_evidence.preflight_admission(
+            _ollama_memory_snapshot(),
+            500_000_000,
+            requested_context=safe_context,
+            model_info=dict(_OLLAMA_ADMISSION_INFO),
+        )
+        assert admission.reason is None
         point = {
             "context": safe_context,
             "requested_context": safe_context,
@@ -9909,6 +9976,7 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
             "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
             "accelerator_margin_bytes": None,
             "refusal_reasons": [],
+            "preload_admission": admission.as_dict(),
         }
         characterization = {
             **characterization,
@@ -9943,6 +10011,8 @@ def _wire_serve(monkeypatch, *, version="0.30.10", names=("qwen3:0.6b",), create
                 "accelerator_memory_delta_bytes": None,
                 "system_margin_bytes": cli.ollama_evidence.SYSTEM_MARGIN_BYTES,
                 "accelerator_margin_bytes": None,
+                "preload_admission": admission.as_dict(),
+                "watchdog": cli.ollama_evidence.WATCHDOG_STATUS,
             },
         }
     monkeypatch.setattr(

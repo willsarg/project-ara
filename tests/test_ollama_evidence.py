@@ -37,6 +37,24 @@ def _process(*, size=4, accelerator=0, context=4096):
     )
 
 
+def _model_info(*, layers=28, kv_heads=8, head_dim=128):
+    return {
+        "general.architecture": "qwen3",
+        "qwen3.block_count": layers,
+        "qwen3.attention.head_count_kv": kv_heads,
+        "qwen3.attention.key_length": head_dim,
+    }
+
+
+def _preflight(snapshot, model_size, *, context=2048, model_info=None):
+    return evidence.preflight_refusal_reason(
+        snapshot,
+        model_size,
+        requested_context=context,
+        model_info=_model_info() if model_info is None else model_info,
+    )
+
+
 def _authority(**changes):
     authority = ollama.OllamaRuntimeAuthority(
         endpoint=ollama.OllamaEndpoint("http://127.0.0.1:11434", "loopback"),
@@ -75,6 +93,14 @@ def _complete_characterization(store, *, authority=None, model=None):
             effective_context_per_request=4096),
         4096,
     )
+    admission = evidence.preflight_admission(
+        snapshot,
+        model.size_bytes,
+        requested_context=4096,
+        model_info=_model_info(),
+    )
+    assert admission.reason is None
+    point["preload_admission"] = admission.as_dict()
     config = {
         "methodology": "ollama-physical-walls-v1",
         "runtime": "ollama",
@@ -104,6 +130,8 @@ def _complete_characterization(store, *, authority=None, model=None):
         "effective_flash_attention": "unknown",
         "configured_scheduler_spread": "unknown",
         "effective_scheduler_spread": "unknown",
+        "preload_admission": admission.as_dict(),
+        "watchdog": evidence.WATCHDOG_STATUS,
     }
     db.save_characterization(
         store,
@@ -146,8 +174,18 @@ def _rewrite_matching_wall_evidence(store, **changes):
 
 def _replace_characterization_evidence(store, before, after, process):
     point = evidence.characterization_point(before, after, process, 4096)
+    admission = evidence.preflight_admission(
+        before,
+        _model().size_bytes,
+        requested_context=4096,
+        model_info=_model_info(),
+    )
+    assert admission.reason is None
+    point["preload_admission"] = admission.as_dict()
     _rewrite_characterization_config(
         store,
+        preload_admission=admission.as_dict(),
+        watchdog=evidence.WATCHDOG_STATUS,
         **{key: point[key] for key in (
             "placement",
             "resident_total_bytes",
@@ -171,6 +209,45 @@ def test_assessment_separates_display_row_from_strict_reusable_row(store):
     assert assessment.display["safe_context"] == 4096
     assert assessment.reusable is assessment.display
     assert assessment.reason is None
+
+
+def test_assessment_keeps_size_only_preflight_history_display_only(store):
+    model, authority = _complete_characterization(store)
+    _rewrite_characterization_config(store, preload_admission=None)
+
+    assessment = evidence.assess_characterization(
+        store, "machine", model, authority)
+
+    assert assessment.display is not None
+    assert assessment.reusable is None
+    assert assessment.reason == "preload_admission_evidence_incomplete"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"watchdog": "claimed-active"},
+        {"model_residency_bound_bytes": 0},
+        {"applicable_walls": ["unknown"]},
+        {"system_margin_bytes": 0},
+    ],
+)
+def test_preload_admission_evidence_rejects_invalid_proof_terms(change):
+    admission = evidence.preflight_admission(
+        _snapshot(available=8),
+        1 * GIB,
+        requested_context=2048,
+        model_info=_model_info(),
+    ).as_dict()
+    changed = {**admission, **change}
+    config = {
+        "requested_context": 2048,
+        "preload_admission": changed,
+        "watchdog": evidence.WATCHDOG_STATUS,
+    }
+
+    assert evidence._admission_evidence_complete(
+        config, {"preload_admission": changed}) is False
 
 
 def test_assessment_rejects_storage_row_marked_nonreusable(store):
@@ -611,48 +688,94 @@ def test_failed_point_keeps_the_requested_context_and_explicit_reason():
     assert point["refusal_reasons"] == ["generation_failed"]
 
 
-def test_preflight_checks_available_physical_capacity_before_model_load():
-    assert evidence.preflight_refusal_reason(_snapshot(available=8), 4 * GIB) is None
-    assert evidence.preflight_refusal_reason(
-        _snapshot(available=3), 4 * GIB) == "model_exceeds_available_memory_walls"
+def test_preflight_bounds_residency_kv_and_runtime_before_model_load():
+    assert _preflight(_snapshot(available=8), 1 * GIB) is None
+    assert _preflight(
+        _snapshot(available=4), 1 * GIB) == "allocation_exceeds_system_wall"
 
     discrete = _snapshot(
-        total=32, available=6, kind="nvidia", count=1,
+        total=32, available=8, kind="nvidia", count=1,
         accelerator_total=8, accelerator_available=7)
-    assert evidence.preflight_refusal_reason(discrete, 8 * GIB) is None
-    assert evidence.preflight_refusal_reason(discrete, 11 * GIB) == (
-        "model_exceeds_available_memory_walls")
+    assert _preflight(discrete, 1 * GIB) is None
+    assert _preflight(discrete, 4 * GIB) == "allocation_exceeds_system_wall"
+    accelerator_tight = _snapshot(
+        total=32, available=16, kind="nvidia", count=1,
+        accelerator_total=8, accelerator_available=3)
+    assert _preflight(
+        accelerator_tight, 1 * GIB) == "allocation_exceeds_accelerator_wall"
+
+
+def test_preflight_refuses_small_model_when_requested_context_exceeds_wall():
+    small_model = 500 * 1024 ** 2
+
+    assert _preflight(
+        _snapshot(available=8),
+        small_model,
+        context=131_072,
+        model_info=_model_info(layers=32, kv_heads=32, head_dim=128),
+    ) == "allocation_exceeds_system_wall"
+
+
+def test_preflight_assessment_records_every_conservative_allocation_term():
+    admission = evidence.preflight_admission(
+        _snapshot(available=8),
+        1 * GIB,
+        requested_context=2048,
+        model_info=_model_info(),
+    )
+
+    assert admission.reason is None
+    assert admission.model_residency_bound_bytes == 5 * GIB // 4
+    assert admission.kv_cache_bound_bytes == 448 * 1024 ** 2
+    assert admission.runtime_overhead_bound_bytes == evidence.RUNTIME_OVERHEAD_BYTES
+    assert admission.total_allocation_bound_bytes == (
+        admission.model_residency_bound_bytes
+        + admission.kv_cache_bound_bytes
+        + admission.runtime_overhead_bound_bytes
+    )
+    assert admission.applicable_walls == ("system",)
 
 
 def test_preflight_fails_closed_for_unknown_size_wall_or_multi_accelerator():
     missing = evidence.MemorySnapshot(None, None, None, None, None, None, False)
-    assert evidence.preflight_refusal_reason(missing, 1) == "system_wall_unknown"
-    assert evidence.preflight_refusal_reason(_snapshot(), None) == "model_size_unknown"
-    assert evidence.preflight_refusal_reason(
+    assert _preflight(missing, 1) == "system_wall_unknown"
+    assert _preflight(_snapshot(), None) == "model_size_unknown"
+    assert _preflight(
         _snapshot(kind="nvidia", count=2), 1) == "placement_unknown"
-    assert evidence.preflight_refusal_reason(
+    assert _preflight(
         evidence.MemorySnapshot(16 * GIB, None, None, 0, None, None, False), 1,
     ) == "system_wall_unknown"
-    assert evidence.preflight_refusal_reason(
+    assert _preflight(
         evidence.MemorySnapshot(16 * GIB, 8 * GIB, "nvidia", 1, 8 * GIB, None, False), 1,
     ) == "accelerator_wall_unknown"
+    assert _preflight(_snapshot(), 1, context=0) == "requested_context_unknown"
+    assert _preflight(
+        _snapshot(), 1, model_info={}) == "context_allocation_unknown"
+    assert _preflight(
+        _snapshot(),
+        1,
+        model_info={"general.architecture": "qwen3"},
+    ) == "context_allocation_unknown"
+    assert _preflight(
+        _snapshot(kind="amd", count=1),
+        1,
+    ) == "placement_unknown"
 
 
 @pytest.mark.parametrize("model_size", [True, 0, "large"])
 def test_preflight_rejects_invalid_model_sizes(model_size):
-    assert evidence.preflight_refusal_reason(
-        _snapshot(), model_size) == "model_size_unknown"
+    assert _preflight(_snapshot(), model_size) == "model_size_unknown"
 
 
 def test_preflight_capacity_never_treats_reserved_margin_as_available():
-    assert evidence.preflight_refusal_reason(
-        _snapshot(available=1), 1) == "model_exceeds_available_memory_walls"
-    assert evidence.preflight_refusal_reason(
+    assert _preflight(
+        _snapshot(available=1), 1) == "allocation_exceeds_system_wall"
+    assert _preflight(
         _snapshot(
             total=16, available=1, kind="nvidia", count=1,
             accelerator_total=1, accelerator_available=0.5),
         1,
-    ) == "model_exceeds_available_memory_walls"
+    ) == "allocation_exceeds_system_wall"
 
 
 @pytest.mark.parametrize(("resident", "available"), [

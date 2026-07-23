@@ -158,7 +158,7 @@ same production entrypoint. In a checkout, prefix either with `uv run`.
 | `ara status` | What ARA itself is doing right now: idle, searching, characterizing, benchmarking, running, serving, or hosting the fleet coordinator. It is not a generic process monitor. |
 | `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in portable CPU path); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on a compatible x86_64 Windows/Linux GPU, including integrated GPUs), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
 | `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts, and with `--model` checks whether that model's weights + context fit. Stored MLX measurements are shown as history until an execution command verifies the live Metal authority. Never loads an engine or a model. |
-| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it crosses the engine's governed memory boundary, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
+| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that applies the engine's pre-load memory gate, then stores the ceiling for `models recommend` / `run`. Native ARA engines also enforce an in-worker watchdog; the external Ollama daemon cannot provide that guarantee (see Safety). The command that crosses into an engine. |
 | `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 | `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget. Add `--engine ollama` to rank supported local Ollama artifacts with exact reusable measurements first; analytic estimates remain clearly labeled comparison-only and cannot authorize execution. With `--engine ollama --use-case ...`, only a locally measured score still bound to the current exact manifest, daemon/config authority, request policy, and runtime target can influence rank; legacy or drifted evidence is labeled unknown, and cross-runtime imported scores are never substituted. Read-only — no model load. |
 | `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. Add `--engine ollama` for the exact cached manifest, Ollama capabilities/parameters, and reusable or display-only characterization evidence. |
@@ -226,13 +226,20 @@ until that path has passed ARA's full suite and live CPU integration on Intel ma
 
 `ara detect` (including `--python`, `--apps`, `--runtime`, and `--models`) and `ara status` are
 **strictly read-only** — they observe, never stress, benchmark, or load a model. Measuring is opt-in:
-`ara characterize` is the command that crosses into the engine, and it finds a model's safe
-context ceiling by **refusing before it crosses the governed memory boundary** and aborting a probe
-the moment usage approaches the limit. Each engine governs against the right boundary — physical
-RAM (CPU; swap is reported but never counted), MLX's live Metal working-set limit (Apple), or VRAM (CUDA) —
-and `ara run` stays capped under that measured ceiling. ARA resolves model weights to an immutable
-artifact, records that identity with the measurement, and verifies it again before loading; changed
-or ambiguous weights are refused instead of being presented as the characterized model. ARA stays
+`ara characterize` is the command that crosses into the engine. Native ARA engines refuse before
+the governed memory boundary and use an in-worker watchdog to abort a probe as usage approaches the
+limit. Each native engine governs against the right boundary — physical RAM (CPU; swap is reported
+but never counted), MLX's live Metal working-set limit (Apple), or VRAM (CUDA).
+
+Ollama is an external daemon, so ARA cannot provide a trustworthy active watchdog after a load
+begins. Before **each** Ollama probe, ARA instead fails closed unless it can conservatively bound
+the model's expanded residency, requested-context KV cache, and runtime overhead against every
+possible physical wall. The after-load process and memory snapshots are evidence, not an active
+abort mechanism. `ara run` stays capped under the resulting reusable measured ceiling. ARA also
+resolves each model to an immutable
+artifact, records that identity with the measurement, and verifies it
+again before loading; changed or ambiguous weights are refused instead of being presented as the
+characterized model. ARA stays
 **advisory** — it surfaces what's true and what to consider; it never runs destructive or
 system-mutating commands on your behalf.
 

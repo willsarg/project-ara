@@ -18,6 +18,12 @@ from ara import db, hardware, ollama
 _MIB = 1024 ** 2
 SYSTEM_MARGIN_BYTES = 2 * 1024 ** 3
 ACCELERATOR_MARGIN_BYTES = 1 * 1024 ** 3
+RUNTIME_OVERHEAD_BYTES = 1 * 1024 ** 3
+ADMISSION_METHODOLOGY = "context-aware-conservative-v1"
+WATCHDOG_STATUS = "unavailable-external-daemon"
+_MODEL_RESIDENCY_NUMERATOR = 5
+_MODEL_RESIDENCY_DENOMINATOR = 4
+_KV_ELEMENT_BYTES = 4
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 
 
@@ -43,12 +49,99 @@ class CharacterizationAssessment:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class PreflightAdmission:
+    """Conservative allocation proof evaluated before an Ollama model load."""
+
+    reason: str | None
+    requested_context: int | None
+    model_size_bytes: int | None
+    model_residency_bound_bytes: int | None
+    kv_cache_bound_bytes: int | None
+    runtime_overhead_bound_bytes: int
+    total_allocation_bound_bytes: int | None
+    applicable_walls: tuple[str, ...]
+    system_available_bytes: int | None
+    accelerator_available_bytes: int | None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the stable JSON evidence stored with a characterization point."""
+
+        return {
+            "methodology": ADMISSION_METHODOLOGY,
+            "reason": self.reason,
+            "requested_context": self.requested_context,
+            "model_size_bytes": self.model_size_bytes,
+            "model_residency_bound_bytes": self.model_residency_bound_bytes,
+            "kv_cache_bound_bytes": self.kv_cache_bound_bytes,
+            "runtime_overhead_bound_bytes": self.runtime_overhead_bound_bytes,
+            "total_allocation_bound_bytes": self.total_allocation_bound_bytes,
+            "applicable_walls": list(self.applicable_walls),
+            "system_available_bytes": self.system_available_bytes,
+            "accelerator_available_bytes": self.accelerator_available_bytes,
+            "system_margin_bytes": SYSTEM_MARGIN_BYTES,
+            "accelerator_margin_bytes": (
+                ACCELERATOR_MARGIN_BYTES
+                if "accelerator" in self.applicable_walls else None
+            ),
+            "watchdog": WATCHDOG_STATUS,
+        }
+
+
 def _display_only(row: dict[str, Any], reason: str) -> CharacterizationAssessment:
     return CharacterizationAssessment(row, None, reason)
 
 
 def _nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _admission_evidence_complete(config: dict[str, Any], point: dict[str, Any]) -> bool:
+    admission = config.get("preload_admission")
+    if (
+        admission != point.get("preload_admission")
+        or not isinstance(admission, dict)
+        or admission.get("methodology") != ADMISSION_METHODOLOGY
+        or admission.get("watchdog") != WATCHDOG_STATUS
+        or config.get("watchdog") != WATCHDOG_STATUS
+        or admission.get("reason") is not None
+        or admission.get("requested_context") != config.get("requested_context")
+    ):
+        return False
+    residency = admission.get("model_residency_bound_bytes")
+    kv_cache = admission.get("kv_cache_bound_bytes")
+    runtime = admission.get("runtime_overhead_bound_bytes")
+    total = admission.get("total_allocation_bound_bytes")
+    if (
+        not _nonnegative_int(residency)
+        or residency == 0
+        or not _nonnegative_int(kv_cache)
+        or kv_cache == 0
+        or runtime != RUNTIME_OVERHEAD_BYTES
+        or total != residency + kv_cache + runtime
+    ):
+        return False
+    walls = admission.get("applicable_walls")
+    if walls not in (["system"], ["system_unified"], ["system", "accelerator"]):
+        return False
+    system_available = admission.get("system_available_bytes")
+    if (
+        not _nonnegative_int(system_available)
+        or admission.get("system_margin_bytes") != SYSTEM_MARGIN_BYTES
+        or total > max(0, system_available - SYSTEM_MARGIN_BYTES)
+    ):
+        return False
+    if "accelerator" not in walls:
+        return (
+            admission.get("accelerator_available_bytes") is None
+            and admission.get("accelerator_margin_bytes") is None
+        )
+    accelerator_available = admission.get("accelerator_available_bytes")
+    return (
+        _nonnegative_int(accelerator_available)
+        and admission.get("accelerator_margin_bytes") == ACCELERATOR_MARGIN_BYTES
+        and total <= max(0, accelerator_available - ACCELERATOR_MARGIN_BYTES)
+    )
 
 
 def _wall_evidence_complete(config: dict[str, Any], point: dict[str, Any]) -> bool:
@@ -207,6 +300,8 @@ def assess_characterization(
         return _display_only(row, "placement_unsupported")
     if not _wall_evidence_complete(config, point):
         return _display_only(row, "wall_evidence_incomplete")
+    if not _admission_evidence_complete(config, point):
+        return _display_only(row, "preload_admission_evidence_incomplete")
     if not row.get("reusable"):
         return _display_only(row, "storage_evidence_not_reusable")
     return CharacterizationAssessment(row, row, None)
@@ -385,32 +480,149 @@ def failed_characterization_point(requested_context: int, reason: str) -> dict[s
     }
 
 
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _context_allocation_bound(
+    requested_context: int,
+    model_info: dict[str, Any],
+) -> int | None:
+    architecture = model_info.get("general.architecture")
+    if not isinstance(architecture, str) or not architecture:
+        return None
+    values = (
+        _positive_int(model_info.get(f"{architecture}.block_count")),
+        _positive_int(model_info.get(f"{architecture}.attention.head_count_kv")),
+        _positive_int(model_info.get(f"{architecture}.attention.key_length")),
+    )
+    if any(value is None for value in values):
+        return None
+    layers, kv_heads, head_dim = values
+    assert layers is not None and kv_heads is not None and head_dim is not None
+    return (
+        requested_context
+        * layers
+        * kv_heads
+        * head_dim
+        * 2
+        * _KV_ELEMENT_BYTES
+    )
+
+
+def preflight_admission(
+    snapshot: MemorySnapshot,
+    model_size_bytes: int | None,
+    *,
+    requested_context: int,
+    model_info: dict[str, Any],
+) -> PreflightAdmission:
+    """Bound weights, KV cache, and runtime overhead against every possible load wall."""
+
+    requested = _positive_int(requested_context)
+    size = _positive_int(model_size_bytes)
+    system_total = _positive_int(snapshot.system_total_bytes)
+    system_available = (
+        snapshot.system_available_bytes
+        if _nonnegative_int(snapshot.system_available_bytes)
+        else None
+    )
+    reason = None
+    if system_total is None or system_available is None:
+        reason = "system_wall_unknown"
+    elif size is None:
+        reason = "model_size_unknown"
+    elif requested is None:
+        reason = "requested_context_unknown"
+
+    kv_cache = (
+        _context_allocation_bound(requested, model_info)
+        if requested is not None and isinstance(model_info, dict)
+        else None
+    )
+    if reason is None and kv_cache is None:
+        reason = "context_allocation_unknown"
+
+    residency = (
+        (size * _MODEL_RESIDENCY_NUMERATOR + _MODEL_RESIDENCY_DENOMINATOR - 1)
+        // _MODEL_RESIDENCY_DENOMINATOR
+        if size is not None
+        else None
+    )
+    total = (
+        residency + kv_cache + RUNTIME_OVERHEAD_BYTES
+        if residency is not None and kv_cache is not None
+        else None
+    )
+    if (
+        reason is None
+        and total is not None
+        and system_available is not None
+        and total > max(0, system_available - SYSTEM_MARGIN_BYTES)
+    ):
+        reason = "allocation_exceeds_system_wall"
+
+    walls: tuple[str, ...] = ()
+    accelerator_available = None
+    if reason is None:
+        if snapshot.accelerator_kind == "apple" and snapshot.unified:
+            walls = ("system_unified",)
+        elif snapshot.accelerator_kind == "nvidia":
+            if snapshot.accelerator_count != 1:
+                reason = "placement_unknown"
+            else:
+                accelerator_available = (
+                    snapshot.accelerator_available_bytes
+                    if _nonnegative_int(snapshot.accelerator_available_bytes)
+                    else None
+                )
+                if accelerator_available is None:
+                    reason = "accelerator_wall_unknown"
+                else:
+                    walls = ("system", "accelerator")
+        elif snapshot.accelerator_kind is None and snapshot.accelerator_count in {None, 0}:
+            walls = ("system",)
+        else:
+            reason = "placement_unknown"
+
+    if (
+        reason is None
+        and total is not None
+        and "accelerator" in walls
+        and accelerator_available is not None
+        and total > max(0, accelerator_available - ACCELERATOR_MARGIN_BYTES)
+    ):
+        reason = "allocation_exceeds_accelerator_wall"
+
+    return PreflightAdmission(
+        reason=reason,
+        requested_context=requested,
+        model_size_bytes=size,
+        model_residency_bound_bytes=residency,
+        kv_cache_bound_bytes=kv_cache,
+        runtime_overhead_bound_bytes=RUNTIME_OVERHEAD_BYTES,
+        total_allocation_bound_bytes=total,
+        applicable_walls=walls,
+        system_available_bytes=system_available,
+        accelerator_available_bytes=accelerator_available,
+    )
+
+
 def preflight_refusal_reason(
     snapshot: MemorySnapshot,
     model_size_bytes: int | None,
+    *,
+    requested_context: int,
+    model_info: dict[str, Any],
 ) -> str | None:
-    """Refuse an obviously unsafe or unprovable model load before Ollama allocates it."""
+    """Return the conservative pre-load admission refusal reason, if any."""
 
-    if snapshot.system_total_bytes is None or snapshot.system_available_bytes is None:
-        return "system_wall_unknown"
-    if (
-        not isinstance(model_size_bytes, int)
-        or isinstance(model_size_bytes, bool)
-        or model_size_bytes <= 0
-    ):
-        return "model_size_unknown"
-    if snapshot.accelerator_kind == "nvidia" and snapshot.accelerator_count != 1:
-        return "placement_unknown"
-
-    capacity = max(0, snapshot.system_available_bytes - SYSTEM_MARGIN_BYTES)
-    if snapshot.accelerator_kind == "nvidia":
-        if snapshot.accelerator_available_bytes is None:
-            return "accelerator_wall_unknown"
-        capacity += max(
-            0, snapshot.accelerator_available_bytes - ACCELERATOR_MARGIN_BYTES)
-    if model_size_bytes > capacity:
-        return "model_exceeds_available_memory_walls"
-    return None
+    return preflight_admission(
+        snapshot,
+        model_size_bytes,
+        requested_context=requested_context,
+        model_info=model_info,
+    ).reason
 
 
 def live_headroom_refusal_reason(
