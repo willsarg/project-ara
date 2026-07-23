@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
-from ara import acquire, calibration, db, engine_env, staleness
+from ara import acquire, calibration, db, engine_env, methodology, staleness
 from ara.contracts import driver
 
 # The built-in worker script (ships in the ARA repo, runs in the isolated cuda_gguf env by path).
@@ -148,6 +148,17 @@ def characterize(model: str, *, progress: bool = False) -> dict:
             stream=progress),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=2.0,
+        methodology_descriptor=methodology.characterization_descriptor(
+            schedule=RAMP_SCHEDULE, repeats=3,
+            reserve_policy="two-wall-fixed-reserve",
+            reserve_bytes={
+                "vram": round(vram_margin * 1024 ** 3),
+                "ram": round(ram_margin * 1024 ** 3),
+            },
+            worker_protocol="ara-cuda-gguf-llama-measurement:v1",
+            sampling_interval_ms=0,
+            telemetry_failure_policy="preflight-and-postload-two-wall:v1",
+            watchdog_stop_rule="either-wall-gte-budget:v1"),
     )
 
 

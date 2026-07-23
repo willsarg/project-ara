@@ -77,16 +77,23 @@ def would_breach(base_gb: float, slope_gb_per_k: float, ctx_tokens: int,
 
 @dataclass(frozen=True)
 class RampResult:
-    """Outcome of a safe ramp: the ceiling (or None), the fit, and the points gathered.
+    """Outcome of a safe ramp with direct evidence separated from fitted advice.
 
     ``binding`` says what limits the ceiling — ``"memory"`` (the safe budget) or
     ``"context_window"`` (the model's own ``max_context``, which memory would otherwise exceed).
     """
-    safe_context: int | None
+    direct_context: int | None
+    fitted_context: int | None
     fit: Fit | None
     points: list[tuple[int, float]]
     stopped_reason: str
     binding: str = "memory"
+    aborted_at: int | None = None
+
+    @property
+    def safe_context(self) -> int | None:
+        """One-release compatibility alias; only direct evidence may govern workloads."""
+        return self.direct_context
 
 
 # Bisection bounds for refining the ceiling between the highest safe context and a measured
@@ -165,18 +172,20 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     # report None rather than reloading it at ever-smaller contexts (RULE #1 + cost).
     if aborted_at is not None:
         if not safe_points:
-            return RampResult(None, None, points, "aborted at smallest context")
+            return RampResult(None, None, None, points, "aborted at smallest context",
+                              aborted_at=aborted_at)
         ceiling = _bisect_ceiling(measure_fn, max(safe_points), aborted_at, points)
         points.sort()
         f = fit(points) if len(points) >= 2 else None
-        return RampResult(ceiling, f, points, "bracketed below abort", "memory")
+        return RampResult(ceiling, None, f, points, "bracketed below abort", "memory",
+                          aborted_at)
 
     # No abort. With <2 points a line is undetermined, but a single safe measurement is still a
     # real lower bound — report it (None only if nothing was ever measured safely).
     if len(points) < 2:
         ceiling = max(safe_points) if safe_points else None
         reason = "single safe point" if safe_points else "insufficient points"
-        return RampResult(ceiling, None, points, reason)
+        return RampResult(ceiling, None, None, points, reason)
 
     # Gentle linear regime: fit + extrapolate to the budget, capped at the model's window.
     f = fit(points)
@@ -193,7 +202,7 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         ceiling, binding = max_context, "context_window"
     elif ceiling is None and measured_window:
         ceiling, binding = max_context, "context_window"
-    return RampResult(ceiling, f, points, "ok", binding)
+    return RampResult(max(safe_points), ceiling, f, points, "ok", binding)
 
 
 def plan_next(schedule: list[int], measured, base_gb: float,

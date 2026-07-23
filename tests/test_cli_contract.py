@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-from ara import cli
+from ara import cli, methodology
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
 
 
@@ -37,7 +37,14 @@ class _FakeBackend:
     CALIBRATION_MODEL = "org/calib"
 
     def characterize(self, model, *, progress=False, kv_quant="f16"):
-        return {"model": model, "safe_context": 8192, "decode_context": None,
+        descriptor = methodology.characterization_descriptor(
+            schedule=[512], repeats=1, reserve_policy="test", reserve_bytes=1024,
+            worker_protocol="test:v1", sampling_interval_ms=50,
+            telemetry_failure_policy="fail-closed", watchdog_stop_rule="test-stop")
+        return {"model": model, "safe_context": 8192, "direct_context": 8192,
+                "fitted_context": None, "stopped_reason": None,
+                "methodology": descriptor, "methodology_key": methodology.key(descriptor),
+                "decode_context": None,
                 "binding": "context_window",
                 "points": [{"context": 512, "mem_gb": 1.2}]}   # real dict-point shape
 

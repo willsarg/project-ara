@@ -14,13 +14,19 @@ import pytest
 from ara import db
 
 
+_CURRENT_EVIDENCE = {
+    "methodology_key": "methodology:v1:sha256:test",
+    "engine_fingerprint": "engine:v2:sha256:test",
+}
+
+
 def test_connect_creates_schema(store):
     tables = {r[0] for r in store.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"calibrations", "models", "characterizations"} <= tables
 
 
-def test_v6_schema_keys_measurements_by_authority(store):
+def test_v7_schema_keys_measurements_by_methodology_and_engine(store):
     calibration_columns = {
         row["name"] for row in store.execute("PRAGMA table_info(calibrations)")}
     characterization_columns = {
@@ -35,10 +41,109 @@ def test_v6_schema_keys_measurements_by_authority(store):
         "environment_key", "authority_key", "memory_unit", "wall_bytes",
         "safe_budget_bytes", "authority_evidence_json",
     } <= calibration_columns
-    assert {"environment_key", "authority_key", "memory_unit"} <= characterization_columns
+    assert {
+        "environment_key", "authority_key", "memory_unit", "direct_context",
+        "fitted_context", "stopped_reason", "methodology_key", "engine_fingerprint",
+    } <= characterization_columns
     assert calibration_pk[-1] == "authority_key"
-    assert characterization_pk[-1] == "authority_key"
-    assert store.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert characterization_pk[-3:] == [
+        "authority_key", "methodology_key", "engine_fingerprint"]
+    assert store.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+def test_save_characterization_persists_direct_fitted_and_methodology(store):
+    db.save_characterization(
+        store, "m", "mlx", "org/model", safe_context=65536,
+        direct_context=65536, fitted_context=77588,
+        stopped_reason="schedule exhausted", points=[{"context": 65536, "mem_gb": 11.5}],
+        artifact_id="hf:org/model@abc", methodology_key="methodology:v1:sha256:test",
+        engine_fingerprint="engine:v2:sha256:test",
+        characterization_evidence={"methodology": {"schema": "test"}},
+    )
+    row = db.get_characterization(store, "m", "mlx", "org/model")
+    assert row["safe_context"] == row["direct_context"] == 65536
+    assert row["fitted_context"] == 77588
+    assert row["stopped_reason"] == "schedule exhausted"
+    assert row["methodology_key"] == "methodology:v1:sha256:test"
+    assert row["engine_fingerprint"] == "engine:v2:sha256:test"
+
+
+def test_v7_migration_preserves_legacy_history_but_never_authorizes_it(
+        tmp_path, monkeypatch):
+    path = tmp_path / "v6-methodology.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE characterizations (
+        machine_key TEXT NOT NULL, runtime TEXT NOT NULL, backend TEXT NOT NULL,
+        artifact_id TEXT NOT NULL, config_key TEXT NOT NULL, logical_model_id TEXT NOT NULL,
+        legacy_engine TEXT, safe_context INTEGER, decode_context INTEGER,
+        config_json TEXT, points_json TEXT, evidence_json TEXT,
+        artifact_confidence TEXT NOT NULL, reusable INTEGER NOT NULL DEFAULT 0,
+        measured_at TEXT, environment_key TEXT NOT NULL, authority_key TEXT NOT NULL,
+        memory_unit TEXT NOT NULL,
+        PRIMARY KEY (machine_key,runtime,backend,artifact_id,config_key,authority_key)
+    );
+    PRAGMA user_version = 6;
+    """)
+    con.executemany(
+        "INSERT INTO characterizations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("m", "mlx", "apple", "hf:org/gemma@abc", "cfg", "org/gemma", "mlx",
+             77588, 100000, "{}",
+             '[{"context":2000,"mem_gb":7.0},{"context":65536,"mem_gb":11.5}]',
+             '{"engine":{"fingerprint":"engine:v1:sha256:old"}}',
+             "manifest_hash", 1, "t1", "env", "authority", "GiB"),
+            ("m", "mlx", "apple", "hf:org/unknown@abc", "cfg", "org/unknown", "mlx",
+             4096, None, "{}", "[]", None, "manifest_hash", 1, "t2", "env",
+             "authority", "GiB"),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    migrated = db.connect()
+    rows = {row["model_id"]: row for row in db.list_characterizations_for_display(migrated, "m")}
+    gemma = rows["org/gemma"]
+    assert gemma["direct_context"] == gemma["safe_context"] == 65536
+    assert gemma["fitted_context"] == 77588
+    assert gemma["methodology_key"] == "legacy-unknown"
+    assert gemma["engine_fingerprint"] == "engine:v1:sha256:old"
+    assert gemma["reusable"] is False
+    unknown = rows["org/unknown"]
+    assert unknown["direct_context"] is None and unknown["fitted_context"] == 4096
+    assert unknown["engine_fingerprint"] == "engine:legacy-unknown"
+    assert unknown["methodology_key"] == "legacy-unknown" and unknown["reusable"] is False
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
+    migrated.close()
+
+    backup = path.with_name(path.name + ".pre-characterization-evidence-v7.bak")
+    saved = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    assert saved.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 6
+    saved.close()
+
+
+def test_v7_migration_failure_rolls_back_and_keeps_v6_store(tmp_path, monkeypatch):
+    path = tmp_path / "v7-rollback.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    con = sqlite3.connect(path)
+    con.executescript(db._CHARACTERIZATIONS_V6_DDL.format(table="characterizations"))
+    con.execute("PRAGMA user_version = 6")
+    con.close()
+    monkeypatch.setattr(
+        db, "_migrate_characterization_evidence_v7",
+        lambda _con: (_ for _ in ()).throw(RuntimeError("forced v7 failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="forced v7 failure"):
+        db.connect()
+
+    saved = sqlite3.connect(path)
+    assert saved.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert "methodology_key" not in {
+        row[1] for row in saved.execute("PRAGMA table_info(characterizations)")}
+    saved.close()
 
 
 def test_connected_yields_working_connection_and_closes(tmp_path, monkeypatch):
@@ -114,7 +219,7 @@ def test_connect_rekeys_legacy_keys_across_all_tables(tmp_path, monkeypatch):
     assert db.get_calibration(con, _NEW, "cpu") is not None
     assert db.get_benchmark_result(con, _NEW, "m1", "coding") is not None
     assert db.get_latest_profile(con, _NEW) is not None
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 7
     assert db.get_characterization(con, _LEGACY, "cpu", "m1") is None   # nothing left under legacy
 
 
@@ -203,7 +308,7 @@ def test_connect_purges_legacy_decimal_wmx_calibrations(tmp_path, monkeypatch):
     assert db.get_calibration(con, "m", "wmx") is None           # purged
     assert db.get_calibration(con, "m", "wcx")["wall_gb"] == 7.6  # untouched
     # The migration chain now ends at v6; the single-field key 'm' is not a legacy machine key.
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 7
 
     # A NEW (GiB-era) wmx calibration written after the purge must survive a reconnect.
     db.upsert_calibration(con, "m", "wmx", fixed_overhead_gb=1.0, calibrated_at="t1",
@@ -434,11 +539,11 @@ def test_characterizations_preserve_artifact_and_config_cells_with_exact_reusabl
     second_artifact = "hf:org/model@bbb"
     db.save_characterization(
         store, "m", "cuda", "org/model", safe_context=4096, points=[],
-        artifact_id=first_artifact, config={"kv_quant": "f16"},
+        artifact_id=first_artifact, config={"kv_quant": "f16"}, **_CURRENT_EVIDENCE,
     )
     db.save_characterization(
         store, "m", "cuda", "org/model", safe_context=8192, points=[],
-        artifact_id=second_artifact, config={"kv_quant": "q8_0"},
+        artifact_id=second_artifact, config={"kv_quant": "q8_0"}, **_CURRENT_EVIDENCE,
     )
 
     rows = db.list_characterizations_for_display(
@@ -506,7 +611,7 @@ def test_machine_key_rekey_preserves_v6_authority_primary_keys(store, monkeypatc
     db.save_characterization(
         store, "legacy", "mlx", "org/model", safe_context=4096, points=[],
         artifact_id="hf:org/model@abc:manifest", config={},
-        environment_key="mlx-env:a", authority_key="mlx-authority:a")
+        environment_key="mlx-env:a", authority_key="mlx-authority:a", **_CURRENT_EVIDENCE)
     monkeypatch.setattr(
         "ara.profile.rekey_legacy_key",
         lambda key: "current" if key == "legacy" else None,
@@ -527,7 +632,7 @@ def test_exact_reusable_characterization_filters_by_authority(store):
     db.save_characterization(
         store, "m", "mlx", "org/model", safe_context=4096, points=[],
         artifact_id="hf:org/model@abc:manifest", config={},
-        environment_key="mlx-env:a", authority_key="mlx-authority:a")
+        environment_key="mlx-env:a", authority_key="mlx-authority:a", **_CURRENT_EVIDENCE)
 
     config_key = db.list_characterizations_for_display(
         store, "m", runtime="mlx", backend="apple")[0]["config_key"]
@@ -546,12 +651,12 @@ def test_engine_reusable_read_selects_matching_config_history(store):
     db.save_characterization(
         store, "m", "cuda", "org/model", safe_context=4096, points=[],
         artifact_id=artifact, config={"kv_quant": "f16"},
-        measured_at="2026-01-01T00:00:00+00:00",
+        measured_at="2026-01-01T00:00:00+00:00", **_CURRENT_EVIDENCE,
     )
     db.save_characterization(
         store, "m", "cuda", "org/model", safe_context=8192, points=[],
         artifact_id=artifact, config={"kv_quant": "q8_0"},
-        measured_at="2026-02-01T00:00:00+00:00",
+        measured_at="2026-02-01T00:00:00+00:00", **_CURRENT_EVIDENCE,
     )
 
     selected = db.get_reusable_characterization_for_engine(
@@ -667,14 +772,15 @@ def test_exact_reusable_read_supports_old_readonly_schema():
         ('m', 'cuda', 'org/model', 4096, NULL, 'hf:org/model@abcdef0:manifest',
          '{}', '[]', '2026-01-01T00:00:00+00:00');
     """)
-    row = db.list_reusable_characterizations(
+    assert db.list_reusable_characterizations(
+        con, "m", runtime="torch", backend="cuda") == []
+    row = db.list_characterizations_for_display(
         con, "m", runtime="torch", backend="cuda")[0]
-
-    selected = db.get_reusable_characterization(
-        con, "m", runtime="torch", backend="cuda", artifact_id=row["artifact_id"],
-        config_key=row["config_key"])
-
-    assert selected["safe_context"] == 4096
+    assert row["safe_context"] == 4096
+    assert row["methodology_key"] == "legacy-unknown"
+    assert db.get_reusable_characterization(
+        con, "m", runtime="torch", backend="cuda",
+        artifact_id="hf:org/model@abcdef0:manifest", config_key=row["config_key"]) is None
     con.close()
 
 
@@ -740,7 +846,7 @@ def test_v5_migrates_unknown_target_rows_as_display_only_and_reopens(
     con.close()
 
     first = db.connect()
-    assert first.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 7
     rows = db.list_characterizations_for_display(
         first, "m", runtime="mystery-runtime", backend="unknown")
     assert len(rows) == 1
@@ -895,7 +1001,7 @@ def test_v6_migration_preserves_history_and_marks_old_mlx_units_unknown(
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
     mlx = db.get_calibration(migrated, "m", "mlx")
     assert mlx["memory_unit"] == "legacy-unit-unknown"
     assert mlx["wall_gb"] == 16.000015258789062
@@ -908,7 +1014,7 @@ def test_v6_migration_preserves_history_and_marks_old_mlx_units_unknown(
     by_model = {row["logical_model_id"]: row for row in rows}
     assert by_model["org/mlx"]["reusable"] is False
     assert by_model["org/mlx"]["authority_key"] == db.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY
-    assert by_model["org/cpu"]["reusable"] is True
+    assert by_model["org/cpu"]["reusable"] is False
     assert by_model["org/cpu"]["authority_key"] == db.UNSCOPED_AUTHORITY_KEY
     benchmark = db.get_benchmark_result(migrated, "m", "org/mlx", "coding")
     assert benchmark["score"] == 0.75 and benchmark["source"] == "fixture"
@@ -1000,7 +1106,8 @@ def test_migration_adds_decode_context_column_to_old_schema(tmp_path, monkeypatc
     # Old row must still be readable and decode_context should be None
     row = db.get_characterization(con, "m", "wcx", "org/model")
     assert row is not None
-    assert row["safe_context"] == 8000
+    assert row["safe_context"] is None
+    assert row["direct_context"] is None and row["fitted_context"] == 8000
     assert row["decode_context"] is None
 
 
@@ -1166,7 +1273,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     first = db.connect()
     row = db.get_benchmark_result(first, "m", "org/model", "coding")
-    assert first.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert first.execute("PRAGMA user_version").fetchone()[0] == 7
     assert row is not None
     assert row["runtime"] == "mystery-runtime"
     assert row["backend"] == "unknown"
@@ -1178,7 +1285,7 @@ def test_v4_migrates_legacy_benchmark_cell_without_loss_and_reopens_idempotently
 
     second = db.connect()
     assert second.execute("SELECT COUNT(*) FROM benchmark_results").fetchone()[0] == 1
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 7
     second.close()
     backup = path.with_name(path.name + ".pre-target-cells-v4.bak")
     assert backup.exists()
@@ -1224,6 +1331,10 @@ def test_v4_benchmark_rebuild_failure_rolls_back_and_keeps_v3_store(
 
 def test_json_object_rejects_malformed_json():
     assert db._json_object("{") is None
+
+
+def test_legacy_direct_context_rejects_malformed_json():
+    assert db._legacy_direct_context("{") is None
 
 
 def test_list_benchmark_results_returns_machine_rows_only(store):
@@ -1385,7 +1496,7 @@ def test_v3_preserves_canonical_only_engine_rows_as_complete_rows(tmp_path, monk
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
     for machine_key, engine, overhead, calibrated_at, wall, budget in calibrations:
         row = db.get_calibration(migrated, machine_key, engine)
         assert (row["fixed_overhead_gb"], row["calibrated_at"], row["wall_gb"],
@@ -1430,14 +1541,15 @@ def test_v3_migrates_engine_evidence_and_resolves_complete_row_collisions(tmp_pa
     con.close()
 
     migrated = db.connect()
-    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert migrated.execute("PRAGMA user_version").fetchone()[0] == 7
     assert db.get_calibration(migrated, "old", "mlx")["legacy_engine"] == "mlx"
     tie = db.get_calibration(migrated, "tie", "mlx")
     assert tie["engine"] == "mlx" and tie["fixed_overhead_gb"] == 2.0 and tie["wall_gb"] == 22.0
     null_ts = db.get_calibration(migrated, "null-ts", "cuda")
     assert null_ts["engine"] == "cuda" and null_ts["fixed_overhead_gb"] == 2.0
     char = db.get_characterization(migrated, "collision", "cuda", "b")
-    assert char["engine"] == "cuda" and char["safe_context"] == 200
+    assert char["engine"] == "cuda" and char["safe_context"] is None
+    assert char["direct_context"] is None and char["fitted_context"] == 200
     assert char["decode_context"] == 202 and char["points_json"] == '["complete-winner"]'
     old_char = db.get_characterization(migrated, "old", "cuda", "a")
     assert old_char["engine"] == "cuda"
@@ -1480,7 +1592,7 @@ def test_v3_second_connect_is_noop_and_preserves_existing_backup(tmp_path, monke
     backup = path.with_name(path.name + ".pre-engine-identity-v3.bak")
     before = backup.read_bytes()
     second = db.connect()
-    assert second.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert second.execute("PRAGMA user_version").fetchone()[0] == 7
     assert db.get_calibration(second, "m", "mlx")["legacy_engine"] == "mlx"
     second.close()
     assert backup.read_bytes() == before

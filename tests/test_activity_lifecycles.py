@@ -108,6 +108,22 @@ def test_run_gate_failure_never_creates_activity(make_console, monkeypatch, acti
 
 
 def _wire_characterize(monkeypatch, backend):
+    descriptor = cli.methodology.characterization_descriptor(
+        schedule=[512], repeats=1, reserve_policy="test", reserve_bytes=1024,
+        worker_protocol="test:v1", sampling_interval_ms=50,
+        telemetry_failure_policy="fail-closed", watchdog_stop_rule="test-stop")
+    original_characterize = backend.characterize
+
+    def evidenced_characterize(*args, **kwargs):
+        result = dict(original_characterize(*args, **kwargs))
+        if "error" not in result:
+            result.update(
+                direct_context=result.get("safe_context"), fitted_context=None,
+                stopped_reason=None, methodology=descriptor,
+                methodology_key=cli.methodology.key(descriptor))
+        return result
+
+    backend.characterize = evidenced_characterize
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")

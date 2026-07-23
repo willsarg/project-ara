@@ -27,7 +27,7 @@ from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine
                  engine_identity, engines, estimate, hub,
                  hub_server,
                  hf_auth, locking, measurement_authority, mlx, ollama, ollama_evidence,
-                 profile, calibration, pythons, scoring, serialize,
+                 profile, calibration, methodology, pythons, scoring, serialize,
                  staleness, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
@@ -1795,7 +1795,18 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             c.emit(c.style("warn", f"  {engine_label} couldn't load {model}: {result['error']}") + hint)
         return 1
 
-    ceiling = result["safe_context"]
+    descriptor = result.get("methodology")
+    methodology_key = result.get("methodology_key")
+    direct_context = result.get("direct_context")
+    fitted_context = result.get("fitted_context")
+    if (not isinstance(descriptor, dict)
+            or not isinstance(methodology_key, str)
+            or methodology.key(descriptor) != methodology_key
+            or result.get("safe_context") != direct_context):
+        msg = "engine returned incomplete characterization evidence — result not stored"
+        print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
+        return 1
+    ceiling = direct_context
     artifact_id = _artifact_identity_for_plan(evidence_model, prefetch_size)
     if artifact_id != artifact_id_before:
         msg = f"the artifact for {model} changed during characterization — result not stored"
@@ -1814,7 +1825,9 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps({"error": msg})) if as_json else c.emit(
             c.style("bad", f"  {msg}"))
         return 1
+    engine_fingerprint = engine_report_after["fingerprint"]
     engine_evidence = engine_audit.characterization_evidence(engine_report_after)
+    engine_evidence["methodology"] = descriptor
     with db.connected() as con:
         if pending_calibration is not None:
             calibration.save_calibration(
@@ -1832,6 +1845,11 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
             )
         db.save_characterization(con, profile.machine_key(), sel.engine_key,
                                  evidence_model, safe_context=ceiling, points=result["points"],
+                                 direct_context=direct_context,
+                                 fitted_context=fitted_context,
+                                 stopped_reason=result.get("stopped_reason"),
+                                 methodology_key=methodology_key,
+                                 engine_fingerprint=engine_fingerprint,
                                  decode_context=result.get("decode_context"),
                                  config=measured_config, artifact_id=artifact_id,
                                  characterization_evidence=engine_evidence,
@@ -1848,11 +1866,17 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
+                     "direct_context": direct_context,
+                     "fitted_context": fitted_context,
+                     "methodology_key": methodology_key,
+                     "engine_fingerprint": engine_fingerprint,
                      "config": measured_config,
                      "decode_context": result.get("decode_context"),
                      "memory_unit": "GiB",
                      "measurement_authority": authority_after.key,
                      "authority_status": "current"}
+        if result.get("stopped_reason") is not None:
+            out["stopped_reason"] = result["stopped_reason"]
         if calibration_error:
             out.update(calibration_error=calibration_error, calibration_fallback=True)
         if ceiling is None:
@@ -1864,8 +1888,10 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         print(json.dumps(out, indent=2))
         return 0
     if ceiling:
-        c.emit(c.style("good", f"  safe context ceiling  ~{ceiling} tokens")
+        c.emit(c.style("good", f"  directly tested context  ~{ceiling} tokens")
                + c.style("dim", f"  · {sel.engine_key} · stored (see ara models show {model})"))
+        if fitted_context and fitted_context > ceiling:
+            c.emit(c.style("dim", f"  fitted ceiling (advisory)  ~{fitted_context} tokens"))
         dc = result.get("decode_context")
         if dc and dc > ceiling:
             c.emit(c.style("good", f"  decode ceiling (est.)  ~{dc} tokens")
@@ -4810,15 +4836,19 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     c.emit(c.section("  CHARACTERIZED MODELS"))
     for r in rows:
         name = r["model_id"].split("/")[-1]
-        if r["safe_context"]:
+        direct = r.get("direct_context", r["safe_context"])
+        if direct:
             dc = r.get("decode_context")
-            ceiling = f"~{r['safe_context']} tokens"
-            if dc and dc > r["safe_context"]:
+            ceiling = f"~{direct} directly tested"
+            fitted = r.get("fitted_context")
+            if fitted and fitted > direct:
+                ceiling += f"  · ~{fitted} fitted (advisory)"
+            if dc and dc > direct:
                 ceiling += f"  · ~{dc} stream-only (est.)"
         else:
             ceiling = "—"
         c.emit("  " + c.style("metric", name) + c.style("dim", "  →  ")
-               + c.style("good", ceiling) + c.style("dim", "  safe context ceiling"))
+               + c.style("good", ceiling))
     c.emit()
 
 

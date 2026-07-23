@@ -363,13 +363,13 @@ def test_render_doctor_verbose_reports_store_details(
 
     out = buf.getvalue()
     assert f"database             {db._db_path()}" in out
-    assert "schema version       6" in out
+    assert "schema version       7" in out
 
     c = cli.Console.from_env(verbose=True)
     assert cli.render_doctor(c, as_json=True) == 0
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["database"] == str(db._db_path())
-    assert out_json["schema_version"] == 6
+    assert out_json["schema_version"] == 7
 
 
 def test_render_doctor_text_reports_ollama_findings(
@@ -1890,14 +1890,16 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
 
 def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    cli.db.save_characterization(store, "mkey", "cuda", "org/SmolLM", safe_context=16000, points=[],
-                                 decode_context=None)
+    cli.db.save_characterization(
+        store, "mkey", "cuda", "org/SmolLM", safe_context=16000,
+        direct_context=16000, fitted_context=20000, points=[], decode_context=None)
     cli.db.save_characterization(store, "mkey", "cuda", "org/Unbound", safe_context=None, points=[],
                                  decode_context=None)
     c, buf = make_console()
     cli._emit_characterized(c, "cuda")
     out = buf.getvalue()
     assert "CHARACTERIZED" in out and "SmolLM" in out and "16000" in out
+    assert "20000 fitted (advisory)" in out
     assert "—" in out               # the None-ceiling model
 
 
@@ -5398,7 +5400,8 @@ def test_characterize_cuda_persists_effective_sdpa_fallback_config(
 
     def characterize(model, *, progress=False, flash_attn=False, **kwargs):
         seen["flash_attn_requested"] = flash_attn
-        return {"model": model, "safe_context": 4096, "decode_context": None, "points": []}
+        return _evidenced_characterization(
+            {"model": model, "safe_context": 4096, "decode_context": None, "points": []})
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         flash_attn_capable=lambda: False, characterize=characterize,
@@ -5951,6 +5954,22 @@ def _current_memory_authority(key="mlx-memory-authority:test"):
     )
 
 
+_TEST_METHODOLOGY = cli.methodology.characterization_descriptor(
+    schedule=[512], repeats=1, reserve_policy="test", reserve_bytes=1024,
+    worker_protocol="test:v1", sampling_interval_ms=50,
+    telemetry_failure_policy="fail-closed", watchdog_stop_rule="test-stop")
+
+
+def _evidenced_characterization(result):
+    result = dict(result)
+    result.setdefault("direct_context", result.get("safe_context"))
+    result.setdefault("fitted_context", None)
+    result.setdefault("stopped_reason", None)
+    result.setdefault("methodology", _TEST_METHODOLOGY)
+    result.setdefault("methodology_key", cli.methodology.key(_TEST_METHODOLOGY))
+    return result
+
+
 def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characterize=None):
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
@@ -5967,7 +5986,7 @@ def _wire_characterize(monkeypatch, *, backend="apple", engine_ok=True, characte
         # Wrap plain lambdas so they accept the progress= kwarg render_characterize passes.
         _char = characterize
         def _char_wrapper(m, *, progress=False, **_kwargs):
-            return _char(m)
+            return _evidenced_characterization(_char(m))
         monkeypatch.setattr(cli, "get_backend",
                             lambda b=None: types.SimpleNamespace(
                                 characterize=_char_wrapper,
@@ -5985,8 +6004,26 @@ def test_render_characterize_persists_and_shows(make_console, store, monkeypatch
     assert "20000" in buf.getvalue() and "mlx" in buf.getvalue()
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
     assert row["safe_context"] == 20000 and row["points"] == [[512, 1.4]]
+    assert row["direct_context"] == 20000 and row["fitted_context"] is None
+    assert row["methodology_key"] == cli.methodology.key(_TEST_METHODOLOGY)
     assert row["artifact_id"] == "artifact:test"
     assert row["authority_key"] == "mlx-memory-authority:test"
+
+
+def test_render_characterize_refuses_incomplete_methodology_evidence(
+        make_console, store, monkeypatch):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda m: {
+            "model": m, "safe_context": 20000, "decode_context": None,
+            "points": [], "methodology_key": "methodology:wrong",
+        },
+    )
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model") == 1
+    assert "incomplete characterization evidence" in buf.getvalue()
+    assert cli.db.get_characterization(store, "mkey", "mlx", "org/Model") is None
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -6058,7 +6095,9 @@ def test_render_characterize_binds_workload_proof_to_engine_fingerprint(
     assert cli.render_characterize(make_console()[0], "org/Model") == 0
 
     row = cli.db.get_characterization(store, "mkey", "mlx", "org/Model")
-    assert row["evidence"] == cli.engine_audit.characterization_evidence(audit)
+    expected_evidence = cli.engine_audit.characterization_evidence(audit)
+    expected_evidence["methodology"] = _TEST_METHODOLOGY
+    assert row["evidence"] == expected_evidence
     assert cli.db.get_model_artifact(store, "artifact:test")["evidence"] is None
     assert seen == [
         {"key": "mlx", "host_features": ["NEON"]},
@@ -6222,7 +6261,9 @@ def test_characterize_self_calibrates_when_uncalibrated(make_console, store, mon
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 1.7,
@@ -6243,8 +6284,9 @@ def test_characterize_passes_new_calibration_overhead_into_same_mlx_ramp(
 
     def characterize(model, *, progress=False, kv_quant="f16", fixed_overhead_gb=None):
         seen["overhead"] = fixed_overhead_gb
-        return {"model": model, "safe_context": 9000,
-                "decode_context": None, "points": []}
+        return _evidenced_characterization(
+            {"model": model, "safe_context": 9000,
+             "decode_context": None, "points": []})
 
     monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
@@ -6271,7 +6313,9 @@ def test_characterize_warns_when_calibration_unavailable(make_console, store, mo
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"calibrated": False, "overhead_gb": None, "wall_gb": None,
@@ -6295,7 +6339,9 @@ def test_characterize_surfaces_measured_wall(make_console, store, monkeypatch):
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": 15.2},
@@ -6316,7 +6362,9 @@ def test_characterize_wall_line_without_budget(make_console, store, monkeypatch)
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": 17.2, "safe_budget_gb": None},
@@ -6337,7 +6385,9 @@ def test_characterize_omits_wall_line_when_wall_none(make_console, store, monkey
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": 1.7, "wall_gb": None, "safe_budget_gb": None},
@@ -6357,7 +6407,9 @@ def test_characterize_persists_measured_wall_when_overhead_none(make_console, st
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 9000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 9000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"overhead_gb": None, "wall_gb": 30.0, "safe_budget_gb": 28.0},
@@ -6385,7 +6437,9 @@ def test_characterize_skips_calibration_when_already_calibrated(make_console, st
         authority_key="mlx-memory-authority:test",
     )   # already calibrated under the live authority
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 5000, "decode_context": None, "points": []},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 5000, "decode_context": None, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: (calls.append("cal") or {"overhead_gb": 9.9}),
@@ -6414,11 +6468,28 @@ def test_render_characterize_positive_ceiling_points_to_concrete_run(
     _wire_characterize(
         monkeypatch,
         characterize=lambda m: {"model": m, "safe_context": 9000,
+                                 "direct_context": 9000, "fitted_context": 12000,
                                  "decode_context": None, "points": []},
     )
     c, buf = make_console()
     assert cli.render_characterize(c, "org/M") == 0
-    assert 'next: ara run org/M "Explain local AI simply"' in buf.getvalue()
+    out = buf.getvalue()
+    assert "fitted ceiling (advisory)  ~12000 tokens" in out
+    assert 'next: ara run org/M "Explain local AI simply"' in out
+
+
+def test_render_characterize_json_reports_observed_stop_reason(
+        make_console, store, monkeypatch, capsys):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda m: {"model": m, "safe_context": 9000,
+                                 "direct_context": 9000, "fitted_context": 12000,
+                                 "stopped_reason": "schedule exhausted",
+                                 "decode_context": None, "points": []},
+    )
+    assert cli.render_characterize(make_console()[0], "org/M", as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped_reason"] == "schedule exhausted"
 
 
 def test_render_characterize_no_ceiling_explains_with_budget(make_console, store, monkeypatch):
@@ -6527,8 +6598,9 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
-        characterize=lambda m, *, progress=False, kv_quant="f16": {
-            "model": m, "safe_context": 2048, "decode_context": 2048, "points": []},
+        characterize=lambda m, *, progress=False, kv_quant="f16":
+            _evidenced_characterization({
+                "model": m, "safe_context": 2048, "decode_context": 2048, "points": []}),
         calibration_model_cached=lambda m: True,
         download_calibration_model=lambda m, *, progress=False: None,
         calibrate=lambda: {"calibration_error": "calibration unavailable: boom"},
@@ -6538,15 +6610,14 @@ def test_render_characterize_json_stdout_is_one_document_even_on_first_calibrati
     assert cli.render_characterize(c, "org/M", as_json=True) == 0
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {
-        "model": "org/M", "engine": "mlx", "safe_context": 2048, "decode_context": 2048,
-        "config": {},
-        "calibration_error": "calibration unavailable: boom",
-        "calibration_fallback": True,
-        "memory_unit": "GiB",
-        "measurement_authority": "mlx-memory-authority:test",
-        "authority_status": "current",
-    }
+    payload = json.loads(captured.out)
+    assert payload["model"] == "org/M" and payload["engine"] == "mlx"
+    assert payload["safe_context"] == payload["direct_context"] == 2048
+    assert payload["fitted_context"] is None and payload["decode_context"] == 2048
+    assert payload["methodology_key"] == cli.methodology.key(_TEST_METHODOLOGY)
+    assert payload["calibration_error"] == "calibration unavailable: boom"
+    assert payload["calibration_fallback"] is True
+    assert payload["memory_unit"] == "GiB"
 
 
 @pytest.mark.parametrize(("characterize", "expected_error"), [
@@ -6592,7 +6663,9 @@ def test_render_characterize_engine_flag_overrides_detected_backend(make_console
     def fake_get_backend(b=None):
         seen["backend"] = b
         return types.SimpleNamespace(
-            characterize=lambda m, *, progress=False, kv_quant="f16": {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]},
+            characterize=lambda m, *, progress=False, kv_quant="f16":
+                _evidenced_characterization(
+                    {"model": m, "safe_context": 8192, "points": [[2000, 0.2]]}),
             calibration_model_cached=lambda m: True,   # skip pre-fetch in this test
             download_calibration_model=lambda m, *, progress=False: None,
         )
@@ -6676,6 +6749,13 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, "ara-engine-mlx"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "remember", lambda con, m: None)
+    original_characterize = bk.characterize
+
+    def evidenced_characterize(*args, **kwargs):
+        result = original_characterize(*args, **kwargs)
+        return result if result.get("error") else _evidenced_characterization(result)
+
+    bk.characterize = evidenced_characterize
     monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
     monkeypatch.setattr(
         cli.measurement_authority,
@@ -6688,7 +6768,8 @@ def _wire_characterize_bk(monkeypatch, bk, *, backend="apple", engine_ok=True,
 
 
 def _fake_bk_characterize(model, *, progress=False, kv_quant="f16"):
-    return {"model": model, "safe_context": 16000, "decode_context": None, "points": [[1024, 1.2]]}
+    return {"model": model, "safe_context": 16000, "decode_context": None,
+            "points": [[1024, 1.2]]}
 
 
 def test_render_characterize_prefetch_uncached_transformers(make_console, store, monkeypatch):
@@ -6925,7 +7006,8 @@ def _wire_characterize_progress(monkeypatch, *, backend="apple", cached=True):
 
     def _characterize(model, *, progress=False, kv_quant="f16"):
         captured["characterize_progress"] = progress
-        return {"model": model, "safe_context": 8000, "decode_context": None, "points": []}
+        return _evidenced_characterization(
+            {"model": model, "safe_context": 8000, "decode_context": None, "points": []})
 
     monkeypatch.setattr(cli.detect, "backend_name", lambda: backend)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
@@ -8026,7 +8108,9 @@ def test_characterize_threads_flash_attn_to_vulkan_backend(make_console, store, 
 
     def char(m, *, progress=False, flash_attn=True, kv_quant="f16"):
         seen["flash_attn"], seen["kv_quant"] = flash_attn, kv_quant
-        return {"model": m, "safe_context": 9000, "decode_context": None, "points": [[512, 1.0]]}
+        return _evidenced_characterization(
+            {"model": m, "safe_context": 9000, "decode_context": None,
+             "points": [[512, 1.0]]})
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         characterize=char, calibration_model_cached=lambda m: True,
@@ -8092,7 +8176,9 @@ def test_characterize_threads_kv_quant_to_apple_backend(make_console, store, mon
 
     def char(m, *, progress=False, kv_quant="f16"):  # note: no flash_attn kwarg
         seen["kv_quant"] = kv_quant
-        return {"model": m, "safe_context": 9000, "decode_context": None, "points": [[512, 1.0]]}
+        return _evidenced_characterization(
+            {"model": m, "safe_context": 9000, "decode_context": None,
+             "points": [[512, 1.0]]})
 
     monkeypatch.setattr(cli, "get_backend", lambda b=None: types.SimpleNamespace(
         characterize=char, calibration_model_cached=lambda m: True,

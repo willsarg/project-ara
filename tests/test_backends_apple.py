@@ -248,7 +248,8 @@ def test_characterize_drives_ramp_over_engine_env(monkeypatch):
 def test_characterize_accepts_freshly_measured_overhead_without_stored_lookup(monkeypatch):
     captured = {}
 
-    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes):
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes,
+                          methodology_descriptor):
         preflight(model)
         return {"model": model, "safe_context": 1, "points": []}
 
@@ -275,7 +276,8 @@ def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
-    assert r["safe_context"] == 22_999    # (36-8-5)/1 = 23k, −1 to stay strictly under budget
+    assert r["direct_context"] == 16_000
+    assert r["fitted_context"] == 22_999  # advisory fit: (36-8-5)/1 = 23k, −1
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):
@@ -284,7 +286,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     out = apple.characterize("missing/model")
-    assert out == {"model": "missing/model", "safe_context": None, "points": [],
+    assert out == {"model": "missing/model", "safe_context": None,
+                   "direct_context": None, "fitted_context": None, "points": [],
                    "error": "model not found in HF cache"}
 
 
@@ -342,7 +345,8 @@ def test_worker_argv_maps_kv_quant_to_kv_bits(kv_quant, bits):
 def _capture_driver_kv_dtype_bytes(monkeypatch):
     captured = {}
 
-    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0):
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0,
+                          methodology_descriptor=None):
         captured["kv_dtype_bytes"] = kv_dtype_bytes
         return {"model": model, "safe_context": 1, "points": []}
 

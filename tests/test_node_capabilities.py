@@ -234,12 +234,16 @@ def test_advertised_capabilities_from_characterizations(monkeypatch):
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "m", "cuda", "org/model-a",
                                           safe_context=4096, points=[], config={},
-                                          artifact_id="hf:org/model-a@revision-a")
+                                          artifact_id="hf:org/model-a@revision-a",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     capabilities.db.save_characterization(con, "m", "mlx", "org/model-b",
                                           safe_context=2048, points=[], config={},
                                           artifact_id="hf:org/model-b@revision-b",
                                           environment_key="mlx-env:current",
-                                          authority_key="mlx-authority:current")
+                                          authority_key="mlx-authority:current",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     capabilities.db.save_characterization(con, "other", "cuda", "org/model-z",
                                           safe_context=1, points=[], config={},
                                           artifact_id="hf:org/model-z@revision-z")  # other machine → excluded
@@ -356,7 +360,9 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "chip|GPU|16|Linux", "cuda", "org/m",
                                           safe_context=8192, points=[], config={},
-                                          artifact_id="hf:org/m@revision")
+                                          artifact_id="hf:org/m@revision",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     con.close()
     desc = capabilities.self_description()
     assert len(desc["capabilities"]) == 1

@@ -211,7 +211,8 @@ def test_characterize_passes_kv_dtype_bytes_from_quant_to_driver(monkeypatch):
     # per-element byte count so the estimate reflects the KV cache type. Slug: 2026-06-25-vulkan-kv-cache-quant
     seen = {}
 
-    def fake_driver(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0):
+    def fake_driver(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0,
+                    methodology_descriptor=None):
         seen["kv_dtype_bytes"] = kv_dtype_bytes
         return {"model": model, "safe_context": 1, "points": []}
 
@@ -240,7 +241,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     fake = _FakeEngine({"error": "Vulkan offload not active"})
     _patch(monkeypatch, fake)
     assert vulkan.characterize("org/model") == {
-        "model": "org/model", "safe_context": None, "points": [],
+        "model": "org/model", "safe_context": None,
+        "direct_context": None, "fitted_context": None, "points": [],
         "error": "Vulkan offload not active"}
 
 

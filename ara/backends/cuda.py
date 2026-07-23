@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 
 # Core, engine-free helpers — safe to import at module load and patchable in tests.
-from ara import calibration, db, engine_env
+from ara import calibration, db, engine_env, methodology
 from ara.contracts import driver
 
 # Native CUDA worker modules ARA drives in the isolated cuda env (never imported in-process).
@@ -201,6 +201,14 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16",
                                  prefill_chunk=prefill_chunk)),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_CUDA_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
+        methodology_descriptor=methodology.characterization_descriptor(
+            schedule=RAMP_SCHEDULE, repeats=1,
+            reserve_policy="vram-wall-minus-fixed-reserve",
+            reserve_bytes=round(margin * 1024 ** 3),
+            worker_protocol="ara-engine-cuda-measurement:v1",
+            sampling_interval_ms=250,
+            telemetry_failure_policy="in-worker-vram-watchdog:v1",
+            watchdog_stop_rule="allocated-vram-gte-budget:v1"),
     )
 
 

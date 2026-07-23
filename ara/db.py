@@ -79,6 +79,37 @@ CREATE TABLE IF NOT EXISTS {table} (
     logical_model_id     TEXT NOT NULL,
     legacy_engine        TEXT,
     safe_context         INTEGER,
+    direct_context       INTEGER,
+    fitted_context       INTEGER,
+    decode_context       INTEGER,
+    stopped_reason       TEXT,
+    config_json          TEXT,
+    points_json          TEXT,
+    evidence_json        TEXT,
+    artifact_confidence  TEXT NOT NULL,
+    reusable             INTEGER NOT NULL DEFAULT 0,
+    measured_at          TEXT,
+    environment_key      TEXT NOT NULL,
+    authority_key        TEXT NOT NULL,
+    memory_unit          TEXT NOT NULL,
+    methodology_key      TEXT NOT NULL,
+    engine_fingerprint   TEXT NOT NULL,
+    PRIMARY KEY (machine_key, runtime, backend, artifact_id, config_key, authority_key,
+                 methodology_key, engine_fingerprint)
+);
+"""
+
+
+_CHARACTERIZATIONS_V6_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    machine_key          TEXT NOT NULL,
+    runtime              TEXT NOT NULL,
+    backend              TEXT NOT NULL,
+    artifact_id          TEXT NOT NULL,
+    config_key           TEXT NOT NULL,
+    logical_model_id     TEXT NOT NULL,
+    legacy_engine        TEXT,
+    safe_context         INTEGER,
     decode_context       INTEGER,
     config_json          TEXT,
     points_json          TEXT,
@@ -328,6 +359,24 @@ def connect() -> sqlite3.Connection:
             con.close()
             raise
         con.execute("PRAGMA foreign_keys = ON")
+    if con.execute("PRAGMA user_version").fetchone()[0] < 7:
+        rebuild = _characterization_evidence_v7_needed(con)
+        if rebuild:
+            _backup_before_characterization_evidence_v7(con, path)
+        con.commit()
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if rebuild:
+                _migrate_characterization_evidence_v7(con)
+            con.execute("PRAGMA user_version = 7")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.execute("PRAGMA foreign_keys = ON")
+            con.close()
+            raise
+        con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
@@ -422,6 +471,17 @@ def _backup_before_measurement_authority_v6(
         path,
         suffix=".pre-measurement-authority-v6.bak",
         validation_label="pre-v6",
+    )
+
+
+def _backup_before_characterization_evidence_v7(
+        con: sqlite3.Connection, path: Path) -> None:
+    """Keep one validated SQLite backup before direct/methodology evidence migration."""
+    _backup_before_migration(
+        con,
+        path,
+        suffix=".pre-characterization-evidence-v7.bak",
+        validation_label="pre-v7",
     )
 
 
@@ -680,7 +740,7 @@ def _migrate_measurement_authority_v6(con: sqlite3.Connection) -> None:
     con.execute("DROP TABLE IF EXISTS calibrations_new")
     con.execute("DROP TABLE IF EXISTS characterizations_new")
     con.execute(_CALIBRATIONS_DDL.format(table="calibrations_new"))
-    con.execute(_CHARACTERIZATIONS_DDL.format(table="characterizations_new"))
+    con.execute(_CHARACTERIZATIONS_V6_DDL.format(table="characterizations_new"))
 
     for row in calibration_rows:
         environment_key, authority_key, memory_unit, authority_json, _legacy_mlx = (
@@ -722,6 +782,70 @@ def _migrate_measurement_authority_v6(con: sqlite3.Connection) -> None:
     con.execute("DROP TABLE calibrations")
     con.execute("DROP TABLE characterizations")
     con.execute("ALTER TABLE calibrations_new RENAME TO calibrations")
+    con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
+
+
+def _characterization_evidence_v7_needed(con: sqlite3.Connection) -> bool:
+    columns = {row["name"] for row in con.execute(
+        "PRAGMA table_info(characterizations)")}
+    return not {
+        "direct_context", "fitted_context", "stopped_reason", "methodology_key",
+        "engine_fingerprint",
+    }.issubset(columns)
+
+
+def _legacy_direct_context(raw_points) -> int | None:
+    """Highest valid successful context in legacy point JSON, for display only."""
+    try:
+        points = json.loads(raw_points) if isinstance(raw_points, str) else raw_points
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(points, list):
+        return None
+    contexts = []
+    for point in points:
+        value = point.get("context") if isinstance(point, dict) else (
+            point[0] if isinstance(point, (list, tuple)) and point else None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            contexts.append(value)
+    return max(contexts) if contexts else None
+
+
+def _legacy_engine_fingerprint(raw_evidence) -> str:
+    evidence = _json_object(raw_evidence)
+    engine = evidence.get("engine") if isinstance(evidence, dict) else None
+    fingerprint = engine.get("fingerprint") if isinstance(engine, dict) else None
+    return (fingerprint if isinstance(fingerprint, str) and fingerprint
+            else "engine:legacy-unknown")
+
+
+def _migrate_characterization_evidence_v7(con: sqlite3.Connection) -> None:
+    """Preserve pre-v7 history while making unknown methodology non-reusable."""
+    rows = [dict(row) for row in con.execute("SELECT * FROM characterizations")]
+    con.execute("DROP TABLE IF EXISTS characterizations_new")
+    con.execute(_CHARACTERIZATIONS_DDL.format(table="characterizations_new"))
+    for row in rows:
+        direct = _legacy_direct_context(row.get("points_json"))
+        legacy_safe = row.get("safe_context")
+        fitted = legacy_safe if direct is None or legacy_safe != direct else None
+        con.execute(
+            "INSERT INTO characterizations_new "
+            "(machine_key,runtime,backend,artifact_id,config_key,logical_model_id,"
+            "legacy_engine,safe_context,direct_context,fitted_context,decode_context,"
+            "stopped_reason,config_json,points_json,evidence_json,artifact_confidence,"
+            "reusable,measured_at,environment_key,authority_key,memory_unit,methodology_key,"
+            "engine_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["machine_key"], row["runtime"], row["backend"], row["artifact_id"],
+                row["config_key"], row["logical_model_id"], row.get("legacy_engine"),
+                direct, direct, fitted, row.get("decode_context"), "legacy-unknown",
+                row.get("config_json"), row.get("points_json"), row.get("evidence_json"),
+                row["artifact_confidence"], 0, row.get("measured_at"),
+                row["environment_key"], row["authority_key"], row["memory_unit"],
+                "legacy-unknown", _legacy_engine_fingerprint(row.get("evidence_json")),
+            ),
+        )
+    con.execute("DROP TABLE characterizations")
     con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
 
 
@@ -827,6 +951,8 @@ def _rekey_legacy(con: sqlite3.Connection) -> int:
             pk_rest = ("runtime", "backend", "artifact_id", "config_key")
             if "authority_key" in columns:
                 pk_rest = (*pk_rest, "authority_key")
+            if "methodology_key" in columns:
+                pk_rest = (*pk_rest, "methodology_key", "engine_fingerprint")
         elif table == "benchmark_results" and "evidence_key" in columns:
             pk_rest = (*pk_rest, "evidence_key")
         n += _rekey_pk_table(con, table, pk_rest, ts)
@@ -1044,6 +1170,9 @@ def get_model_artifact(con: sqlite3.Connection, artifact_id: str) -> dict | None
 def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
                           model_id: str, *, safe_context: int | None,
                           points: list, measured_at: str | None = None,
+                          direct_context: int | None = None,
+                          fitted_context: int | None = None,
+                          stopped_reason: str | None = None,
                           decode_context: int | None = None,
                           config: dict | None = None,
                           artifact_id: str | None = None,
@@ -1051,7 +1180,9 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
                           characterization_evidence: dict | None = None,
                           environment_key: str = UNSCOPED_ENVIRONMENT_KEY,
                           authority_key: str = UNSCOPED_AUTHORITY_KEY,
-                          memory_unit: str = "GiB") -> None:
+                          memory_unit: str = "GiB",
+                          methodology_key: str = "legacy-unknown",
+                          engine_fingerprint: str = "engine:legacy-unknown") -> None:
     stored_config = {} if config is None else config
     identity = _characterization_identity(
         engine, model_id, artifact_id, stored_config)
@@ -1061,27 +1192,36 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
         artifact_confidence=identity["artifact_confidence"], evidence=evidence,
         preserve_existing_evidence=evidence is None,
     )
+    direct_context = safe_context if direct_context is None else direct_context
+    safe_context = direct_context
+    reusable = (identity["reusable"] and methodology_key != "legacy-unknown"
+                and engine_fingerprint != "engine:legacy-unknown")
     con.execute(
         "INSERT INTO characterizations "
         "(machine_key,runtime,backend,artifact_id,config_key,logical_model_id,legacy_engine,"
-        "safe_context,decode_context,config_json,points_json,evidence_json,artifact_confidence,"
-        "reusable,measured_at,environment_key,authority_key,memory_unit) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(machine_key,runtime,backend,artifact_id,config_key,authority_key) "
+        "safe_context,direct_context,fitted_context,decode_context,stopped_reason,config_json,"
+        "points_json,evidence_json,artifact_confidence,reusable,measured_at,environment_key,"
+        "authority_key,memory_unit,methodology_key,engine_fingerprint) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(machine_key,runtime,backend,artifact_id,config_key,authority_key,"
+        "methodology_key,engine_fingerprint) "
         "DO UPDATE SET "
         "logical_model_id=excluded.logical_model_id,legacy_engine=excluded.legacy_engine,"
-        "safe_context=excluded.safe_context, decode_context=excluded.decode_context, "
+        "safe_context=excluded.safe_context,direct_context=excluded.direct_context,"
+        "fitted_context=excluded.fitted_context,decode_context=excluded.decode_context,"
+        "stopped_reason=excluded.stopped_reason,"
         "config_json=excluded.config_json,points_json=excluded.points_json,"
         "evidence_json=excluded.evidence_json,artifact_confidence=excluded.artifact_confidence,"
         "reusable=excluded.reusable,measured_at=excluded.measured_at,"
         "environment_key=excluded.environment_key,memory_unit=excluded.memory_unit",
         (machine_key, identity["runtime"], identity["backend"], identity["artifact_id"],
          identity["config_key"], model_id, identity["legacy_engine"], safe_context,
-         decode_context, json.dumps(stored_config, sort_keys=True), json.dumps(points),
+         direct_context, fitted_context, decode_context, stopped_reason,
+         json.dumps(stored_config, sort_keys=True), json.dumps(points),
          _compact_json(characterization_evidence if characterization_evidence is not None
                        else evidence),
-         identity["artifact_confidence"], identity["reusable"],
-         measured_at or _now(), environment_key, authority_key, memory_unit))
+         identity["artifact_confidence"], int(reusable), measured_at or _now(), environment_key,
+         authority_key, memory_unit, methodology_key, engine_fingerprint))
     con.commit()
 
 
@@ -1109,6 +1249,11 @@ def _legacy_characterization_row(row: sqlite3.Row) -> dict:
     d["evidence_json"] = None
     d["evidence"] = None
     d["reusable"] = identity["reusable"] == 1
+    d["direct_context"] = d.get("safe_context")
+    d["fitted_context"] = None
+    d["stopped_reason"] = "legacy-unknown"
+    d["methodology_key"] = "legacy-unknown"
+    d["engine_fingerprint"] = "engine:legacy-unknown"
     return d
 
 
@@ -1140,7 +1285,7 @@ def list_characterizations_for_display(
     rows = con.execute(
         f"SELECT * FROM characterizations WHERE {' AND '.join(clauses)} "  # noqa: S608
         "ORDER BY logical_model_id,runtime,backend,measured_at,artifact_id,config_key,"
-        "authority_key",
+        "authority_key,methodology_key,engine_fingerprint",
         values).fetchall()
     return [_characterization_row(row) for row in rows]
 
@@ -1163,6 +1308,8 @@ def list_reusable_characterizations(
     return [row for row in list_characterizations_for_display(
         con, machine_key, runtime=runtime, backend=backend,
         logical_model_id=logical_model_id) if row["reusable"]
+        and row["methodology_key"] != "legacy-unknown"
+        and row["engine_fingerprint"] != "engine:legacy-unknown"
         and row["artifact_confidence"] in {"strong", "observed_digest", "manifest_hash"}
         and (authority_key is None or row.get("authority_key") == authority_key)]
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 
 # Core, engine-free helpers — safe to import at module load and patchable in tests.
-from ara import calibration, db, engine_env, measurement_authority
+from ara import calibration, db, engine_env, measurement_authority, methodology
 from ara.contracts import driver
 from ara.engine_env import EngineEnvError
 
@@ -200,6 +200,14 @@ def characterize(
             "apple", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant)),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_MLX_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
+        methodology_descriptor=methodology.characterization_descriptor(
+            schedule=RAMP_SCHEDULE, repeats=3,
+            reserve_policy="metal-recommendation-minus-fixed-reserve",
+            reserve_bytes=round(margin * 1024 ** 3),
+            worker_protocol="ara-engine-mlx-measurement:v1",
+            sampling_interval_ms=50,
+            telemetry_failure_policy="in-worker-daemon-watchdog:v1",
+            watchdog_stop_rule="host-wired-gte-budget:v1"),
     )
 
 
