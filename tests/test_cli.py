@@ -5575,6 +5575,7 @@ def test_ollama_measure_ceiling_accepts_safe_partial_offload(monkeypatch):
 
 
 def test_ollama_measure_ceiling_stops_on_create_fail(monkeypatch):
+    _wire_ollama_probe(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda p, m, ctx: False)
     best, points = _measure_ollama("m", 4096, "pr")
     assert best is None and points == []
@@ -5755,6 +5756,7 @@ def test_ollama_measure_ceiling_can_track_probe_without_base_gate(monkeypatch):
 
 def test_ollama_measure_ceiling_refuses_retargeted_base_before_probe_load(monkeypatch):
     base_digests = iter(["a" * 64, "c" * 64])
+    _wire_ollama_probe(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     monkeypatch.setattr(
         cli.ollama, "manifest_digest",
@@ -5771,6 +5773,7 @@ def test_ollama_measure_ceiling_refuses_retargeted_base_before_probe_load(monkey
 
 
 def test_ollama_measure_ceiling_refuses_retargeted_base_before_create(monkeypatch):
+    _wire_ollama_probe(monkeypatch)
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
     monkeypatch.setattr(cli.ollama, "create",
                         lambda *_a: pytest.fail("created from retargeted base"))
@@ -5783,6 +5786,7 @@ def test_ollama_measure_ceiling_refuses_retargeted_base_before_create(monkeypatc
 
 
 def test_ollama_measure_ceiling_requires_probe_identity_without_provenance_dict(monkeypatch):
+    _wire_ollama_probe(monkeypatch)
     monkeypatch.setattr(cli.ollama, "create", lambda *_a: True)
     monkeypatch.setattr(cli.ollama, "manifest_digest",
                         lambda name: "a" * 64 if name == "base" else None)
