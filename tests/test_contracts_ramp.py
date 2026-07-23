@@ -139,8 +139,9 @@ def test_plan_next_none_when_all_measured():
 # --------------------------------------------------------------------------- #
 class FakeM:
     """Stand-in for a worker Measurement (duck-typed: .refused, .mem_gb)."""
-    def __init__(self, mem_gb=None, refused=False):
+    def __init__(self, mem_gb=None, refused=False, telemetry=None):
         self.mem_gb, self.refused, self.reason = mem_gb, refused, None
+        self.telemetry = telemetry
 
 
 def _linear_measure(intercept, slope_per_k):
@@ -198,6 +199,19 @@ def test_run_bisects_below_abort_instead_of_extrapolating_past_it():
     assert res.direct_context == res.safe_context
     assert res.fitted_context is None
     assert res.aborted_at == 8000
+
+
+def test_run_preserves_telemetry_from_abort_and_bisection():
+    def measure(ctx):
+        telemetry = {"context": ctx}
+        return (FakeM(refused=True, telemetry=telemetry) if ctx >= 5000 else
+                FakeM(mem_gb=5.0 + ctx / 1000, telemetry=telemetry))
+
+    res = ramp.run(measure, schedule=[2000, 4000, 8000],
+                   base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
+
+    assert res.telemetry[8000] == {"context": 8000}
+    assert any(4000 < context < 8000 for context in res.telemetry)
 
 
 def test_run_finds_the_wall_when_growth_is_super_linear():

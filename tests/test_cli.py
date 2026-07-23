@@ -3627,6 +3627,37 @@ def test_current_reuse_identity_hashes_live_method_and_engine(monkeypatch):
     assert seen == {"engine": "mlx", "host_features": ["NEON"]}
 
 
+def test_current_reuse_identity_fails_closed_for_missing_method(monkeypatch):
+    monkeypatch.setattr(cli, "get_backend", lambda _backend: object())
+
+    assert cli._current_reuse_identity("mlx", "apple") == (
+        None, None, "cannot identify the current characterization methodology")
+
+
+def test_current_reuse_identity_fails_closed_when_audit_raises(monkeypatch):
+    monkeypatch.setattr(
+        cli, "get_backend", lambda _backend: types.SimpleNamespace(
+            characterization_methodology=lambda: {"schema": "test"}))
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("audit failed")))
+
+    method_key, fingerprint, error = cli._current_reuse_identity("mlx", "apple")
+
+    assert method_key is None and fingerprint is None
+    assert "cannot verify the installed engine build" in error
+
+
+def test_current_reuse_identity_fails_closed_without_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        cli, "get_backend", lambda _backend: types.SimpleNamespace(
+            characterization_methodology=lambda: {"schema": "test"}))
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda *_a, **_k: {})
+
+    assert cli._current_reuse_identity("mlx", "apple")[2] == (
+        "cannot identify the installed engine build")
+
+
 def test_reuse_identity_error_names_the_changed_dimension():
     method_error = cli._reuse_identity_error(
         {"methodology_key": "old", "engine_fingerprint": _TEST_ENGINE_FP},
@@ -3717,6 +3748,35 @@ def test_serve_mlx_lookup_requires_current_method_and_engine_identity(
         assume_yes=True) == 1
     assert seen["methodology_key"] == _TEST_METHOD_KEY
     assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
+
+
+def test_serve_mlx_refuses_unverifiable_current_identity(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    _patch_native_characterization(monkeypatch, {"safe_context": 8000})
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_a: (None, None, "current engine identity unavailable"))
+
+    c, buf = make_console()
+    assert cli._render_serve_mlx(
+        c, "org/m", engine_key="mlx", assume_yes=True) == 1
+    assert "identity unavailable" in buf.getvalue()
+
+
+def test_serve_mlx_refuses_stale_runtime_identity(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    stale = {"safe_context": 8000, "methodology_key": "old",
+             "engine_fingerprint": _TEST_ENGINE_FP}
+    _patch_native_characterization(monkeypatch, stale)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+
+    c, buf = make_console()
+    assert cli._render_serve_mlx(
+        c, "org/m", engine_key="mlx", assume_yes=True) == 1
+    assert "methodology" in buf.getvalue()
 
 
 def test_serve_mlx_refuses_ceiling_measured_with_nondefault_config(
@@ -3894,6 +3954,17 @@ def test_run_lookup_requires_current_method_and_engine_identity(
         make_console()[0], "org/m", prompt="hi", engine="cpu", assume_yes=True) == 0
     assert seen["methodology_key"] == _TEST_METHOD_KEY
     assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
+
+
+def test_run_pinned_refuses_unverifiable_current_identity(make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_a: (None, None, "current engine identity unavailable"))
+
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "identity unavailable" in buf.getvalue()
 
 
 def test_run_refuses_when_no_safe_ceiling(make_console, monkeypatch):
@@ -4283,6 +4354,20 @@ def test_run_auto_refuses_display_only_ceiling(make_console, monkeypatch):
 
     assert cli.render_run(c, "org/m", prompt="hi") == 1
     assert "not reusable" in buf.getvalue()
+
+
+def test_run_auto_refuses_unverifiable_current_identity(make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cpu",
+        chars={"cpu": {"model_id": "org/m", "safe_context": 4096}},
+        supports={"cpu": True})
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_a: (None, None, "current engine identity unavailable"))
+
+    c, buf = make_console()
+    assert cli.render_run(c, "org/m", prompt="hi") == 1
+    assert "identity unavailable" in buf.getvalue()
 
 
 def test_run_picks_largest_safe_context_engine(monkeypatch, capsys):
@@ -5539,6 +5624,60 @@ def test_render_run_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True,
                           weight_quant="fp8") == 1
     assert "Ada/Hopper" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_render_run_pinned_rejects_fp8_on_incapable_gpu(monkeypatch, capsys):
+    _wire_run_cross(monkeypatch, detected="cuda",
+                    chars={"cuda": {"model_id": "org/m", "safe_context": 4096,
+                                    "config": {"weight_quant": "fp8"}}},
+                    supports={"cuda": True})
+    bk = types.SimpleNamespace(generate=lambda *a, **k: {"completion": "x"},
+                               fp8_capable=lambda: False)
+    monkeypatch.setattr(cli, "get_backend", lambda b=None: bk)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", engine="cuda", as_json=True,
+        assume_yes=True, weight_quant="fp8") == 1
+    assert "Ada/Hopper" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_render_run_rechecks_lever_after_engine_selection(
+        make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    calls = []
+
+    def lever_error(*_args, **_kwargs):
+        calls.append(True)
+        return None if len(calls) == 1 else "selected engine lever changed"
+
+    monkeypatch.setattr(cli, "_unsupported_lever_error", lever_error)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "lever changed" in buf.getvalue()
+
+
+def test_render_run_rechecks_weight_hardware_after_engine_selection(
+        make_console, monkeypatch):
+    _wire_run_cross(
+        monkeypatch, detected="cuda",
+        chars={"cuda": {"model_id": "org/m", "safe_context": 4096,
+                        "config": {"weight_quant": "fp8"}}},
+        supports={"cuda": True})
+    calls = []
+
+    def hardware_error(*_args, **_kwargs):
+        calls.append(True)
+        return None if len(calls) == 1 else "selected GPU capability changed"
+
+    monkeypatch.setattr(cli, "_weight_quant_hw_error", hardware_error)
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", engine="cuda", assume_yes=True,
+        weight_quant="fp8") == 1
+    assert "capability changed" in buf.getvalue()
 
 
 def test_render_run_rejects_invalid_weight_quant(monkeypatch, capsys):
@@ -11580,6 +11719,69 @@ def test_benchmark_lookup_requires_current_method_and_engine_identity(monkeypatc
     assert plan is None and "exceeds" in error
     assert seen["methodology_key"] == _TEST_METHOD_KEY
     assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
+
+
+def test_benchmark_pinned_refuses_unverifiable_current_identity(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_a: (None, None, "current engine identity unavailable"))
+
+    plan, error = cli._native_benchmark_plan("org/m", "mlx", None)
+
+    assert plan is None and "identity unavailable" in error
+
+
+def test_benchmark_pinned_refuses_stale_runtime_identity(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    stale = {"safe_context": 8000, "artifact_id": "artifact:test",
+             "methodology_key": "old", "engine_fingerprint": _TEST_ENGINE_FP}
+    monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: stale)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+
+    plan, error = cli._native_benchmark_plan("org/m", "mlx", None)
+
+    assert plan is None and "methodology" in error
+
+
+def test_benchmark_auto_refuses_unverifiable_current_identity(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_a: (None, None, "current engine identity unavailable"))
+
+    plan, error = cli._native_benchmark_plan("org/m", None, None)
+
+    assert plan is None and "identity unavailable" in error
+
+
+def test_benchmark_auto_refuses_stale_runtime_identity(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    stale = {"safe_context": 8000, "artifact_id": "artifact:test",
+             "methodology_key": "old", "engine_fingerprint": _TEST_ENGINE_FP}
+    monkeypatch.setattr(
+        cli.db, "get_characterization",
+        lambda _con, _mk, engine, _model: stale if engine == "mlx" else None)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+
+    plan, error = cli._native_benchmark_plan("org/m", None, None)
+
+    assert plan is None and "methodology" in error
+
+
+def test_benchmark_auto_refuses_otherwise_matching_display_only_evidence(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+
+    plan, error = cli._native_benchmark_plan("org/m", None, None)
+
+    assert plan is None and "no measured ceiling" in error
 
 
 _OLLAMA_BENCHMARK_POLICY = {

@@ -162,6 +162,21 @@ def test_preserves_per_rung_telemetry_in_driver_evidence():
     assert result["points"][0]["telemetry"] == telemetry
 
 
+def test_preserves_refusal_telemetry_separately_from_successful_points():
+    telemetry = {"schema": "macos-native-vm-telemetry:v1", "sample_count": 2}
+    result = driver.characterize(
+        "org/model", schedule=[2000],
+        preflight=lambda _model: _est(max_context=2000),
+        measure=lambda _model, context: {
+            "context": context, "refused": True, "reason": "boundary",
+            "telemetry": telemetry,
+        })
+
+    assert result["points"] == []
+    assert result["refusal_telemetry"] == [
+        {"context": result["aborted_at"], "telemetry": telemetry}]
+
+
 def test_l2_stops_when_measured_reaches_budget():
     # L1 thinks it's safe (tiny slope), but the ACTUAL measurement is at/over budget
     est = _est(slope_gb_per_k=0.001)
