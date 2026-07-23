@@ -52,6 +52,7 @@ def _make_hw(
             logical=12,
         ),
         memory=memory or MemoryInfo(
+            physical_memory_bytes=16 * hardware.GB,
             total_gb=16.0,
             available_gb=8.0,
             swap_gb=2.0,
@@ -941,7 +942,8 @@ def test_profile_flat_fields_sourced_from_hw_structures(set_platform, run_stub, 
 
     hw = _make_hw(
         cpu=CpuInfo(brand="Test CPU", physical=8, logical=16),
-        memory=MemoryInfo(total_gb=32.0, available_gb=20.0, swap_gb=4.0),
+        memory=MemoryInfo(physical_memory_bytes=32 * hardware.GB,
+                          total_gb=32.0, available_gb=20.0, swap_gb=4.0),
         storage=StorageInfo(free_gb=250.0),
     )
     monkeypatch.setattr(hardware, "probe", lambda: hw)
@@ -949,6 +951,7 @@ def test_profile_flat_fields_sourced_from_hw_structures(set_platform, run_stub, 
     m = detect.machine()
     assert m.cpu_physical == 8
     assert m.cpu_logical == 16
+    assert m.physical_memory_bytes == 32 * hardware.GB
     assert m.ram_total_gb == 32.0
     assert m.ram_available_gb == 20.0
     assert m.swap_gb == 4.0

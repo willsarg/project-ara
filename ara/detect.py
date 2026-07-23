@@ -524,6 +524,7 @@ class Machine:
     swap_gb: float | None
     accel: Accelerator
     disk_free_gb: float | None
+    physical_memory_bytes: int | None = None
     # Detailed hardware structures (Task 6).  All four are always present; fields within
     # are best-effort / may be None when the OS probe fails or the field doesn't apply.
     cpu: _hardware.CpuInfo = field(default_factory=_hardware.CpuInfo)
@@ -581,6 +582,7 @@ def machine() -> Machine:
         swap_gb=hw.memory.swap_gb,
         accel=accel,
         disk_free_gb=hw.storage.free_gb,
+        physical_memory_bytes=hw.memory.physical_memory_bytes,
         # Detailed hardware structures embedded directly.
         cpu=hw.cpu,
         memory=hw.memory,

@@ -21,6 +21,7 @@ def test_machine_matches_detect_json_shape(sample_machine):
                           "wcx-suite": "cuda"}.get(expected["engine"], expected["engine"])
     assert d == expected
     assert isinstance(d["accelerated"], bool)
+    assert d["physical_memory_bytes"] == m.physical_memory_bytes
 
 
 @pytest.mark.parametrize(("legacy", "canonical"), [("wmx", "mlx"), ("wcx", "cuda")])
@@ -34,7 +35,8 @@ def test_profile_record_includes_durable_capability(sample_machine):
     m = sample_machine
     rec = serialize.profile_record(m)
     for key in ("system", "os_version", "arch", "chip", "cpu_physical", "cpu_logical",
-                "cpu_features", "ram_total_gb", "swap_gb", "accel", "gpus", "board",
+                "cpu_features", "physical_memory_bytes", "ram_total_gb", "swap_gb",
+                "accel", "gpus", "board",
                 "backend", "engine", "engine_ready", "runtimes"):
         assert key in rec, f"missing durable field: {key}"
     # nested domain objects come through as dicts/lists (asdict-expanded), JSON-ready

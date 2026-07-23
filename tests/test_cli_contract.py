@@ -24,7 +24,7 @@ def _machine() -> Machine:
         cpu_physical=12, cpu_logical=12, cpu_features=["NEON"],
         python_version="3.12.8", ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0,
+        disk_free_gb=500.0, physical_memory_bytes=48 * 1024 ** 3,
         runtimes=[Runtime("MLX", True, "0.18", kind="engine", accels=("apple",), usable=True)],
         framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0)],
@@ -116,7 +116,6 @@ CONTRACT = [
     (["mlx", "--json"], dict, "apple_silicon"),
     (["models", "show", "org/m", "--json"], dict, "model_id"),
     (["models", "search", "smol", "--json"], list, None),
-    (["models", "recommend", "--json"], list, None),
     (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
     (["install", "--engine", "mlx", "--json"], dict, "status"),
@@ -141,6 +140,15 @@ def test_command_emits_valid_json(mocked_world, monkeypatch, capsys, argv, kind,
     assert isinstance(payload, kind), f"{argv} → {type(payload).__name__}, want {kind.__name__}"
     if anchor is not None:
         assert anchor in payload, f"{argv} JSON missing '{anchor}'"
+
+
+def test_models_recommend_json_errors_without_current_mlx_budget(
+        mocked_world, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["ara", "models", "recommend", "--json"])
+    assert cli.main() == 1
+    assert _extract_json(capsys.readouterr().out) == {
+        "error": "no current MLX budget is available for a safe ranking"
+    }
 
 
 def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
@@ -188,9 +196,12 @@ def test_models_list_is_a_click_usage_error_not_a_model_alias(mocked_world, caps
 ])
 def test_deprecated_aliases_warn_only_on_stderr_and_keep_json_exact(
         mocked_world, capsys, argv, warning):
-    assert cli.main(argv) == 0
+    expected_status = 1 if argv[0] == "recommend" else 0
+    assert cli.main(argv) == expected_status
     captured = capsys.readouterr()
-    json.loads(captured.out)
+    payload = json.loads(captured.out)
+    if argv[0] == "recommend":
+        assert payload == {"error": "no current MLX budget is available for a safe ranking"}
     assert captured.err == warning
 
 

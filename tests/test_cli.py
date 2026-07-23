@@ -1222,7 +1222,7 @@ def _machine(**over) -> Machine:
         cpu_physical=12, cpu_logical=12, cpu_features=["NEON", "BF16"],
         python_version="3.12.8", ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0,
+        disk_free_gb=500.0, physical_memory_bytes=48 * 1024 ** 3,
         runtimes=[Runtime("MLX", True, "0.18", kind="engine", accels=("apple",), usable=True),
                   Runtime("vLLM", True, "0.5", kind="engine", accels=("nvidia",), usable=False),
                   Runtime("PyTorch", True, "2.1", kind="framework")],
@@ -1506,7 +1506,9 @@ def _wire_profile(monkeypatch, set_platform, machine=None):
     a stubbed Machine + machine_key on Apple. profile makes NO engine call — there is
     deliberately no backend wired here."""
     set_platform("Darwin", "arm64")  # resolve_engine(None) -> apple/mlx
-    monkeypatch.setattr(cli.detect, "machine", lambda: machine if machine is not None else _machine())
+    selected_machine = machine if machine is not None else _machine()
+    monkeypatch.setattr(cli.detect, "machine", lambda: selected_machine)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: selected_machine.backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
 
 
@@ -1518,7 +1520,8 @@ def test_profile_never_loads_an_engine(make_console, monkeypatch, set_platform, 
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "SAFE LIMITS" in out and "estimated" in out
+    assert "MEMORY AUTHORITY" in out and "current governed budget" in out
+    assert "unknown" in out
     assert "ara characterize" in out                              # points at the empirical step
     assert cli.db.get_latest_profile(store, "mkey") is None       # profile is read-only
 
@@ -1533,26 +1536,41 @@ def test_profile_does_not_create_database(tmp_path, make_console, monkeypatch, s
     assert not path.exists()
 
 
-def test_profile_estimated_budget_mirrors_wall(make_console, monkeypatch, set_platform):
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+def test_profile_apple_reports_physical_memory_but_no_current_budget(
+        make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="apple", ram_total_gb=24.0, physical_memory_bytes=25_769_803_776))
     c, buf = make_console()
     assert cli.render_profile(c) == 0
-    out = buf.getvalue()
-    assert "36.0 GiB" in out          # Apple working set: 0.75 × 48
-    assert "34.0 GiB" in out          # safe budget: boundary − 2 GiB margin
+    out = " ".join(buf.getvalue().split())
+    assert "physical memory 24 GiB" in out
+    assert "25,769,803,776 bytes" in out
+    assert "current governed budget unknown" in out
+    assert "36.0 GiB" not in out
 
 
-def test_profile_json_emits_estimate(monkeypatch, set_platform, capsys):
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+def test_profile_json_emits_unknown_apple_budget(monkeypatch, set_platform, capsys):
+    physical_bytes = 25_769_803_776
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="apple", ram_total_gb=24.0, physical_memory_bytes=physical_bytes))
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["basis"] == "estimated"
+    assert payload["physical_memory_bytes"] == physical_bytes
+    assert payload["total_gb"] == 24.0
+    assert payload["basis"] == "unknown"
     assert payload["calibrated"] is False
-    assert payload["safe_budget_gb"] == 48.0 * 0.75 - 2.0
+    assert payload["wall_gb"] is None and payload["safe_budget_gb"] is None
     assert payload["memory_unit"] == "GiB"
     assert payload["wall_bytes"] is None and payload["safe_budget_bytes"] is None
     assert payload["authority_status"] == "unknown"
+    assert payload["current_governed_budget"] == {
+        "status": "unknown",
+        "wall_bytes": None,
+        "wall_gib": None,
+        "safe_budget_bytes": None,
+        "safe_budget_gib": None,
+    }
 
 
 def test_profile_explicit_cpu_uses_system_ram_on_cuda_host(
@@ -1591,35 +1609,49 @@ def test_profile_text_handles_unknown_memory(make_console, monkeypatch, set_plat
 
 
 def test_profile_keeps_mlx_history_display_only(make_console, monkeypatch, set_platform, store):
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="apple", ram_total_gb=24.0, physical_memory_bytes=25_769_803_776))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
-                                     wall_gb=41.3, safe_budget_gb=39.3)
+                                     wall_gb=17.760009765625,
+                                     safe_budget_gb=15.760009765625,
+                                     wall_bytes=19_069_665_280,
+                                     safe_budget_bytes=16_922_181_632)
     c, buf = make_console(verbose=True)
     assert cli.render_profile(c) == 0
-    out = buf.getvalue()
-    assert "41.3 GiB" in out and "display only" in out
-    assert "36.0 GiB" in out and "34.0 GiB" in out
-    assert "estimated" in out
+    out = " ".join(buf.getvalue().split())
+    assert "current governed budget unknown" in out
+    assert "historical Metal recommendation 17.760 GiB · 19,069,665,280 bytes" in out
+    assert "historical ARA policy budget 15.760 GiB · 16,922,181,632 bytes" in out
+    assert "historical-unverified" in out
 
 
 def test_profile_json_reports_historical_mlx_authority(monkeypatch, set_platform, capsys, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
-                                     wall_gb=41.3, safe_budget_gb=39.3)
+                                     wall_gb=17.760009765625,
+                                     safe_budget_gb=15.760009765625,
+                                     wall_bytes=19_069_665_280,
+                                     safe_budget_bytes=16_922_181_632)
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["basis"] == "estimated"
+    assert payload["basis"] == "unknown"
     assert payload["calibrated"] is False
-    assert payload["wall_gb"] == 36.0 and payload["safe_budget_gb"] == 34.0
+    assert payload["wall_gb"] is None and payload["safe_budget_gb"] is None
     assert payload["authority_status"] == "historical-unverified"
-    assert payload["historical_measurement"]["wall_gb"] == 41.3
+    history = payload["historical_measurement"]
+    assert history["wall_gb"] == 17.760009765625
+    assert history["metal_recommendation_bytes"] == 19_069_665_280
+    assert history["metal_recommendation_gib"] == 17.760009765625
+    assert history["ara_policy_budget_bytes"] == 16_922_181_632
+    assert history["ara_policy_budget_gib"] == 15.760009765625
+    assert history["authority_status"] == "historical-unverified"
 
 
 def test_profile_reads_legacy_calibration_without_migrating(
-        monkeypatch, set_platform, capsys, store):
+        make_console, monkeypatch, set_platform, capsys, store):
     from ara import db
 
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
@@ -1649,27 +1681,31 @@ def test_profile_reads_legacy_calibration_without_migrating(
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["engine"] == "mlx"
-    assert payload["basis"] == "estimated"
-    assert payload["wall_gb"] == 36.0
+    assert payload["basis"] == "unknown"
+    assert payload["wall_gb"] is None
     assert payload["historical_measurement"]["wall_gb"] == 41.3
-    assert payload["authority_status"] == "historical-unverified"
+    assert payload["authority_status"] == "legacy-unit-unknown"
+    assert payload["historical_measurement"]["authority_status"] == "legacy-unit-unknown"
+    text_console, text_buffer = make_console()
+    assert cli.render_profile(text_console) == 0
+    assert "41.3 · legacy unit unknown · exact bytes unavailable" in text_buffer.getvalue()
     with sqlite3.connect(path) as check:
         assert check.execute("PRAGMA user_version").fetchone()[0] == 2
         assert check.execute("SELECT engine FROM calibrations").fetchone()[0] == "wmx"
     assert not backup_path.exists()
 
 
-def test_profile_uncalibrated_stays_estimated(monkeypatch, set_platform, capsys, store):
-    # No stored wall → profile must STILL say estimated (no fabrication).
+def test_profile_uncalibrated_apple_stays_unknown(monkeypatch, set_platform, capsys, store):
+    # No stored wall and no live Metal read means no current budget.
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["basis"] == "estimated" and payload["calibrated"] is False
+    assert payload["basis"] == "unknown" and payload["calibrated"] is False
 
 
-def test_profile_footer_keeps_estimated_for_unverified_mlx_history(
+def test_profile_footer_keeps_unknown_for_unverified_mlx_history(
         make_console, monkeypatch, set_platform, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
@@ -1678,18 +1714,17 @@ def test_profile_footer_keeps_estimated_for_unverified_mlx_history(
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "estimated" in out
+    assert "current governed budget" in out and "unknown" in out
     assert "ara characterize <model>" in out
 
 
-def test_profile_footer_keeps_estimated_when_uncalibrated(make_console, monkeypatch, set_platform, store):
-    # No measured wall → the footer keeps the honest "estimated —" framing.
+def test_profile_footer_keeps_unknown_when_uncalibrated(make_console, monkeypatch, set_platform, store):
     _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
-    assert "estimated — run " in out
+    assert "current governed budget" in out and "unknown" in out
     assert "ara characterize <model>" in out
 
 
@@ -1711,7 +1746,8 @@ def test_profile_non_mlx_measurement_is_current_and_drives_footer(
 
 
 def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform):
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
@@ -1720,6 +1756,24 @@ def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform)
     out = buf.getvalue()
     assert "MODEL FIT: org/small" in out
     assert "full 8192 ctx" in out
+
+
+def test_profile_model_apple_fit_is_unknown_without_current_budget(
+        make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, model="org/small") == 0
+    out = buf.getvalue()
+    assert "MODEL FIT: org/small" in out
+    assert "(unknown — no current budget)" in out
+    assert "unknown" in out
+    assert "no current governed memory budget" in out
+    assert "won't fit" not in out
+    assert "estimated — run" not in out
 
 
 def test_profile_model_context_limited(make_console, monkeypatch, set_platform):
@@ -1745,7 +1799,8 @@ def test_profile_model_wont_fit(make_console, monkeypatch, set_platform):
 
 def test_profile_model_fits_unknown_architecture(make_console, monkeypatch, set_platform):
     # Describable + fits, but missing dims → no slope → "fits" with an honest unknown-context note.
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=None, kv_heads=None, head_dim=None, max_context=8192))
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
@@ -1767,7 +1822,8 @@ def test_profile_model_uses_cataloged_weight_no_network(
     # profile --model and recommend must compute identically: a cataloged model's weight comes
     # from the local catalog (catalog.get → weights_gb), never a network repo_size_gb call.
     # Spec 2026-06-23-capability-pipeline.
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.catalog, "get",
@@ -1781,7 +1837,8 @@ def test_profile_model_uses_cataloged_weight_no_network(
 
 def test_profile_model_falls_back_to_network_when_uncataloged(make_console, monkeypatch, set_platform):
     # No catalog weight (model not cataloged, or weights_gb None) → fall back to repo_size_gb.
-    _wire_profile(monkeypatch, set_platform, _machine(backend="apple", ram_total_gb=48.0))
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
@@ -1804,7 +1861,9 @@ def test_profile_model_json_includes_fit(monkeypatch, set_platform, capsys):
     c = cli.Console(color=False, stream=sys.stderr)
     assert cli.render_profile(c, as_json=True, model="org/small") == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["model_fit"]["fits"] is True
+    assert payload["model_fit"]["fits"] is None
+    assert payload["model_fit"]["est_context"] is None
+    assert payload["model_fit"]["reason"] == "no_current_budget"
     assert payload["model_fit"]["max_context"] == 8192
 
 
@@ -1817,10 +1876,10 @@ def test_main_profile_passes_engine(monkeypatch):
 def test_profile_help_explains_analytic_boundary_and_options(capsys):
     assert cli.main(["profile", "--help"]) == 0
     out = " ".join(capsys.readouterr().out.split())
-    assert "Estimate this machine's safe memory budget" in out
+    assert "Assess this machine's memory authority" in out
     assert "without loading an engine or model" in out
-    assert "Estimate whether MODEL fits and its usable context" in out
-    assert "Estimate for ENGINE; defaults to the detected engine" in out
+    assert "Assess whether MODEL fits and its usable context" in out
+    assert "Assess for ENGINE; defaults to the detected engine" in out
 
 
 def test_profile_unknown_engine_errors(make_console, monkeypatch):
@@ -1872,6 +1931,23 @@ def test_emit_limits_omits_swap_when_none(make_console):
     out = buf.getvalue()
     assert "SAFE LIMITS" in out
     assert "swap" not in out
+
+
+def test_emit_unknown_mlx_limits_handles_missing_exact_memory_and_swap(make_console):
+    c, buf = make_console()
+    cli._emit_limits(c, _limits(
+        engine="mlx", basis="unknown", physical_memory_bytes=None,
+        total_gb=None, wall_gb=None, safe_budget_gb=None,
+        historical_measurement=None, swap_free_gb=None,
+    ))
+    out = buf.getvalue()
+    assert "MEMORY AUTHORITY" in out
+    assert "exact bytes unavailable" in out
+    assert "swap" not in out
+
+
+def test_memory_evidence_text_is_unknown_without_bytes_or_legacy_value():
+    assert cli._memory_evidence_text(None, None) == "unknown · exact bytes unavailable"
 
 
 def test_emit_limits_measured_reads_as_measured(make_console):
@@ -3026,10 +3102,10 @@ def _model_row(model_id, *, weights_gb=4.0, max_context=8192, **over):
 
 def _wire_recommend(monkeypatch, set_platform, models, machine=None):
     set_platform("Darwin", "arm64")
-    monkeypatch.setattr(cli.detect, "machine",
-                        lambda: machine if machine is not None
-                        else _machine(backend="apple", ram_total_gb=48.0))
-    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    selected_machine = machine if machine is not None else _machine(
+        backend="cpu", ram_total_gb=48.0, chip="Test CPU")
+    monkeypatch.setattr(cli.detect, "machine", lambda: selected_machine)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: selected_machine.backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
@@ -3188,8 +3264,8 @@ def test_recommend_empty_catalog_shows_first_model_path(
     assert "no models cached" in out
     assert "nothing in the catalog fits" not in out
     assert "ara install" in out
-    assert "ara characterize mlx-community/SmolLM-135M-Instruct-4bit --engine mlx" in out
-    assert ('ara run mlx-community/SmolLM-135M-Instruct-4bit '
+    assert "ara characterize bartowski/SmolLM2-135M-Instruct-GGUF --engine cpu" in out
+    assert ('ara run bartowski/SmolLM2-135M-Instruct-GGUF '
             '"Explain local AI simply"') in out
 
 
@@ -3244,14 +3320,32 @@ def test_recommend_does_not_govern_from_unverified_mlx_history(
         captured["measured"] = measured
         return real_limits(machine, measured=measured)
 
-    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small", max_context=8192)])
+    _wire_recommend(
+        monkeypatch, set_platform, [_model_row("org/Small", max_context=8192)],
+        machine=_machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.estimate, "limits", spy_limits)
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=41.3, safe_budget_gb=39.3)
     c, buf = make_console()
-    assert cli.render_recommend(c) == 0
+    assert cli.render_recommend(c) == 1
     assert captured["measured"] is None
+    assert "no current MLX budget is available for a safe ranking" in buf.getvalue()
+
+
+def test_recommend_mlx_unknown_budget_json_is_structured_error(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch, set_platform, [_model_row("org/Small")],
+        machine=_machine(backend="apple", ram_total_gb=48.0))
+    monkeypatch.setattr(
+        cli, "get_backend", lambda *a, **k: pytest.fail("recommend loaded an engine"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "no current MLX budget is available for a safe ranking"
+    }
 
 
 def test_recommend_json(monkeypatch, set_platform, capsys):
@@ -3269,21 +3363,23 @@ def test_recommend_verbose_discloses_budget_provenance(
     c, buf = make_console(verbose=True)
     assert cli.render_recommend(c) == 0
     out = " ".join(buf.getvalue().split())
-    assert "provenance wall estimated · mlx · 34.0 GiB safe budget" in out
+    assert "provenance wall estimated · cpu · 46.0 GiB safe budget" in out
     assert "catalog 1 cached model · ephemeral read-only scan" in out
 
 
 def test_recommend_verbose_keeps_mlx_history_out_of_active_fit(
         store, make_console, monkeypatch, set_platform):
-    _wire_recommend(monkeypatch, set_platform, [_model_row("org/Small")])
+    _wire_recommend(
+        monkeypatch, set_platform, [_model_row("org/Small")],
+        machine=_machine(backend="apple", ram_total_gb=48.0))
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     cli.calibration.save_calibration(store, "mlx", fixed_overhead_gb=1.7,
                                      wall_gb=20.0, safe_budget_gb=18.0)
     c, buf = make_console(verbose=True)
-    assert cli.render_recommend(c) == 0
+    assert cli.render_recommend(c) == 1
     out = " ".join(buf.getvalue().split())
-    assert "provenance wall estimated · mlx · 34.0 GiB safe budget" in out
-    assert "estimated — fits this machine" in out
+    assert "no current MLX budget is available for a safe ranking" in out
+    assert "estimated — fits this machine" not in out
 
 
 def test_recommend_does_not_create_database(
@@ -3421,7 +3517,7 @@ def test_recommend_surfaces_quant_tradeoff(make_console, monkeypatch, set_platfo
                                 weights_gb=2.0, max_context=131072),
                      _model_row("org/Llama-3.2-3B-Instruct-8bit", quant="8bit",
                                 weights_gb=4.0, max_context=131072)],
-                    machine=_machine(backend="apple", ram_total_gb=10.0))   # memory-bound → ctx differs
+                    machine=_machine(backend="cpu", ram_total_gb=10.0))   # memory-bound → ctx differs
     c, buf = make_console()
     assert cli.render_recommend(c) == 0
     out = buf.getvalue()
@@ -3446,7 +3542,7 @@ def test_recommend_quant_tradeoff_survives_unmappable_bits(make_console, monkeyp
     _wire_recommend(monkeypatch, set_platform,
                     [_model_row("org/Foo-q8bit", quant="q8bit", weights_gb=2.0, max_context=131072),
                      _model_row("org/Foo-4bit", quant="4bit", weights_gb=2.0, max_context=131072)],
-                    machine=_machine(backend="apple", ram_total_gb=10.0))
+                    machine=_machine(backend="cpu", ram_total_gb=10.0))
     c, buf = make_console()
     assert cli.render_recommend(c) == 0                    # no crash
     note = buf.getvalue().lower()

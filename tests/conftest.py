@@ -52,7 +52,7 @@ def sample_machine():
         cpu_physical=12, cpu_logical=12, cpu_features=["NEON"], python_version="3.12.8",
         ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0,
+        disk_free_gb=500.0, physical_memory_bytes=48 * 1024 ** 3,
         runtimes=[Runtime("Ollama", True, "0.6", serving=True)],
         framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0)],

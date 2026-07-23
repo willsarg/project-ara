@@ -60,6 +60,16 @@ def _fmt_gb(v: float | None, decimals: int = 0) -> str:
     return f"{v:.{decimals}f} GiB" if v is not None else "unknown"
 
 
+def _memory_evidence_text(gib: float | None, exact_bytes: int | None,
+                          legacy_value: float | None = None) -> str:
+    """Render byte-authoritative memory evidence without assigning units to legacy scalars."""
+    if exact_bytes is not None and gib is not None:
+        return f"{_fmt_gb(gib, 3)} · {exact_bytes:,} bytes"
+    if legacy_value is not None:
+        return f"{legacy_value:g} · legacy unit unknown · exact bytes unavailable"
+    return "unknown · exact bytes unavailable"
+
+
 def _fmt_size(gb: float | None) -> str:
     """Human download size: MB under a gigabyte, GB above. 'size unknown' if None."""
     if gb is None:
@@ -1008,6 +1018,49 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
 # characterize (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
+    if m.get("engine") == "mlx" and m.get("basis") == "unknown":
+        c.emit()
+        c.emit(c.section("  MEMORY AUTHORITY") + c.style("dim", "  (engine-free)"))
+        c.emit(c.field("engine", m["engine"], label_width=34))
+        physical_gloss = (
+            f"{m['physical_memory_bytes']:,} bytes"
+            if m.get("physical_memory_bytes") is not None
+            else "exact bytes unavailable")
+        c.emit(c.field("physical memory", _fmt_gb(m.get("total_gb"), 0), physical_gloss,
+                       label_width=34))
+        c.emit(c.field(
+            "current governed budget", "unknown",
+            "requires a live Metal read inside a consented engine operation",
+            value_role="warn",
+            label_width=34,
+        ))
+        historical = m.get("historical_measurement")
+        if historical is not None:
+            c.emit(c.field(
+                "historical Metal recommendation",
+                _memory_evidence_text(
+                    historical.get("metal_recommendation_gib"),
+                    historical.get("metal_recommendation_bytes"),
+                    historical.get("wall_gb"),
+                ),
+                "display only · Metal advisory",
+                label_width=34,
+            ))
+            c.emit(c.field(
+                "historical ARA policy budget",
+                _memory_evidence_text(
+                    historical.get("ara_policy_budget_gib"),
+                    historical.get("ara_policy_budget_bytes"),
+                    historical.get("safe_budget_gb"),
+                ),
+                f"display only · authority {m.get('authority_status', 'unknown')}",
+                label_width=34,
+            ))
+        if m.get("swap_free_gb") is not None:
+            c.emit(c.field("swap", f"{m['swap_free_gb']:.1f} GiB free", label_width=34))
+        c.emit()
+        return
+
     # The tag must match the data source: a measured wall reads as measured; without one it's
     # honestly flagged as an uncalibrated estimate. Spec 2026-06-23-capability-pipeline.
     measured = m.get("basis") == "measured"
@@ -1037,13 +1090,6 @@ def _emit_limits(c: Console, m: dict) -> None:
                                "before measured correction", label_width=16))
         else:
             c.emit(c.field("provenance", "analytic estimate", "read-only hardware facts"))
-        historical = m.get("historical_measurement")
-        if historical is not None:
-            c.emit(c.field(
-                "history",
-                _fmt_gb(historical.get("wall_gb"), 1),
-                f"display only · authority {m.get('authority_status', 'unknown')}",
-            ))
     if m.get("headroom_gb") is not None:
         c.emit(c.field("headroom", _fmt_gb(m["headroom_gb"], 1), "free under budget right now"))
     if m["overhead_gb"] is not None:
@@ -2039,6 +2085,12 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             None if engine_identity.canonical_engine(default_engine) == "mlx"
             else historical_calibration)
         lim = estimate.limits(detect.machine(), measured=measured)
+        if (engine_identity.canonical_engine(default_engine) == "mlx"
+                and lim["safe_budget_gb"] is None):
+            msg = "no current MLX budget is available for a safe ranking"
+            print(json.dumps({"error": msg})) if as_json else c.emit(
+                c.style("bad", f"  {msg}"))
+            return 1
         history = _best_ceiling_history(evidence_con)
         best = _best_ceilings(evidence_con)  # current without crossing the engine seam
 
@@ -4791,13 +4843,18 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     """Render the per-model analytic verdict: does it fit, and what context does the budget hold?"""
     fit = _model_fit(lim, model)
     c.emit()
-    c.emit(c.section(f"  MODEL FIT: {model}") + c.style("dim", "  (estimated)"))
+    tag = ("  (unknown — no current budget)"
+           if lim.get("safe_budget_gb") is None else "  (estimated)")
+    c.emit(c.section(f"  MODEL FIT: {model}") + c.style("dim", tag))
     if fit is None:
         c.emit(c.style("warn", f"  couldn't describe {model} — is it a valid repo / downloaded?"))
         c.emit()
         return
     c.emit(c.field("weights", _fmt_gb(fit["weights_gb"], 1), "estimated in-memory footprint"))
-    if not fit["fits"]:
+    if fit["fits"] is None:
+        c.emit(c.field("verdict", "unknown", "no current governed memory budget",
+                       value_role="warn"))
+    elif not fit["fits"]:
         c.emit(c.field("verdict", "won't fit", "weights alone exceed the estimated budget",
                        value_role="bad"))
     elif fit["binding"] == "context_window":
@@ -4810,17 +4867,18 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     else:
         c.emit(c.field("verdict", "fits", "context estimate unavailable (unknown architecture)",
                        value_role="good"))
-    c.emit(c.style("dim", "  estimated — run ") + c.style("accent", f"ara characterize {model}")
+    prefix = "  current budget unknown — run " if fit["fits"] is None else "  estimated — run "
+    c.emit(c.style("dim", prefix) + c.style("accent", f"ara characterize {model}")
            + c.style("dim", " to measure the real ceiling"))
     c.emit()
 
 
 def render_profile(c: Console, *, as_json: bool = False, model: str | None = None,
                    engine: str | None = None) -> int:
-    """Analytic capability assessment — engine-free. Reasons over ``detect.machine()`` facts +
-    ARA's heuristics to estimate the memory budget and (with ``--model``) checks whether a model's
-    weights + context window fit the estimate. It never loads an engine or model and never mutates
-    ARA's store; ``characterize`` does that to measure and persist the real ceiling.
+    """Analytic capability assessment — engine-free. Reasons over ``detect.machine()`` facts and
+    checks model fit only when the read-only seam has a current admissible budget. It never loads an
+    engine or model and never mutates ARA's store; ``characterize`` does that to measure and persist
+    the real ceiling.
     Spec 2026-06-23-capability-pipeline."""
     try:
         sel = resolve_engine(engine)
@@ -4847,7 +4905,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         authority_key = historical.get("authority_key")
         authority_status = (
             "legacy-unit-unknown"
-            if authority_key == measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY
+            if authority_key in (None, measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY)
             else "historical-unverified"
         )
     else:
@@ -4855,13 +4913,34 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         authority_status = "current"
     lim = {"engine": sel.engine_key,
            **estimate.limits(m, measured=measured, backend=sel.backend)}
+    historical_measurement = None
+    if historical is not None and measured is None:
+        wall_bytes = historical.get("wall_bytes")
+        safe_budget_bytes = historical.get("safe_budget_bytes")
+        historical_measurement = {
+            **historical,
+            "metal_recommendation_bytes": wall_bytes,
+            "metal_recommendation_gib": (
+                wall_bytes / estimate.GIB if wall_bytes is not None else None),
+            "ara_policy_budget_bytes": safe_budget_bytes,
+            "ara_policy_budget_gib": (
+                safe_budget_bytes / estimate.GIB if safe_budget_bytes is not None else None),
+            "authority_status": authority_status,
+        }
     lim.update(
         memory_unit="GiB",
         wall_bytes=(measured or {}).get("wall_bytes"),
         safe_budget_bytes=(measured or {}).get("safe_budget_bytes"),
         measurement_authority=authority_key,
         authority_status=authority_status,
-        historical_measurement=(historical if measured is None else None),
+        current_governed_budget={
+            "status": "unknown" if lim["safe_budget_gb"] is None else lim["basis"],
+            "wall_bytes": (measured or {}).get("wall_bytes"),
+            "wall_gib": lim["wall_gb"],
+            "safe_budget_bytes": (measured or {}).get("safe_budget_bytes"),
+            "safe_budget_gib": lim["safe_budget_gb"],
+        },
+        historical_measurement=historical_measurement,
     )
 
     if as_json:
@@ -4883,6 +4962,10 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
             c.emit(c.style("dim", "  run ")
                    + c.style("accent", "ara characterize <model>")
                    + c.style("dim", " to measure a model's real ceiling"))
+        elif lim["basis"] == "unknown":
+            c.emit(c.style("dim", "  current budget unknown — run ")
+                   + c.style("accent", "ara characterize <model>")
+                   + c.style("dim", " to measure a governed ceiling"))
         else:
             c.emit(c.style("dim", "  estimated — run ")
                    + c.style("accent", "ara characterize <model>")
@@ -5635,14 +5718,14 @@ def _click_characterize(ctx: click.Context, model: str, engine: str | None, kv_q
 
 @_click_cli.command("profile", context_settings=_HELP_SETTINGS)
 @click.option("--model", metavar="MODEL",
-              help="Estimate whether MODEL fits and its usable context.")
+              help="Assess whether MODEL fits and its usable context.")
 @click.option("--engine", callback=_engine_callback, metavar="ENGINE",
-              help="Estimate for ENGINE; defaults to the detected engine.")
+              help="Assess for ENGINE; defaults to the detected engine.")
 @_json_verbose_options
 @click.pass_context
 def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
                    verbose: bool, as_json: bool) -> int:
-    """Estimate this machine's safe memory budget without loading an engine or model."""
+    """Assess this machine's memory authority without loading an engine or model."""
     return render_profile(_mark_json(ctx, as_json), as_json=as_json, model=model, engine=engine)
 
 
