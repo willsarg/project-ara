@@ -36,8 +36,23 @@ print(json.dumps({
 
 
 _CUDA_PROBE = r"""
+import hashlib
+import importlib.metadata as metadata
+import importlib.util
 import json
+from pathlib import Path
 import torch
+
+engine_spec = importlib.util.find_spec("ara_engine_cuda")
+engine_root = Path(next(iter(engine_spec.submodule_search_locations))).resolve()
+source_hash = hashlib.sha256()
+for source in sorted(
+        (path for path in engine_root.rglob("*.py")
+         if "__pycache__" not in path.parts),
+        key=lambda path: path.relative_to(engine_root).as_posix()):
+    source_hash.update(source.relative_to(engine_root).as_posix().encode())
+    source_hash.update(b"\0")
+    source_hash.update(source.read_bytes())
 
 available = bool(torch.cuda.is_available())
 operation_ok = False
@@ -56,6 +71,8 @@ if available:
 print(json.dumps({
     "kind": "torch_cuda",
     "package_version": str(torch.__version__),
+    "engine_package_version": metadata.version("ara-engine-cuda"),
+    "engine_source_digest": "sha256:" + source_hash.hexdigest(),
     "cuda_build": torch.version.cuda,
     "arch_list": list(torch.cuda.get_arch_list()),
     "available": available,
@@ -133,8 +150,9 @@ def _stable_probe(probe: dict[str, Any]) -> dict[str, Any]:
     kind = probe.get("kind")
     keys = {
         "llama_cpp": ("kind", "package_version", "python_arch", "system_info"),
-        "torch_cuda": ("kind", "package_version", "cuda_build", "arch_list",
-                       "device", "capability"),
+        "torch_cuda": ("kind", "package_version", "engine_package_version",
+                       "engine_source_digest", "cuda_build", "arch_list", "device",
+                       "capability"),
         "mlx": ("kind", "package_version", "mlx_lm_version",
                 "engine_package_version", "engine_source_digest", "device", "architecture"),
     }.get(kind, tuple(sorted(probe)))

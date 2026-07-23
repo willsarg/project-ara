@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -726,6 +727,9 @@ def test_run_help_explains_governance_and_generation_controls(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "characterized safe ceiling" in out
     assert "auto, mlx, cuda, cpu, vulkan, cuda-gguf, ollama" in out
+    assert "--prompt-file PATH" in out
+    assert "1 MiB" in out and "standard input" in out
+    assert "--ctx N" in out and "Lower context cap" in out
     assert "--max-tokens N" in out and "Maximum new tokens" in out
     assert "KV-cache format (mlx/cuda/vulkan): f16, q8_0, or q4_0" in out
     assert "Omit tuning options to use ARA's safe defaults" in out
@@ -4022,6 +4026,87 @@ def test_run_generates_capped_at_ceiling(make_console, monkeypatch):
     assert seen["max_context"] == 8192 and seen["prompt"] == "meaning?"   # governed ceiling
 
 
+@pytest.mark.parametrize("requested", [8192, 4096])
+def test_run_context_cap_at_or_below_ceiling_controls_engine_and_json(
+        make_console, monkeypatch, capsys, requested):
+    seen = {}
+
+    def gen(_model, _prompt, *, max_context, max_tokens):
+        seen["max_context"] = max_context
+        return {"context": max_context, "completion": "ok"}
+
+    _wire_run(monkeypatch, characterization=_CHAR, generate=gen)
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", ctx=requested, as_json=True,
+        assume_yes=True) == 0
+
+    assert seen["max_context"] == requested
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_context"] == 8192
+    assert payload["characterized_ceiling"] == 8192
+    assert payload["effective_context"] == requested
+
+
+def test_run_refuses_context_above_ceiling_before_generation(
+        make_console, monkeypatch):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *_a, **_k: pytest.fail("model was loaded"),
+    )
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", ctx=16384, assume_yes=True) == 1
+
+    assert "--ctx 16384 exceeds the measured safe ceiling 8192" in buf.getvalue()
+
+
+def test_run_rejects_nonpositive_context_before_engine_contact(
+        make_console, monkeypatch):
+    monkeypatch.setattr(
+        cli, "resolve_engine", lambda *_a: pytest.fail("engine was resolved"))
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi", ctx=0) == 1
+
+    assert "--ctx must be a positive integer" in buf.getvalue()
+
+
+def test_run_verbose_distinguishes_ceiling_from_effective_context(
+        make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_run(
+        c, "org/m", prompt="hi", ctx=4096, assume_yes=True) == 0
+
+    output = buf.getvalue()
+    assert "characterized ceiling" in output and "8,192 tokens" in output
+    assert "effective context" in output and "4,096 tokens" in output
+
+
+def test_run_lower_context_preserves_engine_prompt_fit_refusal(
+        make_console, monkeypatch):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *_a, **_k: {
+            "context": 4096,
+            "refused": True,
+            "reason": "prompt plus generation budget exceeds context",
+        },
+    )
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "org/m", prompt="large prompt", ctx=4096, assume_yes=True) == 1
+
+    assert "prompt plus generation budget exceeds context" in buf.getvalue()
+
+
 def test_run_loads_immutable_pinned_artifact_reference(make_console, monkeypatch):
     seen = {}
 
@@ -4506,17 +4591,184 @@ def test_main_run_dispatch(monkeypatch):
     assert rec["run"]["prompt"] == "hello world"
 
 
+def test_main_run_reads_exact_multiline_prompt_from_stdin(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin",
+        io.TextIOWrapper(io.BytesIO(b"first line\nsecond line\n"), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-"]) == 0
+
+    assert rec["run"]["prompt"] == "first line\nsecond line\n"
+
+
+def test_main_run_reads_exact_utf8_prompt_file(monkeypatch, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("first line\ncaf\u00e9\n", encoding="utf-8")
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "--prompt-file", str(prompt_file)]) == 0
+
+    assert rec["run"]["prompt"] == "first line\ncaf\u00e9\n"
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "org/m", "text", "--prompt-file", "prompt.txt"],
+    ["run", "org/m", "-", "extra"],
+])
+def test_main_run_rejects_multiple_prompt_sources_before_dispatch(
+        monkeypatch, capsys, argv):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(monkeypatch, argv) == 2
+
+    assert "run" not in rec
+    assert "prompt" in capsys.readouterr().err.lower()
+
+
+def test_main_run_rejects_empty_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b""), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert json.loads(capsys.readouterr().out)["error"] == "prompt input is empty"
+
+
+def test_main_run_reports_prompt_source_error_in_human_output(
+        monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b" \n"), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-"]) == 1
+
+    assert "run" not in rec
+    assert "prompt input is empty" in capsys.readouterr().out
+
+
+def test_main_run_rejects_unreadable_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+
+    class BrokenInput:
+        def read(self, _limit):
+            raise OSError("stdin unavailable")
+
+    monkeypatch.setattr(cli.sys, "stdin", types.SimpleNamespace(buffer=BrokenInput()))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert "cannot read prompt from standard input" in json.loads(
+        capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_oversized_stdin_before_dispatch(monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+    monkeypatch.setattr(
+        cli.sys, "stdin",
+        io.TextIOWrapper(
+            io.BytesIO(b"x" * (cli.RUN_PROMPT_MAX_BYTES + 1)), encoding="utf-8"))
+
+    assert _run_main(monkeypatch, ["run", "org/m", "-", "--json"]) == 1
+
+    assert "run" not in rec
+    assert "1 MiB" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_non_utf8_positional_text_before_dispatch(
+        monkeypatch, capsys):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "secret-\udcff-prompt", "--json"]) == 1
+
+    assert "run" not in rec
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert "valid UTF-8" in json.loads(output)["error"]
+
+
+def test_main_run_rejects_invalid_utf8_prompt_file_without_echoing_bytes(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_bytes(b"secret-\xff-prompt")
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(prompt_file), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert "valid UTF-8" in json.loads(output)["error"]
+
+
+def test_main_run_rejects_unreadable_prompt_file_before_dispatch(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    missing = tmp_path / "missing.txt"
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(missing), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    assert "cannot read prompt file" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_main_run_rejects_prompt_larger_than_documented_bound(
+        monkeypatch, capsys, tmp_path):
+    rec = _capture_dispatch(monkeypatch)
+    prompt_file = tmp_path / "large.txt"
+    prompt_file.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    assert _run_main(
+        monkeypatch,
+        ["run", "org/m", "--prompt-file", str(prompt_file), "--json"],
+    ) == 1
+
+    assert "run" not in rec
+    assert "1 MiB" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_main_run_parses_max_tokens(monkeypatch):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["run", "org/m", "hello", "--max-tokens", "32"]) == 0
     assert rec["run"]["max_tokens"] == 32
 
 
+def test_main_run_parses_lower_context_cap(monkeypatch):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "hello", "--ctx", "4096"]) == 0
+
+    assert rec["run"]["ctx"] == 4096
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "many"])
+def test_main_run_rejects_invalid_context_cap(monkeypatch, capsys, value):
+    rec = _capture_dispatch(monkeypatch)
+
+    assert _run_main(
+        monkeypatch, ["run", "org/m", "hello", "--ctx", value]) == 2
+
+    assert "run" not in rec
+    assert "Invalid value for '--ctx'" in capsys.readouterr().err
+
+
 def test_main_run_requires_prompt(monkeypatch, capsys):
     rec = _capture_dispatch(monkeypatch)
     assert _run_main(monkeypatch, ["run", "org/m"]) == 2
     assert "run" not in rec
-    assert "Missing argument 'PROMPT...'" in capsys.readouterr().err
+    assert "provide prompt text" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("flag", "value"), [
@@ -9054,14 +9306,14 @@ def _ollama_run_process(*, context=4096, accelerator=100):
 
 
 def _wire_ollama_run(monkeypatch, *, warm=False, response=Ellipsis, final_process=None,
-                     characterization=None):
+                     characterization=None, context=4096):
     characterization = characterization or {"safe_context": 4096}
     _wire_serve(
         monkeypatch,
         names=("qwen3:0.6b",),
         characterization=characterization,
     )
-    process = _ollama_run_process()
+    process = _ollama_run_process(context=context)
     observations = ([process, final_process or process] if warm else
                     [[], process, final_process or process])
     monkeypatch.setattr(cli.ollama, "processes", lambda: (
@@ -9116,6 +9368,8 @@ def test_run_ollama_cold_path_warms_generates_verifies_then_emits_json(
         "placement": "unified",
         "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
         "safe_context": 4096,
+        "characterized_ceiling": 4096,
+        "effective_context": 4096,
         "completion": "Hello",
         "thinking": "hidden chain",
         "stop_reason": "stop",
@@ -9127,6 +9381,39 @@ def test_run_ollama_cold_path_warms_generates_verifies_then_emits_json(
         },
         "concurrency_scope": "ARA governs this request; outside Ollama clients remain concurrent",
     }
+
+
+def test_run_ollama_lower_context_controls_warm_generation_and_json(
+        make_console, monkeypatch, capsys):
+    calls = _wire_ollama_run(monkeypatch, context=2048)
+    c, _ = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", ctx=2048,
+        as_json=True) == 0
+
+    assert calls == [
+        ("warm", "qwen3:0.6b", 2048),
+        ("generate", "qwen3:0.6b", "Hi", 2048, 256),
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe_context"] == 4096
+    assert payload["characterized_ceiling"] == 4096
+    assert payload["effective_context"] == 2048
+
+
+def test_run_ollama_refuses_context_above_ceiling_before_residency_or_generation(
+        make_console, monkeypatch):
+    calls = _wire_ollama_run(monkeypatch)
+    monkeypatch.setattr(
+        cli.ollama, "processes", lambda: pytest.fail("residency inspected"))
+    c, buf = make_console()
+
+    assert cli.render_run(
+        c, "qwen3:0.6b", prompt="Hi", engine="ollama", ctx=8192) == 1
+
+    assert calls == []
+    assert "--ctx 8192 exceeds the measured safe ceiling 4096" in buf.getvalue()
 
 
 def test_run_ollama_reuses_exact_warm_target_without_a_warm_request(

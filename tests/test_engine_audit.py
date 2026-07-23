@@ -319,6 +319,74 @@ def test_mlx_probe_identity_includes_runtime_and_installed_source(monkeypatch):
     assert "source_digest" in seen["code"] and "hashlib.sha256" in seen["code"]
 
 
+def test_cuda_probe_identity_includes_engine_package_and_installed_source(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        engine_audit.engine_env, "run_python_json",
+        lambda backend, code, *, timeout: seen.update(code=code) or {"ok": True})
+
+    engine_audit._probe("cuda", "cuda")
+
+    assert 'metadata.version("ara-engine-cuda")' in seen["code"]
+    assert 'find_spec("ara_engine_cuda")' in seen["code"]
+    assert 'rglob("*.py")' in seen["code"]
+    assert '"__pycache__" not in path.parts' in seen["code"]
+    assert "relative_to(engine_root).as_posix()" in seen["code"]
+    assert "key=lambda path: path.relative_to(engine_root).as_posix()" in seen["code"]
+    assert "engine_source_digest" in seen["code"] and "hashlib.sha256" in seen["code"]
+
+
+def test_cuda_stable_probe_and_fingerprint_bind_native_engine_identity():
+    probe = {
+        "kind": "torch_cuda", "package_version": "2.9.0+cu128",
+        "engine_package_version": "0.1.3", "engine_source_digest": "sha256:source-a",
+        "cuda_build": "12.8", "arch_list": ["sm_75"], "device": "RTX 2080",
+        "capability": "7.5", "available": True, "operation_ok": True, "error": None,
+    }
+
+    stable = engine_audit._stable_probe(probe)
+
+    assert stable == {
+        "kind": "torch_cuda", "package_version": "2.9.0+cu128",
+        "engine_package_version": "0.1.3", "engine_source_digest": "sha256:source-a",
+        "cuda_build": "12.8", "arch_list": ["sm_75"], "device": "RTX 2080",
+        "capability": "7.5",
+    }
+    first = engine_audit._fingerprint("cuda", "0.1.3", "schema", probe)
+    assert engine_audit._fingerprint(
+        "cuda", "0.1.3", "schema",
+        {**probe, "engine_package_version": "0.1.4"}) != first
+    assert engine_audit._fingerprint(
+        "cuda", "0.1.3", "schema",
+        {**probe, "engine_source_digest": "sha256:source-b"}) != first
+    assert engine_audit._fingerprint(
+        "cuda", "0.1.3", "schema",
+        {**probe, "operation_ok": False, "error": "temporary"}) == first
+
+
+def test_changed_cuda_source_digest_marks_workload_evidence_stale(monkeypatch):
+    _installed(monkeypatch, schema="ara-engine-cuda:ara_engine_cuda:v1")
+    probe = {
+        "kind": "torch_cuda", "package_version": "2.9.0+cu128",
+        "engine_package_version": "0.1.3", "engine_source_digest": "sha256:source-a",
+        "cuda_build": "12.8", "arch_list": ["sm_75"], "available": True,
+        "operation_ok": True, "device": "RTX 2080", "capability": "7.5", "error": None,
+    }
+    monkeypatch.setattr(engine_audit, "_probe", lambda *_args: probe)
+    first = engine_audit.audit_engine("cuda")
+    probe["engine_source_digest"] = "sha256:source-b"
+
+    report = engine_audit.audit_engine(
+        "cuda",
+        characterization_rows=[{
+            "safe_context": 8192,
+            "evidence": {"engine": {"fingerprint": first["fingerprint"]}},
+        }],
+    )
+
+    assert report["workload"]["status"] == "stale"
+
+
 def test_mlx_stable_probe_and_fingerprint_bind_all_runtime_dimensions():
     probe = {
         "kind": "mlx", "package_version": "0.29.3", "mlx_lm_version": "0.28.3",

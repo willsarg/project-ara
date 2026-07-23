@@ -231,8 +231,13 @@ def test_characterize_worker_with_engine(monkeypatch):
 def test_run_worker_builds_args_with_engine_and_prompt(monkeypatch):
     seen = {}
     monkeypatch.setattr(wiring, "_run_cli", lambda args: seen.setdefault("a", args) or {})
-    wiring._run({"model": "org/m", "engine": "cuda", "prompt": "hello world"})
-    assert seen["a"] == ["run", "--engine", "cuda", "--yes", "--", "org/m", "hello world"]
+    wiring._run({
+        "model": "org/m", "engine": "cuda", "ctx": 4096, "prompt": "hello world",
+    })
+    assert seen["a"] == [
+        "run", "--engine", "cuda", "--ctx", "4096", "--yes", "--",
+        "org/m", "hello world",
+    ]
 
 
 def test_run_worker_without_optional_fields(monkeypatch):

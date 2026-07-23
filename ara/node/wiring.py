@@ -115,10 +115,12 @@ def _characterize(args: dict) -> dict:
 
 
 def _run(args: dict) -> dict:
-    """``ara run <model> <prompt> [--engine E] --yes`` — one governed generation."""
+    """``ara run <model> <prompt> [--engine E] [--ctx N] --yes`` — governed generation."""
     cli = ["run"]
     if args.get("engine"):
         cli += ["--engine", _safe(args["engine"], "engine")]
+    if args.get("ctx") is not None:
+        cli += ["--ctx", str(args["ctx"])]
     cli.append("--yes")                          # non-interactive: no TTY to confirm at
     cli += ["--", _safe(args["model"], "model")]
     if args.get("prompt"):
