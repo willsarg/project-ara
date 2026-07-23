@@ -70,12 +70,13 @@ print(json.dumps({
 _MLX_PROBE = r"""
 import hashlib
 import importlib.metadata as metadata
+import importlib.util
 import json
 from pathlib import Path
-import ara_engine_mlx
 import mlx.core as mx
 
-engine_root = Path(ara_engine_mlx.__file__).resolve().parent
+engine_spec = importlib.util.find_spec("ara_engine_mlx")
+engine_root = Path(next(iter(engine_spec.submodule_search_locations))).resolve()
 source_hash = hashlib.sha256()
 for source in sorted(
         path for path in engine_root.rglob("*.py")

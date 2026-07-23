@@ -10,7 +10,7 @@ of tokens) and ceiling solve.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Memory is binary GiB everywhere in ARA (detect/workers/fits all divide bytes by 1024**3 and
 # call it "gb"). The analytic KV slope must use the SAME unit, or the ceiling solve mixes a GiB
@@ -89,6 +89,7 @@ class RampResult:
     stopped_reason: str
     binding: str = "memory"
     aborted_at: int | None = None
+    telemetry: dict[int, dict] = field(default_factory=dict)
 
     @property
     def safe_context(self) -> int | None:
@@ -103,7 +104,8 @@ BISECT_MIN_GAP = 256       # tokens — stop when the safe/abort bracket is this
 BISECT_MAX_STEPS = 6       # hard cap on bisection probes
 
 
-def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]]) -> int:
+def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]],
+                    telemetry: dict[int, dict]) -> int:
     """Refine the highest safe context in ``[lo, hi)``: *lo* is known-safe, *hi* a measured abort.
 
     Probes midpoints — each guarded by the engine's own L4/L5, since the abort proved the
@@ -116,6 +118,8 @@ def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]
         mid = (lo + hi) // 2
         steps += 1
         m = measure_fn(mid)
+        if getattr(m, "telemetry", None) is not None:
+            telemetry[mid] = m.telemetry
         if m.refused:
             hi = mid
         else:
@@ -143,6 +147,7 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     no abort is still a real lower bound and is reported as the ceiling, not discarded.
     """
     points: list[tuple[int, float]] = []
+    telemetry: dict[int, dict] = {}
     measured: set[int] = set()
     aborted_at: int | None = None
     while True:
@@ -159,6 +164,8 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         if ctx is None:
             break
         m = measure_fn(ctx)
+        if getattr(m, "telemetry", None) is not None:
+            telemetry[ctx] = m.telemetry
         measured.add(ctx)
         if m.refused:
             aborted_at = ctx
@@ -173,19 +180,20 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     if aborted_at is not None:
         if not safe_points:
             return RampResult(None, None, None, points, "aborted at smallest context",
-                              aborted_at=aborted_at)
-        ceiling = _bisect_ceiling(measure_fn, max(safe_points), aborted_at, points)
+                              aborted_at=aborted_at, telemetry=telemetry)
+        ceiling = _bisect_ceiling(
+            measure_fn, max(safe_points), aborted_at, points, telemetry)
         points.sort()
         f = fit(points) if len(points) >= 2 else None
         return RampResult(ceiling, None, f, points, "bracketed below abort", "memory",
-                          aborted_at)
+                          aborted_at, telemetry)
 
     # No abort. With <2 points a line is undetermined, but a single safe measurement is still a
     # real lower bound — report it (None only if nothing was ever measured safely).
     if len(points) < 2:
         ceiling = max(safe_points) if safe_points else None
         reason = "single safe point" if safe_points else "insufficient points"
-        return RampResult(ceiling, None, None, points, reason)
+        return RampResult(ceiling, None, None, points, reason, telemetry=telemetry)
 
     # Gentle linear regime: fit + extrapolate to the budget, capped at the model's window.
     f = fit(points)
@@ -202,7 +210,8 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         ceiling, binding = max_context, "context_window"
     elif ceiling is None and measured_window:
         ceiling, binding = max_context, "context_window"
-    return RampResult(max(safe_points), ceiling, f, points, "ok", binding)
+    return RampResult(max(safe_points), ceiling, f, points, "ok", binding,
+                      telemetry=telemetry)
 
 
 def plan_next(schedule: list[int], measured, base_gb: float,

@@ -19,13 +19,18 @@ Strategy:
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
+import time
+from dataclasses import asdict
 from dataclasses import dataclass
 
-from . import config, models, profiles
+from . import config, models, profiles, system, units
 from .system import SystemLimits, read_limits, sample_settled_baseline
 
 DEFAULT_RAMP = [2048, 8192, 16384, 32768, 49152, 65536, 98304, 131072]
@@ -115,27 +120,175 @@ def estimate_base_gb(info: models.ModelInfo, limits: SystemLimits, overhead_gb: 
     return os_baseline + info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
 
 
+def _terminate_process_group(proc) -> None:
+    """Terminate, then kill, the worker's entire isolated process group and reap it."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def _telemetry_summary(baseline, samples, sample_times, interval: float) -> dict:
+    """Summarize strict host-wide samples without claiming an unsampled transient peak."""
+    final = samples[-1] if samples else baseline
+    gaps = [(b - a) * 1000 for a, b in zip(sample_times, sample_times[1:])]
+    highest = max(
+        baseline.wired_bytes,
+        max((sample.wired_bytes for sample in samples), default=baseline.wired_bytes),
+    )
+    return {
+        "schema": "macos-native-vm-telemetry:v1",
+        "scope": "host-wide",
+        "sampling_interval_ms": round(interval * 1000, 3),
+        "sample_count": len(samples),
+        "max_sample_gap_ms": round(max(gaps), 3) if gaps else 0.0,
+        "peak_qualification": "highest sampled; gaps unobserved",
+        "baseline": asdict(baseline),
+        "final": asdict(final),
+        "highest_sampled_host_wired_bytes": highest,
+        "compression_delta": {
+            "compressor_bytes": final.compressor_bytes - baseline.compressor_bytes,
+            "compressions": final.compressions - baseline.compressions,
+            "decompressions": final.decompressions - baseline.decompressions,
+        },
+        "swap_delta": {
+            "swapins": final.swapins - baseline.swapins,
+            "swapouts": final.swapouts - baseline.swapouts,
+            "swap_used_bytes": final.swap_used_bytes - baseline.swap_used_bytes,
+        },
+        "throttled_bytes_delta": final.throttled_bytes - baseline.throttled_bytes,
+    }
+
+
+def _supervise_process(cmd: list[str], *, context: int, abort_wired_bytes: int | None,
+                       timeout: float, sampling_interval: float = 0.05,
+                       snapshot_fn=system.native_vm_snapshot) -> dict:
+    """Run one model worker under strict external native VM telemetry."""
+    try:
+        baseline = snapshot_fn()
+    except Exception as exc:
+        return {"context": context, "status": "aborted",
+                "note": f"telemetry failed closed before launch: {exc}"}
+    if abort_wired_bytes is not None and baseline.wired_bytes >= abort_wired_bytes:
+        telemetry = _telemetry_summary(baseline, [], [], sampling_interval)
+        return {
+            "context": context,
+            "status": "aborted",
+            "note": ("baseline host wired memory already reached ARA boundary: "
+                     f"{baseline.wired_bytes} >= {abort_wired_bytes} bytes"),
+            "baseline_wired_bytes": baseline.wired_bytes,
+            "highest_sampled_host_wired_bytes": baseline.wired_bytes,
+            "telemetry": telemetry,
+        }
+    samples = []
+    sample_times = []
+    reason = None
+    with (tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file,
+          tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file):
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=stdout_file, stderr=stderr_file, text=True,
+                start_new_session=True)
+        except OSError as exc:
+            return {
+                "context": context,
+                "status": "aborted",
+                "note": f"probe worker launch failed closed: {exc}",
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": baseline.wired_bytes,
+                "telemetry": _telemetry_summary(
+                    baseline, [], [], sampling_interval),
+            }
+        started = time.monotonic()
+        while True:
+            if time.monotonic() - started >= timeout:
+                reason = f"probe worker timed out after {timeout:.0f}s (hung load?)"
+                _terminate_process_group(proc)
+                break
+            try:
+                sample = snapshot_fn()
+            except Exception as exc:
+                reason = f"telemetry failed closed: {exc}"
+                _terminate_process_group(proc)
+                break
+            samples.append(sample)
+            sample_times.append(time.monotonic())
+            if (abort_wired_bytes is not None
+                    and sample.wired_bytes >= abort_wired_bytes):
+                reason = ("sampled host wired memory reached ARA boundary: "
+                          f"{sample.wired_bytes} >= {abort_wired_bytes} bytes")
+                _terminate_process_group(proc)
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(sampling_interval)
+        telemetry = _telemetry_summary(
+            baseline, samples, sample_times, sampling_interval)
+        if reason is not None or not samples:
+            return {
+                "context": context, "status": "aborted",
+                "note": reason or "telemetry failed closed: zero successful samples",
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": telemetry[
+                    "highest_sampled_host_wired_bytes"],
+                "telemetry": telemetry,
+            }
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        line = next((line for line in stdout_file if line.startswith("{")), None)
+        if line is None:
+            return {
+                "context": context, "status": "load_error",
+                "note": _summarize_worker_error(stderr_file.read()),
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": telemetry[
+                    "highest_sampled_host_wired_bytes"],
+                "telemetry": telemetry,
+            }
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return {"context": context, "status": "load_error",
+                    "note": f"worker emitted invalid JSON: {exc}", "telemetry": telemetry}
+        result.update(
+            baseline_wired_bytes=baseline.wired_bytes,
+            highest_sampled_host_wired_bytes=telemetry[
+                "highest_sampled_host_wired_bytes"],
+            baseline_wired_gb=units.bytes_to_gib(baseline.wired_bytes),
+            os_wired_gb=units.bytes_to_gib(
+                telemetry["highest_sampled_host_wired_bytes"]),
+            telemetry=telemetry,
+        )
+        if "mlx_peak_bytes" in result:
+            result["mlx_peak_gb"] = units.bytes_to_gib(result["mlx_peak_bytes"])
+        if "mlx_active_plus_cache_bytes" in result:
+            result["mlx_true_gb"] = units.bytes_to_gib(
+                result["mlx_active_plus_cache_bytes"])
+        return result
+
+
 def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None,
                 timeout: float = 600) -> dict:
     cmd = [py, "-m", "ara_engine_mlx.probe_worker", hf_id, str(ctx)]
     if kv_bits is not None:
         cmd += ["--kv-bits", str(kv_bits)]
-    if abort_wired_gb is not None:
-        cmd += ["--abort-wired-gb", str(abort_wired_gb)]
-    # Bound the subprocess (parity with the CUDA probe) so a wedged worker — a stalled HF load or a
-    # GPU/driver hang before the L5 wired-mem watchdog can trip — can't block the ramp forever. A
-    # timeout is reported as a dead worker (no JSON line), the caller's existing load_error path.
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"status": "load_error",
-                "note": f"probe worker timed out after {timeout:.0f}s (hung load?)"}
-    line = next((l for l in out.stdout.splitlines() if l.startswith("{")), None)
-    if not line:
-        # No JSON line -> the worker died (usually a model-load error). Return a
-        # one-line summary so the caller can render it cleanly.
-        return {"status": "load_error", "note": _summarize_worker_error(out.stderr)}
-    return json.loads(line)
+    abort_wired_bytes = (units.gib_to_bytes(abort_wired_gb)
+                         if abort_wired_gb is not None else None)
+    return _supervise_process(
+        cmd, context=ctx, abort_wired_bytes=abort_wired_bytes, timeout=timeout)
 
 
 def _summarize_worker_error(stderr: str) -> str:

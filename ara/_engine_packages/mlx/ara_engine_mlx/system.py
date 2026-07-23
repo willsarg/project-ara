@@ -35,6 +35,21 @@ class SystemLimits:
         return self.wall_gb - margin_gb
 
 
+@dataclass(frozen=True)
+class VMSnapshot:
+    """Exact host-wide VM counters from one native Mach/sysctl sample."""
+    wired_bytes: int
+    compressor_bytes: int
+    compressions: int
+    decompressions: int
+    swapins: int
+    swapouts: int
+    throttled_bytes: int
+    swap_total_bytes: int
+    swap_used_bytes: int
+    swap_available_bytes: int
+
+
 def device_limits() -> dict:
     import mlx.core as mx
 
@@ -151,15 +166,20 @@ def _mach_host():
     return _HOST
 
 
-def _mach_wired_pages() -> int:
-    """Wired page count from the kernel (== vm_stat 'Pages wired down'). Raises OSError."""
+def _mach_vm_statistics() -> _vm_statistics64:
+    """One complete HOST_VM_INFO64 snapshot. Raises OSError on ABI/kernel failure."""
     stats = _vm_statistics64()
     count = _mach_msg_type_number_t(_VM_INFO64_COUNT)
     kr = _libsystem().host_statistics64(
         _mach_host(), _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count))
     if kr != _KERN_SUCCESS:
         raise OSError(f"host_statistics64 failed (kr={kr})")
-    return stats.wire_count
+    return stats
+
+
+def _mach_wired_pages() -> int:
+    """Wired page count from the kernel (== vm_stat 'Pages wired down'). Raises OSError."""
+    return _mach_vm_statistics().wire_count
 
 
 def _mach_page_size() -> int:
@@ -175,16 +195,39 @@ def _native_wired_gb() -> float:
     return units.bytes_to_gib(_mach_wired_pages() * _mach_page_size())
 
 
-def _native_swap_free_gb() -> float:
-    """Free swap in GiB via sysctlbyname('vm.swapusage'), matching the text parser's units
-    (MiB/1024). Raises OSError on failure."""
+def _native_swap_usage() -> _xsw_usage:
+    """Exact vm.swapusage counters. Raises OSError on failure."""
     xsw = _xsw_usage()
     ln = ctypes.c_size_t(ctypes.sizeof(xsw))
     rc = _libsystem().sysctlbyname(b"vm.swapusage", ctypes.byref(xsw), ctypes.byref(ln),
                                    None, 0)
     if rc != _KERN_SUCCESS:
         raise OSError(f"sysctlbyname(vm.swapusage) failed (rc={rc})")
-    return xsw.xsu_avail / (1024 ** 3)
+    return xsw
+
+
+def _native_swap_free_gb() -> float:
+    """Free swap in GiB from the exact native swap snapshot."""
+    return _native_swap_usage().xsu_avail / (1024 ** 3)
+
+
+def native_vm_snapshot() -> VMSnapshot:
+    """Strict native host VM sample for safety supervision; never falls back to text."""
+    stats = _mach_vm_statistics()
+    page_size = _mach_page_size()
+    swap = _native_swap_usage()
+    return VMSnapshot(
+        wired_bytes=int(stats.wire_count) * page_size,
+        compressor_bytes=int(stats.compressor_page_count) * page_size,
+        compressions=int(stats.compressions),
+        decompressions=int(stats.decompressions),
+        swapins=int(stats.swapins),
+        swapouts=int(stats.swapouts),
+        throttled_bytes=int(stats.throttled_count) * page_size,
+        swap_total_bytes=int(swap.xsu_total),
+        swap_used_bytes=int(swap.xsu_used),
+        swap_available_bytes=int(swap.xsu_avail),
+    )
 
 
 def _plausible_gb(gb: float) -> bool:

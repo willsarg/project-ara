@@ -274,7 +274,9 @@ def test_characterization_methodology_is_current_reuse_identity(monkeypatch):
 
     assert descriptor["reserve_bytes"] == 2 * 1024 ** 3
     assert descriptor["schedule"] == apple.RAMP_SCHEDULE
-    assert descriptor["worker_protocol"] == "ara-engine-mlx-measurement:v1"
+    assert descriptor["worker_protocol"] == "ara-engine-mlx-measurement:v2"
+    assert descriptor["telemetry_failure_policy"] == (
+        "external-native-vm-supervisor-fail-closed:v1")
 
 
 def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):

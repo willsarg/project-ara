@@ -315,7 +315,7 @@ def test_mlx_probe_identity_includes_runtime_and_installed_source(monkeypatch):
 
     assert 'metadata.version("mlx")' in seen["code"]
     assert 'metadata.version("mlx-lm")' in seen["code"]
-    assert "import ara_engine_mlx" in seen["code"]
+    assert 'find_spec("ara_engine_mlx")' in seen["code"]
     assert "source_digest" in seen["code"] and "hashlib.sha256" in seen["code"]
 
 

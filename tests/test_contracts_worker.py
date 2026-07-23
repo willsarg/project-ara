@@ -21,6 +21,22 @@ def test_parse_successful_measurement():
     assert m == worker.Measurement(context=4096, mem_gb=8.2, refused=False, reason=None)
 
 
+def test_parse_preserves_optional_telemetry_for_success_and_refusal():
+    telemetry = {"schema": "macos-native-vm-telemetry:v1", "sample_count": 3}
+
+    measured = worker.parse({"context": 4096, "mem_gb": 8.2, "telemetry": telemetry})
+    refused = worker.parse({
+        "context": 8192, "refused": True, "reason": "boundary", "telemetry": telemetry})
+
+    assert measured.telemetry == telemetry
+    assert refused.telemetry == telemetry
+
+
+def test_parse_rejects_non_object_telemetry():
+    with pytest.raises(worker.WorkerProtocolError, match="telemetry"):
+        worker.parse({"context": 4096, "mem_gb": 8.2, "telemetry": []})
+
+
 def test_parse_integer_mem_is_coerced_to_float():
     m = worker.parse({"context": 1024, "mem_gb": 7})
     assert m.mem_gb == 7.0 and isinstance(m.mem_gb, float)

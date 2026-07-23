@@ -176,10 +176,10 @@ def characterization_methodology(*, margin_gb: float | None = None) -> dict:
         schedule=RAMP_SCHEDULE, repeats=3,
         reserve_policy="metal-recommendation-minus-fixed-reserve",
         reserve_bytes=round(margin * 1024 ** 3),
-        worker_protocol="ara-engine-mlx-measurement:v1",
+        worker_protocol="ara-engine-mlx-measurement:v2",
         sampling_interval_ms=50,
-        telemetry_failure_policy="in-worker-daemon-watchdog:v1",
-        watchdog_stop_rule="host-wired-gte-budget:v1")
+        telemetry_failure_policy="external-native-vm-supervisor-fail-closed:v1",
+        watchdog_stop_rule="highest-sampled-host-wired-gte-budget:v1")
 
 
 def characterize(

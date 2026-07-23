@@ -149,6 +149,19 @@ def test_reports_methodology_identity():
     assert result["methodology_key"] == methodology.key(descriptor)
 
 
+def test_preserves_per_rung_telemetry_in_driver_evidence():
+    telemetry = {"schema": "macos-native-vm-telemetry:v1", "repeats": [{"sample_count": 3}]}
+    result = driver.characterize(
+        "org/model", schedule=[2000, 4000],
+        preflight=lambda _model: _est(max_context=4000),
+        measure=lambda _model, context: {
+            "context": context, "mem_gb": context / 1000,
+            "telemetry": telemetry,
+        })
+
+    assert result["points"][0]["telemetry"] == telemetry
+
+
 def test_l2_stops_when_measured_reaches_budget():
     # L1 thinks it's safe (tiny slope), but the ACTUAL measurement is at/over budget
     est = _est(slope_gb_per_k=0.001)

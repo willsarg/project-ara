@@ -30,6 +30,7 @@ class Measurement:
     mem_gb: float | None
     refused: bool = False
     reason: str | None = None
+    telemetry: dict | None = None
 
 
 def _is_number(v) -> bool:
@@ -43,15 +44,20 @@ def parse(payload: dict) -> Measurement:
         raise WorkerProtocolError("worker payload missing integer 'context'")
     if ctx <= 0:
         raise WorkerProtocolError("worker 'context' must be a positive integer")
+    telemetry = payload.get("telemetry")
+    if telemetry is not None and not isinstance(telemetry, dict):
+        raise WorkerProtocolError("worker 'telemetry' must be an object")
     if payload.get("refused"):
         reason = payload.get("reason")
         if not isinstance(reason, str) or not reason:
             raise WorkerProtocolError("refused measurement needs a non-empty 'reason'")
-        return Measurement(context=ctx, mem_gb=None, refused=True, reason=reason)
+        return Measurement(context=ctx, mem_gb=None, refused=True, reason=reason,
+                           telemetry=telemetry)
     mem = payload.get("mem_gb")
     if not _is_number(mem):
         raise WorkerProtocolError("measurement needs numeric 'mem_gb'")
     mem = float(mem)
     if not math.isfinite(mem) or mem < 0:
         raise WorkerProtocolError("measurement 'mem_gb' must be finite non-negative")
-    return Measurement(context=ctx, mem_gb=mem, refused=False, reason=None)
+    return Measurement(context=ctx, mem_gb=mem, refused=False, reason=None,
+                       telemetry=telemetry)
