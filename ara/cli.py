@@ -2077,15 +2077,21 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                     **{name: durable.get(name) for name in db._MODEL_COLS})
         # Mirror profile's engine-free authority rule: MLX history is useful display evidence but
         # cannot govern fit until an execution command re-reads exact live Metal limits.
-        default_engine = engines.for_backend(detect.backend_name())
+        selected_engine = "mlx" if engine == "mlx" else engines.for_backend(
+            detect.backend_name())
         historical_calibration = (
-            calibration.get_calibration(evidence_con, default_engine)
-            if default_engine is not None else None)
+            calibration.get_calibration(evidence_con, selected_engine)
+            if selected_engine is not None else None)
         measured = (
-            None if engine_identity.canonical_engine(default_engine) == "mlx"
+            None if engine_identity.canonical_engine(selected_engine) == "mlx"
             else historical_calibration)
-        lim = estimate.limits(detect.machine(), measured=measured)
-        if (engine_identity.canonical_engine(default_engine) == "mlx"
+        if engine == "mlx":
+            lim = estimate.limits(
+                detect.machine(), measured=measured,
+                backend=engines.ENGINES[selected_engine]["backend"])
+        else:
+            lim = estimate.limits(detect.machine(), measured=measured)
+        if (engine_identity.canonical_engine(selected_engine) == "mlx"
                 and lim["safe_budget_gb"] is None):
             msg = "no current MLX budget is available for a safe ranking"
             print(json.dumps({"error": msg})) if as_json else c.emit(
@@ -2188,14 +2194,14 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     if c.verbose:
         c.emit(c.field(
             "provenance",
-            f"wall {lim['basis']} · {default_engine or 'unknown'} · "
+            f"wall {lim['basis']} · {selected_engine or 'unknown'} · "
             f"{_fmt_gb(lim['safe_budget_gb'], 1)} safe budget",
         ))
         noun = "model" if len(models) == 1 else "models"
         c.emit(c.field("catalog", f"{len(models)} cached {noun} · ephemeral read-only scan"))
     if not recs:
         if not models:
-            _emit_first_model_path(c, default_engine or "cpu")
+            _emit_first_model_path(c, selected_engine or "cpu")
         else:
             c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                                   "try a smaller / more-quantized model"))
@@ -4890,7 +4896,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     m = detect.machine()
     # Stored MLX history cannot be proven current without crossing the engine seam to re-read
     # Metal's exact device limits. Profile stays engine-free, so MLX history is display-only and
-    # the active assessment falls back to the analytic estimate.
+    # the current governed budget remains unknown.
     measured = None
     historical = None
     if db._db_path().is_file():
@@ -5656,8 +5662,8 @@ def _click_models_search(ctx: click.Context, query: tuple[str, ...],
 
 
 @_click_models.command("recommend", context_settings=_HELP_SETTINGS)
-@click.option("--engine", type=click.Choice(["ollama"], case_sensitive=False),
-              help="Rank artifacts in an external runtime store (currently: ollama).")
+@click.option("--engine", type=click.Choice(["mlx", "ollama"], case_sensitive=False),
+              help="Select the MLX analytic lane or rank artifacts in Ollama.")
 @click.option("--use-case", metavar="USE_CASE",
               help="Rank by capability evidence: extraction, reasoning, rag, agentic, or coding.")
 @_json_verbose_options

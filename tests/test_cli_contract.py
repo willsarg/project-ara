@@ -151,6 +151,16 @@ def test_models_recommend_json_errors_without_current_mlx_budget(
     }
 
 
+def test_models_recommend_explicit_mlx_json_errors_without_current_budget(
+        mocked_world, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv", ["ara", "models", "recommend", "--engine", "mlx", "--json"])
+    assert cli.main() == 1
+    assert _extract_json(capsys.readouterr().out) == {
+        "error": "no current MLX budget is available for a safe ranking"
+    }
+
+
 def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
     assert cli.main(["frobnicate", "--json"]) == 2
     captured = capsys.readouterr()
