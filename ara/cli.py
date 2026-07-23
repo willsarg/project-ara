@@ -2154,7 +2154,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
     labelled), never a guess (Rule #3). Stays engine-free either way. Spec
     2026-06-23-capability-pipeline + 2026-06-28-recommend-use-case-and-serve-selection."""
     if engine == "ollama":
-        return _render_recommend_ollama(c, as_json=as_json, use_case=use_case)
+        return _render_recommend_ollama(
+            c, as_json=as_json, use_case=use_case, explain=explain)
     if use_case is not None and use_case not in scoring.USE_CASES:
         msg = (f"unknown use-case {use_case!r} — choose one of: "
                f"{', '.join(scoring.USE_CASES)}")
@@ -2165,7 +2166,8 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         cache_con.row_factory = sqlite3.Row
         cache_con.executescript(db.SCHEMA)
         stack.callback(cache_con.close)
-        catalog.scan(cache_con)            # ephemeral snapshot of the local cache
+        _, unresolved_models = catalog.scan_with_unresolved(
+            cache_con)                     # ephemeral snapshot of the local cache
         evidence_con = (stack.enter_context(db.connected_readonly())
                         if db._db_path().is_file() else cache_con)
         for durable in catalog.all_models(evidence_con):
@@ -2201,7 +2203,11 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         best = _best_ceilings(evidence_con)  # current without crossing the engine seam
 
         recs = []
-        explanations = []
+        explanations = ([{
+            "model_id": model_id,
+            "status": "unrankable",
+            "reason": "artifact_unresolved",
+        } for model_id in unresolved_models] if explain else [])
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
         models = catalog.all_models(cache_con)
         for row in models:
@@ -4354,7 +4360,7 @@ def _ollama_ranked_models(
 
 
 def _render_recommend_ollama(
-    c: Console, *, as_json: bool, use_case: str | None,
+    c: Console, *, as_json: bool, use_case: str | None, explain: bool = False,
 ) -> int:
     """Read-only ranking of supported local Ollama artifacts and their exact evidence."""
     def err(msg: str) -> int:
@@ -4373,22 +4379,65 @@ def _render_recommend_ollama(
     authority = _ollama_display_authority(endpoint)
     ranked = (_ollama_ranked_models(models, authority, use_case=use_case)
               if use_case is not None else _ollama_ranked_models(models, authority))
+    explained = []
+    if explain:
+        ranked_names = {item["model_id"] for item in ranked}
+        explained = [{
+            **item,
+            "status": (
+                "recommended"
+                if item["selection_eligible"] or item["estimated_context"] is not None
+                else "unrankable"
+            ),
+            "reason": (
+                "context_unavailable"
+                if not item["selection_eligible"] and item["estimated_context"] is None
+                else "use_case_score_unavailable"
+                if use_case is not None and item.get("score") is None
+                else None
+            ),
+        } for item in ranked]
+        for record in models:
+            if _is_ara_ollama_derived(record.name):
+                reason = "ara_internal_artifact"
+            elif record.scope != "local":
+                reason = "nonlocal_artifact"
+            elif not isinstance(record.format, str) or record.format.casefold() != "gguf":
+                reason = "unsupported_format"
+            elif "completion" not in record.capabilities:
+                reason = "completion_unsupported"
+            else:
+                reason = None
+            if record.name not in ranked_names:
+                explained.append({
+                    "model_id": record.name,
+                    "status": "excluded",
+                    "reason": reason or "unknown",
+                })
     if as_json:
         if use_case is not None:
             ranked = [{**item, "score": (
                 asdict(item["score"]) if item["score"] is not None else None)}
                       for item in ranked]
-        print(json.dumps(ranked, indent=2))
+            explained = [{**item, "score": (
+                asdict(item["score"]) if item.get("score") is not None else None)}
+                         for item in explained]
+        print(json.dumps(explained if explain else ranked, indent=2))
         return 0
     c.emit()
     sub = ("  (exact reusable evidence first)" if use_case is None else
            f"  (for {use_case} — exact current Ollama measurements only)")
     c.emit(c.section("  RECOMMENDED OLLAMA MODELS") + c.style("dim", sub))
+    shown = ([item for item in explained if item["status"] == "recommended"]
+             if explain else ranked)
+    nonrecommendations = ([item for item in explained if item["status"] != "recommended"]
+                          if explain else [])
     if not ranked:
         c.emit(c.style("dim", "  no local cached GGUF completion artifacts are supported"))
-        c.emit()
-        return 0
-    for item in ranked:
+        if not nonrecommendations:
+            c.emit()
+            return 0
+    for item in shown:
         if item["selection_eligible"]:
             tail = f"~{item['safe_context']} tok measured · eligible for governed selection"
             role = "good"
@@ -4431,6 +4480,17 @@ def _render_recommend_ollama(
     if measured is not None:
         summary += f" · {measured} reusable {use_case} measurement"
     c.emit(c.style("dim", summary))
+    if nonrecommendations:
+        c.emit()
+        c.emit(c.section("  EXCLUDED / UNRANKABLE"))
+        for item in nonrecommendations:
+            c.emit(
+                "  " + c.style("metric", item["model_id"])
+                + c.style(
+                    "dim",
+                    f"  {item['status']} · {item['reason'].replace('_', ' ')}",
+                )
+            )
     c.emit()
     return 0
 
@@ -5617,6 +5677,7 @@ def _ollama_doctor_report() -> dict:
 
 
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
+_DOCTOR_SCHEMA_TABLES = frozenset((*_DOCTOR_TABLES, "model_artifacts", "models"))
 
 
 def _database_health(con: sqlite3.Connection) -> dict:
@@ -5627,6 +5688,7 @@ def _database_health(con: sqlite3.Connection) -> dict:
         "readable": True,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -5636,11 +5698,16 @@ def _database_health(con: sqlite3.Connection) -> dict:
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         health["schema_version"] = con.execute("PRAGMA user_version").fetchone()[0]
-        if not tables.intersection(_DOCTOR_TABLES):
+        if not tables.intersection(_DOCTOR_SCHEMA_TABLES):
             health.update(status="unknown", presence="uninitialized",
                           schema_supported=False)
         else:
             health["schema_supported"] = health["schema_version"] == db.SCHEMA_VERSION
+            missing_tables = sorted(_DOCTOR_SCHEMA_TABLES - tables)
+            health["schema_check"] = {
+                "status": "failed" if missing_tables else "passed",
+                "missing_tables": missing_tables,
+            }
     except sqlite3.Error as exc:
         health.update(status="degraded", readable=False, error=str(exc))
         return health
@@ -5672,6 +5739,7 @@ def _database_health(con: sqlite3.Connection) -> dict:
 
     if (health["presence"] == "present"
             and (health["schema_supported"] is False
+                 or health["schema_check"]["status"] == "failed"
                  or health["quick_check"]["status"] == "failed"
                  or health["foreign_key_check"]["status"] == "failed")):
         health["status"] = "degraded"
@@ -5685,6 +5753,7 @@ def _missing_database_health() -> dict:
         "readable": None,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -5796,6 +5865,12 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
             "dim",
             f"    schema {database_health['schema_version']} · {supported}",
         ))
+        schema_check = database_health["schema_check"]
+        if schema_check["missing_tables"]:
+            c.emit(c.style(
+                "warn",
+                f"    missing tables · {', '.join(schema_check['missing_tables'])}",
+            ))
         quick = database_health["quick_check"]
         foreign = database_health["foreign_key_check"]
         c.emit(c.style("dim", f"    quick check · {quick['status']}"))

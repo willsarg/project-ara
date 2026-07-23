@@ -314,6 +314,7 @@ def test_render_doctor_json_reports_key_and_counts(
         "readable": True,
         "schema_version": 7,
         "schema_supported": True,
+        "schema_check": {"status": "passed", "missing_tables": []},
         "quick_check": {"status": "passed", "messages": []},
         "foreign_key_check": {"status": "passed", "violations": []},
     }
@@ -340,6 +341,7 @@ def test_render_doctor_reports_missing_database_without_creating_it(
         "readable": None,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -358,8 +360,45 @@ def test_database_health_reports_uninitialized_store():
     assert health["presence"] == "uninitialized"
     assert health["readable"] is True
     assert health["schema_supported"] is False
+    assert health["schema_check"] == {"status": "not_run", "missing_tables": []}
     assert health["quick_check"]["status"] == "passed"
     assert health["foreign_key_check"]["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        "benchmark_results",
+        "calibrations",
+        "characterizations",
+        "model_artifacts",
+        "models",
+        "profiles",
+    ],
+)
+def test_database_health_reports_missing_required_schema_table(store, missing_table):
+    store.execute(f"DROP TABLE {missing_table}")  # noqa: S608 - fixed test-only names
+
+    health = cli._database_health(store)
+
+    assert health["status"] == "degraded"
+    assert health["schema_supported"] is True
+    assert health["schema_check"] == {
+        "status": "failed",
+        "missing_tables": [missing_table],
+    }
+    assert health["quick_check"]["status"] == "passed"
+    assert health["foreign_key_check"]["status"] == "passed"
+
+
+def test_render_doctor_human_names_missing_schema_tables(
+        store, make_console, doctor_ollama_clean):
+    store.execute("DROP TABLE models")
+    c, buf = make_console()
+
+    assert cli.render_doctor(c) == 1
+
+    assert "missing tables · models" in buf.getvalue()
 
 
 def test_database_health_reports_schema_read_error():
@@ -3369,6 +3408,7 @@ def _wire_recommend(monkeypatch, set_platform, models, machine=None):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.calibration, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli.catalog, "scan", lambda con: 0)
+    monkeypatch.setattr(cli.catalog, "scan_with_unresolved", lambda con: (0, []))
     monkeypatch.setattr(cli.catalog, "all_models", lambda con: models)
     monkeypatch.setattr(cli.db, "list_characterizations", lambda con, mk, e: [])
     monkeypatch.setattr(cli.staleness, "artifact_identity",
@@ -3457,6 +3497,27 @@ def test_recommend_explain_json_accounts_for_every_cached_model(
     assert by_model["org/UnknownSize"]["reason"] == "size_unknown"
     assert by_model["org/UnknownArchitecture"]["status"] == "unrankable"
     assert by_model["org/UnknownArchitecture"]["reason"] == "architecture_unknown"
+
+
+def test_recommend_explain_reports_cached_model_with_unresolved_artifact(
+        monkeypatch, set_platform, tmp_path, capsys):
+    set_platform("Darwin", "arm64")
+    machine = _machine(backend="cpu", ram_total_gb=48.0, chip="Test CPU")
+    monkeypatch.setattr(cli.detect, "machine", lambda: machine)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: machine.backend)
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "_hf_cache_models", lambda: ["org/Unresolved"])
+    monkeypatch.setattr(cli.catalog, "describe", lambda _model_id: None)
+    monkeypatch.setenv("ARA_DB_PATH", str(tmp_path / "missing.sqlite"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == [{
+        "model_id": "org/Unresolved",
+        "status": "unrankable",
+        "reason": "artifact_unresolved",
+    }]
 
 
 def test_recommend_explain_reports_unknown_budget(
@@ -11728,6 +11789,156 @@ def test_ollama_recommendation_separates_certified_selection_from_estimates(
     assert payload[1]["selection_eligible"] is False
     assert payload[1]["estimated_context"] == 16384
     assert payload[1]["evidence_status"] == "missing"
+
+
+def test_ollama_recommendation_explain_accounts_for_every_inventory_model(
+        make_console, monkeypatch, capsys):
+    supported = _local_ollama_model("supported:1")
+    no_context = _local_ollama_model("no-context:1")
+    cloud = _local_ollama_model("cloud:1", scope="cloud", remote_model="upstream")
+    embedding = cli.ollama.OllamaModel(
+        name="embed:1", format="gguf", capabilities=("embedding",), scope="local")
+    unsupported_format = cli.ollama.OllamaModel(
+        name="safetensors:1", format="safetensors",
+        capabilities=("completion",), scope="local")
+    derived = _local_ollama_model(
+        "ara-qwen3-0.6b-ctx8192-" + "e" * 24 + "-probe:latest")
+    inventory = [
+        supported, no_context, cloud, embedding, unsupported_format, derived,
+    ]
+    ranked = [
+        {
+            "model_id": supported.name,
+            "selection_eligible": True,
+            "safe_context": 8192,
+            "estimated_context": None,
+            "evidence_status": "reusable",
+            "evidence_reason": None,
+            "quantization": None,
+        },
+        {
+            "model_id": no_context.name,
+            "selection_eligible": False,
+            "safe_context": None,
+            "estimated_context": None,
+            "evidence_status": "missing",
+            "evidence_reason": "missing",
+            "quantization": None,
+        },
+    ]
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: inventory)
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args, **_kwargs: ranked)
+    c, _ = make_console()
+
+    assert cli.render_recommend(
+        c, engine="ollama", as_json=True, explain=True) == 0
+
+    by_model = {
+        item["model_id"]: item for item in json.loads(capsys.readouterr().out)
+    }
+    assert set(by_model) == {model.name for model in inventory}
+    assert (by_model[supported.name]["status"], by_model[supported.name]["reason"]) == (
+        "recommended", None)
+    assert (by_model[no_context.name]["status"], by_model[no_context.name]["reason"]) == (
+        "unrankable", "context_unavailable")
+    assert (by_model[cloud.name]["status"], by_model[cloud.name]["reason"]) == (
+        "excluded", "nonlocal_artifact")
+    assert (by_model[embedding.name]["status"], by_model[embedding.name]["reason"]) == (
+        "excluded", "completion_unsupported")
+    assert (
+        by_model[unsupported_format.name]["status"],
+        by_model[unsupported_format.name]["reason"],
+    ) == ("excluded", "unsupported_format")
+    assert (by_model[derived.name]["status"], by_model[derived.name]["reason"]) == (
+        "excluded", "ara_internal_artifact")
+
+
+def test_ollama_recommendation_explain_human_separates_nonrecommendations(
+        make_console, monkeypatch):
+    supported = _local_ollama_model("supported:1")
+    no_context = _local_ollama_model("no-context:1")
+    cloud = _local_ollama_model("cloud:1", scope="cloud", remote_model="upstream")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [supported, no_context, cloud])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args, **_kwargs: [
+        {
+            "model_id": supported.name,
+            "selection_eligible": True,
+            "safe_context": 8192,
+            "estimated_context": None,
+            "evidence_status": "reusable",
+            "evidence_reason": None,
+            "quantization": None,
+        },
+        {
+            "model_id": no_context.name,
+            "selection_eligible": False,
+            "safe_context": None,
+            "estimated_context": None,
+            "evidence_status": "missing",
+            "evidence_reason": "missing",
+            "quantization": None,
+        },
+    ])
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, engine="ollama", explain=True) == 0
+
+    output = buf.getvalue()
+    explanation_start = output.index("EXCLUDED / UNRANKABLE")
+    assert output.index(supported.name) < explanation_start
+    assert output.index(no_context.name) > explanation_start
+    assert output.index(cloud.name) > explanation_start
+    assert "context unavailable" in output
+    assert "nonlocal artifact" in output
+
+
+def test_ollama_recommendation_explain_human_reports_only_excluded_inventory(
+        make_console, monkeypatch):
+    cloud = _local_ollama_model("cloud:1", scope="cloud", remote_model="upstream")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [cloud])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args, **_kwargs: [])
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, engine="ollama", explain=True) == 0
+
+    output = buf.getvalue()
+    assert "EXCLUDED / UNRANKABLE" in output
+    assert cloud.name in output
+    assert "nonlocal artifact" in output
+
+
+def test_ollama_recommendation_explain_serializes_unavailable_use_case_score(
+        make_console, monkeypatch, capsys):
+    supported = _local_ollama_model("supported:1")
+    cloud = _local_ollama_model("cloud:1", scope="cloud", remote_model="upstream")
+    monkeypatch.setattr(cli.ollama, "inventory", lambda: [supported, cloud])
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: _pick_authority())
+    monkeypatch.setattr(cli, "_ollama_ranked_models", lambda *_args, **_kwargs: [{
+        "model_id": supported.name,
+        "selection_eligible": True,
+        "safe_context": 8192,
+        "estimated_context": None,
+        "evidence_status": "reusable",
+        "evidence_reason": None,
+        "evidence_warning": "no stored Ollama benchmark evidence",
+        "quantization": None,
+        "score": None,
+    }])
+    c, _ = make_console()
+
+    assert cli.render_recommend(
+        c, engine="ollama", use_case="extraction", as_json=True, explain=True) == 0
+
+    by_model = {
+        item["model_id"]: item for item in json.loads(capsys.readouterr().out)
+    }
+    assert by_model[supported.name]["reason"] == "use_case_score_unavailable"
+    assert by_model[supported.name]["score"] is None
+    assert by_model[cloud.name]["reason"] == "nonlocal_artifact"
+    assert by_model[cloud.name]["score"] is None
 
 
 @pytest.mark.parametrize(("case", "as_json"), [

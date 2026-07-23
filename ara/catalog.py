@@ -350,10 +350,18 @@ def _hf_cache_models() -> list[str]:
         return []
 
 
-def scan(con) -> int:
-    """Catalog every describable model in the HF cache; return how many were added/updated."""
+def scan_with_unresolved(con) -> tuple[int, list[str]]:
+    """Catalog the HF cache and return its count plus model ids whose artifacts are unresolved."""
     n = 0
+    unresolved = []
     for model_id in _hf_cache_models():
         if remember(con, model_id) is not None:
             n += 1
-    return n
+        else:
+            unresolved.append(model_id)
+    return n, sorted(set(unresolved))
+
+
+def scan(con) -> int:
+    """Catalog every describable model in the HF cache; return how many were added/updated."""
+    return scan_with_unresolved(con)[0]
