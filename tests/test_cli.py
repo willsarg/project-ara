@@ -308,6 +308,101 @@ def test_render_doctor_json_reports_key_and_counts(
     assert out["counts"]["characterizations"] == 1      # only this machine's rows
     assert out["other_keys_rows"] >= 1                    # foreign/legacy rows counted separately
     assert out["ollama"] == doctor_ollama_clean
+    assert out["database_health"] == {
+        "status": "healthy",
+        "presence": "present",
+        "readable": True,
+        "schema_version": 7,
+        "schema_supported": True,
+        "quick_check": {"status": "passed", "messages": []},
+        "foreign_key_check": {"status": "passed", "violations": []},
+    }
+
+
+def test_render_doctor_reports_missing_database_without_creating_it(
+        tmp_path, monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    monkeypatch.setattr(
+        db,
+        "connected",
+        lambda: pytest.fail("default doctor must not open a writable connection"),
+    )
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"] == {
+        "status": "unknown",
+        "presence": "missing",
+        "readable": None,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+    assert out["ollama"] == doctor_ollama_clean
+    assert not path.exists()
+
+
+def test_render_doctor_reports_unsupported_schema_read_only(
+        store, monkeypatch, capsys, doctor_ollama_clean):
+    store.execute("PRAGMA user_version = 99")
+    store.commit()
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 1
+
+    health = json.loads(capsys.readouterr().out)["database_health"]
+    assert health["status"] == "degraded"
+    assert health["schema_version"] == 99
+    assert health["schema_supported"] is False
+    assert store.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+@pytest.mark.parametrize(
+    ("pragma", "rows", "check_name", "detail_name"),
+    [
+        ("PRAGMA quick_check", [("database disk image is malformed",)],
+         "quick_check", "messages"),
+        ("PRAGMA foreign_key_check", [("child", 1, "parent", 0)],
+         "foreign_key_check", "violations"),
+    ],
+)
+def test_render_doctor_reports_failed_integrity_check_and_continues(
+        store, monkeypatch, capsys, doctor_ollama_clean,
+        pragma, rows, check_name, detail_name):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Result:
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement == pragma:
+                return Result()
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def failed_check():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", failed_check)
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "degraded"
+    assert out["database_health"][check_name]["status"] == "failed"
+    assert out["database_health"][check_name][detail_name]
+    assert out["ollama"] == doctor_ollama_clean
 
 
 def test_render_doctor_rekey_reports_migrated_count(
@@ -560,26 +655,30 @@ def test_ollama_doctor_warns_for_non_loopback_endpoint(monkeypatch):
 
 
 @pytest.mark.parametrize("as_json", [False, True])
-def test_render_doctor_reports_database_failure(monkeypatch, make_console, capsys, as_json):
+def test_render_doctor_reports_database_failure(
+        monkeypatch, make_console, capsys, doctor_ollama_clean, as_json):
     from ara import db
+    db._db_path().parent.mkdir(parents=True, exist_ok=True)
+    db._db_path().write_text("not a database")
 
     @contextlib.contextmanager
     def broken_store():
         raise sqlite3.DatabaseError("file is not a database")
         yield  # pragma: no cover - contextmanager requires an iterator
 
-    monkeypatch.setattr(db, "connected", broken_store)
+    monkeypatch.setattr(db, "connected_readonly", broken_store)
     c, buf = make_console()
 
     assert cli.render_doctor(c, as_json=as_json) == 1
 
     rendered = capsys.readouterr().out if as_json else buf.getvalue()
-    assert "database problem" in rendered
+    assert "DATABASE HEALTH" in rendered or '"database_health"' in rendered
     assert "file is not a database" in rendered
     if as_json:
         payload = json.loads(rendered)
-        assert payload["error"].startswith("database problem")
-        assert payload["database"] == str(db._db_path())
+        assert payload["database_health"]["status"] == "degraded"
+        assert payload["database_health"]["readable"] is False
+        assert payload["ollama"]["findings"] == []
     else:
         assert str(db._db_path()) in rendered
 

@@ -5567,6 +5567,88 @@ def _ollama_doctor_report() -> dict:
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
 
 
+def _database_health(con: sqlite3.Connection) -> dict:
+    """Assess an already read-only ARA store without changing or repairing it."""
+    health = {
+        "status": "healthy",
+        "presence": "present",
+        "readable": True,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+    try:
+        tables = {
+            row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        health["schema_version"] = con.execute("PRAGMA user_version").fetchone()[0]
+        if not tables.intersection(_DOCTOR_TABLES):
+            health.update(status="unknown", presence="uninitialized",
+                          schema_supported=False)
+        else:
+            health["schema_supported"] = health["schema_version"] == db.SCHEMA_VERSION
+    except sqlite3.Error as exc:
+        health.update(status="degraded", readable=False, error=str(exc))
+        return health
+
+    try:
+        quick_rows = con.execute("PRAGMA quick_check").fetchall()
+        messages = [str(row[0]) for row in quick_rows]
+        if messages == ["ok"]:
+            health["quick_check"] = {"status": "passed", "messages": []}
+        else:
+            health["quick_check"] = {"status": "failed", "messages": messages}
+    except sqlite3.Error as exc:
+        health["quick_check"] = {"status": "failed", "messages": [str(exc)]}
+
+    try:
+        violations = [
+            {"table": row[0], "rowid": row[1], "parent": row[2], "fkid": row[3]}
+            for row in con.execute("PRAGMA foreign_key_check").fetchall()
+        ]
+        health["foreign_key_check"] = {
+            "status": "failed" if violations else "passed",
+            "violations": violations,
+        }
+    except sqlite3.Error as exc:
+        health["foreign_key_check"] = {
+            "status": "failed",
+            "violations": [{"error": str(exc)}],
+        }
+
+    if (health["presence"] == "present"
+            and (health["schema_supported"] is False
+                 or health["quick_check"]["status"] == "failed"
+                 or health["foreign_key_check"]["status"] == "failed")):
+        health["status"] = "degraded"
+    return health
+
+
+def _missing_database_health() -> dict:
+    return {
+        "status": "unknown",
+        "presence": "missing",
+        "readable": None,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+
+
+def _unreadable_database_health(path: Path, exc: BaseException) -> dict:
+    health = _missing_database_health()
+    health.update(
+        status="degraded",
+        presence="present",
+        readable=False,
+        error=f"database problem at {path}: {exc}",
+    )
+    return health
+
+
 def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
                   as_json: bool = False) -> int:
     """``ara doctor``: this machine's identity (``machine_key``) and the count of stored records
@@ -5578,47 +5660,98 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
     installed build and one minimal device operation. Spec 2026-07-04-machine-key-stabilization."""
     mk = profile.machine_key()
     path = db._db_path()
-    try:
-        with db.connected() as con:
-            rekeyed = db._rekey_legacy(con) if rekey else None
-            counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key=?",  # noqa: S608
-                                     (mk,)).fetchone()[0] for t in _DOCTOR_TABLES}
-            other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
-                                    (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
-            schema_version = con.execute("PRAGMA user_version").fetchone()[0]
-            characterization_rows = (db.list_characterizations_for_display(con, mk)
-                                     if engines else [])
-    except (OSError, sqlite3.Error) as exc:
-        msg = f"database problem at {path}: {exc}"
-        print(json.dumps({"error": msg, "database": str(path)})) if as_json \
-            else c.emit(c.style("bad", f"  {msg}"))
-        return 1
+    rekeyed = None
+    counts: dict[str, int | None] = dict.fromkeys(_DOCTOR_TABLES)
+    other: int | None = None
+    characterization_rows = []
+    database_health = _missing_database_health()
+    if rekey:
+        try:
+            with db.connected() as con:
+                rekeyed = db._rekey_legacy(con)
+        except (OSError, sqlite3.Error) as exc:
+            database_health = _unreadable_database_health(path, exc)
+    if database_health["readable"] is not False and path.is_file():
+        try:
+            with db.connected_readonly() as con:
+                database_health = _database_health(con)
+                try:
+                    counts = {
+                        table: con.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE machine_key=?",  # noqa: S608
+                            (mk,),
+                        ).fetchone()[0]
+                        for table in _DOCTOR_TABLES
+                    }
+                    other = sum(
+                        con.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE machine_key<>?",  # noqa: S608
+                            (mk,),
+                        ).fetchone()[0]
+                        for table in _DOCTOR_TABLES
+                    )
+                    characterization_rows = (
+                        db.list_characterizations_for_display(con, mk) if engines else [])
+                except sqlite3.Error:
+                    counts = dict.fromkeys(_DOCTOR_TABLES)
+                    other = None
+                    characterization_rows = []
+        except (OSError, sqlite3.Error) as exc:
+            database_health = _unreadable_database_health(path, exc)
     ollama_report = _ollama_doctor_report()
     engine_reports = (engine_audit.audit_installed(
         host_features=detect._cpu_features(), characterization_rows=characterization_rows)
         if engines else None)
     if as_json:
         out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other,
-                     "ollama": ollama_report}
+                     "database_health": database_health, "ollama": ollama_report}
         if rekey:
             out["rekeyed_rows"] = rekeyed
         if engine_reports is not None:
             out["engines"] = engine_reports
         if c.verbose:
-            out.update(database=str(path), schema_version=schema_version)
+            out.update(database=str(path),
+                       schema_version=database_health["schema_version"])
         print(json.dumps(out))
-        return 0
-    if rekey:
+        return 1 if database_health["status"] == "degraded" else 0
+    if rekey and rekeyed is not None:
         c.emit(c.style("good" if rekeyed else "dim",
                        f"  rekeyed {rekeyed} legacy row(s) to the versioned machine_key format"))
     c.emit(c.style("accent", "  machine  ") + c.style("dim", mk))
     for name, n in counts.items():
-        c.emit(f"    {name:<18} {n}")
+        c.emit(f"    {name:<18} {n if n is not None else 'unknown'}")
     if other:
         c.emit(c.style("dim", f"    ({other} row(s) under other machine keys — not this box)"))
     if c.verbose:
         c.emit(f"    {'database':<20} {path}")
-        c.emit(f"    {'schema version':<20} {schema_version}")
+        c.emit(f"    {'schema version':<20} {database_health['schema_version']}")
+    c.emit(c.section("  DATABASE HEALTH"))
+    summary_role = ("good" if database_health["status"] == "healthy"
+                    else "warn" if database_health["status"] == "degraded" else "dim")
+    readable = ("readable" if database_health["readable"] is True
+                else "not readable" if database_health["readable"] is False
+                else "not initialized")
+    c.emit(c.style(
+        summary_role,
+        f"    {database_health['status']} · {database_health['presence']} · "
+        f"{readable}",
+    ))
+    if database_health.get("error"):
+        c.emit(c.style("dim", f"    {database_health['error']}"))
+    if database_health["readable"]:
+        supported = ("supported" if database_health["schema_supported"] else "unsupported")
+        c.emit(c.style(
+            "dim",
+            f"    schema {database_health['schema_version']} · {supported}",
+        ))
+        quick = database_health["quick_check"]
+        foreign = database_health["foreign_key_check"]
+        c.emit(c.style("dim", f"    quick check · {quick['status']}"))
+        c.emit(c.style("dim", f"    foreign keys · {foreign['status']}"))
+        for message in quick["messages"]:
+            c.emit(c.style("warn", f"      {message}"))
+        for violation in foreign["violations"]:
+            c.emit(c.style("warn", f"      {violation}"))
     if ollama_report["findings"]:
         c.emit(c.section("  OLLAMA"))
         for finding in ollama_report["findings"]:
@@ -5643,7 +5776,7 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
             for finding in report["findings"]:
                 c.emit(c.style("warn", f"      {finding['code'].replace('_', ' ')}")
                        + c.style("dim", f" — {finding['detail']}"))
-    return 0
+    return 1 if database_health["status"] == "degraded" else 0
 
 
 _HELP_SETTINGS = {"help_option_names": ["-h", "--help"]}
