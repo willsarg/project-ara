@@ -16,6 +16,8 @@ import threading
 import time
 import sys
 
+from . import units
+
 # 16 sentences of approximately 100 characters each to benchmark concurrency levels 1 to 16
 BENCHMARK_SENTENCES = [
     "The sun rises gracefully over the sleeping mountains, casting a golden glow on the quiet valley below.",
@@ -59,8 +61,8 @@ def main() -> None:
         print(json.dumps({
             "status": "error",
             "note": (f"Pre-flight aborted: settled baseline + "
-                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GB model-load headroom would reach "
-                     f"the safe threshold ({threshold:.2f} GB); model not loaded."),
+                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GiB model-load headroom would reach "
+                     f"the safe threshold ({threshold:.2f} GiB); model not loaded."),
         }), flush=True)
         sys.exit(0)
 
@@ -137,9 +139,9 @@ def main() -> None:
             print(json.dumps({
                 "status": "safeguard_triggered",
                 "note": (f"Active memory safeguard: predicted concurrent peak "
-                         f"{predicted_peak:.2f} GB (current {current_wired:.2f} + "
-                         f"{batch_size}x{per_call_gb:.3f} GB/call) would reach the safe "
-                         f"threshold ({threshold:.2f} GB) at batch {batch_size}.")
+                         f"{predicted_peak:.2f} GiB (current {current_wired:.2f} + "
+                         f"{batch_size}x{per_call_gb:.3f} GiB/call) would reach the safe "
+                         f"threshold ({threshold:.2f} GiB) at batch {batch_size}.")
             }), flush=True)
             break
 
@@ -189,7 +191,7 @@ def main() -> None:
 
                 run_times.append(elapsed)
                 run_cpss.append(total_chars / elapsed)
-                run_peaks.append(mx.get_peak_memory() / 1e9)  # GB
+                run_peaks.append(units.bytes_to_gib(mx.get_peak_memory()))
         finally:
             stop[0] = True
             sampler_thread.join(timeout=0.2)

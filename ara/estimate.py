@@ -2,19 +2,17 @@
 # Copyright 2026 Will Sarg
 """Engine-free analytic capability estimate — the reasoning behind ``ara profile``.
 
-ARA's *analytic* layer: it mirrors the engine memory wall from ``detect`` facts (no engine, no
-model load) and checks whether a model's weights + context window fit the estimated budget.
-``characterize`` later *measures* the real ceiling; this only predicts it. Everything here is an
-estimate and is labelled as such. See Spec 2026-06-23-capability-pipeline.
+ARA's *analytic* layer reasons over ``detect`` facts (no engine, no model load) and checks whether
+a model's weights + context window fit an available budget. Apple/MLX has no current budget at
+this seam because Metal authority is read only inside the isolated engine. ``characterize`` later
+measures the real ceiling. See Spec 2026-06-23-capability-pipeline.
 """
 from __future__ import annotations
 
 from ara.contracts import ramp
 
-# ARA policy (not engine-measured): the analytic safety margin below the wall, and Apple's
-# unified-memory working-set fraction (Metal's recommendedMaxWorkingSetSize ≈ 75% of RAM).
+# ARA policy (not engine-measured): the analytic safety margin below a known wall.
 MARGIN_GB = 2.0
-APPLE_WORKING_SET = 0.75
 
 # The analytic layer's unit contract is binary GiB (matching detect's RAM/VRAM and the KV slope).
 # Weight sizes arrive as DECIMAL GB (on-disk bytes / 1e9, the disk-space denomination) and are
@@ -26,10 +24,11 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
            backend: str | None = None) -> dict:
     """Analytic memory limits from detect facts — no engine, no model load.
 
-    Mirrors the wall each backend would read: CUDA → a single device's VRAM by default (the
+    Mirrors the wall available from engine-free facts: CUDA → a single device's VRAM by default (the
     shipped engine reads device 0 only and does not shard a model across GPUs; pass
     ``sharded=True`` for a future engine that does, which sums VRAM across all cards), Apple → a
-    working-set fraction of unified RAM, CPU → physical RAM. ``total_gb`` always reports the
+    current wall is unknown until a live measurement is supplied, CPU → physical RAM. ``total_gb``
+    always reports the
     true physical total across all cards; ``wall_gb`` is the governable budget. The safe budget
     is the wall minus ARA's margin. Shape is compatible with the limits dict the engines return.
 
@@ -37,11 +36,9 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
     (for example, the CPU fallback on a CUDA host). Pure: the heuristic never touches a database.
     The CALLER may pass *measured* — a stored
     calibration dict carrying ``wall_gb``/``safe_budget_gb`` from the engine's own ``safe_limits``.
-    When it holds a usable wall, those measured numbers replace the heuristic and the result is
-    labelled ``basis="measured"`` / ``calibrated=True`` (the heuristic value is kept alongside as
-    ``estimated_wall_gb``/``estimated_safe_budget_gb`` so the correction is visible). Otherwise the
-    result is the honest heuristic: ``basis="estimated"`` / ``calibrated=False``. The label always
-    matches the data source — a heuristic is never reported as measured.
+    When it holds a usable wall, those measured numbers replace the analytic value and the result
+    is labelled ``basis="measured"`` / ``calibrated=True``. Otherwise Apple is ``unknown`` and
+    CPU/CUDA remain ``estimated``. The label always matches the data source.
     """
     selected_backend = backend or machine.backend
     if selected_backend == "cuda":
@@ -53,11 +50,11 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
     else:
         total = machine.ram_total_gb
         device = machine.chip
-        wall = total * APPLE_WORKING_SET if (selected_backend == "apple" and total is not None) \
-            else total
+        wall = None if selected_backend == "apple" else total
     safe_budget = wall - MARGIN_GB if wall is not None else None
     out = {
         "device": device,
+        "physical_memory_bytes": getattr(machine, "physical_memory_bytes", None),
         "total_gb": total,
         "wall_gb": wall,
         "safe_budget_gb": safe_budget,
@@ -67,14 +64,15 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
         "swap_free_gb": machine.swap_gb,
         "calibrated": False,
         "calibrated_at": None,
-        "basis": "estimated",
+        "basis": "unknown" if selected_backend == "apple" else "estimated",
     }
     # A real measurement for this machine + engine wins over the heuristic — but only when it
     # actually carries a wall (older/partial calibration rows fall back to the estimate honestly).
     measured_wall = (measured or {}).get("wall_gb")
     if measured_wall is not None:
-        out["estimated_wall_gb"] = wall              # keep the heuristic visible for comparison
-        out["estimated_safe_budget_gb"] = safe_budget
+        if wall is not None:
+            out["estimated_wall_gb"] = wall
+            out["estimated_safe_budget_gb"] = safe_budget
         out["wall_gb"] = measured_wall
         out["safe_budget_gb"] = (measured or {}).get("safe_budget_gb")
         out["calibrated"] = True
@@ -90,7 +88,8 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     is the analytic fp16 slope from the model's architecture. ``binding`` reports what limits the
     context — ``"context_window"`` (the budget covers the model's whole window) or ``"memory"``
     (the budget binds first) — or None when the slope can't be estimated. ``fits`` is False when
-    the weights alone exceed the budget.
+    the weights alone exceed the budget, and None with ``reason="no_current_budget"`` when the
+    read-only seam has no admissible current budget.
 
     Units: *weights_gb* arrives in DECIMAL GB (on-disk bytes / 1e9 — the callers pass catalog /
     Hub sizes) while the budget and KV slope are binary GiB, so the weights are converted here
@@ -100,7 +99,12 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     """
     budget = limits_dict["safe_budget_gb"]
     weights_gib = weights_gb * 1e9 / GIB if weights_gb is not None else None
-    fits = weights_gib is not None and budget is not None and weights_gib < budget
+    if budget is None:
+        fits = None
+        reason = "no_current_budget"
+    else:
+        fits = weights_gib is not None and weights_gib < budget
+        reason = None
     slope = ramp.analytic_kv_slope_gb_per_k(meta.get("n_layers"), meta.get("kv_heads"),
                                             meta.get("head_dim"))
     est_context, binding = None, None
@@ -113,4 +117,5 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
         "est_context": est_context,
         "max_context": meta.get("max_context"),
         "binding": binding,
+        "reason": reason,
     }

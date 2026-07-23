@@ -243,7 +243,8 @@ def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     fake = _FakeEngine(est, intercept=1.0, slope_per_k=0.2)
     _fake_worker(monkeypatch, fake)
     r = cuda.characterize("org/model")
-    assert r["safe_context"] == 19_999    # (7-2-1)/0.2 = 20k, −1 to stay strictly under budget
+    assert r["direct_context"] == 16_000
+    assert r["fitted_context"] == 19_999  # advisory fit: (7-2-1)/0.2 = 20k, −1
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):
@@ -251,7 +252,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     fake = _FakeEngine({"error": "model not found in HF cache"})
     _fake_worker(monkeypatch, fake)
     out = cuda.characterize("missing/model")
-    assert out == {"model": "missing/model", "safe_context": None, "points": [],
+    assert out == {"model": "missing/model", "safe_context": None,
+                   "direct_context": None, "fitted_context": None, "points": [],
                    "error": "model not found in HF cache"}
 
 

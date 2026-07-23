@@ -76,7 +76,8 @@ def test_run_threads_ref_baseline_into_ceiling():
     # delta points: model base 5, slope 1; ref baseline 8 → (36-8-5)/1 = 23k, −1 strictly under
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=13.0, slope_gb_per_k=1.0, budget_gb=36.0, ref_baseline_gb=8.0)
-    assert res.safe_context == 22_999
+    assert res.safe_context == 8_000
+    assert res.fitted_context == 22_999
 
 
 def test_safe_ceiling_none_when_no_measurable_growth():
@@ -138,8 +139,9 @@ def test_plan_next_none_when_all_measured():
 # --------------------------------------------------------------------------- #
 class FakeM:
     """Stand-in for a worker Measurement (duck-typed: .refused, .mem_gb)."""
-    def __init__(self, mem_gb=None, refused=False):
+    def __init__(self, mem_gb=None, refused=False, telemetry=None):
         self.mem_gb, self.refused, self.reason = mem_gb, refused, None
+        self.telemetry = telemetry
 
 
 def _linear_measure(intercept, slope_per_k):
@@ -151,9 +153,12 @@ def test_run_collects_points_fits_and_solves():
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
     assert len(res.points) == 3
-    # fitted intercept 5, slope 1 → ceiling (36-5)/1 = 31k
-    assert res.safe_context == 30_999
+    # 8k is the highest context actually completed; the 31k solve is advisory only.
+    assert res.direct_context == 8_000
+    assert res.safe_context == 8_000
+    assert res.fitted_context == 30_999
     assert res.stopped_reason == "ok"
+    assert res.aborted_at is None
 
 
 def test_run_keeps_safely_measured_model_window_when_noise_makes_fit_fall():
@@ -191,6 +196,22 @@ def test_run_bisects_below_abort_instead_of_extrapolating_past_it():
     assert 4000 <= res.safe_context < 8000      # bisected into the bracket, never past it
     assert res.safe_context != 30_999           # the old extrapolate-past-abort answer is gone
     assert res.safe_context in {c for c, _ in res.points}   # the ceiling is a measured context
+    assert res.direct_context == res.safe_context
+    assert res.fitted_context is None
+    assert res.aborted_at == 8000
+
+
+def test_run_preserves_telemetry_from_abort_and_bisection():
+    def measure(ctx):
+        telemetry = {"context": ctx}
+        return (FakeM(refused=True, telemetry=telemetry) if ctx >= 5000 else
+                FakeM(mem_gb=5.0 + ctx / 1000, telemetry=telemetry))
+
+    res = ramp.run(measure, schedule=[2000, 4000, 8000],
+                   base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0)
+
+    assert res.telemetry[8000] == {"context": 8000}
+    assert any(4000 < context < 8000 for context in res.telemetry)
 
 
 def test_run_finds_the_wall_when_growth_is_super_linear():
@@ -259,17 +280,20 @@ def test_run_refines_gate_from_measurements_to_escalate_safely():
 
 
 def test_run_caps_ceiling_at_model_context_window():
-    # memory would allow ~31k, but the model's window is 20k → report 20k, window-bound
+    # The supplied low-level schedule stops at 8k. The fit is capped at the 20k model window,
+    # but only the directly completed 8k may govern.
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0, max_context=20000)
-    assert res.safe_context == 20000
+    assert res.safe_context == 8000
+    assert res.direct_context == 8000 and res.fitted_context == 20000
     assert res.binding == "context_window"
 
 
 def test_run_memory_bound_when_ceiling_below_window():
     res = ramp.run(_linear_measure(5.0, 1.0), schedule=[2000, 4000, 8000],
                    base_gb=5.0, slope_gb_per_k=1.0, budget_gb=36.0, max_context=100000)
-    assert res.safe_context == 30999 and res.binding == "memory"
+    assert res.safe_context == 8000 and res.direct_context == 8000
+    assert res.fitted_context == 30999 and res.binding == "memory"
 
 
 def test_run_none_when_fewer_than_two_points():

@@ -13,6 +13,8 @@ import json
 import time
 import sys
 
+from . import units
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -34,8 +36,8 @@ def main() -> None:
         print(json.dumps({
             "status": "error",
             "note": (f"Pre-flight aborted: settled baseline + "
-                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GB model-load headroom would reach "
-                     f"the safe threshold ({threshold:.2f} GB); model not loaded."),
+                     f"{kokoro_safety.MODEL_WEIGHT_EST_GB} GiB model-load headroom would reach "
+                     f"the safe threshold ({threshold:.2f} GiB); model not loaded."),
         }), flush=True)
         sys.exit(0)
 
@@ -88,7 +90,7 @@ def main() -> None:
         if kokoro_safety.over_threshold(threshold):
             print(json.dumps({
                 "status": "safeguard_triggered",
-                "note": f"Active memory safeguard during cache sweep: OS-wired memory reached the safe threshold ({threshold:.2f} GB)."
+                "note": f"Active memory safeguard during cache sweep: OS-wired memory reached the safe threshold ({threshold:.2f} GiB)."
             }), flush=True)
             break
 
@@ -107,7 +109,7 @@ def main() -> None:
             time.sleep(0.05)
             
             os_wired_gb = wired_gb()
-            peak_gb = mx.get_peak_memory() / 1e9
+            peak_gb = units.bytes_to_gib(mx.get_peak_memory())
         except Exception as e:
             print(json.dumps({"status": "error", "note": f"Voice load failed at cache size {cache_size}: {e}"}), flush=True)
             break

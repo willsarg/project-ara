@@ -34,7 +34,7 @@ def machine(m: detect.Machine) -> dict:
 _PROFILE_SCALARS = (
     "system", "os_version", "arch", "chip",
     "cpu_physical", "cpu_logical", "cpu_features",
-    "ram_total_gb", "swap_gb",
+    "physical_memory_bytes", "ram_total_gb", "swap_gb",
     "backend", "engine", "engine_ready",
 )
 

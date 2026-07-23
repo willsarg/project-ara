@@ -16,10 +16,10 @@ def render_header(console, data: dict) -> None:
     c.emit(c.style("dim", "  measuring the fixed memory overhead so future "
                           "predictions start accurate."))
     c.emit()
-    c.emit(c.field("safe budget", f"{data['threshold_gb']:.2f} GB",
+    c.emit(c.field("safe budget", f"{data['threshold_gb']:.2f} GiB",
                    "the ceiling these probes stay under"))
     c.emit(c.field("model", data["model"],
-                   f"{data['weights_gb']:.1f} GB weights · {data['kv_mode']} KV"))
+                   f"{data['weights_gb']:.1f} GiB weights · {data['kv_mode']} KV"))
     c.emit()
 
 
@@ -30,7 +30,7 @@ def render_rung(console, data: dict) -> None:
         "  " + c.glyph("ok") + " "
         + c.style("value", f"{data['ctx']:>6,} tok")
         + c.style("dim", "   ")
-        + c.style("metric", f"+{data['delta_gb']:.2f} GB over base")
+        + c.style("metric", f"+{data['delta_gb']:.2f} GiB over base")
         + c.style("dim", f"   (median of {data['repeats']})")
     )
 
@@ -68,13 +68,13 @@ def render_summary(console, data: dict) -> None:
     c.emit(c.style("good", "✓ Calibrated this machine's cold-start estimate."))
     c.emit(c.field("machine", data["machine"], "where the profile is stored"))
     c.emit(c.field("model used", data["model"], f"{data['n_points']} probe rungs"))
-    c.emit(c.field("measured", f"{data['measured_overhead_gb']:.2f} GB overhead",
-                   f"default is {data['default_overhead_gb']:.2f} GB"))
+    c.emit(c.field("measured", f"{data['measured_overhead_gb']:.2f} GiB overhead",
+                   f"default is {data['default_overhead_gb']:.2f} GiB"))
     if data["changed"]:
         note = "tightened the estimate for this machine"
     else:
         note = "kept the safe default (measurement didn't beat the floor)"
-    c.emit(c.field("stored", f"{data['fixed_overhead_gb']:.2f} GB", note))
+    c.emit(c.field("stored", f"{data['fixed_overhead_gb']:.2f} GiB", note))
     c.emit(c.next_block([
         ("ara profile", "confirm the updated machine estimate"),
         ("ara models show MODEL", "re-check a model's per-engine ceiling"),

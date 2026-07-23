@@ -68,12 +68,12 @@ CREATE TABLE IF NOT EXISTS fits (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id           INTEGER NOT NULL,
     model_base_gb    REAL,               -- DELTA intercept: model's own wired footprint at c->0 (invariant)
-    slope_gb_per_k   REAL,               -- GB per 1000 tokens
+    slope_gb_per_k   REAL,               -- GiB per 1000 tokens
     r2               REAL,
     ref_baseline_gb  REAL,               -- live system baseline used for the ceiling calc
     threshold_gb     REAL,
     safe_ceiling_ctx INTEGER,            -- context where (ref_baseline + model_base + slope*c) hits threshold
-    hard_wall_ctx    INTEGER,            -- ... hits the measured wall (17.18 GB on the testbed)
+    hard_wall_ctx    INTEGER,            -- ... hits the measured wall (17.18 GiB on the testbed)
     n_points         INTEGER,
     created_at       TEXT,
     FOREIGN KEY (run_id) REFERENCES probe_runs(id)

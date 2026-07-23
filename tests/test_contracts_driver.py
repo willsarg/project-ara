@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from ara import catalog
+from ara import catalog, methodology
 from ara.contracts import driver, worker
 
 
@@ -44,8 +44,22 @@ def test_drives_ramp_and_shapes_result():
                             schedule=[2000, 4000, 8000, 16000, 32000])
     assert r["model"] == "org/model"
     assert r["safe_context"] == 16000
+    assert r["direct_context"] == 16000
+    assert r["fitted_context"] == 16000
     assert r["binding"] == "context_window"
+    assert r["stopped_reason"] == "ok"
+    assert r["aborted_at"] is None
     assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
+
+
+def test_unbounded_fit_is_advisory_while_direct_context_governs():
+    r = driver.characterize(
+        "org/model", preflight=lambda _m: _est(), measure=_linear(5.0, 1.0),
+        schedule=[2000, 4000, 8000],
+    )
+    assert r["safe_context"] == r["direct_context"] == 8000
+    assert r["fitted_context"] == 30999
+    assert r["stopped_reason"] == "ok"
 
 
 def test_filters_schedule_above_model_window():
@@ -113,8 +127,54 @@ def test_none_when_preflight_errors():
     r = driver.characterize("missing/model",
                             preflight=lambda m: {"error": "not in HF cache"},
                             measure=lambda m, c: {}, schedule=[2000])
-    assert r == {"model": "missing/model", "safe_context": None, "points": [],
+    assert r == {"model": "missing/model", "safe_context": None,
+                 "direct_context": None, "fitted_context": None, "points": [],
                  "error": "not in HF cache"}
+
+
+def test_reports_methodology_identity():
+    descriptor = methodology.characterization_descriptor(
+        schedule=[2000, 4000], repeats=3,
+        reserve_policy="test", reserve_bytes=1024,
+        worker_protocol="test:v1", sampling_interval_ms=50,
+        telemetry_failure_policy="fail-closed",
+        watchdog_stop_rule="test-stop")
+
+    result = driver.characterize(
+        "org/model", schedule=[2000, 4000], methodology_descriptor=descriptor,
+        preflight=lambda _model: _est(max_context=4000),
+        measure=_linear(1.0, 0.1))
+
+    assert result["methodology"] == descriptor
+    assert result["methodology_key"] == methodology.key(descriptor)
+
+
+def test_preserves_per_rung_telemetry_in_driver_evidence():
+    telemetry = {"schema": "macos-native-vm-telemetry:v1", "repeats": [{"sample_count": 3}]}
+    result = driver.characterize(
+        "org/model", schedule=[2000, 4000],
+        preflight=lambda _model: _est(max_context=4000),
+        measure=lambda _model, context: {
+            "context": context, "mem_gb": context / 1000,
+            "telemetry": telemetry,
+        })
+
+    assert result["points"][0]["telemetry"] == telemetry
+
+
+def test_preserves_refusal_telemetry_separately_from_successful_points():
+    telemetry = {"schema": "macos-native-vm-telemetry:v1", "sample_count": 2}
+    result = driver.characterize(
+        "org/model", schedule=[2000],
+        preflight=lambda _model: _est(max_context=2000),
+        measure=lambda _model, context: {
+            "context": context, "refused": True, "reason": "boundary",
+            "telemetry": telemetry,
+        })
+
+    assert result["points"] == []
+    assert result["refusal_telemetry"] == [
+        {"context": result["aborted_at"], "telemetry": telemetry}]
 
 
 def test_l2_stops_when_measured_reaches_budget():
@@ -161,7 +221,8 @@ def test_threads_ref_baseline_into_ceiling():
     est = _est(base_gb=13.0, ref_baseline_gb=8.0)
     r = driver.characterize("m", preflight=lambda m: est, measure=_linear(5.0, 1.0),
                             schedule=[2000, 4000, 8000])
-    assert r["safe_context"] == 22_999
+    assert r["safe_context"] == 8_000
+    assert r["fitted_context"] == 22_999
     assert r["binding"] == "memory"
 
 

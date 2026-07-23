@@ -14,8 +14,9 @@ from __future__ import annotations
 import json
 
 # Core, engine-free helpers — safe to import at module load and patchable in tests.
-from ara import calibration, db, engine_env
+from ara import calibration, db, engine_env, measurement_authority, methodology
 from ara.contracts import driver
+from ara.engine_env import EngineEnvError
 
 # Native MLX worker modules ARA drives in the isolated apple env (never imported in-process).
 DEVICE_MODULE = "ara_engine_mlx.device"
@@ -24,34 +25,21 @@ DEVICE_MODULE = "ara_engine_mlx.device"
 # fixed memory overhead, so a tiny instruct model is plenty.
 CALIBRATION_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
-# The MLX engine denominates memory in DECIMAL GB (bytes / 1e9) — except swap, reported in binary
-# GiB already. ARA's contract is binary GiB throughout (matching detect and the workers),
-# so engine facts are converted at this boundary. Slug 2026-07-02-analytic-units-gib.
-_GIB = 1024 ** 3
-_DEC_TO_GIB = 1e9 / _GIB
+_MLX_V2_BYTES = (
+    "memory_size_bytes", "recommended_working_set_bytes", "max_buffer_length_bytes",
+    "safe_budget_bytes")
 
 
-def _facts_to_gib(facts: dict) -> dict:
-    """Convert the MLX engine's decimal-GB limit facts to ARA's binary-GiB contract.
-
-    The margin-bearing fields are RE-DERIVED rather than scaled: ``margin_gb`` is an absolute
-    policy cushion, and multiplying it by the ≈0.93 conversion factor would silently shrink it
-    ~7% (an unsafe direction). So: wall/total convert directly; ``safe_budget_gb`` becomes the
-    converted wall minus the unchanged margin; ``headroom_gb`` (= safe − wired) is rebuilt from
-    the converted wired footprint. ``swap_free_gb`` is already GiB and passes through.
-    """
-    wall = facts["wall_gb"] * _DEC_TO_GIB
-    margin = facts["margin_gb"]
-    safe = wall - margin
-    # Engine headroom = decimal safe budget − wired-now; recover wired, convert, re-derive.
-    wired = (facts["safe_budget_gb"] - facts["headroom_gb"]) * _DEC_TO_GIB
-    return {
-        **facts,
-        "total_gb": facts["total_gb"] * _DEC_TO_GIB,
-        "wall_gb": wall,
-        "safe_budget_gb": safe,
-        "headroom_gb": safe - wired,
-    }
+def _validate_gib_facts(facts: dict) -> dict:
+    """Reject an old or malformed MLX worker before its units reach ARA's safety math."""
+    valid_bytes = all(
+        isinstance(facts.get(key), int) and not isinstance(facts.get(key), bool)
+        and facts[key] >= 0 for key in _MLX_V2_BYTES)
+    if facts.get("memory_unit") != "GiB" or not valid_bytes:
+        raise EngineEnvError(
+            "installed MLX worker does not implement the GiB v2 memory contract; "
+            "run: ara install --engine mlx --refresh")
+    return facts
 
 
 def safe_limits() -> dict:
@@ -59,9 +47,10 @@ def safe_limits() -> dict:
 
     Stateless: returns the budget with no stored overhead (``calibrated=False``). ARA overlays
     a previously-measured overhead from its own store — the engine no longer reads a database.
-    Facts arrive in engine decimal GB and leave here in ARA's binary GiB (see ``_facts_to_gib``).
+    Worker schema v2 reports GiB plus exact bytes. Legacy decimal-GB workers fail closed.
     """
-    facts = _facts_to_gib(engine_env.run_worker("apple", ["-m", DEVICE_MODULE, "limits"]))
+    facts = _validate_gib_facts(
+        engine_env.run_worker("apple", ["-m", DEVICE_MODULE, "limits"]))
     return {
         **facts,
         "overhead_gb": None,        # ARA owns the stored calibration now
@@ -132,11 +121,8 @@ def calibrate(model: str = CALIBRATION_MODEL) -> dict:
         )
         limits["calibration"] = result
         return limits
-    # Overheads are engine-measured (decimal GB) and get subtracted from the GiB wall later —
-    # convert them to the wall's units here (Slug 2026-07-02-analytic-units-gib). The raw
-    # engine numbers stay visible unconverted in the "calibration" sub-dict.
-    overheads = [v * _DEC_TO_GIB for v in (result.get("measured_overhead_gb"),
-                                           result.get("default_overhead_gb")) if v is not None]
+    overheads = [v for v in (result.get("measured_overhead_gb"),
+                             result.get("default_overhead_gb")) if v is not None]
     limits["overhead_gb"] = max(overheads) if overheads else None
     limits["calibrated"] = True
     limits["calibration"] = result
@@ -154,8 +140,10 @@ def _budget_params() -> tuple[float, float]:
     """ARA-owned (margin, overhead). Margin is policy; overhead is this machine's stored
     calibration for the MLX engine, or a safe default if uncalibrated."""
     overhead = DEFAULT_OVERHEAD_GB
+    current = measurement_authority.current_measurement_authority("mlx")
     with db.connected() as con:
-        stored = calibration.get_calibration(con, "mlx")
+        stored = (calibration.get_calibration(
+            con, "mlx", authority_key=current.key) if current is not None else None)
     if stored and stored.get("fixed_overhead_gb") is not None:
         overhead = stored["fixed_overhead_gb"]
     return DEFAULT_MARGIN_GB, overhead
@@ -181,7 +169,26 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
-def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -> dict:
+def characterization_methodology(*, margin_gb: float | None = None) -> dict:
+    """Current MLX characterization behavior used to authorize evidence reuse."""
+    margin = DEFAULT_MARGIN_GB if margin_gb is None else margin_gb
+    return methodology.characterization_descriptor(
+        schedule=RAMP_SCHEDULE, repeats=3,
+        reserve_policy="metal-recommendation-minus-fixed-reserve",
+        reserve_bytes=round(margin * 1024 ** 3),
+        worker_protocol="ara-engine-mlx-measurement:v2",
+        sampling_interval_ms=50,
+        telemetry_failure_policy="external-native-vm-supervisor-fail-closed:v1",
+        watchdog_stop_rule="highest-sampled-host-wired-gte-budget:v1")
+
+
+def characterize(
+    model: str,
+    *,
+    progress: bool = False,
+    kv_quant: str = "f16",
+    fixed_overhead_gb: float | None = None,
+) -> dict:
     """Measure *model*'s safe context ceiling on this Mac — the thin path.
 
     Pure wiring: ARA owns the methodology in the engine-agnostic ``contracts.driver`` (the
@@ -194,7 +201,10 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
     ``progress`` is accepted for interface symmetry with the cpu backend but has no effect
     here: the HF download bar already ran in-process during the pre-fetch step.
     """
-    margin, overhead = _budget_params()
+    if fixed_overhead_gb is None:
+        margin, overhead = _budget_params()
+    else:
+        margin, overhead = DEFAULT_MARGIN_GB, fixed_overhead_gb
     return driver.characterize(
         model,
         preflight=lambda m: engine_env.run_worker(
@@ -203,6 +213,7 @@ def characterize(model: str, *, progress: bool = False, kv_quant: str = "f16") -
             "apple", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant)),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_MLX_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
+        methodology_descriptor=characterization_methodology(margin_gb=margin),
     )
 
 

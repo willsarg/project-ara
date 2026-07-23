@@ -34,6 +34,29 @@ def test_save_calibration_persists_measured_wall(store, monkeypatch):
     assert row["wall_gb"] == 24.0 and row["safe_budget_gb"] == 23.0
 
 
+def test_calibration_round_trips_exact_measurement_authority(store, monkeypatch):
+    monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")
+    calibration.save_calibration(
+        store,
+        "mlx",
+        fixed_overhead_gb=0.6,
+        wall_gb=17.760009765625,
+        safe_budget_gb=15.760009765625,
+        wall_bytes=19_069_665_280,
+        safe_budget_bytes=16_922_181_632,
+        memory_unit="GiB",
+        environment_key="mlx-env",
+        authority_key="mlx-authority",
+        authority_evidence={"schema": "mlx-memory-authority:v1"},
+    )
+
+    row = calibration.get_calibration(
+        store, "mlx", authority_key="mlx-authority")
+    assert row["wall_bytes"] == 19_069_665_280
+    assert row["safe_budget_bytes"] == 16_922_181_632
+    assert row["authority_evidence"]["schema"] == "mlx-memory-authority:v1"
+
+
 def test_save_calibration_wall_defaults_none(store, monkeypatch):
     # Existing callers (overhead only) still work — wall columns stay NULL.
     monkeypatch.setattr(calibration, "machine_key", lambda: "mkey")

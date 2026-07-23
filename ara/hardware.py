@@ -49,6 +49,7 @@ class MemoryModule:
 
 @dataclass(frozen=True)
 class MemoryInfo:
+    physical_memory_bytes: int | None = None
     total_gb: float | None = None
     available_gb: float | None = None
     swap_gb: float | None = None
@@ -408,14 +409,14 @@ _SMBIOS_MEM: dict[int, str] = {
 def _mem_windows(
     modules: list[dict],
     array: dict,
-    totals: tuple[float, float, float],
+    totals: tuple[float, float, float] | tuple[int, float, float, float],
 ) -> "MemoryInfo":
     """Parse Win32_PhysicalMemory rows + Win32_PhysicalMemoryArray dict → MemoryInfo.
 
     `totals` is (total_gb, available_gb, swap_gb) from psutil — passed in so the parser
     is pure/testable without live psutil calls.
     """
-    total_gb, available_gb, swap_gb = totals
+    physical_memory_bytes, total_gb, available_gb, swap_gb = _split_memory_totals(totals)
     parsed: list[MemoryModule] = []
     for m in modules:
         parsed.append(MemoryModule(
@@ -436,6 +437,7 @@ def _mem_windows(
     slots_total = array.get("MemoryDevices") if array else None
 
     return MemoryInfo(
+        physical_memory_bytes=physical_memory_bytes,
         total_gb=total_gb,
         available_gb=available_gb,
         swap_gb=swap_gb,
@@ -449,14 +451,14 @@ def _mem_windows(
 
 def _mem_macos(
     spmemory_text: str,
-    totals: tuple[float, float, float],
+    totals: tuple[float, float, float] | tuple[int, float, float, float],
 ) -> "MemoryInfo":
     """Parse `system_profiler SPMemoryDataType` text → MemoryInfo.
 
     Apple Silicon is soldered — there are no per-module rows, only totals + kind.
     modules=[] is intentional and honest.
     """
-    total_gb, available_gb, swap_gb = totals
+    physical_memory_bytes, total_gb, available_gb, swap_gb = _split_memory_totals(totals)
     kind: str | None = None
 
     for line in spmemory_text.splitlines():
@@ -466,6 +468,7 @@ def _mem_macos(
             break
 
     return MemoryInfo(
+        physical_memory_bytes=physical_memory_bytes,
         total_gb=total_gb,
         available_gb=available_gb,
         swap_gb=swap_gb,
@@ -477,14 +480,14 @@ def _mem_macos(
 def _mem_linux(
     meminfo_text: str,
     dmidecode_text: str | None,
-    totals: tuple[float, float, float],
+    totals: tuple[float, float, float] | tuple[int, float, float, float],
 ) -> "MemoryInfo":
     """Parse /proc/meminfo + optional dmidecode output → MemoryInfo.
 
     Per-module detail requires root (`dmidecode -t memory`). When dmidecode_text is None
     (non-root or tool absent) modules=[] — honest gap, renderer shows "needs root".
     """
-    total_gb, available_gb, swap_gb = totals
+    physical_memory_bytes, total_gb, available_gb, swap_gb = _split_memory_totals(totals)
 
     # Parse per-module from dmidecode if we have it.
     modules: list[MemoryModule] = []
@@ -526,6 +529,7 @@ def _mem_linux(
     speed_mts = max(speeds) if speeds else None
 
     return MemoryInfo(
+        physical_memory_bytes=physical_memory_bytes,
         total_gb=total_gb,
         available_gb=available_gb,
         swap_gb=swap_gb,
@@ -791,19 +795,31 @@ def clamp_ram_to_cgroup(total_bytes: int) -> int:
     return total_bytes
 
 
-def _psutil_totals() -> tuple[float, float, float]:
-    """Return (total_gb, available_gb, swap_gb) from psutil.
+def _split_memory_totals(
+    totals: tuple[float, float, float] | tuple[int, float, float, float],
+) -> tuple[int | None, float, float, float]:
+    """Normalize old parser fixtures and the exact-byte live psutil shape."""
+    if len(totals) == 4:
+        physical_memory_bytes, total_gb, available_gb, swap_gb = totals
+        return int(physical_memory_bytes), total_gb, available_gb, swap_gb
+    total_gb, available_gb, swap_gb = totals
+    return None, total_gb, available_gb, swap_gb
 
-    The total is cgroup-honest: inside a container capped below the host it is clamped to the cgroup
-    memory ceiling, so every wall-consumer downstream (``estimate.limits`` → the Rule #1 gate) sizes
-    against the real wall rather than the host's physical RAM."""
+
+def _psutil_totals() -> tuple[int, float, float, float]:
+    """Return exact physical bytes plus compatible total/available/swap GiB from psutil.
+
+    ``physical_memory_bytes`` preserves psutil's unrounded host total. The compatible ``total_gb``
+    remains cgroup-honest: inside a capped container it reflects the effective allocation ceiling,
+    preserving the CPU safety behavior used by downstream wall consumers."""
     import psutil
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
-    total_gb = round(clamp_ram_to_cgroup(vm.total) / GB, 1)
+    physical_memory_bytes = int(vm.total)
+    total_gb = round(clamp_ram_to_cgroup(physical_memory_bytes) / GB, 1)
     available_gb = round(vm.available / GB, 1)
     swap_gb = round(sw.total / GB, 1)
-    return total_gb, available_gb, swap_gb
+    return physical_memory_bytes, total_gb, available_gb, swap_gb
 
 
 def memory_info() -> "MemoryInfo":

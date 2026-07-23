@@ -23,14 +23,15 @@ def _fake_worker(monkeypatch, fn):
                         type("E", (), {"run_worker": staticmethod(fn)}))
 
 
-# The engine facts the MLX `device limits` worker returns (ARA overlays its own fields).
-# The MLX engine denominates memory in DECIMAL GB (bytes / 1e9) except swap (already binary GiB);
-# apple.safe_limits converts to ARA's binary-GiB contract at this boundary.
+# The v2 MLX worker returns binary GiB plus exact byte authority.
 _LIMITS_FACTS = {
+    "memory_unit": "GiB", "memory_size_bytes": 48 * 1024 ** 3,
+    "recommended_working_set_bytes": 40 * 1024 ** 3,
+    "max_buffer_length_bytes": 32 * 1024 ** 3,
+    "safe_budget_bytes": 36 * 1024 ** 3,
     "device": "Apple M4 Pro", "total_gb": 48.0, "wall_gb": 40.0,
     "safe_budget_gb": 36.0, "margin_gb": 4.0, "headroom_gb": 28.0, "swap_free_gb": 2.0,
 }
-_DEC = 1e9 / (1024 ** 3)     # decimal-GB value × _DEC = the same bytes in binary GiB
 
 
 def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
@@ -44,30 +45,33 @@ def test_safe_limits_drives_device_worker_and_overlays(monkeypatch):
     m = apple.safe_limits()
     assert calls == [("apple", ["-m", "ara_engine_mlx.device", "limits"])]
     assert m["device"] == "Apple M4 Pro"
-    assert m["total_gb"] == pytest.approx(48.0 * _DEC)
-    assert m["wall_gb"] == pytest.approx(40.0 * _DEC)
-    assert m["swap_free_gb"] == 2.0        # MLX reports swap in GiB already — passes through
+    assert m["total_gb"] == 48.0
+    assert m["wall_gb"] == 40.0
+    assert m["memory_unit"] == "GiB"
+    assert m["recommended_working_set_bytes"] == 40 * 1024 ** 3
+    assert m["swap_free_gb"] == 2.0
     # no stored calibration in the engine — ARA overlays it from its own store
     assert m["calibrated"] is False
     assert m["overhead_gb"] is None
     assert m["calibrated_at"] is None
 
 
-def test_safe_limits_converts_mlx_decimal_to_gib_preserving_margin(monkeypatch):
-    """MLX wall/budget values are decimal GB (bytes/1e9); ARA's contract is binary GiB. The boundary
-    conversion must NOT scale the absolute safety margin (a blind × factor would shrink it ~7%,
-    an unsafe direction): safe_budget is re-derived as converted wall − margin, and headroom as
-    safe_budget − converted wired footprint.
-
-    Slug: 2026-07-02-analytic-units-gib
-    """
+def test_safe_limits_accepts_v2_gib_worker_contract(monkeypatch):
     _fake_worker(monkeypatch, lambda name, argv: dict(_LIMITS_FACTS))
     m = apple.safe_limits()
-    wall = 40.0 * _DEC
-    assert m["margin_gb"] == 4.0                                  # policy constant, not scaled
-    assert m["safe_budget_gb"] == pytest.approx(wall - 4.0)       # margin preserved exactly
-    wired = (36.0 - 28.0) * _DEC                                  # MLX wired = safe − headroom
-    assert m["headroom_gb"] == pytest.approx((wall - 4.0) - wired)
+    assert m["margin_gb"] == 4.0
+    assert m["safe_budget_gb"] == 36.0
+    assert m["headroom_gb"] == 28.0
+
+
+def test_safe_limits_rejects_legacy_decimal_worker(monkeypatch):
+    legacy = {key: value for key, value in _LIMITS_FACTS.items()
+              if key not in {"memory_unit", "memory_size_bytes",
+                             "recommended_working_set_bytes", "max_buffer_length_bytes",
+                             "safe_budget_bytes"}}
+    _fake_worker(monkeypatch, lambda name, argv: legacy)
+    with pytest.raises(engine_env.EngineEnvError, match="GiB v2"):
+        apple.safe_limits()
 
 
 def test_calibration_model_cached_true(monkeypatch):
@@ -160,10 +164,7 @@ def test_calibrate_surfaces_effective_overhead(monkeypatch):
     }, calls)
     m = apple.calibrate("org/calib-model")
     assert m["device"] == "Apple M4 Pro"               # carries fresh limits …
-    # effective = max(default 6, measured 5), converted from MLX decimal GB to binary GiB
-    # (it is subtracted from the GiB wall, so it must share the wall's units).
-    # Slug: 2026-07-02-analytic-units-gib
-    assert m["overhead_gb"] == pytest.approx(6.0 * _DEC)
+    assert m["overhead_gb"] == 6.0
     assert m["calibrated"] is True
     assert m["calibration"]["n_points"] == 4           # … plus what it measured (engine-raw)
     assert ["-m", "ara_engine_mlx.device", "calibrate", "org/calib-model"] in calls
@@ -244,6 +245,40 @@ def test_characterize_drives_ramp_over_engine_env(monkeypatch):
     assert r["points"][0] == {"context": 2000, "mem_gb": 7.0}
 
 
+def test_characterize_accepts_freshly_measured_overhead_without_stored_lookup(monkeypatch):
+    captured = {}
+
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes,
+                          methodology_descriptor):
+        preflight(model)
+        return {"model": model, "safe_context": 1, "points": []}
+
+    def worker(_name, argv):
+        captured["argv"] = argv
+        return {"base_gb": 3.0, "slope_gb_per_k": 0.1, "budget_gb": 10.0}
+
+    monkeypatch.setattr(apple.driver, "characterize", fake_characterize)
+    monkeypatch.setattr(
+        apple, "_budget_params", lambda: pytest.fail("stored lookup must be skipped"))
+    _fake_worker(monkeypatch, worker)
+
+    apple.characterize("org/model", fixed_overhead_gb=1.75)
+
+    assert captured["argv"][captured["argv"].index("--overhead") + 1] == "1.75"
+
+
+def test_characterization_methodology_is_current_reuse_identity(monkeypatch):
+    monkeypatch.setattr(apple, "_budget_params", lambda: (2.0, 1.0))
+
+    descriptor = apple.characterization_methodology()
+
+    assert descriptor["reserve_bytes"] == 2 * 1024 ** 3
+    assert descriptor["schedule"] == apple.RAMP_SCHEDULE
+    assert descriptor["worker_protocol"] == "ara-engine-mlx-measurement:v2"
+    assert descriptor["telemetry_failure_policy"] == (
+        "external-native-vm-supervisor-fail-closed:v1")
+
+
 def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     _patch_budget(monkeypatch)
     # delta fit: model base 5, slope 1; live OS baseline 8 GB → ceiling (36-8-5)/1 = 23k
@@ -253,7 +288,8 @@ def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     r = apple.characterize("org/model")
-    assert r["safe_context"] == 22_999    # (36-8-5)/1 = 23k, −1 to stay strictly under budget
+    assert r["direct_context"] == 16_000
+    assert r["fitted_context"] == 22_999  # advisory fit: (36-8-5)/1 = 23k, −1
 
 
 def test_characterize_none_when_preflight_errors(monkeypatch):
@@ -262,7 +298,8 @@ def test_characterize_none_when_preflight_errors(monkeypatch):
     monkeypatch.setattr(apple, "engine_env",
                         type("E", (), {"run_worker": staticmethod(fake)}))
     out = apple.characterize("missing/model")
-    assert out == {"model": "missing/model", "safe_context": None, "points": [],
+    assert out == {"model": "missing/model", "safe_context": None,
+                   "direct_context": None, "fitted_context": None, "points": [],
                    "error": "model not found in HF cache"}
 
 
@@ -320,7 +357,8 @@ def test_worker_argv_maps_kv_quant_to_kv_bits(kv_quant, bits):
 def _capture_driver_kv_dtype_bytes(monkeypatch):
     captured = {}
 
-    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0):
+    def fake_characterize(model, *, preflight, measure, schedule, kv_dtype_bytes=2.0,
+                          methodology_descriptor=None):
         captured["kv_dtype_bytes"] = kv_dtype_bytes
         return {"model": model, "safe_context": 1, "points": []}
 
@@ -389,19 +427,52 @@ def test_generate_omits_kv_bits_for_fp16(monkeypatch):
 
 def test_budget_params_uses_stored_calibration(monkeypatch):
     engines = []
+    current = type("Authority", (), {"key": "current"})()
+    monkeypatch.setattr(
+        apple.measurement_authority, "current_measurement_authority",
+        lambda _engine: current)
     monkeypatch.setattr(apple, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(apple, "calibration",
                         type("P", (), {"get_calibration": staticmethod(
-                            lambda con, eng: engines.append(eng) or {"fixed_overhead_gb": 5.5})}), raising=False)
+                            lambda con, eng, **kwargs: engines.append((eng, kwargs))
+                            or {"fixed_overhead_gb": 5.5})}), raising=False)
     margin, overhead = apple._budget_params()
     assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, 5.5)
-    assert engines == ["mlx"]
+    assert engines == [("mlx", {"authority_key": "current"})]
+
+
+def test_budget_params_reads_only_the_live_measurement_authority(monkeypatch):
+    current = type("Authority", (), {"key": "mlx-authority:current"})()
+    monkeypatch.setattr(
+        apple.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: current,
+    )
+    seen = {}
+
+    def get_calibration(_con, _engine, *, authority_key=None):
+        seen["authority_key"] = authority_key
+        return {"fixed_overhead_gb": 1.25}
+
+    monkeypatch.setattr(apple.calibration, "get_calibration", get_calibration)
+    monkeypatch.setattr(
+        apple.db,
+        "connected",
+        lambda: contextlib.nullcontext(None),
+    )
+
+    assert apple._budget_params() == (apple.DEFAULT_MARGIN_GB, 1.25)
+    assert seen["authority_key"] == "mlx-authority:current"
 
 
 def test_budget_params_falls_back_to_default_overhead(monkeypatch):
+    monkeypatch.setattr(
+        apple.measurement_authority, "current_measurement_authority",
+        lambda _engine: None)
     monkeypatch.setattr(apple, "db", type("D", (), {"connected": staticmethod(lambda: contextlib.nullcontext(None))}))
     monkeypatch.setattr(apple, "calibration",
-                        type("P", (), {"get_calibration": staticmethod(lambda con, eng: None)}),
+                        type("P", (), {"get_calibration": staticmethod(
+                            lambda con, eng, **kwargs: None)}),
                         raising=False)
     margin, overhead = apple._budget_params()
     assert (margin, overhead) == (apple.DEFAULT_MARGIN_GB, apple.DEFAULT_OVERHEAD_GB)

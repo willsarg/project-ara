@@ -22,6 +22,13 @@ from pathlib import Path
 
 import platformdirs
 
+from ara.measurement_authority import (
+    LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY,
+    LEGACY_UNIT_UNKNOWN_ENVIRONMENT_KEY,
+    UNSCOPED_AUTHORITY_KEY,
+    UNSCOPED_ENVIRONMENT_KEY,
+)
+
 _MODEL_ARTIFACTS_DDL = """
 CREATE TABLE IF NOT EXISTS model_artifacts (
     artifact_id          TEXT PRIMARY KEY,
@@ -51,12 +58,91 @@ CREATE TABLE IF NOT EXISTS {table} (
     wall_gb           REAL,
     safe_budget_gb    REAL,
     evidence_json     TEXT,
-    PRIMARY KEY (machine_key, runtime, backend, config_key)
+    environment_key   TEXT NOT NULL,
+    authority_key     TEXT NOT NULL,
+    memory_unit       TEXT NOT NULL,
+    wall_bytes        INTEGER,
+    safe_budget_bytes INTEGER,
+    authority_evidence_json TEXT,
+    PRIMARY KEY (machine_key, runtime, backend, config_key, authority_key)
 );
 """
 
 
 _CHARACTERIZATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    machine_key          TEXT NOT NULL,
+    runtime              TEXT NOT NULL,
+    backend              TEXT NOT NULL,
+    artifact_id          TEXT NOT NULL,
+    config_key           TEXT NOT NULL,
+    logical_model_id     TEXT NOT NULL,
+    legacy_engine        TEXT,
+    safe_context         INTEGER,
+    direct_context       INTEGER,
+    fitted_context       INTEGER,
+    decode_context       INTEGER,
+    stopped_reason       TEXT,
+    config_json          TEXT,
+    points_json          TEXT,
+    evidence_json        TEXT,
+    artifact_confidence  TEXT NOT NULL,
+    reusable             INTEGER NOT NULL DEFAULT 0,
+    measured_at          TEXT,
+    environment_key      TEXT NOT NULL,
+    authority_key        TEXT NOT NULL,
+    memory_unit          TEXT NOT NULL,
+    methodology_key      TEXT NOT NULL,
+    engine_fingerprint   TEXT NOT NULL,
+    PRIMARY KEY (machine_key, runtime, backend, artifact_id, config_key, authority_key,
+                 methodology_key, engine_fingerprint)
+);
+"""
+
+
+_CHARACTERIZATIONS_V6_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    machine_key          TEXT NOT NULL,
+    runtime              TEXT NOT NULL,
+    backend              TEXT NOT NULL,
+    artifact_id          TEXT NOT NULL,
+    config_key           TEXT NOT NULL,
+    logical_model_id     TEXT NOT NULL,
+    legacy_engine        TEXT,
+    safe_context         INTEGER,
+    decode_context       INTEGER,
+    config_json          TEXT,
+    points_json          TEXT,
+    evidence_json        TEXT,
+    artifact_confidence  TEXT NOT NULL,
+    reusable             INTEGER NOT NULL DEFAULT 0,
+    measured_at          TEXT,
+    environment_key      TEXT NOT NULL,
+    authority_key        TEXT NOT NULL,
+    memory_unit          TEXT NOT NULL,
+    PRIMARY KEY (machine_key, runtime, backend, artifact_id, config_key, authority_key)
+);
+"""
+
+
+_CALIBRATIONS_V5_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    machine_key       TEXT NOT NULL,
+    runtime           TEXT NOT NULL,
+    backend           TEXT NOT NULL,
+    config_key        TEXT NOT NULL,
+    legacy_engine     TEXT,
+    fixed_overhead_gb REAL,
+    calibrated_at     TEXT,
+    wall_gb           REAL,
+    safe_budget_gb    REAL,
+    evidence_json     TEXT,
+    PRIMARY KEY (machine_key, runtime, backend, config_key)
+);
+"""
+
+
+_CHARACTERIZATIONS_V5_DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
     machine_key          TEXT NOT NULL,
     runtime              TEXT NOT NULL,
@@ -255,6 +341,42 @@ def connect() -> sqlite3.Connection:
             con.close()
             raise
         con.execute("PRAGMA foreign_keys = ON")
+    if con.execute("PRAGMA user_version").fetchone()[0] < 6:
+        rebuild = _measurement_authority_v6_needed(con)
+        if rebuild:
+            _backup_before_measurement_authority_v6(con, path)
+        con.commit()
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if rebuild:
+                _migrate_measurement_authority_v6(con)
+            con.execute("PRAGMA user_version = 6")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.execute("PRAGMA foreign_keys = ON")
+            con.close()
+            raise
+        con.execute("PRAGMA foreign_keys = ON")
+    if con.execute("PRAGMA user_version").fetchone()[0] < 7:
+        rebuild = _characterization_evidence_v7_needed(con)
+        if rebuild:
+            _backup_before_characterization_evidence_v7(con, path)
+        con.commit()
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if rebuild:
+                _migrate_characterization_evidence_v7(con)
+            con.execute("PRAGMA user_version = 7")
+            con.commit()
+        except Exception:
+            con.rollback()
+            con.execute("PRAGMA foreign_keys = ON")
+            con.close()
+            raise
+        con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
@@ -339,6 +461,28 @@ def _backup_before_target_schema_v5(con: sqlite3.Connection, path: Path) -> None
     """Keep one byte-independent SQLite backup of the pre-v5 target store."""
     _backup_before_migration(
         con, path, suffix=".pre-target-schema-v5.bak", validation_label="pre-v5")
+
+
+def _backup_before_measurement_authority_v6(
+        con: sqlite3.Connection, path: Path) -> None:
+    """Keep one validated SQLite backup of the pre-v6 measurement store."""
+    _backup_before_migration(
+        con,
+        path,
+        suffix=".pre-measurement-authority-v6.bak",
+        validation_label="pre-v6",
+    )
+
+
+def _backup_before_characterization_evidence_v7(
+        con: sqlite3.Connection, path: Path) -> None:
+    """Keep one validated SQLite backup before direct/methodology evidence migration."""
+    _backup_before_migration(
+        con,
+        path,
+        suffix=".pre-characterization-evidence-v7.bak",
+        validation_label="pre-v7",
+    )
 
 
 def _json_object(raw) -> dict | None:
@@ -492,8 +636,8 @@ def _migrate_target_schema_v5(con: sqlite3.Connection) -> None:
         dict(row) for row in con.execute("SELECT * FROM characterizations")]
     con.execute("DROP TABLE IF EXISTS calibrations_new")
     con.execute("DROP TABLE IF EXISTS characterizations_new")
-    con.execute(_CALIBRATIONS_DDL.format(table="calibrations_new"))
-    con.execute(_CHARACTERIZATIONS_DDL.format(table="characterizations_new"))
+    con.execute(_CALIBRATIONS_V5_DDL.format(table="calibrations_new"))
+    con.execute(_CHARACTERIZATIONS_V5_DDL.format(table="characterizations_new"))
     for row in calibration_rows:
         runtime, backend, legacy_engine = targets.for_engine(row.get("engine"))
         con.execute(
@@ -531,6 +675,177 @@ def _migrate_target_schema_v5(con: sqlite3.Connection) -> None:
     con.execute("DROP TABLE calibrations")
     con.execute("DROP TABLE characterizations")
     con.execute("ALTER TABLE calibrations_new RENAME TO calibrations")
+    con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
+
+
+def _measurement_authority_v6_needed(con: sqlite3.Connection) -> bool:
+    calibration_columns = {
+        row["name"] for row in con.execute("PRAGMA table_info(calibrations)")}
+    characterization_columns = {
+        row["name"] for row in con.execute("PRAGMA table_info(characterizations)")}
+    return not {
+        "environment_key", "authority_key", "memory_unit", "wall_bytes",
+        "safe_budget_bytes", "authority_evidence_json",
+    }.issubset(calibration_columns) or not {
+        "environment_key", "authority_key", "memory_unit",
+    }.issubset(characterization_columns)
+
+
+def _v6_authority_values(row: dict) -> tuple[str, str, str, str | None, bool]:
+    """Classify a pre-v6 row without inventing byte precision from stored floats."""
+    authority_key = row.get("authority_key")
+    environment_key = row.get("environment_key")
+    memory_unit = row.get("memory_unit")
+    if all(isinstance(value, str) and value for value in (
+            authority_key, environment_key, memory_unit)):
+        return (
+            environment_key,
+            authority_key,
+            memory_unit,
+            row.get("authority_evidence_json"),
+            False,
+        )
+
+    from ara.engine_identity import canonical_engine
+
+    is_mlx = row.get("runtime") == "mlx" or canonical_engine(
+        row.get("legacy_engine")) == "mlx"
+    if is_mlx:
+        evidence = _compact_json({
+            "schema": "legacy-unit-unknown:v1",
+            "reason": "measurement predates exact byte authority",
+        })
+        return (
+            LEGACY_UNIT_UNKNOWN_ENVIRONMENT_KEY,
+            LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY,
+            "legacy-unit-unknown",
+            evidence,
+            True,
+        )
+    evidence = _compact_json({"schema": "unscoped-authority:v1", "scope": "unscoped"})
+    return (
+        UNSCOPED_ENVIRONMENT_KEY,
+        UNSCOPED_AUTHORITY_KEY,
+        "GiB",
+        evidence,
+        False,
+    )
+
+
+def _migrate_measurement_authority_v6(con: sqlite3.Connection) -> None:
+    """Rekey measured rows by exact authority while retaining all historical evidence."""
+    calibration_rows = [dict(row) for row in con.execute("SELECT * FROM calibrations")]
+    characterization_rows = [
+        dict(row) for row in con.execute("SELECT * FROM characterizations")]
+    con.execute("DROP TABLE IF EXISTS calibrations_new")
+    con.execute("DROP TABLE IF EXISTS characterizations_new")
+    con.execute(_CALIBRATIONS_DDL.format(table="calibrations_new"))
+    con.execute(_CHARACTERIZATIONS_V6_DDL.format(table="characterizations_new"))
+
+    for row in calibration_rows:
+        environment_key, authority_key, memory_unit, authority_json, _legacy_mlx = (
+            _v6_authority_values(row))
+        con.execute(
+            "INSERT INTO calibrations_new "
+            "(machine_key,runtime,backend,config_key,legacy_engine,fixed_overhead_gb,"
+            "calibrated_at,wall_gb,safe_budget_gb,evidence_json,environment_key,"
+            "authority_key,memory_unit,wall_bytes,safe_budget_bytes,"
+            "authority_evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["machine_key"], row["runtime"], row["backend"], row["config_key"],
+                row.get("legacy_engine"), row.get("fixed_overhead_gb"),
+                row.get("calibrated_at"), row.get("wall_gb"), row.get("safe_budget_gb"),
+                row.get("evidence_json"), environment_key, authority_key, memory_unit,
+                row.get("wall_bytes"), row.get("safe_budget_bytes"), authority_json,
+            ),
+        )
+
+    for row in characterization_rows:
+        environment_key, authority_key, memory_unit, _authority_json, legacy_mlx = (
+            _v6_authority_values(row))
+        con.execute(
+            "INSERT INTO characterizations_new "
+            "(machine_key,runtime,backend,artifact_id,config_key,logical_model_id,"
+            "legacy_engine,safe_context,decode_context,config_json,points_json,evidence_json,"
+            "artifact_confidence,reusable,measured_at,environment_key,authority_key,memory_unit) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["machine_key"], row["runtime"], row["backend"], row["artifact_id"],
+                row["config_key"], row["logical_model_id"], row.get("legacy_engine"),
+                row.get("safe_context"), row.get("decode_context"), row.get("config_json"),
+                row.get("points_json"), row.get("evidence_json"),
+                row["artifact_confidence"], 0 if legacy_mlx else row.get("reusable", 0),
+                row.get("measured_at"), environment_key, authority_key, memory_unit,
+            ),
+        )
+
+    con.execute("DROP TABLE calibrations")
+    con.execute("DROP TABLE characterizations")
+    con.execute("ALTER TABLE calibrations_new RENAME TO calibrations")
+    con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
+
+
+def _characterization_evidence_v7_needed(con: sqlite3.Connection) -> bool:
+    columns = {row["name"] for row in con.execute(
+        "PRAGMA table_info(characterizations)")}
+    return not {
+        "direct_context", "fitted_context", "stopped_reason", "methodology_key",
+        "engine_fingerprint",
+    }.issubset(columns)
+
+
+def _legacy_direct_context(raw_points) -> int | None:
+    """Highest valid successful context in legacy point JSON, for display only."""
+    try:
+        points = json.loads(raw_points) if isinstance(raw_points, str) else raw_points
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(points, list):
+        return None
+    contexts = []
+    for point in points:
+        value = point.get("context") if isinstance(point, dict) else (
+            point[0] if isinstance(point, (list, tuple)) and point else None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            contexts.append(value)
+    return max(contexts) if contexts else None
+
+
+def _legacy_engine_fingerprint(raw_evidence) -> str:
+    evidence = _json_object(raw_evidence)
+    engine = evidence.get("engine") if isinstance(evidence, dict) else None
+    fingerprint = engine.get("fingerprint") if isinstance(engine, dict) else None
+    return (fingerprint if isinstance(fingerprint, str) and fingerprint
+            else "engine:legacy-unknown")
+
+
+def _migrate_characterization_evidence_v7(con: sqlite3.Connection) -> None:
+    """Preserve pre-v7 history while making unknown methodology non-reusable."""
+    rows = [dict(row) for row in con.execute("SELECT * FROM characterizations")]
+    con.execute("DROP TABLE IF EXISTS characterizations_new")
+    con.execute(_CHARACTERIZATIONS_DDL.format(table="characterizations_new"))
+    for row in rows:
+        direct = _legacy_direct_context(row.get("points_json"))
+        legacy_safe = row.get("safe_context")
+        fitted = legacy_safe if direct is None or legacy_safe != direct else None
+        con.execute(
+            "INSERT INTO characterizations_new "
+            "(machine_key,runtime,backend,artifact_id,config_key,logical_model_id,"
+            "legacy_engine,safe_context,direct_context,fitted_context,decode_context,"
+            "stopped_reason,config_json,points_json,evidence_json,artifact_confidence,"
+            "reusable,measured_at,environment_key,authority_key,memory_unit,methodology_key,"
+            "engine_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["machine_key"], row["runtime"], row["backend"], row["artifact_id"],
+                row["config_key"], row["logical_model_id"], row.get("legacy_engine"),
+                direct, direct, fitted, row.get("decode_context"), "legacy-unknown",
+                row.get("config_json"), row.get("points_json"), row.get("evidence_json"),
+                row["artifact_confidence"], 0, row.get("measured_at"),
+                row["environment_key"], row["authority_key"], row["memory_unit"],
+                "legacy-unknown", _legacy_engine_fingerprint(row.get("evidence_json")),
+            ),
+        )
+    con.execute("DROP TABLE characterizations")
     con.execute("ALTER TABLE characterizations_new RENAME TO characterizations")
 
 
@@ -630,8 +945,14 @@ def _rekey_legacy(con: sqlite3.Connection) -> int:
             row["name"] for row in con.execute(f"PRAGMA table_info({table})")}  # noqa: S608
         if table == "calibrations" and "runtime" in columns:
             pk_rest = ("runtime", "backend", "config_key")
+            if "authority_key" in columns:
+                pk_rest = (*pk_rest, "authority_key")
         elif table == "characterizations" and "runtime" in columns:
             pk_rest = ("runtime", "backend", "artifact_id", "config_key")
+            if "authority_key" in columns:
+                pk_rest = (*pk_rest, "authority_key")
+            if "methodology_key" in columns:
+                pk_rest = (*pk_rest, "methodology_key", "engine_fingerprint")
         elif table == "benchmark_results" and "evidence_key" in columns:
             pk_rest = (*pk_rest, "evidence_key")
         n += _rekey_pk_table(con, table, pk_rest, ts)
@@ -678,27 +999,39 @@ def _now() -> str:
 def upsert_calibration(con: sqlite3.Connection, machine_key: str, engine: str, *,
                    fixed_overhead_gb: float, calibrated_at: str,
                    wall_gb: float | None = None, safe_budget_gb: float | None = None,
-                   config_key: str | None = None, evidence: dict | None = None) -> None:
+                   config_key: str | None = None, evidence: dict | None = None,
+                   environment_key: str = UNSCOPED_ENVIRONMENT_KEY,
+                   authority_key: str = UNSCOPED_AUTHORITY_KEY,
+                   memory_unit: str = "GiB", wall_bytes: int | None = None,
+                   safe_budget_bytes: int | None = None,
+                   authority_evidence: dict | None = None) -> None:
     from ara import targets
     runtime, backend, legacy_engine = targets.for_engine(engine)
     config_key = config_key or targets.calibration_config_key()
     con.execute(
         "INSERT INTO calibrations "
         "(machine_key,runtime,backend,config_key,legacy_engine,fixed_overhead_gb,"
-        "calibrated_at,wall_gb,safe_budget_gb,evidence_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(machine_key,runtime,backend,config_key) DO UPDATE SET "
+        "calibrated_at,wall_gb,safe_budget_gb,evidence_json,environment_key,authority_key,"
+        "memory_unit,wall_bytes,safe_budget_bytes,authority_evidence_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(machine_key,runtime,backend,config_key,authority_key) DO UPDATE SET "
         "legacy_engine=excluded.legacy_engine, "
         "fixed_overhead_gb=excluded.fixed_overhead_gb, calibrated_at=excluded.calibrated_at, "
         "wall_gb=excluded.wall_gb, safe_budget_gb=excluded.safe_budget_gb, "
-        "evidence_json=excluded.evidence_json",
+        "evidence_json=excluded.evidence_json, environment_key=excluded.environment_key, "
+        "memory_unit=excluded.memory_unit, wall_bytes=excluded.wall_bytes, "
+        "safe_budget_bytes=excluded.safe_budget_bytes, "
+        "authority_evidence_json=excluded.authority_evidence_json",
         (machine_key, runtime, backend, config_key, legacy_engine, fixed_overhead_gb,
-         calibrated_at, wall_gb, safe_budget_gb, _compact_json(evidence)))
+         calibrated_at, wall_gb, safe_budget_gb, _compact_json(evidence), environment_key,
+         authority_key, memory_unit, wall_bytes, safe_budget_bytes,
+         _compact_json(authority_evidence)))
     con.commit()
 
 
 def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
-                    *, config_key: str | None = None) -> dict | None:
+                    *, config_key: str | None = None,
+                    authority_key: str | None = None) -> dict | None:
     from ara import targets
     from ara.engine_identity import LEGACY_ENGINE_ALIASES
     runtime, backend, canonical = targets.for_engine(engine)
@@ -720,16 +1053,38 @@ def get_calibration(con: sqlite3.Connection, machine_key: str, engine: str,
                       legacy_engine=canonical, evidence_json=None, evidence=None)
         result["engine"] = canonical
         return result
+    clauses = ["machine_key=?", "runtime=?", "backend=?", "config_key=?"]
+    values = [machine_key, runtime, backend, config_key or targets.calibration_config_key()]
+    if authority_key is not None:
+        if "authority_key" not in columns:
+            # A pre-v6 read-only store has no exact authority to match. It remains useful as
+            # display history, but must never satisfy an authority-scoped operational lookup.
+            return None
+        clauses.append("authority_key=?")
+        values.append(authority_key)
+    authority_order = ", authority_key DESC" if "authority_key" in columns else ""
     row = con.execute(
-        "SELECT * FROM calibrations WHERE machine_key=? AND runtime=? AND backend=? "
-        "AND config_key=?",
-        (machine_key, runtime, backend,
-         config_key or targets.calibration_config_key())).fetchone()
+        f"SELECT * FROM calibrations WHERE {' AND '.join(clauses)} "  # noqa: S608
+        f"ORDER BY calibrated_at DESC{authority_order} LIMIT 1",
+        values).fetchone()
     if row is None:
         return None
     result = dict(row)
+    if "authority_key" not in columns:
+        environment, authority, unit, evidence_json, _display_only = (
+            _v6_authority_values(result))
+        result.update(
+            environment_key=environment,
+            authority_key=authority,
+            memory_unit=unit,
+            wall_bytes=None,
+            safe_budget_bytes=None,
+            authority_evidence_json=evidence_json,
+        )
     result["engine"] = result.get("legacy_engine") or canonical
     result["evidence"] = _json_object(result.get("evidence_json"))
+    result["authority_evidence"] = _json_object(
+        result.get("authority_evidence_json"))
     return result
 
 
@@ -815,11 +1170,19 @@ def get_model_artifact(con: sqlite3.Connection, artifact_id: str) -> dict | None
 def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str,
                           model_id: str, *, safe_context: int | None,
                           points: list, measured_at: str | None = None,
+                          direct_context: int | None = None,
+                          fitted_context: int | None = None,
+                          stopped_reason: str | None = None,
                           decode_context: int | None = None,
                           config: dict | None = None,
                           artifact_id: str | None = None,
                           evidence: dict | None = None,
-                          characterization_evidence: dict | None = None) -> None:
+                          characterization_evidence: dict | None = None,
+                          environment_key: str = UNSCOPED_ENVIRONMENT_KEY,
+                          authority_key: str = UNSCOPED_AUTHORITY_KEY,
+                          memory_unit: str = "GiB",
+                          methodology_key: str = "legacy-unknown",
+                          engine_fingerprint: str = "engine:legacy-unknown") -> None:
     stored_config = {} if config is None else config
     identity = _characterization_identity(
         engine, model_id, artifact_id, stored_config)
@@ -829,24 +1192,36 @@ def save_characterization(con: sqlite3.Connection, machine_key: str, engine: str
         artifact_confidence=identity["artifact_confidence"], evidence=evidence,
         preserve_existing_evidence=evidence is None,
     )
+    direct_context = safe_context if direct_context is None else direct_context
+    safe_context = direct_context
+    reusable = (identity["reusable"] and methodology_key != "legacy-unknown"
+                and engine_fingerprint != "engine:legacy-unknown")
     con.execute(
         "INSERT INTO characterizations "
         "(machine_key,runtime,backend,artifact_id,config_key,logical_model_id,legacy_engine,"
-        "safe_context,decode_context,config_json,points_json,evidence_json,artifact_confidence,"
-        "reusable,measured_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(machine_key,runtime,backend,artifact_id,config_key) DO UPDATE SET "
+        "safe_context,direct_context,fitted_context,decode_context,stopped_reason,config_json,"
+        "points_json,evidence_json,artifact_confidence,reusable,measured_at,environment_key,"
+        "authority_key,memory_unit,methodology_key,engine_fingerprint) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(machine_key,runtime,backend,artifact_id,config_key,authority_key,"
+        "methodology_key,engine_fingerprint) "
+        "DO UPDATE SET "
         "logical_model_id=excluded.logical_model_id,legacy_engine=excluded.legacy_engine,"
-        "safe_context=excluded.safe_context, decode_context=excluded.decode_context, "
+        "safe_context=excluded.safe_context,direct_context=excluded.direct_context,"
+        "fitted_context=excluded.fitted_context,decode_context=excluded.decode_context,"
+        "stopped_reason=excluded.stopped_reason,"
         "config_json=excluded.config_json,points_json=excluded.points_json,"
         "evidence_json=excluded.evidence_json,artifact_confidence=excluded.artifact_confidence,"
-        "reusable=excluded.reusable,measured_at=excluded.measured_at",
+        "reusable=excluded.reusable,measured_at=excluded.measured_at,"
+        "environment_key=excluded.environment_key,memory_unit=excluded.memory_unit",
         (machine_key, identity["runtime"], identity["backend"], identity["artifact_id"],
          identity["config_key"], model_id, identity["legacy_engine"], safe_context,
-         decode_context, json.dumps(stored_config, sort_keys=True), json.dumps(points),
+         direct_context, fitted_context, decode_context, stopped_reason,
+         json.dumps(stored_config, sort_keys=True), json.dumps(points),
          _compact_json(characterization_evidence if characterization_evidence is not None
                        else evidence),
-         identity["artifact_confidence"], identity["reusable"],
-         measured_at or _now()))
+         identity["artifact_confidence"], int(reusable), measured_at or _now(), environment_key,
+         authority_key, memory_unit, methodology_key, engine_fingerprint))
     con.commit()
 
 
@@ -874,6 +1249,11 @@ def _legacy_characterization_row(row: sqlite3.Row) -> dict:
     d["evidence_json"] = None
     d["evidence"] = None
     d["reusable"] = identity["reusable"] == 1
+    d["direct_context"] = d.get("safe_context")
+    d["fitted_context"] = None
+    d["stopped_reason"] = "legacy-unknown"
+    d["methodology_key"] = "legacy-unknown"
+    d["engine_fingerprint"] = "engine:legacy-unknown"
     return d
 
 
@@ -904,7 +1284,8 @@ def list_characterizations_for_display(
             values.append(value)
     rows = con.execute(
         f"SELECT * FROM characterizations WHERE {' AND '.join(clauses)} "  # noqa: S608
-        "ORDER BY logical_model_id,runtime,backend,measured_at,artifact_id,config_key",
+        "ORDER BY logical_model_id,runtime,backend,measured_at,artifact_id,config_key,"
+        "authority_key,methodology_key,engine_fingerprint",
         values).fetchall()
     return [_characterization_row(row) for row in rows]
 
@@ -921,29 +1302,54 @@ def get_characterization_for_display(
 
 def list_reusable_characterizations(
         con: sqlite3.Connection, machine_key: str, *, runtime: str | None = None,
-        backend: str | None = None, logical_model_id: str | None = None) -> list[dict]:
+        backend: str | None = None, logical_model_id: str | None = None,
+        authority_key: str | None = None, methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> list[dict]:
     """Return only explicitly reusable, artifact-bound target evidence."""
     return [row for row in list_characterizations_for_display(
         con, machine_key, runtime=runtime, backend=backend,
         logical_model_id=logical_model_id) if row["reusable"]
-        and row["artifact_confidence"] in {"strong", "observed_digest", "manifest_hash"}]
+        and row["methodology_key"] != "legacy-unknown"
+        and row["engine_fingerprint"] != "engine:legacy-unknown"
+        and row["artifact_confidence"] in {"strong", "observed_digest", "manifest_hash"}
+        and (authority_key is None or row.get("authority_key") == authority_key)
+        and (methodology_key is None or row["methodology_key"] == methodology_key)
+        and (engine_fingerprint is None
+             or row["engine_fingerprint"] == engine_fingerprint)]
 
 
 def get_reusable_characterization(
         con: sqlite3.Connection, machine_key: str, *, runtime: str, backend: str,
-        artifact_id: str, config_key: str) -> dict | None:
+        artifact_id: str, config_key: str, authority_key: str | None = None,
+        methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> dict | None:
     """Return the exact reusable target cell or ``None``; weak history never matches."""
     columns = {
         row["name"] for row in con.execute("PRAGMA table_info(characterizations)")}
     if "runtime" not in columns:
         rows = list_reusable_characterizations(
-            con, machine_key, runtime=runtime, backend=backend)
+            con, machine_key, runtime=runtime, backend=backend,
+            authority_key=authority_key, methodology_key=methodology_key,
+            engine_fingerprint=engine_fingerprint)
         return next((row for row in rows if row["artifact_id"] == artifact_id
                      and row["config_key"] == config_key), None)
+    clauses = []
+    values = [machine_key, runtime, backend, artifact_id, config_key]
+    if authority_key is not None:
+        clauses.append("authority_key=?")
+        values.append(authority_key)
+    if methodology_key is not None:
+        clauses.append("methodology_key=?")
+        values.append(methodology_key)
+    if engine_fingerprint is not None:
+        clauses.append("engine_fingerprint=?")
+        values.append(engine_fingerprint)
+    identity_clause = "" if not clauses else " AND " + " AND ".join(clauses)
     row = con.execute(
         "SELECT * FROM characterizations WHERE machine_key=? AND runtime=? AND backend=? "
-        "AND artifact_id=? AND config_key=? AND reusable=1",
-        (machine_key, runtime, backend, artifact_id, config_key)).fetchone()
+        f"AND artifact_id=? AND config_key=? AND reusable=1{identity_clause} "
+        "ORDER BY measured_at DESC, authority_key DESC LIMIT 1",
+        values).fetchone()
     if row is None:
         return None
     result = _characterization_row(row)
@@ -954,14 +1360,18 @@ def get_reusable_characterization(
 def get_reusable_characterization_for_engine(
         con: sqlite3.Connection, machine_key: str, engine: str,
         logical_model_id: str, *, config: dict,
-        artifact_id: str | None = None) -> dict | None:
+        artifact_id: str | None = None,
+        authority_key: str | None = None,
+        methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> dict | None:
     """Return the newest reusable native compatibility cell with an exact target config."""
     from ara import targets
     runtime, backend, _legacy_engine = targets.for_engine(engine)
     expected_key = targets.characterization_config_key(engine, config)
     rows = list_reusable_characterizations(
         con, machine_key, runtime=runtime, backend=backend,
-        logical_model_id=logical_model_id)
+        logical_model_id=logical_model_id, authority_key=authority_key,
+        methodology_key=methodology_key, engine_fingerprint=engine_fingerprint)
     candidates = [row for row in rows
                   if row["config_key"] == expected_key
                   and (artifact_id is None or row["artifact_id"] == artifact_id)]

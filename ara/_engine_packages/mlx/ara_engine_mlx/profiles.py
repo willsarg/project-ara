@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """Per-machine cold-start constants for the pre-flight base estimate.
 
-The crash wall, the ambient baseline, and per-model fits already adapt to the host
+The Metal working-set limit, ambient baseline, and per-model fits already adapt to the host
 at runtime. The only part still tied to the testbed is the cold-start base estimate for
 models that haven't been characterized yet: until a machine is calibrated it falls back to
 priors measured on the M4 Pro testbed. The native MLX calibration worker measures this machine's real
@@ -26,8 +26,8 @@ DEFAULT_FIXED_OVERHEAD_GB = 1.0
 def machine_key() -> tuple[str, int, int]:
     """(device_name, total_ram_bytes, macos_major) identifying the current machine.
 
-    total RAM is read in BYTES from mx.device_info()['memory_size'] (SystemLimits.total_gb
-    is already divided by 1e9, so it can't supply a stable integer key).
+    Total RAM is read in bytes from ``mx.device_info()['memory_size']`` so the key never
+    reconstructs exact authority from a floating-point GiB value.
     """
     import mlx.core as mx
     d = mx.device_info()

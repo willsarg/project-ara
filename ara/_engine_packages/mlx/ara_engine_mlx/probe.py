@@ -4,7 +4,7 @@
 
 Strategy:
   1. Pre-flight: estimate base footprint from weights.
-       * estimate >= hard wall  -> HARD REFUSE (hopeless; e.g. the 27B). Never probe.
+       * estimate >= Metal working-set limit -> HARD REFUSE (hopeless; e.g. the 27B). Never probe.
        * estimate >= threshold  -> borderline. Refuse UNLESS allow_min_probe, in which
          case run ONE supervised 512-token probe (deep in the safe zone) to replace the
          blind guess with ground truth, then decide.
@@ -14,18 +14,23 @@ Strategy:
      This isolates the model's footprint from background noise (browsers, IDEs, etc.).
   4. Before every rung, predict its ABSOLUTE peak = live_baseline + (model_base + slope*c)
      and STOP if it would cross the safe threshold.
-  5. Solve for the safe ceiling and hard wall against a reference baseline.
+  5. Solve for the safe ceiling and boundary projection against a reference baseline.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
+import time
+from dataclasses import asdict
 from dataclasses import dataclass
 
-from . import config, models, profiles
+from . import config, models, profiles, system, units
 from .system import SystemLimits, read_limits, sample_settled_baseline
 
 DEFAULT_RAMP = [2048, 8192, 16384, 32768, 49152, 65536, 98304, 131072]
@@ -61,7 +66,7 @@ def resolve_speed(speed: str, repeats: int | None = None) -> tuple[list[int], in
         raise ValueError(f"unknown speed preset: {speed!r} "
                          f"(choose from {', '.join(SPEED_PRESETS)})")
     return list(preset["ramp"]), preset["repeats"] if repeats is None else repeats
-# rough base-footprint estimate (GB): weights resident + fixed overhead, on top of the
+# rough base-footprint estimate (GiB): weights resident + fixed overhead, on top of the
 # live system baseline. Calibrated loosely on Gemma/Qwen; refined as more models run.
 # profiles.py is the source of truth for these cold-start defaults; aliased here for
 # backward references (tests / readers). Do not redefine — change them in profiles.py.
@@ -115,27 +120,175 @@ def estimate_base_gb(info: models.ModelInfo, limits: SystemLimits, overhead_gb: 
     return os_baseline + info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
 
 
+def _terminate_process_group(proc) -> None:
+    """Terminate, then kill, the worker's entire isolated process group and reap it."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def _telemetry_summary(baseline, samples, sample_times, interval: float) -> dict:
+    """Summarize strict host-wide samples without claiming an unsampled transient peak."""
+    final = samples[-1] if samples else baseline
+    gaps = [(b - a) * 1000 for a, b in zip(sample_times, sample_times[1:])]
+    highest = max(
+        baseline.wired_bytes,
+        max((sample.wired_bytes for sample in samples), default=baseline.wired_bytes),
+    )
+    return {
+        "schema": "macos-native-vm-telemetry:v1",
+        "scope": "host-wide",
+        "sampling_interval_ms": round(interval * 1000, 3),
+        "sample_count": len(samples),
+        "max_sample_gap_ms": round(max(gaps), 3) if gaps else 0.0,
+        "peak_qualification": "highest sampled; gaps unobserved",
+        "baseline": asdict(baseline),
+        "final": asdict(final),
+        "highest_sampled_host_wired_bytes": highest,
+        "compression_delta": {
+            "compressor_bytes": final.compressor_bytes - baseline.compressor_bytes,
+            "compressions": final.compressions - baseline.compressions,
+            "decompressions": final.decompressions - baseline.decompressions,
+        },
+        "swap_delta": {
+            "swapins": final.swapins - baseline.swapins,
+            "swapouts": final.swapouts - baseline.swapouts,
+            "swap_used_bytes": final.swap_used_bytes - baseline.swap_used_bytes,
+        },
+        "throttled_bytes_delta": final.throttled_bytes - baseline.throttled_bytes,
+    }
+
+
+def _supervise_process(cmd: list[str], *, context: int, abort_wired_bytes: int | None,
+                       timeout: float, sampling_interval: float = 0.05,
+                       snapshot_fn=system.native_vm_snapshot) -> dict:
+    """Run one model worker under strict external native VM telemetry."""
+    try:
+        baseline = snapshot_fn()
+    except Exception as exc:
+        return {"context": context, "status": "aborted",
+                "note": f"telemetry failed closed before launch: {exc}"}
+    if abort_wired_bytes is not None and baseline.wired_bytes >= abort_wired_bytes:
+        telemetry = _telemetry_summary(baseline, [], [], sampling_interval)
+        return {
+            "context": context,
+            "status": "aborted",
+            "note": ("baseline host wired memory already reached ARA boundary: "
+                     f"{baseline.wired_bytes} >= {abort_wired_bytes} bytes"),
+            "baseline_wired_bytes": baseline.wired_bytes,
+            "highest_sampled_host_wired_bytes": baseline.wired_bytes,
+            "telemetry": telemetry,
+        }
+    samples = []
+    sample_times = []
+    reason = None
+    with (tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file,
+          tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file):
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=stdout_file, stderr=stderr_file, text=True,
+                start_new_session=True)
+        except OSError as exc:
+            return {
+                "context": context,
+                "status": "aborted",
+                "note": f"probe worker launch failed closed: {exc}",
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": baseline.wired_bytes,
+                "telemetry": _telemetry_summary(
+                    baseline, [], [], sampling_interval),
+            }
+        started = time.monotonic()
+        while True:
+            if time.monotonic() - started >= timeout:
+                reason = f"probe worker timed out after {timeout:.0f}s (hung load?)"
+                _terminate_process_group(proc)
+                break
+            try:
+                sample = snapshot_fn()
+            except Exception as exc:
+                reason = f"telemetry failed closed: {exc}"
+                _terminate_process_group(proc)
+                break
+            samples.append(sample)
+            sample_times.append(time.monotonic())
+            if (abort_wired_bytes is not None
+                    and sample.wired_bytes >= abort_wired_bytes):
+                reason = ("sampled host wired memory reached ARA boundary: "
+                          f"{sample.wired_bytes} >= {abort_wired_bytes} bytes")
+                _terminate_process_group(proc)
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(sampling_interval)
+        telemetry = _telemetry_summary(
+            baseline, samples, sample_times, sampling_interval)
+        if reason is not None or not samples:
+            return {
+                "context": context, "status": "aborted",
+                "note": reason or "telemetry failed closed: zero successful samples",
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": telemetry[
+                    "highest_sampled_host_wired_bytes"],
+                "telemetry": telemetry,
+            }
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        line = next((line for line in stdout_file if line.startswith("{")), None)
+        if line is None:
+            return {
+                "context": context, "status": "load_error",
+                "note": _summarize_worker_error(stderr_file.read()),
+                "baseline_wired_bytes": baseline.wired_bytes,
+                "highest_sampled_host_wired_bytes": telemetry[
+                    "highest_sampled_host_wired_bytes"],
+                "telemetry": telemetry,
+            }
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return {"context": context, "status": "load_error",
+                    "note": f"worker emitted invalid JSON: {exc}", "telemetry": telemetry}
+        result.update(
+            baseline_wired_bytes=baseline.wired_bytes,
+            highest_sampled_host_wired_bytes=telemetry[
+                "highest_sampled_host_wired_bytes"],
+            baseline_wired_gb=units.bytes_to_gib(baseline.wired_bytes),
+            os_wired_gb=units.bytes_to_gib(
+                telemetry["highest_sampled_host_wired_bytes"]),
+            telemetry=telemetry,
+        )
+        if "mlx_peak_bytes" in result:
+            result["mlx_peak_gb"] = units.bytes_to_gib(result["mlx_peak_bytes"])
+        if "mlx_active_plus_cache_bytes" in result:
+            result["mlx_true_gb"] = units.bytes_to_gib(
+                result["mlx_active_plus_cache_bytes"])
+        return result
+
+
 def _run_worker(py: str, hf_id: str, ctx: int, kv_bits, abort_wired_gb=None,
                 timeout: float = 600) -> dict:
     cmd = [py, "-m", "ara_engine_mlx.probe_worker", hf_id, str(ctx)]
     if kv_bits is not None:
         cmd += ["--kv-bits", str(kv_bits)]
-    if abort_wired_gb is not None:
-        cmd += ["--abort-wired-gb", str(abort_wired_gb)]
-    # Bound the subprocess (parity with the CUDA probe) so a wedged worker — a stalled HF load or a
-    # GPU/driver hang before the L5 wired-mem watchdog can trip — can't block the ramp forever. A
-    # timeout is reported as a dead worker (no JSON line), the caller's existing load_error path.
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"status": "load_error",
-                "note": f"probe worker timed out after {timeout:.0f}s (hung load?)"}
-    line = next((l for l in out.stdout.splitlines() if l.startswith("{")), None)
-    if not line:
-        # No JSON line -> the worker died (usually a model-load error). Return a
-        # one-line summary so the caller can render it cleanly.
-        return {"status": "load_error", "note": _summarize_worker_error(out.stderr)}
-    return json.loads(line)
+    abort_wired_bytes = (units.gib_to_bytes(abort_wired_gb)
+                         if abort_wired_gb is not None else None)
+    return _supervise_process(
+        cmd, context=ctx, abort_wired_bytes=abort_wired_bytes, timeout=timeout)
 
 
 def _summarize_worker_error(stderr: str) -> str:
@@ -163,7 +316,7 @@ def _summarize_worker_error(stderr: str) -> str:
 def _measure_rung(py: str, hf_id: str, ctx: int, kv_bits, repeats: int, *, verbose, log):
     """Run a rung `repeats` times in fresh processes; return the MEDIAN high-water.
 
-    Each prefill can land its peak between sampler windows (±~1GB jitter), so a single run
+    Each prefill can land its peak between sampler windows (±~1GiB jitter), so a single run
     makes ceilings look erratic. The median of N isolated runs is the textbook smoother.
     Returns a dict with median os_wired/delta/mlx_peak, or the first failure dict / None.
     """
@@ -264,12 +417,13 @@ def characterize(hf_id: str, *, margin_gb: float | None = None, ramp=None,
                 "run_id": run_id}
 
     if est >= wall:
-        return _refuse(f"estimated base {est:.2f}GB >= hard wall {wall:.2f}GB — "
-                       f"cannot load without breaching the wall. Never probe.", "hopeless")
+        return _refuse(f"estimated base {est:.2f}GiB >= Metal working-set limit "
+                       f"{wall:.2f}GiB — ARA cannot prove a safe launch. Never probe.",
+                       "hopeless")
     if est >= threshold:
         if not allow_min_probe:
-            return _refuse(f"estimated base {est:.2f}GB >= safe threshold {threshold:.2f}GB "
-                           f"(but < wall {wall:.2f}GB). Borderline — re-run with --min-probe "
+            return _refuse(f"estimated base {est:.2f}GiB >= safe threshold {threshold:.2f}GiB "
+                           f"(but < wall {wall:.2f}GiB). Borderline — re-run with --min-probe "
                            f"to measure the true base with a supervised 512-token probe.",
                            "borderline")
         # supervised minimal probe: deep in the safe zone, replaces the blind guess
@@ -290,7 +444,7 @@ def characterize(hf_id: str, *, margin_gb: float | None = None, ramp=None,
                                         "delta_gb": true_delta, "peak_gb": m["mlx_peak_gb"],
                                         "repeats": 1, "spread_gb": 0.0})
         if true_abs >= threshold:
-            return _refuse(f"measured base {true_abs:.2f}GB >= threshold {threshold:.2f}GB "
+            return _refuse(f"measured base {true_abs:.2f}GiB >= threshold {threshold:.2f}GiB "
                            f"— genuinely too tight, not just a pessimistic estimate.",
                            "borderline")
         xs_k.append(MIN_PROBE_CTX / 1000)
@@ -442,11 +596,11 @@ def _calibrate_one(hf_id: str, *, margin_gb: float, repeats: int, prior_overhead
     est = estimate_base_gb(info, limits, prior_overhead_gb)
     if est >= threshold:
         _abort(
-            f"[calibrate] estimated base {est:.2f}GB >= threshold {threshold:.2f}GB — "
+            f"[calibrate] estimated base {est:.2f}GiB >= threshold {threshold:.2f}GiB — "
             f"machine too loaded or model too large to calibrate safely. Free memory or "
             f"pass a smaller --model.",
-            f"estimated load ({est:.2f} GB) is at/over the safe budget "
-            f"({threshold:.2f} GB) — the machine is too loaded, or this model is too "
+            f"estimated load ({est:.2f} GiB) is at/over the safe budget "
+            f"({threshold:.2f} GiB) — the machine is too loaded, or this model is too "
             f"big, to calibrate safely.", kind="memory")
 
     factor, overhead = profiles.DEFAULT_RESIDENT_FACTOR, prior_overhead_gb
@@ -467,11 +621,11 @@ def _calibrate_one(hf_id: str, *, margin_gb: float, repeats: int, prior_overhead
         predicted = live_base + model_base + slope * (ctx / 1000)
         if predicted >= threshold:
             _abort(
-                f"[calibrate] predicted {predicted:.2f}GB (live {live_base:.2f} + model "
+                f"[calibrate] predicted {predicted:.2f}GiB (live {live_base:.2f} + model "
                 f"{model_base:.2f} + slope {slope:.4f}*{ctx/1000:.1f}k) >= threshold "
-                f"{threshold:.2f}GB before rung {ctx}; aborting (free memory and retry).",
-                f"predicted {predicted:.2f} GB at {ctx:,} tok would reach the safe budget "
-                f"({threshold:.2f} GB) before measuring — aborting before any risk.",
+                f"{threshold:.2f}GiB before rung {ctx}; aborting (free memory and retry).",
+                f"predicted {predicted:.2f} GiB at {ctx:,} tok would reach the safe budget "
+                f"({threshold:.2f} GiB) before measuring — aborting before any risk.",
                 kind="memory")
         m = _measure_rung(py, hf_id, ctx, kv_bits, repeats, verbose=verbose, log=log)
         if m is None or m.get("status") != "ok":

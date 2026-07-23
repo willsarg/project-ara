@@ -10,10 +10,11 @@ the internals churn — complementing the per-command behaviour tests in test_cl
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 
-from ara import cli
+from ara import cli, methodology
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
 
 
@@ -23,7 +24,7 @@ def _machine() -> Machine:
         cpu_physical=12, cpu_logical=12, cpu_features=["NEON"],
         python_version="3.12.8", ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0,
+        disk_free_gb=500.0, physical_memory_bytes=48 * 1024 ** 3,
         runtimes=[Runtime("MLX", True, "0.18", kind="engine", accels=("apple",), usable=True)],
         framework_python="/usr/bin/python3",
         model_stores=[ModelStore("HF cache", True, 3, 12.0)],
@@ -36,7 +37,14 @@ class _FakeBackend:
     CALIBRATION_MODEL = "org/calib"
 
     def characterize(self, model, *, progress=False, kv_quant="f16"):
-        return {"model": model, "safe_context": 8192, "decode_context": None,
+        descriptor = methodology.characterization_descriptor(
+            schedule=[512], repeats=1, reserve_policy="test", reserve_bytes=1024,
+            worker_protocol="test:v1", sampling_interval_ms=50,
+            telemetry_failure_policy="fail-closed", watchdog_stop_rule="test-stop")
+        return {"model": model, "safe_context": 8192, "direct_context": 8192,
+                "fitted_context": None, "stopped_reason": None,
+                "methodology": descriptor, "methodology_key": methodology.key(descriptor),
+                "decode_context": None,
                 "binding": "context_window",
                 "points": [{"context": 512, "mem_gb": 1.2}]}   # real dict-point shape
 
@@ -81,7 +89,16 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
-    monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key: None)
+    monkeypatch.setattr(cli.calibration, "get_calibration", lambda con, key, **kwargs: None)
+    monkeypatch.setattr(
+        cli.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: types.SimpleNamespace(
+            key="mlx-authority:contract",
+            environment_key="mlx-environment:contract",
+            evidence={"schema": "mlx-memory-authority:v1"},
+        ),
+    )
     monkeypatch.setattr(cli.hub, "search", lambda q: [{"id": "org/m"}])
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (True, "MLX engine"))
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
@@ -106,7 +123,6 @@ CONTRACT = [
     (["mlx", "--json"], dict, "apple_silicon"),
     (["models", "show", "org/m", "--json"], dict, "model_id"),
     (["models", "search", "smol", "--json"], list, None),
-    (["models", "recommend", "--json"], list, None),
     (["characterize", "org/m", "--json"], dict, "safe_context"),
     (["profile", "--json"], dict, "device"),
     (["install", "--engine", "mlx", "--json"], dict, "status"),
@@ -131,6 +147,25 @@ def test_command_emits_valid_json(mocked_world, monkeypatch, capsys, argv, kind,
     assert isinstance(payload, kind), f"{argv} → {type(payload).__name__}, want {kind.__name__}"
     if anchor is not None:
         assert anchor in payload, f"{argv} JSON missing '{anchor}'"
+
+
+def test_models_recommend_json_errors_without_current_mlx_budget(
+        mocked_world, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["ara", "models", "recommend", "--json"])
+    assert cli.main() == 1
+    assert _extract_json(capsys.readouterr().out) == {
+        "error": "no current MLX budget is available for a safe ranking"
+    }
+
+
+def test_models_recommend_explicit_mlx_json_errors_without_current_budget(
+        mocked_world, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv", ["ara", "models", "recommend", "--engine", "mlx", "--json"])
+    assert cli.main() == 1
+    assert _extract_json(capsys.readouterr().out) == {
+        "error": "no current MLX budget is available for a safe ranking"
+    }
 
 
 def test_unknown_command_is_a_click_usage_error(mocked_world, capsys):
@@ -178,9 +213,12 @@ def test_models_list_is_a_click_usage_error_not_a_model_alias(mocked_world, caps
 ])
 def test_deprecated_aliases_warn_only_on_stderr_and_keep_json_exact(
         mocked_world, capsys, argv, warning):
-    assert cli.main(argv) == 0
+    expected_status = 1 if argv[0] == "recommend" else 0
+    assert cli.main(argv) == expected_status
     captured = capsys.readouterr()
-    json.loads(captured.out)
+    payload = json.loads(captured.out)
+    if argv[0] == "recommend":
+        assert payload == {"error": "no current MLX budget is available for a safe ranking"}
     assert captured.err == warning
 
 

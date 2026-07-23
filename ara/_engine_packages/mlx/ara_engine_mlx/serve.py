@@ -509,7 +509,7 @@ def main(argv=None) -> None:
     )
     ap.add_argument(
         "--measured-slope", type=float, default=None,
-        help="Measured ramp slope (GB per 1k tokens) fit from this model's characterization on "
+        help="Measured ramp slope (GiB per 1k tokens) fit from this model's characterization on "
              "this machine. When ARA serves the model's own measured ceiling it passes this so the "
              "gate predicts with the real growth, not the conservative a-priori slope. Omit for "
              "the a-priori gate (uncharacterized / --ctx serves).",

@@ -773,6 +773,13 @@ def test_mem_macos_apple_silicon_no_modules():
     assert mi.slots_total is None
 
 
+def test_mem_macos_preserves_exact_physical_memory_bytes():
+    physical_bytes = 25_769_803_776
+    mi = hw._mem_macos(_MACOS_SPMEMORY, (physical_bytes, 24.0, 18.0, 0.0))
+    assert mi.physical_memory_bytes == physical_bytes
+    assert mi.total_gb == 24.0
+
+
 def test_mem_macos_missing_type_line():
     """SPMemoryDataType with no 'Type:' line → kind=None (honest gap)."""
     text = "Hardware Overview:\n\n      Memory: 16 GB\n"
@@ -2573,13 +2580,14 @@ def test_clamp_ram_to_cgroup_ignores_cgroup_off_linux(cgroup_files, monkeypatch)
 
 
 def test_psutil_totals_clamps_total_to_cgroup(cgroup_files, monkeypatch):
-    """The Rule #1 clamp lives at the source: _psutil_totals reports the cgroup wall, not host RAM."""
+    """Keep exact physical bytes while the compatibility total remains cgroup-honest."""
     import psutil
     monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
     monkeypatch.setattr(psutil, "virtual_memory",
                         lambda: type("vm", (), {"total": 32 * hw.GB, "available": 20 * hw.GB})())
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
     cgroup_files[hw._CGROUP_V2] = str(8 * hw.GB)                      # container capped at 8 GiB
-    total_gb, available_gb, _swap = hw._psutil_totals()
+    physical_bytes, total_gb, available_gb, _swap = hw._psutil_totals()
+    assert physical_bytes == 32 * hw.GB
     assert total_gb == 8.0                                            # clamped, not 32
     assert available_gb == 20.0                                       # available is left untouched

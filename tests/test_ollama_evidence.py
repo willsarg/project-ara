@@ -114,6 +114,8 @@ def _complete_characterization(store, *, authority=None, model=None):
         points=[point],
         artifact_id="ollama-manifest-sha256:" + model.digest,
         config=config,
+        methodology_key="methodology:ollama-physical-walls-v1",
+        engine_fingerprint="engine:ollama-runtime-test",
     )
     return model, authority
 

@@ -2,7 +2,7 @@
 # Copyright 2026 Will Sarg
 """The ramp contract: fit memory-vs-context, solve for the safe context ceiling.
 
-For hardware with a hard memory wall (Apple, CUDA, ROCm, …), a model's footprint grows
+For memory-bounded accelerators (Apple, CUDA, ROCm, …), a model's footprint grows
 ~linearly with context as the KV cache fills. ARA owns this methodology so the number means
 the same thing on every ramp-class backend; engines only supply safe ``(context, memory)``
 measurements. Preserves the predecessor MLX engine's proven fit (least-squares ``y = a + b·x``, x in thousands
@@ -10,7 +10,7 @@ of tokens) and ceiling solve.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Memory is binary GiB everywhere in ARA (detect/workers/fits all divide bytes by 1024**3 and
 # call it "gb"). The analytic KV slope must use the SAME unit, or the ceiling solve mixes a GiB
@@ -26,13 +26,13 @@ class RampError(ValueError):
 class Fit:
     """A fitted memory curve: ``mem_gb = intercept_gb + slope_gb_per_k · (ctx/1000)``."""
     intercept_gb: float    # memory extrapolated to zero context (model + OS base)
-    slope_gb_per_k: float  # GB added per 1000 tokens of context
+    slope_gb_per_k: float  # GiB added per 1000 tokens of context
     r2: float              # goodness of fit, 0..1
     n_points: int
 
 
 def fit(points: list[tuple[int, float]]) -> Fit:
-    """Least-squares fit of memory (GB) against context (tokens) from safe measurements.
+    """Least-squares fit of memory (GiB) against context (tokens) from safe measurements.
 
     *points* are ``(context_tokens, mem_gb)``. Needs at least two points at two distinct
     contexts, else a line is undetermined — raises :class:`RampError`.
@@ -77,16 +77,24 @@ def would_breach(base_gb: float, slope_gb_per_k: float, ctx_tokens: int,
 
 @dataclass(frozen=True)
 class RampResult:
-    """Outcome of a safe ramp: the ceiling (or None), the fit, and the points gathered.
+    """Outcome of a safe ramp with direct evidence separated from fitted advice.
 
     ``binding`` says what limits the ceiling — ``"memory"`` (the safe budget) or
     ``"context_window"`` (the model's own ``max_context``, which memory would otherwise exceed).
     """
-    safe_context: int | None
+    direct_context: int | None
+    fitted_context: int | None
     fit: Fit | None
     points: list[tuple[int, float]]
     stopped_reason: str
     binding: str = "memory"
+    aborted_at: int | None = None
+    telemetry: dict[int, dict] = field(default_factory=dict)
+
+    @property
+    def safe_context(self) -> int | None:
+        """One-release compatibility alias; only direct evidence may govern workloads."""
+        return self.direct_context
 
 
 # Bisection bounds for refining the ceiling between the highest safe context and a measured
@@ -96,7 +104,8 @@ BISECT_MIN_GAP = 256       # tokens — stop when the safe/abort bracket is this
 BISECT_MAX_STEPS = 6       # hard cap on bisection probes
 
 
-def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]]) -> int:
+def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]],
+                    telemetry: dict[int, dict]) -> int:
     """Refine the highest safe context in ``[lo, hi)``: *lo* is known-safe, *hi* a measured abort.
 
     Probes midpoints — each guarded by the engine's own L4/L5, since the abort proved the
@@ -109,6 +118,8 @@ def _bisect_ceiling(measure_fn, lo: int, hi: int, points: list[tuple[int, float]
         mid = (lo + hi) // 2
         steps += 1
         m = measure_fn(mid)
+        if getattr(m, "telemetry", None) is not None:
+            telemetry[mid] = m.telemetry
         if m.refused:
             hi = mid
         else:
@@ -130,12 +141,13 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
 
     Two regimes produce the ceiling. If no rung ever aborts, the model grows gently and the
     fitted line extrapolates the ceiling (capped at the model's window). If a rung **aborts**
-    (engine L4/L5 veto, or ARA's L2), that abort is a hard wall — extrapolating past it would
+    (engine L4/L5 veto, or ARA's L2), that abort is a measured upper bound — extrapolating past it would
     claim unsafe contexts are safe — so the ramp bisects ``[highest safe, abort)`` and reports
     the highest *confirmed-safe* context (always memory-bound). A single safe measurement with
     no abort is still a real lower bound and is reported as the ceiling, not discarded.
     """
     points: list[tuple[int, float]] = []
+    telemetry: dict[int, dict] = {}
     measured: set[int] = set()
     aborted_at: int | None = None
     while True:
@@ -152,6 +164,8 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         if ctx is None:
             break
         m = measure_fn(ctx)
+        if getattr(m, "telemetry", None) is not None:
+            telemetry[ctx] = m.telemetry
         measured.add(ctx)
         if m.refused:
             aborted_at = ctx
@@ -165,18 +179,21 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
     # report None rather than reloading it at ever-smaller contexts (RULE #1 + cost).
     if aborted_at is not None:
         if not safe_points:
-            return RampResult(None, None, points, "aborted at smallest context")
-        ceiling = _bisect_ceiling(measure_fn, max(safe_points), aborted_at, points)
+            return RampResult(None, None, None, points, "aborted at smallest context",
+                              aborted_at=aborted_at, telemetry=telemetry)
+        ceiling = _bisect_ceiling(
+            measure_fn, max(safe_points), aborted_at, points, telemetry)
         points.sort()
         f = fit(points) if len(points) >= 2 else None
-        return RampResult(ceiling, f, points, "bracketed below abort", "memory")
+        return RampResult(ceiling, None, f, points, "bracketed below abort", "memory",
+                          aborted_at, telemetry)
 
     # No abort. With <2 points a line is undetermined, but a single safe measurement is still a
     # real lower bound — report it (None only if nothing was ever measured safely).
     if len(points) < 2:
         ceiling = max(safe_points) if safe_points else None
         reason = "single safe point" if safe_points else "insufficient points"
-        return RampResult(ceiling, None, points, reason)
+        return RampResult(ceiling, None, None, points, reason, telemetry=telemetry)
 
     # Gentle linear regime: fit + extrapolate to the budget, capped at the model's window.
     f = fit(points)
@@ -193,7 +210,8 @@ def run(measure_fn, schedule: list[int], base_gb: float, slope_gb_per_k: float,
         ceiling, binding = max_context, "context_window"
     elif ceiling is None and measured_window:
         ceiling, binding = max_context, "context_window"
-    return RampResult(ceiling, f, points, "ok", binding)
+    return RampResult(max(safe_points), ceiling, f, points, "ok", binding,
+                      telemetry=telemetry)
 
 
 def plan_next(schedule: list[int], measured, base_gb: float,
@@ -214,7 +232,7 @@ def plan_next(schedule: list[int], measured, base_gb: float,
 
 
 def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2):
-    """Analytic fp16 KV-cache growth, GB per 1000 tokens, from model metadata.
+    """Analytic fp16 KV-cache growth, GiB per 1000 tokens, from model metadata.
 
     2 (K and V) · n_layers · kv_heads · head_dim · kv_dtype_bytes bytes per token. Returns None
     if any dimension is missing or zero (can't estimate). Uses TOTAL n_layers (over-counts KV for
@@ -227,8 +245,8 @@ def analytic_kv_slope_gb_per_k(n_layers, kv_heads, head_dim, *, kv_dtype_bytes=2
     trace confirmed binary GiB is correct here. At the sole ``decode_ceiling`` call site
     (estimate.model_fit), the budget is binary GiB on every backend — RAM is ``vm.total/1024³``
     and CUDA VRAM is nvidia-smi MiB ``/1024`` — and the two decimal leaks feeding it (the
-    weights intercept, on-disk bytes/1e9; the MLX engine's measured wall) are now converted at their
-    boundaries (estimate.model_fit; backends/apple). test_analytic_kv_slope_uses_binary_gib_
+    weights intercept, on-disk bytes/1e9) are converted at their boundaries
+    (estimate.model_fit). test_analytic_kv_slope_uses_binary_gib_
     not_decimal_gb pins this. Slug 2026-07-02-analytic-units-gib.
     """
     if not (n_layers and kv_heads and head_dim):

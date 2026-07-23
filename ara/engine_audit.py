@@ -68,9 +68,22 @@ print(json.dumps({
 
 
 _MLX_PROBE = r"""
+import hashlib
 import importlib.metadata as metadata
+import importlib.util
 import json
+from pathlib import Path
 import mlx.core as mx
+
+engine_spec = importlib.util.find_spec("ara_engine_mlx")
+engine_root = Path(next(iter(engine_spec.submodule_search_locations))).resolve()
+source_hash = hashlib.sha256()
+for source in sorted(
+        path for path in engine_root.rglob("*.py")
+        if "__pycache__" not in path.parts):
+    source_hash.update(source.relative_to(engine_root).as_posix().encode())
+    source_hash.update(b"\0")
+    source_hash.update(source.read_bytes())
 
 metal_available = bool(mx.metal.is_available())
 gpu_count = int(mx.device_count(mx.gpu))
@@ -89,6 +102,9 @@ except Exception as exc:
 print(json.dumps({
     "kind": "mlx",
     "package_version": metadata.version("mlx"),
+    "mlx_lm_version": metadata.version("mlx-lm"),
+    "engine_package_version": metadata.version("ara-engine-mlx"),
+    "engine_source_digest": "sha256:" + source_hash.hexdigest(),
     "metal_available": metal_available,
     "gpu_count": gpu_count,
     "operation_ok": operation_ok,
@@ -119,7 +135,8 @@ def _stable_probe(probe: dict[str, Any]) -> dict[str, Any]:
         "llama_cpp": ("kind", "package_version", "python_arch", "system_info"),
         "torch_cuda": ("kind", "package_version", "cuda_build", "arch_list",
                        "device", "capability"),
-        "mlx": ("kind", "package_version", "device", "architecture"),
+        "mlx": ("kind", "package_version", "mlx_lm_version",
+                "engine_package_version", "engine_source_digest", "device", "architecture"),
     }.get(kind, tuple(sorted(probe)))
     return {key: probe.get(key) for key in keys}
 
@@ -134,7 +151,7 @@ def _fingerprint(key: str, version: str | None, schema: str | None,
     }
     digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return f"engine:v1:sha256:{digest}"
+    return f"engine:v2:sha256:{digest}"
 
 
 def _strongest_simd(host_features: list[str]) -> str | None:

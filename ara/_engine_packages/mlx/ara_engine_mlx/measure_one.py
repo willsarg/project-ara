@@ -21,10 +21,10 @@ import json
 import statistics
 import sys
 
-from . import models, probe, profiles, system
+from . import models, probe, profiles, system, units
 
 # Repeat each rung in fresh processes and take the median: a single prefill peak lands
-# between sampler windows (±~1GB jitter), so one shot makes ceilings erratic.
+# between sampler windows (±~1GiB jitter), so one shot makes ceilings erratic.
 DEFAULT_REPEATS = 3
 
 
@@ -52,21 +52,21 @@ def safety_gate(info, limits, ctx: int, *, margin_gb: float, overhead_gb: float,
     UNcharacterized models) over-predicts and would refuse a safe serve. Crucially this only
     swaps the slope — the base-load check and the *current* live baseline still apply, so a
     busier machine at serve time still refuses honestly. Rule #1 is preserved: the ceiling was
-    empirically measured safe, and the L5 runtime watchdog remains the hard backstop.
+    empirically measured safe, and the external native-VM supervisor remains the hard backstop.
     Slug 2026-07-02-wmx-serve-measured-provenance-gate.
     """
     threshold = limits.safe_threshold_gb(margin_gb)
     est_base = probe.estimate_base_gb(info, limits, overhead_gb)
     if est_base >= threshold:
-        return (f"base estimate {est_base:.2f}GB >= safe budget {threshold:.2f}GB — "
+        return (f"base estimate {est_base:.2f}GiB >= safe budget {threshold:.2f}GiB — "
                 f"won't load")
     model_base = info.weights_gb * profiles.DEFAULT_RESIDENT_FACTOR + overhead_gb
     slope = (measured_slope_gb_per_k if measured_slope_gb_per_k is not None
              else info.estimated_slope_gb_per_k(_effective_kv_bits(info, kv_bits)))
     predicted = live_base + model_base + slope * (ctx / 1000)
     if predicted >= threshold:
-        return (f"predicted {predicted:.2f}GB at {ctx} tok >= safe budget "
-                f"{threshold:.2f}GB")
+        return (f"predicted {predicted:.2f}GiB at {ctx} tok >= safe budget "
+                f"{threshold:.2f}GiB")
     return None
 
 
@@ -97,15 +97,18 @@ def preflight(hf_id: str, *, margin_gb: float, overhead_gb: float,
 def _spawn_worker(hf_id: str, ctx: int, kv_bits, abort_wired_gb) -> dict:
     """Run the isolated probe worker in this interpreter; return its raw result dict.
 
-    The worker is handed the hard wired limit (the safe budget) so its own watchdog (L5)
-    can abort if the live footprint reaches it despite the pre-flight gate.
+    The parent engine process supervises the worker with native host-wide VM samples and
+    terminates its process group if the sampled footprint reaches the safe budget.
     """
     return probe._run_worker(sys.executable, hf_id, ctx, kv_bits,
                              abort_wired_gb=abort_wired_gb)
 
 
-def _refused(ctx: int, reason: str) -> dict:
-    return {"context": ctx, "refused": True, "reason": reason}
+def _refused(ctx: int, reason: str, telemetry: dict | None = None) -> dict:
+    result = {"context": ctx, "refused": True, "reason": reason}
+    if telemetry is not None:
+        result["telemetry"] = telemetry
+    return result
 
 
 def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float,
@@ -132,12 +135,36 @@ def run(hf_id: str, ctx: int, *, margin_gb: float, overhead_gb: float,
 
     threshold = limits.safe_threshold_gb(margin_gb)
     deltas = []
+    telemetry_repeats = []
+    allocator_observations = []
     for _ in range(max(1, repeats)):
         raw = _spawn_worker(hf_id, ctx, kv_bits, abort_wired_gb=threshold)
         if raw.get("status") != "ok":
-            return _refused(ctx, f"probe failed: {raw.get('note', 'no output')}")
-        deltas.append(raw["os_wired_gb"] - raw["baseline_wired_gb"])
-    return {"context": ctx, "mem_gb": round(statistics.median(deltas), 3)}
+            failed_repeats = list(telemetry_repeats)
+            if raw.get("telemetry"):
+                failed_repeats.append(raw["telemetry"])
+            return _refused(
+                ctx, f"probe failed: {raw.get('note', 'no output')}",
+                {"schema": "mlx-external-vm-supervision:v1",
+                 "repeats": failed_repeats} if failed_repeats else None)
+        delta_bytes = (raw["highest_sampled_host_wired_bytes"]
+                       - raw["baseline_wired_bytes"])
+        deltas.append(units.bytes_to_gib(delta_bytes))
+        telemetry_repeats.append(raw["telemetry"])
+        allocator_observations.append({
+            "mlx_peak_bytes": raw["mlx_peak_bytes"],
+            "mlx_active_plus_cache_bytes": raw["mlx_active_plus_cache_bytes"],
+        })
+    return {
+        "context": ctx,
+        "mem_gb": round(statistics.median(deltas), 3),
+        "telemetry": {
+            "schema": "mlx-external-vm-supervision:v1",
+            "scope": "host-wide-samples-plus-mlx-allocator",
+            "repeats": telemetry_repeats,
+            "mlx_allocator_observations": allocator_observations,
+        },
+    }
 
 
 def main(argv=None) -> None:

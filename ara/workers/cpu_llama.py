@@ -110,10 +110,10 @@ def safety_gate(*, base_gb: float, slope_gb_per_k: float, ctx: int,
     model). Two conservative ``>=`` checks: the model must load at all, and the prediction at
     *ctx* must stay under budget. Returns a reason to refuse, or None when safe."""
     if base_gb >= budget_gb:
-        return f"base estimate {base_gb:.2f}GB >= safe budget {budget_gb:.2f}GB — won't load"
+        return f"base estimate {base_gb:.2f}GiB >= safe budget {budget_gb:.2f}GiB — won't load"
     predicted = base_gb + slope_gb_per_k * (ctx / 1000)
     if predicted >= budget_gb:
-        return (f"predicted {predicted:.2f}GB at {ctx} tok >= safe budget {budget_gb:.2f}GB")
+        return (f"predicted {predicted:.2f}GiB at {ctx} tok >= safe budget {budget_gb:.2f}GiB")
     return None
 
 

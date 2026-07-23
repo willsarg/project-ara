@@ -23,7 +23,7 @@ from pathlib import Path
 
 import psutil
 
-from ara import db, detect, hardware, profile
+from ara import db, detect, hardware, measurement_authority, profile
 from ara.node import config
 
 # platform.system() → the environment schema's platform enum (linux | darwin | windows).
@@ -120,7 +120,16 @@ def advertised_capabilities() -> list[dict]:
         rows = db.list_reusable_characterizations(con, profile.machine_key())
     node_id = config.node_identity()
     result = []
+    authorities = {}
     for row in rows:
+        engine = row["legacy_engine"]
+        if engine not in authorities:
+            authorities[engine] = measurement_authority.current_measurement_authority(
+                engine)
+        current_authority = authorities[engine]
+        if measurement_authority.measurement_status(
+                row, current_authority) != "current":
+            continue
         safe_context = row.get("safe_context")
         if (not isinstance(safe_context, int) or isinstance(safe_context, bool)
                 or safe_context <= 0):
@@ -128,7 +137,7 @@ def advertised_capabilities() -> list[dict]:
         cap = {
             "kind": "serve_model",
             "id": row["logical_model_id"],
-            "engine": row["legacy_engine"],
+            "engine": engine,
             "evidence": "characterized",
             "runtime": row["runtime"],
             "backend": row["backend"],

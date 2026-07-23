@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Will Sarg
-"""System memory facts for this machine.
+"""Live Metal memory facts for this machine, expressed in binary GiB.
 
-The crash wall is NOT total RAM — it's the GPU/Metal recommended working-set size
-(max_recommended_working_set_size), because MLX allocates wired (non-swappable) Metal
-buffers. It is read LIVE per machine and treated as an exact, measured value — never
-approximated, because rounding toward the wall is how you crash. On the M4 Pro testbed
-(24 GB) it is 17.18 GB (67% of total). Crossing it, with almost no swap, can hard-lock
-the system.
+ARA derives its conservative governance boundary from Metal's recommended working-set
+size and keeps an additional policy margin below it. Exact byte values remain available
+for durable authority; GiB floats are used only for memory arithmetic and presentation.
 """
 from __future__ import annotations
 
@@ -17,32 +14,58 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+from . import units
 from .config import DEFAULT_MARGIN_GB
 
 
 @dataclass(frozen=True)
 class SystemLimits:
     device: str
+    memory_size_bytes: int
+    recommended_working_set_bytes: int
+    max_buffer_length_bytes: int
     total_gb: float
-    wall_gb: float          # max_recommended_working_set_size — the crash wall
+    wall_gb: float          # Metal recommended working-set size in GiB
     max_buffer_gb: float    # largest single allocation Metal allows
     swap_free_gb: float | None
     wired_now_gb: float      # OS-wired memory right now (baseline pressure)
 
     def safe_threshold_gb(self, margin_gb: float = DEFAULT_MARGIN_GB) -> float:
-        """The line we never let predicted peak cross. Default keeps a 2 GB cushion."""
+        """The line ARA never lets predicted peak cross (2 GiB cushion by default)."""
         return self.wall_gb - margin_gb
+
+
+@dataclass(frozen=True)
+class VMSnapshot:
+    """Exact host-wide VM counters from one native Mach/sysctl sample."""
+    wired_bytes: int
+    compressor_bytes: int
+    compressions: int
+    decompressions: int
+    swapins: int
+    swapouts: int
+    throttled_bytes: int
+    swap_total_bytes: int
+    swap_used_bytes: int
+    swap_available_bytes: int
 
 
 def device_limits() -> dict:
     import mlx.core as mx
 
     d = mx.device_info()
+    memory_size = int(d.get("memory_size", 0))
+    working_set = int(d.get("max_recommended_working_set_size", 0))
+    max_buffer = int(d.get("max_buffer_length", 0))
     return {
         "device": str(d.get("device_name", "")),
-        "total_gb": d.get("memory_size", 0) / 1e9,
-        "wall_gb": d.get("max_recommended_working_set_size", 0) / 1e9,
-        "max_buffer_gb": d.get("max_buffer_length", 0) / 1e9,
+        "memory_unit": units.MEMORY_UNIT,
+        "memory_size_bytes": memory_size,
+        "recommended_working_set_bytes": working_set,
+        "max_buffer_length_bytes": max_buffer,
+        "total_gb": units.bytes_to_gib(memory_size),
+        "wall_gb": units.bytes_to_gib(working_set),
+        "max_buffer_gb": units.bytes_to_gib(max_buffer),
     }
 
 
@@ -143,15 +166,20 @@ def _mach_host():
     return _HOST
 
 
-def _mach_wired_pages() -> int:
-    """Wired page count from the kernel (== vm_stat 'Pages wired down'). Raises OSError."""
+def _mach_vm_statistics() -> _vm_statistics64:
+    """One complete HOST_VM_INFO64 snapshot. Raises OSError on ABI/kernel failure."""
     stats = _vm_statistics64()
     count = _mach_msg_type_number_t(_VM_INFO64_COUNT)
     kr = _libsystem().host_statistics64(
         _mach_host(), _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count))
     if kr != _KERN_SUCCESS:
         raise OSError(f"host_statistics64 failed (kr={kr})")
-    return stats.wire_count
+    return stats
+
+
+def _mach_wired_pages() -> int:
+    """Wired page count from the kernel (== vm_stat 'Pages wired down'). Raises OSError."""
+    return _mach_vm_statistics().wire_count
 
 
 def _mach_page_size() -> int:
@@ -164,19 +192,42 @@ def _mach_page_size() -> int:
 
 
 def _native_wired_gb() -> float:
-    return _mach_wired_pages() * _mach_page_size() / 1e9
+    return units.bytes_to_gib(_mach_wired_pages() * _mach_page_size())
 
 
-def _native_swap_free_gb() -> float:
-    """Free swap in GiB via sysctlbyname('vm.swapusage'), matching the text parser's units
-    (MiB/1024). Raises OSError on failure."""
+def _native_swap_usage() -> _xsw_usage:
+    """Exact vm.swapusage counters. Raises OSError on failure."""
     xsw = _xsw_usage()
     ln = ctypes.c_size_t(ctypes.sizeof(xsw))
     rc = _libsystem().sysctlbyname(b"vm.swapusage", ctypes.byref(xsw), ctypes.byref(ln),
                                    None, 0)
     if rc != _KERN_SUCCESS:
         raise OSError(f"sysctlbyname(vm.swapusage) failed (rc={rc})")
-    return xsw.xsu_avail / (1024 ** 3)
+    return xsw
+
+
+def _native_swap_free_gb() -> float:
+    """Free swap in GiB from the exact native swap snapshot."""
+    return _native_swap_usage().xsu_avail / (1024 ** 3)
+
+
+def native_vm_snapshot() -> VMSnapshot:
+    """Strict native host VM sample for safety supervision; never falls back to text."""
+    stats = _mach_vm_statistics()
+    page_size = _mach_page_size()
+    swap = _native_swap_usage()
+    return VMSnapshot(
+        wired_bytes=int(stats.wire_count) * page_size,
+        compressor_bytes=int(stats.compressor_page_count) * page_size,
+        compressions=int(stats.compressions),
+        decompressions=int(stats.decompressions),
+        swapins=int(stats.swapins),
+        swapouts=int(stats.swapouts),
+        throttled_bytes=int(stats.throttled_count) * page_size,
+        swap_total_bytes=int(swap.xsu_total),
+        swap_used_bytes=int(swap.xsu_used),
+        swap_available_bytes=int(swap.xsu_avail),
+    )
 
 
 def _plausible_gb(gb: float) -> bool:
@@ -206,11 +257,11 @@ def _wired_gb_vmstat() -> float:
             page_size = int(line.split()[-2])
         if "Pages wired down" in line:
             wired_pages = int(line.split()[-1].strip("."))
-    return wired_pages * page_size / 1e9
+    return units.bytes_to_gib(wired_pages * page_size)
 
 
 def swap_free_gb() -> float | None:
-    """Free swap in GB. Native sysctlbyname read, falling back to the `sysctl` text parse."""
+    """Free swap in GiB. Native sysctlbyname read, falling back to the `sysctl` text parse."""
     try:
         return _native_swap_free_gb()
     except Exception:
@@ -218,7 +269,7 @@ def swap_free_gb() -> float | None:
 
 
 def wired_gb() -> float:
-    """OS-wired memory in GB — the metric that actually predicts a crash (MLX's own
+    """OS-wired memory in GiB — the metric that actually predicts a crash (MLX's own
     get_peak_memory() undercounts it ~40%, excluding the buffer cache the OS still wires).
 
     Read natively from the Mach kernel (host_statistics64) to avoid spawning vm_stat, whose
@@ -250,6 +301,9 @@ def read_limits() -> SystemLimits:
     d = device_limits()
     return SystemLimits(
         device=d["device"],
+        memory_size_bytes=d["memory_size_bytes"],
+        recommended_working_set_bytes=d["recommended_working_set_bytes"],
+        max_buffer_length_bytes=d["max_buffer_length_bytes"],
         total_gb=d["total_gb"],
         wall_gb=d["wall_gb"],
         max_buffer_gb=d["max_buffer_gb"],

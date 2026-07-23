@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 
 # Core, engine-free helpers (no llama.cpp) — safe at module load and patchable in tests.
-from ara import acquire, calibration, db, engine_env, staleness
+from ara import acquire, calibration, db, engine_env, methodology, staleness
 from ara.contracts import driver
 
 # The built-in worker script (ships in the ARA repo, runs in the isolated cpu env by path).
@@ -117,6 +117,19 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
+def characterization_methodology(*, margin_gb: float | None = None) -> dict:
+    """Current CPU characterization behavior used to authorize evidence reuse."""
+    margin = DEFAULT_MARGIN_GB if margin_gb is None else margin_gb
+    return methodology.characterization_descriptor(
+        schedule=RAMP_SCHEDULE, repeats=3,
+        reserve_policy="physical-ram-minus-scaled-reserve",
+        reserve_bytes=round(margin * 1024 ** 3),
+        worker_protocol="ara-cpu-llama-measurement:v1",
+        sampling_interval_ms=50,
+        telemetry_failure_policy="in-worker-system-memory-watchdog:v1",
+        watchdog_stop_rule="system-used-gte-budget:v1")
+
+
 def characterize(model: str, *, progress: bool = False) -> dict:
     """Measure *model*'s safe context ceiling on CPU — the thin path, same driver as Apple.
 
@@ -139,6 +152,7 @@ def characterize(model: str, *, progress: bool = False) -> dict:
             ENV_NAME, _worker_argv(m, ctx, margin, overhead),
             stream=progress),
         schedule=RAMP_SCHEDULE,
+        methodology_descriptor=characterization_methodology(margin_gb=margin),
     )
 
 

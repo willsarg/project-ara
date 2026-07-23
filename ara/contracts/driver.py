@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ara import acquire, catalog
+from ara import acquire, catalog, methodology
 from ara.contracts import ramp, worker
 
 
@@ -53,7 +53,8 @@ def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
 
 def characterize(model: str, *, preflight: Callable[[str], dict],
                  measure: Callable[[str, int], dict], schedule: list[int],
-                 kv_dtype_bytes: float = 2.0) -> dict:
+                 kv_dtype_bytes: float = 2.0,
+                 methodology_descriptor: dict | None = None) -> dict:
     """Drive the safe ramp for *model* using engine-supplied *preflight*/*measure* callables.
 
     *kv_dtype_bytes* is the engine's KV-cache element size for the analytic **decode** ceiling —
@@ -63,7 +64,8 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     """
     est = preflight(model)
     if "error" in est:
-        return {"model": model, "safe_context": None, "points": [], "error": est["error"]}
+        return {"model": model, "safe_context": None, "direct_context": None,
+                "fitted_context": None, "points": [], "error": est["error"]}
 
     def measure_fn(ctx: int):
         m = worker.parse(measure(model, ctx))
@@ -76,7 +78,8 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
         if not m.refused and m.mem_gb is not None \
                 and est["ref_baseline_gb"] + m.mem_gb >= est["budget_gb"]:
             return worker.Measurement(context=ctx, mem_gb=None, refused=True,
-                                      reason="ARA L2: measured at/over safe budget")
+                                      reason="ARA L2: measured at/over safe budget",
+                                      telemetry=m.telemetry)
         return m
 
     rungs = _rungs(schedule, est["max_context"])
@@ -93,13 +96,32 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
             decode_context, _ = ramp.decode_ceiling(
                 res.fit.intercept_gb, kv_slope, est["budget_gb"],
                 est["ref_baseline_gb"], est["max_context"])
-    out = {"model": model, "safe_context": res.safe_context, "binding": res.binding,
+    points = []
+    for context, mem_gb in res.points:
+        point = {"context": context, "mem_gb": mem_gb}
+        if context in res.telemetry:
+            point["telemetry"] = res.telemetry[context]
+        points.append(point)
+    successful_contexts = {context for context, _mem_gb in res.points}
+    refusal_telemetry = [
+        {"context": context, "telemetry": telemetry}
+        for context, telemetry in sorted(res.telemetry.items())
+        if context not in successful_contexts
+    ]
+    out = {"model": model, "safe_context": res.safe_context,
+           "direct_context": res.direct_context, "fitted_context": res.fitted_context,
+           "binding": res.binding, "stopped_reason": res.stopped_reason,
+           "aborted_at": res.aborted_at,
            "decode_context": decode_context,
-           "points": [{"context": c, "mem_gb": m} for c, m in res.points]}
+           "points": points}
+    if refusal_telemetry:
+        out["refusal_telemetry"] = refusal_telemetry
+    if methodology_descriptor is not None:
+        out["methodology"] = methodology_descriptor
+        out["methodology_key"] = methodology.key(methodology_descriptor)
     if res.safe_context is None:
         # Surface the stop reason and budget numbers so callers can explain the null — e.g.
         # "all contexts predicted over safe budget" — rather than silently emitting bare null.
-        out["stopped_reason"] = res.stopped_reason
         out["base_gb"] = est.get("base_gb")
         out["budget_gb"] = est.get("budget_gb")
     return out

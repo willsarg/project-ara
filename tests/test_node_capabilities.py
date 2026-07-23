@@ -224,13 +224,26 @@ def test_advertised_capabilities_empty_when_none(monkeypatch):
 def test_advertised_capabilities_from_characterizations(monkeypatch):
     monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
     monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1")
+    mlx_authority = types.SimpleNamespace(key="mlx-authority:current")
+    real_current = capabilities.measurement_authority.current_measurement_authority
+    monkeypatch.setattr(
+        capabilities.measurement_authority,
+        "current_measurement_authority",
+        lambda engine: mlx_authority if engine == "mlx" else real_current(engine),
+    )
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "m", "cuda", "org/model-a",
                                           safe_context=4096, points=[], config={},
-                                          artifact_id="hf:org/model-a@revision-a")
+                                          artifact_id="hf:org/model-a@revision-a",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     capabilities.db.save_characterization(con, "m", "mlx", "org/model-b",
                                           safe_context=2048, points=[], config={},
-                                          artifact_id="hf:org/model-b@revision-b")
+                                          artifact_id="hf:org/model-b@revision-b",
+                                          environment_key="mlx-env:current",
+                                          authority_key="mlx-authority:current",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     capabilities.db.save_characterization(con, "other", "cuda", "org/model-z",
                                           safe_context=1, points=[], config={},
                                           artifact_id="hf:org/model-z@revision-z")  # other machine → excluded
@@ -254,17 +267,46 @@ def test_advertised_capabilities_only_include_exact_reusable_rows(monkeypatch):
     monkeypatch.setattr(capabilities.db, "list_reusable_characterizations", lambda con, mk: [
         {"logical_model_id": "exact", "legacy_engine": "ollama", "runtime": "ollama",
          "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "a" * 64,
-         "config_key": "cfg:v1:{}", "safe_context": 2048},
+         "config_key": "cfg:v1:{}", "safe_context": 2048,
+         "authority_key": capabilities.measurement_authority.UNSCOPED_AUTHORITY_KEY},
         {"logical_model_id": "unfit", "legacy_engine": "ollama", "runtime": "ollama",
          "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "b" * 64,
-         "config_key": "cfg:v1:{}", "safe_context": None},
+         "config_key": "cfg:v1:{}", "safe_context": None,
+         "authority_key": capabilities.measurement_authority.UNSCOPED_AUTHORITY_KEY},
         {"logical_model_id": "zero", "legacy_engine": "ollama", "runtime": "ollama",
          "backend": "apple", "artifact_id": "ollama-manifest-sha256:" + "c" * 64,
-         "config_key": "cfg:v1:{}", "safe_context": 0},
+         "config_key": "cfg:v1:{}", "safe_context": 0,
+         "authority_key": capabilities.measurement_authority.UNSCOPED_AUTHORITY_KEY},
     ])
     caps = capabilities.advertised_capabilities()
     assert [cap["id"] for cap in caps] == ["exact"]
     _validate(caps[0], "https://ara.dev/wire/capability.json")
+
+
+def test_advertised_capabilities_exclude_stale_mlx_authority(monkeypatch):
+    monkeypatch.setattr(capabilities.profile, "machine_key", lambda: "m")
+    monkeypatch.setattr(capabilities.config, "node_identity", lambda: "node1")
+    monkeypatch.setattr(
+        capabilities.measurement_authority,
+        "current_measurement_authority",
+        lambda _engine: types.SimpleNamespace(key="mlx-authority:current"),
+    )
+    monkeypatch.setattr(
+        capabilities.db,
+        "list_reusable_characterizations",
+        lambda _con, _mk: [{
+            "logical_model_id": "org/stale",
+            "legacy_engine": "mlx",
+            "runtime": "mlx",
+            "backend": "apple",
+            "artifact_id": "hf:org/stale@revision",
+            "config_key": "cfg:v1:{}",
+            "safe_context": 2048,
+            "authority_key": "mlx-authority:old",
+        }],
+    )
+
+    assert capabilities.advertised_capabilities() == []
 
 
 def test_ollama_execution_authority_is_node_scoped_and_rejects_target_drift(monkeypatch):
@@ -318,7 +360,9 @@ def test_self_description_advertises_characterized_models(stub_host, env_io, mon
     con = capabilities.db.connect()
     capabilities.db.save_characterization(con, "chip|GPU|16|Linux", "cuda", "org/m",
                                           safe_context=8192, points=[], config={},
-                                          artifact_id="hf:org/m@revision")
+                                          artifact_id="hf:org/m@revision",
+                                          methodology_key="methodology:test",
+                                          engine_fingerprint="engine:test")
     con.close()
     desc = capabilities.self_description()
     assert len(desc["capabilities"]) == 1

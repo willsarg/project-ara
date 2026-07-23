@@ -164,12 +164,12 @@ def two_wall_gate(k: int, n_layers: int, weights_gb: float, kv_slope_gb_per_k_: 
     *k* offloaded layers fit VRAM AND the (N−k) remainder fits system RAM at *ctx*."""
     v = vram_estimate(k, n_layers, weights_gb, kv_slope_gb_per_k_, ctx, cuda_floor_gb)
     if v >= vram_budget_gb:
-        return (f"VRAM: estimated {v:.2f}GB for K={k} layers at {ctx} tok "
-                f">= safe VRAM budget {vram_budget_gb:.2f}GB")
+        return (f"VRAM: estimated {v:.2f}GiB for K={k} layers at {ctx} tok "
+                f">= safe VRAM budget {vram_budget_gb:.2f}GiB")
     r = ram_estimate(k, n_layers, weights_gb, kv_slope_gb_per_k_, ctx, live_base_gb)
     if r >= ram_budget_gb:
-        return (f"RAM: estimated {r:.2f}GB for {n_layers - k} CPU layers at {ctx} tok "
-                f">= safe RAM budget {ram_budget_gb:.2f}GB")
+        return (f"RAM: estimated {r:.2f}GiB for {n_layers - k} CPU layers at {ctx} tok "
+                f">= safe RAM budget {ram_budget_gb:.2f}GiB")
     return None
 
 
@@ -408,9 +408,9 @@ def _verify_offload(stderr: str, b: dict) -> str | None:
         return reason
     m = parse_cuda_buffers(stderr)
     if m["vram_gb"] >= b["vram_budget_gb"]:
-        return f"measured VRAM {m['vram_gb']:.2f}GB >= safe budget {b['vram_budget_gb']:.2f}GB"
+        return f"measured VRAM {m['vram_gb']:.2f}GiB >= safe budget {b['vram_budget_gb']:.2f}GiB"
     if m["ram_gb"] + b.get("ram_used_gb", 0.0) >= b["ram_budget_gb"]:
-        return f"measured RAM {m['ram_gb']:.2f}GB >= safe budget {b['ram_budget_gb']:.2f}GB"
+        return f"measured RAM {m['ram_gb']:.2f}GiB >= safe budget {b['ram_budget_gb']:.2f}GiB"
     return None
 
 

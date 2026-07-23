@@ -20,20 +20,26 @@ def _machine(**over) -> Machine:
         cpu_physical=12, cpu_logical=12, cpu_features=[], python_version="3.12.8",
         ram_total_gb=48.0, ram_available_gb=20.0, swap_gb=2.0,
         accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal", cores=16),
-        disk_free_gb=500.0, backend="apple", engine="mlx",
+        disk_free_gb=500.0, physical_memory_bytes=48 * 1024 ** 3,
+        backend="apple", engine="mlx",
     )
     base.update(over)
     return Machine(**base)
 
 
 # --- limits: mirror the wall, engine-free --------------------------------- #
-def test_limits_apple_mirrors_working_set():
-    # Apple unified memory: the safe working set is a fraction of total RAM.
-    lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0, chip="Apple M4 Pro"))
-    assert lim["total_gb"] == 48.0
-    assert lim["wall_gb"] == 48.0 * estimate.APPLE_WORKING_SET
-    assert lim["safe_budget_gb"] == lim["wall_gb"] - estimate.MARGIN_GB
-    assert lim["basis"] == "estimated"
+def test_limits_apple_without_live_authority_has_no_current_budget():
+    # Engine-free Apple recon knows physical RAM exactly, but it cannot read Metal's current
+    # recommendation without crossing the isolated engine seam. Never invent a 75% budget.
+    physical_bytes = 25_769_803_776
+    lim = estimate.limits(_machine(
+        backend="apple", ram_total_gb=24.0, physical_memory_bytes=physical_bytes,
+        chip="Apple M4 Pro"))
+    assert lim["physical_memory_bytes"] == physical_bytes
+    assert lim["total_gb"] == 24.0
+    assert lim["wall_gb"] is None
+    assert lim["safe_budget_gb"] is None
+    assert lim["basis"] == "unknown"
     assert lim["calibrated"] is False
     assert lim["device"] == "Apple M4 Pro"        # non-CUDA branch: device is the chip, not None
     # These are the exact key names of the output contract — a renamed/misrouted key breaks
@@ -119,7 +125,7 @@ def _clamped_ram_total_gb(monkeypatch, *, system, phys_gb, cgroup_gb=None):
     monkeypatch.setattr(psutil, "swap_memory", lambda: type("sw", (), {"total": 0})())
     files = {} if cgroup_gb is None else {hardware._CGROUP_V2: str(int(cgroup_gb * hardware.GB))}
     monkeypatch.setattr(hardware, "_read_cgroup_file", lambda path: files.get(path))
-    total_gb, _avail, _swap = hardware._psutil_totals()
+    _physical_bytes, total_gb, _avail, _swap = hardware._psutil_totals()
     return total_gb
 
 
@@ -161,29 +167,29 @@ def test_limits_uses_measured_wall_when_supplied():
     assert lim["calibrated_at"] == "2026-07-01T00:00:00Z"
 
 
-def test_limits_records_what_the_heuristic_would_have_said():
-    # When measured, surface the heuristic estimate too so the correction is visible.
+def test_limits_apple_measurement_does_not_retain_removed_heuristic():
+    # An explicitly supplied live measurement can govern, but there is no 75%-of-RAM comparison.
     measured = {"wall_gb": 41.3, "safe_budget_gb": 39.3}
     lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0), measured=measured)
-    assert lim["estimated_wall_gb"] == 48.0 * estimate.APPLE_WORKING_SET
-    assert lim["estimated_safe_budget_gb"] == 48.0 * estimate.APPLE_WORKING_SET - estimate.MARGIN_GB
+    assert "estimated_wall_gb" not in lim
+    assert "estimated_safe_budget_gb" not in lim
 
 
-def test_limits_falls_back_to_estimate_when_measured_lacks_wall():
-    # A calibration row that carries no usable wall (e.g. older row, or wall_gb None) must NOT be
-    # passed off as measured — fall back to the honest heuristic.
+def test_limits_apple_stays_unknown_when_measurement_lacks_wall():
+    # A partial/historical row cannot become a current budget at the engine-free seam.
     lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0),
                           measured={"wall_gb": None, "safe_budget_gb": None})
-    assert lim["wall_gb"] == 48.0 * estimate.APPLE_WORKING_SET
-    assert lim["basis"] == "estimated"
+    assert lim["wall_gb"] is None
+    assert lim["safe_budget_gb"] is None
+    assert lim["basis"] == "unknown"
     assert lim["calibrated"] is False
 
 
-def test_limits_no_measured_is_estimated():
+def test_limits_apple_no_measured_is_unknown():
     lim = estimate.limits(_machine(backend="apple", ram_total_gb=48.0), measured=None)
-    assert lim["basis"] == "estimated"
+    assert lim["basis"] == "unknown"
     assert lim["calibrated"] is False
-    assert "estimated_wall_gb" not in lim       # no correction note when purely estimated
+    assert "estimated_wall_gb" not in lim
 
 
 # --- model_fit: check the model's context limit --------------------------- #
@@ -212,6 +218,14 @@ def test_model_fit_weights_exceed_budget():
     fit = estimate.model_fit(lim, _META, weights_gb=8.0)
     assert fit["fits"] is False
     assert fit["est_context"] is None
+
+
+def test_model_fit_without_current_budget_is_unknown():
+    fit = estimate.model_fit({"safe_budget_gb": None}, _META, weights_gb=4.0)
+    assert fit["fits"] is None
+    assert fit["est_context"] is None
+    assert fit["binding"] is None
+    assert fit["reason"] == "no_current_budget"
 
 
 def test_model_fit_weights_equal_budget_does_not_fit():

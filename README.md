@@ -157,8 +157,8 @@ same production entrypoint. In a checkout, prefix either with `uv run`.
 | `ara detect` | Read-only machine recon: chip, memory, accelerator, storage, engines, frameworks, cached models, and installed AI/ML apps. Facets: `--python`, `--apps`, `--runtime`, and `--models`. Runtime inventory is cross-platform; MLX ecosystem detail is added only on Apple Silicon. Never stresses the machine or loads an engine. |
 | `ara status` | What ARA itself is doing right now: idle, searching, characterizing, benchmarking, running, serving, or hosting the fleet coordinator. It is not a generic process monitor. |
 | `ara install` / `ara uninstall` | Add or remove the engine matched to this machine. `--engine {mlx\|cuda\|cpu\|vulkan\|cuda-gguf\|auto}` picks it (`auto` resolves the GPU engine for this hardware — `mlx` on Apple Silicon, `cuda` when an NVIDIA GPU is present; pass `--engine cpu` for the built-in portable CPU path); the flag is the consent, so it's scriptable. Engines: `mlx` (Apple Silicon/MLX), `cuda` (NVIDIA/CUDA full-GPU), the built-in `cpu` (llama.cpp), `vulkan` (GGUF on a compatible x86_64 Windows/Linux GPU, including integrated GPUs), and `cuda-gguf` (GGUF on NVIDIA via **partial offload** — a two-wall hybrid that splits layers across VRAM and system RAM). |
-| `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts (grounded in a measured wall if you've characterized before), and with `--model` checks whether that model's weights + context fit. Never loads an engine or a model. |
-| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it risks the memory wall, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
+| `ara profile` | **Engine-free** analytic capability assessment: estimates this machine's safe memory budget from `detect` facts, and with `--model` checks whether that model's weights + context fit. Stored MLX measurements are shown as history until an execution command verifies the live Metal authority. Never loads an engine or a model. |
+| `ara characterize <model>` | **Measures** a model's real safe context ceiling on this machine — an empirical ramp under MLX, CUDA, CPU, Vulkan, cuda-gguf, or Ollama that refuses before it crosses the engine's governed memory boundary, then stores the ceiling for `models recommend` / `run`. The command that crosses into an engine. |
 | `ara models search <query>` | Search the Hugging Face Hub for models matching a query (ids, downloads, likes). |
 | `ara models recommend` | Rank the models in your local HF cache that fit this machine's estimated budget. Add `--engine ollama` to rank supported local Ollama artifacts with exact reusable measurements first; analytic estimates remain clearly labeled comparison-only and cannot authorize execution. With `--engine ollama --use-case ...`, only a locally measured score still bound to the current exact manifest, daemon/config authority, request policy, and runtime target can influence rank; legacy or drifted evidence is labeled unknown, and cross-runtime imported scores are never substituted. Read-only — no model load. |
 | `ara models show <model>` | Show one model's architecture and per-engine measured safe ceiling. Add `--engine ollama` for the exact cached manifest, Ollama capabilities/parameters, and reusable or display-only characterization evidence. |
@@ -211,7 +211,7 @@ The catalog of engines and the install logic live in [`ara/engines.py`](./ara/en
 | OS | Engines verified |
 |---|---|
 | **macOS (Apple Silicon)** | CPU + MLX — the primary development machine |
-| **Windows** | CPU + CUDA — full test suite green, inference verified on an 8 GB NVIDIA Turing GPU |
+| **Windows** | CPU + CUDA — full test suite green, inference verified on an 8 GiB NVIDIA Turing GPU |
 | **Linux** | CPU — full suite and CPU integration tests green |
 
 CUDA on Linux shares the same native CUDA engine path as Windows, but isn't claimed here until the
@@ -227,9 +227,9 @@ until that path has passed ARA's full suite and live CPU integration on Intel ma
 `ara detect` (including `--python`, `--apps`, `--runtime`, and `--models`) and `ara status` are
 **strictly read-only** — they observe, never stress, benchmark, or load a model. Measuring is opt-in:
 `ara characterize` is the command that crosses into the engine, and it finds a model's safe
-context ceiling by **refusing before it ever loads past the memory wall** and aborting a probe
-the moment usage approaches the limit. Each engine governs against the right wall — physical RAM
-(CPU; swap is reported but never counted), the MLX unified-memory wall (Apple), or VRAM (CUDA) —
+context ceiling by **refusing before it crosses the governed memory boundary** and aborting a probe
+the moment usage approaches the limit. Each engine governs against the right boundary — physical
+RAM (CPU; swap is reported but never counted), MLX's live Metal working-set limit (Apple), or VRAM (CUDA) —
 and `ara run` stays capped under that measured ceiling. ARA resolves model weights to an immutable
 artifact, records that identity with the measurement, and verifies it again before loading; changed
 or ambiguous weights are refused instead of being presented as the characterized model. ARA stays

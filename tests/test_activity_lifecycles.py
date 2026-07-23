@@ -64,6 +64,8 @@ def _wire_run(monkeypatch, generate):
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: types.SimpleNamespace(
         generate=generate))
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity", lambda *_a: ("method:test", "engine:test", None))
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
     monkeypatch.setattr(
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
@@ -108,6 +110,22 @@ def test_run_gate_failure_never_creates_activity(make_console, monkeypatch, acti
 
 
 def _wire_characterize(monkeypatch, backend):
+    descriptor = cli.methodology.characterization_descriptor(
+        schedule=[512], repeats=1, reserve_policy="test", reserve_bytes=1024,
+        worker_protocol="test:v1", sampling_interval_ms=50,
+        telemetry_failure_policy="fail-closed", watchdog_stop_rule="test-stop")
+    original_characterize = backend.characterize
+
+    def evidenced_characterize(*args, **kwargs):
+        result = dict(original_characterize(*args, **kwargs))
+        if "error" not in result:
+            result.update(
+                direct_context=result.get("safe_context"), fitted_context=None,
+                stopped_reason=None, methodology=descriptor,
+                methodology_key=cli.methodology.key(descriptor))
+        return result
+
+    backend.characterize = evidenced_characterize
     monkeypatch.setattr(cli, "engine_status", lambda _backend: (True, "llama.cpp"))
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
@@ -456,6 +474,8 @@ def _wire_benchmark(monkeypatch, backend):
     monkeypatch.setitem(cli.engines.ENGINES, "cpu", {
         **cli.engines.ENGINES["cpu"], "backend": "cpu"})
     monkeypatch.setattr(cli, "get_backend", lambda _backend: backend)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity", lambda *_a: ("method:test", "engine:test", None))
     monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "CPU engine"))
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
     row = {"safe_context": 4096, "measured_at": None, "artifact_id": "artifact:test"}
@@ -634,10 +654,17 @@ def test_benchmark_click_acquires_measurement_lock_before_tracking(monkeypatch):
 
 def _wire_mlx_serve_characterization(monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "machine")
-    row = {"safe_context": 4096, "measured_at": None, "points": []}
+    authority = types.SimpleNamespace(key="mlx-authority:test")
+    monkeypatch.setattr(
+        cli.measurement_authority, "current_measurement_authority",
+        lambda _engine: authority)
+    row = {"safe_context": 4096, "measured_at": None, "points": [],
+           "authority_key": authority.key}
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: row)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity", lambda *_a: ("method:test", "engine:test", None))
 
 
 def test_mlx_serve_tracks_after_ready_handshake_through_wait(
