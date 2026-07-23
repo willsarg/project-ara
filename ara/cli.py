@@ -5617,6 +5617,7 @@ def _ollama_doctor_report() -> dict:
 
 
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
+_DOCTOR_SCHEMA_TABLES = frozenset((*_DOCTOR_TABLES, "model_artifacts", "models"))
 
 
 def _database_health(con: sqlite3.Connection) -> dict:
@@ -5627,6 +5628,7 @@ def _database_health(con: sqlite3.Connection) -> dict:
         "readable": True,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -5636,11 +5638,16 @@ def _database_health(con: sqlite3.Connection) -> dict:
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         health["schema_version"] = con.execute("PRAGMA user_version").fetchone()[0]
-        if not tables.intersection(_DOCTOR_TABLES):
+        if not tables.intersection(_DOCTOR_SCHEMA_TABLES):
             health.update(status="unknown", presence="uninitialized",
                           schema_supported=False)
         else:
             health["schema_supported"] = health["schema_version"] == db.SCHEMA_VERSION
+            missing_tables = sorted(_DOCTOR_SCHEMA_TABLES - tables)
+            health["schema_check"] = {
+                "status": "failed" if missing_tables else "passed",
+                "missing_tables": missing_tables,
+            }
     except sqlite3.Error as exc:
         health.update(status="degraded", readable=False, error=str(exc))
         return health
@@ -5672,6 +5679,7 @@ def _database_health(con: sqlite3.Connection) -> dict:
 
     if (health["presence"] == "present"
             and (health["schema_supported"] is False
+                 or health["schema_check"]["status"] == "failed"
                  or health["quick_check"]["status"] == "failed"
                  or health["foreign_key_check"]["status"] == "failed")):
         health["status"] = "degraded"
@@ -5685,6 +5693,7 @@ def _missing_database_health() -> dict:
         "readable": None,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -5796,6 +5805,12 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
             "dim",
             f"    schema {database_health['schema_version']} · {supported}",
         ))
+        schema_check = database_health["schema_check"]
+        if schema_check["missing_tables"]:
+            c.emit(c.style(
+                "warn",
+                f"    missing tables · {', '.join(schema_check['missing_tables'])}",
+            ))
         quick = database_health["quick_check"]
         foreign = database_health["foreign_key_check"]
         c.emit(c.style("dim", f"    quick check · {quick['status']}"))

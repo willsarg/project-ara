@@ -314,6 +314,7 @@ def test_render_doctor_json_reports_key_and_counts(
         "readable": True,
         "schema_version": 7,
         "schema_supported": True,
+        "schema_check": {"status": "passed", "missing_tables": []},
         "quick_check": {"status": "passed", "messages": []},
         "foreign_key_check": {"status": "passed", "violations": []},
     }
@@ -340,6 +341,7 @@ def test_render_doctor_reports_missing_database_without_creating_it(
         "readable": None,
         "schema_version": None,
         "schema_supported": None,
+        "schema_check": {"status": "not_run", "missing_tables": []},
         "quick_check": {"status": "not_run", "messages": []},
         "foreign_key_check": {"status": "not_run", "violations": []},
     }
@@ -358,8 +360,45 @@ def test_database_health_reports_uninitialized_store():
     assert health["presence"] == "uninitialized"
     assert health["readable"] is True
     assert health["schema_supported"] is False
+    assert health["schema_check"] == {"status": "not_run", "missing_tables": []}
     assert health["quick_check"]["status"] == "passed"
     assert health["foreign_key_check"]["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        "benchmark_results",
+        "calibrations",
+        "characterizations",
+        "model_artifacts",
+        "models",
+        "profiles",
+    ],
+)
+def test_database_health_reports_missing_required_schema_table(store, missing_table):
+    store.execute(f"DROP TABLE {missing_table}")  # noqa: S608 - fixed test-only names
+
+    health = cli._database_health(store)
+
+    assert health["status"] == "degraded"
+    assert health["schema_supported"] is True
+    assert health["schema_check"] == {
+        "status": "failed",
+        "missing_tables": [missing_table],
+    }
+    assert health["quick_check"]["status"] == "passed"
+    assert health["foreign_key_check"]["status"] == "passed"
+
+
+def test_render_doctor_human_names_missing_schema_tables(
+        store, make_console, doctor_ollama_clean):
+    store.execute("DROP TABLE models")
+    c, buf = make_console()
+
+    assert cli.render_doctor(c) == 1
+
+    assert "missing tables · models" in buf.getvalue()
 
 
 def test_database_health_reports_schema_read_error():
