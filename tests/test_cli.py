@@ -129,9 +129,10 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
-                        lambda c, as_json=False, use_case=None, engine=None:
+                        lambda c, as_json=False, use_case=None, engine=None, explain=False:
                         (rec.update(recommend=as_json, recommend_uc=use_case,
-                                    recommend_engine=engine) or 0))
+                                    recommend_engine=engine,
+                                    recommend_explain=explain) or 0))
     monkeypatch.setattr(cli, "render_run",
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_serve",
@@ -678,9 +679,9 @@ def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, 
     (["models", "search", "smol model", "--json", "-v"],
      {"query": "smol model", "as_json": True}),
     (["models", "recommend", "--use-case", "coding", "--json", "--verbose"],
-     {"as_json": True, "use_case": "coding", "engine": None}),
+     {"as_json": True, "use_case": "coding", "engine": None, "explain": False}),
     (["models", "recommend", "--engine", "ollama", "--json"],
-     {"as_json": True, "use_case": None, "engine": "ollama"}),
+     {"as_json": True, "use_case": None, "engine": "ollama", "explain": False}),
     (["models", "show", "org/m", "--json", "-v"],
      {"model_id": "org/m", "as_json": True, "engine": None}),
     (["models", "show", "qwen3:0.6b", "--engine", "ollama", "--json"],
@@ -705,6 +706,19 @@ def test_models_subcommands_dispatch_to_existing_renderers(monkeypatch, argv, ex
         )
     assert _run_main(monkeypatch, argv) == 0
     assert seen == expected
+
+
+def test_models_recommend_explain_dispatches(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_recommend",
+        lambda c, **kwargs: seen.update(**kwargs) or 0,
+    )
+
+    assert _run_main(monkeypatch, ["models", "recommend", "--explain"]) == 0
+
+    assert seen["explain"] is True
 
 
 # --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention
@@ -3177,6 +3191,99 @@ def test_recommend_excludes_models_that_dont_fit(make_console, monkeypatch, set_
     assert cli.render_recommend(c) == 0
     out = buf.getvalue()
     assert "org/Fits" in out and "org/TooBig" not in out
+
+
+def test_recommend_explain_json_accounts_for_every_cached_model(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [
+            _model_row("org/Fits", weights_gb=4.0),
+            _model_row("org/TooBig", weights_gb=200.0),
+            _model_row("org/UnknownSize", weights_gb=None),
+            _model_row("org/UnknownArchitecture", weights_gb=4.0, n_layers=None),
+        ],
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    by_model = {
+        item["model_id"]: item for item in json.loads(capsys.readouterr().out)
+    }
+    assert by_model["org/Fits"]["status"] == "recommended"
+    assert by_model["org/Fits"]["reason"] is None
+    assert by_model["org/TooBig"]["status"] == "excluded"
+    assert by_model["org/TooBig"]["reason"] == "exceeds_safe_budget"
+    assert by_model["org/UnknownSize"]["status"] == "unrankable"
+    assert by_model["org/UnknownSize"]["reason"] == "size_unknown"
+    assert by_model["org/UnknownArchitecture"]["status"] == "unrankable"
+    assert by_model["org/UnknownArchitecture"]["reason"] == "architecture_unknown"
+
+
+def test_recommend_explain_reports_unknown_budget(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [_model_row("org/UnknownBudget", weights_gb=4.0)],
+        machine=_machine(backend="cpu", ram_total_gb=None),
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == [{
+        "model_id": "org/UnknownBudget",
+        "status": "unrankable",
+        "reason": "no_current_budget",
+    }]
+
+
+def test_recommend_explain_marks_stale_measurement_on_recommended_model(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [_model_row("org/StaleMeasurement", weights_gb=4.0)],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_best_ceiling_history",
+        lambda con: {"org/StaleMeasurement": (4096, "cpu", None, {}, "old-artifact")},
+    )
+    monkeypatch.setattr(cli, "_best_ceilings", lambda con: {})
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["model_id"] == "org/StaleMeasurement"
+    assert payload[0]["status"] == "recommended"
+    assert payload[0]["reason"] == "measurement_stale"
+
+
+def test_recommend_explain_human_separates_non_recommendations(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [
+            _model_row("org/Fits", weights_gb=4.0),
+            _model_row("org/TooBig", weights_gb=200.0),
+            _model_row("org/Unknown", weights_gb=4.0, n_layers=None),
+        ],
+    )
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, explain=True) == 0
+
+    out = buf.getvalue()
+    assert "RECOMMENDED MODELS" in out
+    assert "EXCLUDED / UNRANKABLE" in out
+    assert "org/TooBig" in out and "exceeds safe budget" in out
+    assert "org/Unknown" in out and "architecture unknown" in out
 
 
 def test_recommend_memory_bound_label(make_console, monkeypatch, set_platform):

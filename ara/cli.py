@@ -2103,7 +2103,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
 
 
 def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None = None,
-                     engine: str | None = None) -> int:
+                     engine: str | None = None, explain: bool = False) -> int:
     """Analytic recommendations — which cataloged models fit this machine, ranked by the context
     the estimated budget supports (most first), marking those already characterized here.
 
@@ -2152,7 +2152,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         else:
             lim = estimate.limits(detect.machine(), measured=measured)
         if (engine_identity.canonical_engine(selected_engine) == "mlx"
-                and lim["safe_budget_gb"] is None):
+                and lim["safe_budget_gb"] is None and not explain):
             msg = "no current MLX budget is available for a safe ranking"
             print(json.dumps({"error": msg})) if as_json else c.emit(
                 c.style("bad", f"  {msg}"))
@@ -2161,14 +2161,36 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         best = _best_ceilings(evidence_con)  # current without crossing the engine seam
 
         recs = []
+        explanations = []
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
         models = catalog.all_models(cache_con)
         for row in models:
             fit = estimate.model_fit(lim, row, row.get("weights_gb"))
+            if fit["fits"] is None:
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": "unrankable",
+                    "reason": fit["reason"] or "unknown",
+                })
+                continue
             if not fit["fits"]:
+                if fit["weights_gb"] is None:
+                    status, reason = "unrankable", "size_unknown"
+                else:
+                    status, reason = "excluded", "exceeds_safe_budget"
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": status,
+                    "reason": reason,
+                })
                 continue
             if fit["est_context"] is None:
                 unrankable += 1           # honest: count it rather than drop it silently
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": "unrankable",
+                    "reason": "architecture_unknown",
+                })
                 continue
             quant = row.get("quant") or scoring.quant_key(row["model_id"])
             recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
@@ -2239,6 +2261,18 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                                      "run_scores": r["score"].run_scores,
                                      "evidence_warning": r["score"].evidence_warning,
                                      "inversion": r["score"].inversion})} for r in recs]
+        if explain:
+            recs = [{
+                **r,
+                "status": "recommended",
+                "reason": (
+                    "measurement_stale"
+                    if r["historical_characterization"]
+                    else "use_case_score_unavailable"
+                    if use_case is not None and r.get("score") is None
+                    else None
+                ),
+            } for r in recs] + explanations
         print(json.dumps(recs, indent=2))
         return 0
 
@@ -2246,6 +2280,26 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         if unrankable:
             c.emit(c.style("dim", f"  {unrankable} more fit but can't be ranked "
                                    "(architecture unknown) — try ara profile --model <model>"))
+
+    def _explanation_section() -> None:
+        if not explain or not explanations:
+            return
+        labels = {
+            "exceeds_safe_budget": "exceeds safe budget",
+            "no_current_budget": "no current budget",
+            "size_unknown": "size unknown",
+            "architecture_unknown": "architecture unknown",
+            "artifact_unresolved": "artifact unresolved",
+            "measurement_stale": "measurement stale",
+            "use_case_score_unavailable": "use-case score unavailable",
+            "unknown": "reason unknown",
+        }
+        c.emit()
+        c.emit(c.section("  EXCLUDED / UNRANKABLE"))
+        for item in explanations:
+            reason = labels.get(item["reason"], "reason unknown")
+            c.emit("  " + c.style("metric", item["model_id"])
+                   + c.style("dim", f"  {item['status']} · {reason}"))
 
     c.emit()
     sub = ("  (estimated — fits this machine, most context first)" if use_case is None
@@ -2266,6 +2320,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                                   "try a smaller / more-quantized model"))
         _unrankable_note()
+        _explanation_section()
         c.emit()
         return 0
     for r in recs:
@@ -2334,6 +2389,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             parts = ", ".join(f"{r['quant']}(~{r['est_context']} tok)" for r in ordered)
             c.emit(c.style("dim", f"    {base}: {parts}"))
     _unrankable_note()
+    _explanation_section()
     c.emit()
     return 0
 
@@ -5902,13 +5958,15 @@ def _click_models_search(ctx: click.Context, query: tuple[str, ...],
               help="Select the MLX analytic lane or rank artifacts in Ollama.")
 @click.option("--use-case", metavar="USE_CASE",
               help="Rank by capability evidence: extraction, reasoning, rag, agentic, or coding.")
+@click.option("--explain", is_flag=True,
+              help="Also report excluded and unrankable cached models.")
 @_json_verbose_options
 @click.pass_context
 def _click_models_recommend(ctx: click.Context, engine: str | None, use_case: str | None,
-                            verbose: bool, as_json: bool) -> int:
+                            explain: bool, verbose: bool, as_json: bool) -> int:
     """Rank cached models by estimated usable context or capability evidence."""
     return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case,
-                            engine=engine)
+                            engine=engine, explain=explain)
 
 
 @_click_models.command("show", context_settings=_HELP_SETTINGS)
@@ -5973,13 +6031,16 @@ def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
 
 @_click_cli.command("recommend", hidden=True, context_settings=_HELP_SETTINGS)
 @click.option("--use-case", help="Rank by a measured capability dimension.")
+@click.option("--explain", is_flag=True,
+              help="Also report excluded and unrankable cached models.")
 @_json_verbose_options
 @click.pass_context
 def _click_recommend(ctx: click.Context, use_case: str | None,
-                     verbose: bool, as_json: bool) -> int:
+                     explain: bool, verbose: bool, as_json: bool) -> int:
     """Rank cached models that fit this machine."""
     _warn_deprecated("recommend", "models recommend")
-    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+    return render_recommend(
+        _mark_json(ctx, as_json), as_json=as_json, use_case=use_case, explain=explain)
 
 
 @_click_cli.command("run", context_settings=_HELP_SETTINGS,
