@@ -125,6 +125,26 @@ def _worker_argv(model: str, ctx: int, vram_margin: float, ram_margin: float, *,
     return argv
 
 
+def characterization_methodology(*, vram_margin_gb: float | None = None,
+                                 ram_margin_gb: float | None = None) -> dict:
+    """Current two-wall characterization behavior used to authorize evidence reuse."""
+    vram_margin_gb = (DEFAULT_VRAM_MARGIN_GB
+                      if vram_margin_gb is None else vram_margin_gb)
+    ram_margin_gb = (DEFAULT_RAM_MARGIN_GB
+                     if ram_margin_gb is None else ram_margin_gb)
+    return methodology.characterization_descriptor(
+        schedule=RAMP_SCHEDULE, repeats=3,
+        reserve_policy="two-wall-fixed-reserve",
+        reserve_bytes={
+            "vram": round(vram_margin_gb * 1024 ** 3),
+            "ram": round(ram_margin_gb * 1024 ** 3),
+        },
+        worker_protocol="ara-cuda-gguf-llama-measurement:v1",
+        sampling_interval_ms=0,
+        telemetry_failure_policy="preflight-and-postload-two-wall:v1",
+        watchdog_stop_rule="either-wall-gte-budget:v1")
+
+
 def characterize(model: str, *, progress: bool = False) -> dict:
     """Measure *model*'s safe context ceiling on the hybrid GPU+CPU path.
 
@@ -148,17 +168,8 @@ def characterize(model: str, *, progress: bool = False) -> dict:
             stream=progress),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=2.0,
-        methodology_descriptor=methodology.characterization_descriptor(
-            schedule=RAMP_SCHEDULE, repeats=3,
-            reserve_policy="two-wall-fixed-reserve",
-            reserve_bytes={
-                "vram": round(vram_margin * 1024 ** 3),
-                "ram": round(ram_margin * 1024 ** 3),
-            },
-            worker_protocol="ara-cuda-gguf-llama-measurement:v1",
-            sampling_interval_ms=0,
-            telemetry_failure_policy="preflight-and-postload-two-wall:v1",
-            watchdog_stop_rule="either-wall-gte-budget:v1"),
+        methodology_descriptor=characterization_methodology(
+            vram_margin_gb=vram_margin, ram_margin_gb=ram_margin),
     )
 
 

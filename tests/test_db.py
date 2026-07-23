@@ -68,6 +68,38 @@ def test_save_characterization_persists_direct_fitted_and_methodology(store):
     assert row["engine_fingerprint"] == "engine:v2:sha256:test"
 
 
+def test_reusable_lookup_requires_exact_methodology_and_engine_fingerprint(store):
+    common = dict(
+        safe_context=65536, direct_context=65536, points=[],
+        artifact_id="hf:org/model@abc", config={}, authority_key="authority:test",
+        environment_key="environment:test",
+    )
+    db.save_characterization(
+        store, "m", "mlx", "org/model", **common,
+        methodology_key="methodology:a", engine_fingerprint="engine:a")
+    db.save_characterization(
+        store, "m", "mlx", "org/model", **common,
+        methodology_key="methodology:b", engine_fingerprint="engine:b")
+    config_key = db.list_characterizations_for_display(
+        store, "m", runtime="mlx", backend="apple")[0]["config_key"]
+
+    assert db.get_reusable_characterization(
+        store, "m", runtime="mlx", backend="apple",
+        artifact_id="hf:org/model@abc", config_key=config_key,
+        authority_key="authority:test", methodology_key="methodology:a",
+        engine_fingerprint="engine:a")["methodology_key"] == "methodology:a"
+    assert db.get_reusable_characterization(
+        store, "m", runtime="mlx", backend="apple",
+        artifact_id="hf:org/model@abc", config_key=config_key,
+        authority_key="authority:test", methodology_key="methodology:a",
+        engine_fingerprint="engine:b") is None
+    assert db.get_reusable_characterization_for_engine(
+        store, "m", "mlx", "org/model", config={},
+        artifact_id="hf:org/model@abc", authority_key="authority:test",
+        methodology_key="methodology:b", engine_fingerprint="engine:b"
+    )["engine_fingerprint"] == "engine:b"
+
+
 def test_v7_migration_preserves_legacy_history_but_never_authorizes_it(
         tmp_path, monkeypatch):
     path = tmp_path / "v6-methodology.db"

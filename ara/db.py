@@ -1303,7 +1303,8 @@ def get_characterization_for_display(
 def list_reusable_characterizations(
         con: sqlite3.Connection, machine_key: str, *, runtime: str | None = None,
         backend: str | None = None, logical_model_id: str | None = None,
-        authority_key: str | None = None) -> list[dict]:
+        authority_key: str | None = None, methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> list[dict]:
     """Return only explicitly reusable, artifact-bound target evidence."""
     return [row for row in list_characterizations_for_display(
         con, machine_key, runtime=runtime, backend=backend,
@@ -1311,28 +1312,42 @@ def list_reusable_characterizations(
         and row["methodology_key"] != "legacy-unknown"
         and row["engine_fingerprint"] != "engine:legacy-unknown"
         and row["artifact_confidence"] in {"strong", "observed_digest", "manifest_hash"}
-        and (authority_key is None or row.get("authority_key") == authority_key)]
+        and (authority_key is None or row.get("authority_key") == authority_key)
+        and (methodology_key is None or row["methodology_key"] == methodology_key)
+        and (engine_fingerprint is None
+             or row["engine_fingerprint"] == engine_fingerprint)]
 
 
 def get_reusable_characterization(
         con: sqlite3.Connection, machine_key: str, *, runtime: str, backend: str,
-        artifact_id: str, config_key: str, authority_key: str | None = None) -> dict | None:
+        artifact_id: str, config_key: str, authority_key: str | None = None,
+        methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> dict | None:
     """Return the exact reusable target cell or ``None``; weak history never matches."""
     columns = {
         row["name"] for row in con.execute("PRAGMA table_info(characterizations)")}
     if "runtime" not in columns:
         rows = list_reusable_characterizations(
             con, machine_key, runtime=runtime, backend=backend,
-            authority_key=authority_key)
+            authority_key=authority_key, methodology_key=methodology_key,
+            engine_fingerprint=engine_fingerprint)
         return next((row for row in rows if row["artifact_id"] == artifact_id
                      and row["config_key"] == config_key), None)
-    authority_clause = " AND authority_key=?" if authority_key is not None else ""
+    clauses = []
     values = [machine_key, runtime, backend, artifact_id, config_key]
     if authority_key is not None:
+        clauses.append("authority_key=?")
         values.append(authority_key)
+    if methodology_key is not None:
+        clauses.append("methodology_key=?")
+        values.append(methodology_key)
+    if engine_fingerprint is not None:
+        clauses.append("engine_fingerprint=?")
+        values.append(engine_fingerprint)
+    identity_clause = "" if not clauses else " AND " + " AND ".join(clauses)
     row = con.execute(
         "SELECT * FROM characterizations WHERE machine_key=? AND runtime=? AND backend=? "
-        f"AND artifact_id=? AND config_key=? AND reusable=1{authority_clause} "
+        f"AND artifact_id=? AND config_key=? AND reusable=1{identity_clause} "
         "ORDER BY measured_at DESC, authority_key DESC LIMIT 1",
         values).fetchone()
     if row is None:
@@ -1346,14 +1361,17 @@ def get_reusable_characterization_for_engine(
         con: sqlite3.Connection, machine_key: str, engine: str,
         logical_model_id: str, *, config: dict,
         artifact_id: str | None = None,
-        authority_key: str | None = None) -> dict | None:
+        authority_key: str | None = None,
+        methodology_key: str | None = None,
+        engine_fingerprint: str | None = None) -> dict | None:
     """Return the newest reusable native compatibility cell with an exact target config."""
     from ara import targets
     runtime, backend, _legacy_engine = targets.for_engine(engine)
     expected_key = targets.characterization_config_key(engine, config)
     rows = list_reusable_characterizations(
         con, machine_key, runtime=runtime, backend=backend,
-        logical_model_id=logical_model_id, authority_key=authority_key)
+        logical_model_id=logical_model_id, authority_key=authority_key,
+        methodology_key=methodology_key, engine_fingerprint=engine_fingerprint)
     candidates = [row for row in rows
                   if row["config_key"] == expected_key
                   and (artifact_id is None or row["artifact_id"] == artifact_id)]

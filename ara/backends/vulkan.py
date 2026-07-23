@@ -127,6 +127,19 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
+def characterization_methodology(*, margin_gb: float | None = None) -> dict:
+    """Current Vulkan characterization behavior used to authorize evidence reuse."""
+    margin = DEFAULT_MARGIN_GB if margin_gb is None else margin_gb
+    return methodology.characterization_descriptor(
+        schedule=RAMP_SCHEDULE, repeats=3,
+        reserve_policy="physical-ram-minus-scaled-reserve",
+        reserve_bytes=round(margin * 1024 ** 3),
+        worker_protocol="ara-vulkan-llama-measurement:v1",
+        sampling_interval_ms=50,
+        telemetry_failure_policy="in-worker-system-memory-watchdog:v1",
+        watchdog_stop_rule="system-used-gte-budget:v1")
+
+
 def characterize(model: str, *, progress: bool = False, flash_attn: bool = True,
                  kv_quant: str = "f16") -> dict:
     """Measure *model*'s safe context ceiling on the GPU — the thin path, same driver as CPU/Apple.
@@ -157,14 +170,7 @@ def characterize(model: str, *, progress: bool = False, flash_attn: bool = True,
             stream=progress),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the KV cache type
-        methodology_descriptor=methodology.characterization_descriptor(
-            schedule=RAMP_SCHEDULE, repeats=3,
-            reserve_policy="physical-ram-minus-scaled-reserve",
-            reserve_bytes=round(margin * 1024 ** 3),
-            worker_protocol="ara-vulkan-llama-measurement:v1",
-            sampling_interval_ms=50,
-            telemetry_failure_policy="in-worker-system-memory-watchdog:v1",
-            watchdog_stop_rule="system-used-gte-budget:v1"),
+        methodology_descriptor=characterization_methodology(margin_gb=margin),
     )
 
 

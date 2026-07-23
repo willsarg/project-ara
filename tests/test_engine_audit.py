@@ -32,7 +32,7 @@ def test_cpu_audit_matches_reported_host_simd(monkeypatch):
     assert report["runtime"]["status"] == "matched"
     assert report["workload"]["status"] == "not_verified"
     assert report["package_version"] == "0.3.34"
-    assert report["fingerprint"].startswith("engine:v1:sha256:")
+    assert report["fingerprint"].startswith("engine:v2:sha256:")
     assert report["findings"] == []
 
 
@@ -303,6 +303,43 @@ def test_probe_selects_engine_specific_isolated_script(monkeypatch, key, marker)
     assert engine_audit._probe(key, backend) == {"ok": True}
     assert seen["backend"] == backend and marker in seen["code"]
     assert seen["timeout"] == 30.0
+
+
+def test_mlx_probe_identity_includes_runtime_and_installed_source(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        engine_audit.engine_env, "run_python_json",
+        lambda backend, code, *, timeout: seen.update(code=code) or {"ok": True})
+
+    engine_audit._probe("mlx", "apple")
+
+    assert 'metadata.version("mlx")' in seen["code"]
+    assert 'metadata.version("mlx-lm")' in seen["code"]
+    assert "import ara_engine_mlx" in seen["code"]
+    assert "source_digest" in seen["code"] and "hashlib.sha256" in seen["code"]
+
+
+def test_mlx_stable_probe_and_fingerprint_bind_all_runtime_dimensions():
+    probe = {
+        "kind": "mlx", "package_version": "0.29.3", "mlx_lm_version": "0.28.3",
+        "engine_package_version": "0.1.3", "engine_source_digest": "sha256:source-a",
+        "device": "Apple M4 Pro", "architecture": "arm64",
+        "metal_available": True, "gpu_count": 1, "operation_ok": True,
+    }
+
+    stable = engine_audit._stable_probe(probe)
+
+    assert stable == {
+        "kind": "mlx", "package_version": "0.29.3", "mlx_lm_version": "0.28.3",
+        "engine_package_version": "0.1.3", "engine_source_digest": "sha256:source-a",
+        "device": "Apple M4 Pro", "architecture": "arm64",
+    }
+    first = engine_audit._fingerprint("mlx", "0.1.3", "schema", probe)
+    assert first.startswith("engine:v2:sha256:")
+    assert engine_audit._fingerprint(
+        "mlx", "0.1.3", "schema", {**probe, "mlx_lm_version": "0.28.4"}) != first
+    assert engine_audit._fingerprint(
+        "mlx", "0.1.3", "schema", {**probe, "engine_source_digest": "sha256:source-b"}) != first
 
 
 def test_unknown_engine_is_rejected():

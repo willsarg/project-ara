@@ -70,6 +70,40 @@ def _memory_evidence_text(gib: float | None, exact_bytes: int | None,
     return "unknown · exact bytes unavailable"
 
 
+def _current_reuse_identity(engine_key: str, backend: str) -> tuple[str | None,
+                                                                       str | None,
+                                                                       str | None]:
+    """Live method/build identity required before consented use of stored evidence."""
+    bk = get_backend(backend)
+    method = getattr(bk, "characterization_methodology", None)
+    if method is None:
+        return None, None, "cannot identify the current characterization methodology"
+    try:
+        methodology_key = methodology.key(method())
+        report = engine_audit.audit_engine(
+            engine_key, host_features=detect._cpu_features())
+    except (Exception, SystemExit) as exc:
+        return None, None, f"cannot verify the installed engine build: {exc}"
+    fingerprint = report.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None, None, "cannot identify the installed engine build"
+    return methodology_key, fingerprint, None
+
+
+def _reuse_identity_error(row: dict | None, methodology_key: str,
+                          engine_fingerprint: str, model: str, engine_key: str) -> str | None:
+    """Explain why visible history cannot authorize current execution."""
+    if row is None:
+        return None
+    if row.get("methodology_key") != methodology_key:
+        return (f"the characterization methodology for {model} on {engine_key} changed — "
+                f"re-run: ara characterize {model} --engine {engine_key}")
+    if row.get("engine_fingerprint") != engine_fingerprint:
+        return (f"the installed {engine_key} engine build changed since {model} was measured — "
+                f"re-run: ara characterize {model} --engine {engine_key}")
+    return None
+
+
 def _fmt_size(gb: float | None) -> str:
     """Human download size: MB under a gigabyte, GB above. 'size unknown' if None."""
     if gb is None:
@@ -2465,6 +2499,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
             candidates = []
             config_errors = []
             authority_errors = []
+            identity_errors = []
             unavailable = []
             artifact_mismatch = False
             missing_artifact_authority = False
@@ -2473,15 +2508,23 @@ def _native_benchmark_plan(model: str, engine: str | None,
                 candidate_bk = get_backend(candidate_backend)
                 if not hasattr(candidate_bk, "benchmark"):
                     continue
+                display_row = db.get_characterization(
+                    con, mk, candidate_key, evidence_model)
+                if display_row is None:
+                    continue
                 current_authority = measurement_authority.current_measurement_authority(
                     candidate_key)
                 expected_config = _measurement_config(candidate_backend)
+                method_key, engine_fingerprint, identity_error = _current_reuse_identity(
+                    candidate_key, candidate_backend)
+                if identity_error is not None:
+                    identity_errors.append(identity_error)
+                    continue
                 candidate_row = db.get_reusable_characterization_for_engine(
                     con, mk, candidate_key, evidence_model, config=expected_config,
                     authority_key=(current_authority.key
-                                   if current_authority is not None else "unavailable"))
-                display_row = db.get_characterization(
-                    con, mk, candidate_key, evidence_model)
+                                   if current_authority is not None else "unavailable"),
+                    methodology_key=method_key, engine_fingerprint=engine_fingerprint)
                 if candidate_row is None:
                     if msg := _measurement_authority_error(
                             display_row, current_authority, model, candidate_key):
@@ -2490,6 +2533,10 @@ def _native_benchmark_plan(model: str, engine: str | None,
                     if display_row and (config_error := _measurement_config_error(
                             display_row, expected_config, candidate_backend, model)):
                         config_errors.append(config_error)
+                    elif msg := _reuse_identity_error(
+                            display_row, method_key, engine_fingerprint,
+                            model, candidate_key):
+                        identity_errors.append(msg)
                     continue
                 if candidate_row.get("safe_context") is None:
                     continue
@@ -2514,6 +2561,8 @@ def _native_benchmark_plan(model: str, engine: str | None,
                     return None, authority_errors[0]
                 if config_errors:
                     return None, config_errors[0]
+                if identity_errors:
+                    return None, identity_errors[0]
                 if missing_artifact_authority:
                     return None, (f"the measured ceiling for {model} is not bound to an exact "
                                   f"artifact — re-run: ara characterize {model}")
@@ -2534,10 +2583,15 @@ def _native_benchmark_plan(model: str, engine: str | None,
                 return None, f"the {label} isn't installed — run: ara install --engine {key}"
             expected_config = _measurement_config(backend)
             current_authority = measurement_authority.current_measurement_authority(key)
+            method_key, engine_fingerprint, identity_error = _current_reuse_identity(
+                key, backend)
+            if identity_error is not None:
+                return None, identity_error
             row = db.get_reusable_characterization_for_engine(
                 con, mk, key, evidence_model, config=expected_config,
                 authority_key=(current_authority.key
-                               if current_authority is not None else "unavailable"))
+                               if current_authority is not None else "unavailable"),
+                methodology_key=method_key, engine_fingerprint=engine_fingerprint)
             display_row = db.get_characterization(con, mk, key, evidence_model)
             if row is None:
                 if display_row is None:
@@ -2548,6 +2602,9 @@ def _native_benchmark_plan(model: str, engine: str | None,
                     return None, msg
                 if display_row and (msg := _measurement_config_error(
                         display_row, expected_config, backend, model)):
+                    return None, msg
+                if msg := _reuse_identity_error(
+                        display_row, method_key, engine_fingerprint, model, key):
                     return None, msg
                 return None, (f"no reusable measured ceiling for {model} — run: "
                               f"ara characterize {model}")
@@ -3267,16 +3324,30 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         get_backend(sel.backend), sel.backend, flash_attn=flash_attn,
         flash_attn_optin=flash_attn_optin, kv_quant=kv_quant,
         weight_quant=weight_quant, prefill_chunk=prefill_chunk)
+    if engine is not None:
+        if msg := _unsupported_lever_error(
+                sel.backend, kv_quant=kv_quant, flash_attn=flash_attn,
+                flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                prefill_chunk=prefill_chunk):
+            return err(msg)
+        if msg := _weight_quant_hw_error(
+                get_backend(sel.backend), sel.backend, weight_quant):
+            return err(msg)
 
     with db.connected() as con:
         if engine is not None:
             # Pinned: use exactly the named engine — honour the explicit choice, don't second-guess it.
             current_authority = measurement_authority.current_measurement_authority(
                 sel.engine_key)
+            method_key, engine_fingerprint, identity_error = _current_reuse_identity(
+                sel.engine_key, sel.backend)
+            if identity_error is not None:
+                return err(identity_error)
             row = db.get_reusable_characterization_for_engine(
                 con, mk, sel.engine_key, evidence_model, config=requested_config,
                 authority_key=(current_authority.key
-                               if current_authority is not None else "unavailable"))
+                               if current_authority is not None else "unavailable"),
+                methodology_key=method_key, engine_fingerprint=engine_fingerprint)
             display_row = db.get_characterization(con, mk, sel.engine_key, evidence_model)
             if row is None and display_row is None:
                 return err(f"{model} isn't characterized on {sel.engine_key} yet — run: "
@@ -3287,6 +3358,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                     return err(msg)
                 if msg := _measurement_config_error(
                         display_row, requested_config, sel.backend, model):
+                    return err(msg)
+                if msg := _reuse_identity_error(
+                        display_row, method_key, engine_fingerprint,
+                        model, sel.engine_key):
                     return err(msg)
                 return err(f"the measured ceiling for {model} is not reusable — re-run: "
                            f"ara characterize {model}{suffix}")
@@ -3307,6 +3382,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             default = engines.for_backend(detect.backend_name())
             per_engine = {}                  # engine_key -> (safe_context, backend, can_run, time, row)
             authority_errors = []
+            identity_errors = []
+            hardware_errors = []
             for key in dict.fromkeys([default, *engines.ENGINES]):
                 backend = engines.ENGINES[key]["backend"]
                 candidate_config = _effective_measurement_config(
@@ -3314,13 +3391,37 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                     flash_attn_optin=flash_attn_optin, kv_quant=kv_quant,
                     weight_quant=weight_quant, prefill_chunk=prefill_chunk)
                 current_authority = measurement_authority.current_measurement_authority(key)
-                row = db.get_reusable_characterization_for_engine(
-                    con, mk, key, evidence_model, config=candidate_config,
-                    authority_key=(current_authority.key
-                                   if current_authority is not None else "unavailable"))
                 display_row = db.get_characterization(con, mk, key, evidence_model)
-                if row is None and display_row is None:
+                if display_row is None:
                     continue
+                lever_error = _unsupported_lever_error(
+                    backend, kv_quant=kv_quant, flash_attn=flash_attn,
+                    flash_attn_optin=flash_attn_optin, weight_quant=weight_quant,
+                    prefill_chunk=prefill_chunk)
+                hardware_error = _weight_quant_hw_error(
+                    get_backend(backend), backend, weight_quant)
+                if lever_error is not None or hardware_error is not None:
+                    if hardware_error is not None:
+                        hardware_errors.append(hardware_error)
+                    row = None
+                    selected = display_row
+                    per_engine[key] = (
+                        selected.get("safe_context"), backend,
+                        hasattr(get_backend(backend), "generate"),
+                        selected.get("measured_at"), selected, False)
+                    continue
+                method_key, engine_fingerprint, identity_error = _current_reuse_identity(
+                    key, backend)
+                if identity_error is not None:
+                    identity_errors.append(identity_error)
+                    row = None
+                else:
+                    row = db.get_reusable_characterization_for_engine(
+                        con, mk, key, evidence_model, config=candidate_config,
+                        authority_key=(current_authority.key
+                                       if current_authority is not None else "unavailable"),
+                        methodology_key=method_key,
+                        engine_fingerprint=engine_fingerprint)
                 selected = row if row is not None else display_row
                 if row is None and (msg := _measurement_authority_error(
                         display_row, current_authority, model, key)):
@@ -3355,6 +3456,10 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
             if not config_runnable:
                 if authority_errors:
                     return err(authority_errors[0])
+                if identity_errors:
+                    return err(identity_errors[0])
+                if hardware_errors:
+                    return err(hardware_errors[0])
                 mismatches = [
                     _measurement_config_error(
                         v[4], _effective_measurement_config(
@@ -4283,14 +4388,22 @@ def _render_serve_mlx(c: Console, model: str, *, engine_key: str, ctx: int | Non
     mk = profile.machine_key()
     expected_config = _measurement_config("apple", kv_quant=kv_quant)
     current_authority = measurement_authority.current_measurement_authority(engine_key)
+    method_key, engine_fingerprint, identity_error = _current_reuse_identity(
+        engine_key, "apple")
+    if identity_error is not None:
+        return err(identity_error)
     with db.connected() as con:
         reusable_row = db.get_reusable_characterization_for_engine(
             con, mk, engine_key, model, config=expected_config,
             authority_key=(current_authority.key
-                           if current_authority is not None else "unavailable"))
+                           if current_authority is not None else "unavailable"),
+            methodology_key=method_key, engine_fingerprint=engine_fingerprint)
         display_row = db.get_characterization(con, mk, engine_key, model)
         if reusable_row is None and (msg := _measurement_authority_error(
                 display_row, current_authority, model, engine_key)):
+            return err(msg)
+        if reusable_row is None and (msg := _reuse_identity_error(
+                display_row, method_key, engine_fingerprint, model, engine_key)):
             return err(msg)
         if ctx is not None:
             if display_row and (msg := _measurement_config_error(

@@ -169,6 +169,19 @@ def _worker_argv(model: str, ctx: int, margin: float, overhead: float, *,
     return argv
 
 
+def characterization_methodology(*, margin_gb: float | None = None) -> dict:
+    """Current MLX characterization behavior used to authorize evidence reuse."""
+    margin = DEFAULT_MARGIN_GB if margin_gb is None else margin_gb
+    return methodology.characterization_descriptor(
+        schedule=RAMP_SCHEDULE, repeats=3,
+        reserve_policy="metal-recommendation-minus-fixed-reserve",
+        reserve_bytes=round(margin * 1024 ** 3),
+        worker_protocol="ara-engine-mlx-measurement:v1",
+        sampling_interval_ms=50,
+        telemetry_failure_policy="in-worker-daemon-watchdog:v1",
+        watchdog_stop_rule="host-wired-gte-budget:v1")
+
+
 def characterize(
     model: str,
     *,
@@ -200,14 +213,7 @@ def characterize(
             "apple", _worker_argv(m, ctx, margin, overhead, kv_quant=kv_quant)),
         schedule=RAMP_SCHEDULE,
         kv_dtype_bytes=_MLX_KV_BYTES[kv_quant],   # decode-ceiling estimate reflects the cache type
-        methodology_descriptor=methodology.characterization_descriptor(
-            schedule=RAMP_SCHEDULE, repeats=3,
-            reserve_policy="metal-recommendation-minus-fixed-reserve",
-            reserve_bytes=round(margin * 1024 ** 3),
-            worker_protocol="ara-engine-mlx-measurement:v1",
-            sampling_interval_ms=50,
-            telemetry_failure_policy="in-worker-daemon-watchdog:v1",
-            watchdog_stop_rule="host-wired-gte-budget:v1"),
+        methodology_descriptor=characterization_methodology(margin_gb=margin),
     )
 
 

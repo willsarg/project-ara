@@ -267,6 +267,16 @@ def test_characterize_accepts_freshly_measured_overhead_without_stored_lookup(mo
     assert captured["argv"][captured["argv"].index("--overhead") + 1] == "1.75"
 
 
+def test_characterization_methodology_is_current_reuse_identity(monkeypatch):
+    monkeypatch.setattr(apple, "_budget_params", lambda: (2.0, 1.0))
+
+    descriptor = apple.characterization_methodology()
+
+    assert descriptor["reserve_bytes"] == 2 * 1024 ** 3
+    assert descriptor["schedule"] == apple.RAMP_SCHEDULE
+    assert descriptor["worker_protocol"] == "ara-engine-mlx-measurement:v1"
+
+
 def test_characterize_subtracts_live_ref_baseline_from_ceiling(monkeypatch):
     _patch_budget(monkeypatch)
     # delta fit: model base 5, slope 1; live OS baseline 8 GB → ceiling (36-8-5)/1 = 23k

@@ -1517,6 +1517,9 @@ def test_profile_never_loads_an_engine(make_console, monkeypatch, set_platform, 
     _wire_profile(monkeypatch, set_platform)
     monkeypatch.setattr(cli, "get_backend",
                         lambda *a, **k: pytest.fail("profile loaded an engine"))
+    monkeypatch.setattr(
+        cli.engine_audit, "audit_engine",
+        lambda *a, **k: pytest.fail("profile audited a live engine"))
     c, buf = make_console()
     assert cli.render_profile(c) == 0
     out = buf.getvalue()
@@ -3567,7 +3570,17 @@ def test_main_recommend_use_case_dispatch(monkeypatch):
 # ara serve --engine mlx — governed MLX endpoint (this Mac)
 # Spec 2026-06-28-recommend-use-case-and-serve-selection
 # --------------------------------------------------------------------------- #
+_TEST_METHOD_KEY = "methodology:v1:sha256:test"
+_TEST_ENGINE_FP = "engine:v2:sha256:test"
+
+
 def _patch_native_characterization(monkeypatch, row):
+    if row is not None:
+        row = {
+            **row,
+            "methodology_key": row.get("methodology_key", _TEST_METHOD_KEY),
+            "engine_fingerprint": row.get("engine_fingerprint", _TEST_ENGINE_FP),
+        }
     def reusable_row(*_args, config, **_kwargs):
         if row is None:
             return None
@@ -3576,6 +3589,9 @@ def _patch_native_characterization(monkeypatch, row):
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine", reusable_row)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_args: (_TEST_METHOD_KEY, _TEST_ENGINE_FP, None))
 
 
 def _patch_native_characterization_lookup(monkeypatch, lookup):
@@ -3584,6 +3600,43 @@ def _patch_native_characterization_lookup(monkeypatch, lookup):
         cli.db, "get_reusable_characterization_for_engine",
         lambda con, mk, engine, model, **_kwargs: lookup(con, mk, engine, model),
     )
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_args: (_TEST_METHOD_KEY, _TEST_ENGINE_FP, None))
+
+
+def test_current_reuse_identity_hashes_live_method_and_engine(monkeypatch):
+    descriptor = {"schema": "method:test", "sampling_interval_ms": 50}
+    monkeypatch.setattr(
+        cli, "get_backend",
+        lambda _backend: types.SimpleNamespace(
+            characterization_methodology=lambda: descriptor))
+    monkeypatch.setattr(cli.detect, "_cpu_features", lambda: ["NEON"])
+    seen = {}
+
+    def audit(engine, *, host_features):
+        seen.update(engine=engine, host_features=host_features)
+        return {"fingerprint": "engine:v2:sha256:live"}
+
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", audit)
+
+    method_key, fingerprint, error = cli._current_reuse_identity("mlx", "apple")
+
+    assert method_key == cli.methodology.key(descriptor)
+    assert fingerprint == "engine:v2:sha256:live" and error is None
+    assert seen == {"engine": "mlx", "host_features": ["NEON"]}
+
+
+def test_reuse_identity_error_names_the_changed_dimension():
+    method_error = cli._reuse_identity_error(
+        {"methodology_key": "old", "engine_fingerprint": _TEST_ENGINE_FP},
+        _TEST_METHOD_KEY, _TEST_ENGINE_FP, "org/m", "mlx")
+    engine_error = cli._reuse_identity_error(
+        {"methodology_key": _TEST_METHOD_KEY, "engine_fingerprint": "old"},
+        _TEST_METHOD_KEY, _TEST_ENGINE_FP, "org/m", "mlx")
+
+    assert "methodology" in method_error
+    assert "engine build changed" in engine_error
 
 
 def test_serve_mlx_governs_via_measured_ceiling(make_console, monkeypatch, set_platform):
@@ -3641,6 +3694,29 @@ def test_serve_mlx_refuses_without_measured_ceiling(make_console, monkeypatch, s
     c, buf = make_console()
     assert cli.render_serve(c, "org/Uncharacterized", engine="mlx", assume_yes=True) == 1
     assert "characterize" in buf.getvalue()
+
+
+def test_serve_mlx_lookup_requires_current_method_and_engine_identity(
+        make_console, monkeypatch, set_platform):
+    set_platform("Darwin", "arm64")
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    row = {"safe_context": 8000, "config": {},
+           "methodology_key": _TEST_METHOD_KEY,
+           "engine_fingerprint": _TEST_ENGINE_FP}
+    _patch_native_characterization(monkeypatch, row)
+    seen = {}
+
+    def lookup(*_args, **kwargs):
+        seen.update(kwargs)
+        return row
+
+    monkeypatch.setattr(cli.db, "get_reusable_characterization_for_engine", lookup)
+
+    assert cli._render_serve_mlx(
+        make_console()[0], "org/m", engine_key="mlx", ctx=9000,
+        assume_yes=True) == 1
+    assert seen["methodology_key"] == _TEST_METHOD_KEY
+    assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 def test_serve_mlx_refuses_ceiling_measured_with_nondefault_config(
@@ -3788,6 +3864,36 @@ def test_run_refuses_uncharacterized(make_console, monkeypatch):
     assert cli.render_run(c, "org/m", prompt="hi") == 1
     out = buf.getvalue()
     assert "isn't characterized" in out and "ara characterize org/m" in out
+
+
+def test_run_rejects_stale_methodology_with_exact_reason(make_console, monkeypatch):
+    stale = {**_CHAR, "methodology_key": "methodology:old",
+             "engine_fingerprint": _TEST_ENGINE_FP}
+    _wire_run(monkeypatch, characterization=stale)
+    monkeypatch.setattr(
+        cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
+    c, buf = make_console()
+
+    assert cli.render_run(c, "org/m", prompt="hi", engine="cpu") == 1
+    assert "characterization methodology" in buf.getvalue()
+
+
+def test_run_lookup_requires_current_method_and_engine_identity(
+        make_console, monkeypatch):
+    _wire_run(monkeypatch, characterization=_CHAR)
+    seen = {}
+
+    def lookup(*_args, **kwargs):
+        seen.update(kwargs)
+        return {**_CHAR, "methodology_key": _TEST_METHOD_KEY,
+                "engine_fingerprint": _TEST_ENGINE_FP}
+
+    monkeypatch.setattr(cli.db, "get_reusable_characterization_for_engine", lookup)
+
+    assert cli.render_run(
+        make_console()[0], "org/m", prompt="hi", engine="cpu", assume_yes=True) == 0
+    assert seen["methodology_key"] == _TEST_METHOD_KEY
+    assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 def test_run_refuses_when_no_safe_ceiling(make_console, monkeypatch):
@@ -4126,7 +4232,9 @@ def test_run_unknown_engine(make_console):
 # not just the detected engine. Spec 2026-06-23-capability-pipeline.
 def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, isatty=False):
     """chars: {engine_key: characterization|None}; supports: {backend: bool} (has .generate)."""
-    chars = {key: ({**row, "artifact_id": row.get("artifact_id", "artifact:test")}
+    chars = {key: ({**row, "artifact_id": row.get("artifact_id", "artifact:test"),
+                    "methodology_key": row.get("methodology_key", _TEST_METHOD_KEY),
+                    "engine_fingerprint": row.get("engine_fingerprint", _TEST_ENGINE_FP)}
                    if row is not None else None) for key, row in chars.items()}
     monkeypatch.setattr(cli.detect, "backend_name", lambda: detected)
     monkeypatch.setattr(cli, "engine_status", lambda b=None: (engine_ok, f"{b} pkg"))
@@ -4138,6 +4246,9 @@ def _wire_run_cross(monkeypatch, *, detected, chars, supports, engine_ok=True, i
         lambda _con, _mk, engine, _model, **_kwargs: chars.get(engine),
     )
     monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_args: (_TEST_METHOD_KEY, _TEST_ENGINE_FP, None))
 
     def backend(b=None):
         bk = types.SimpleNamespace()
@@ -11409,13 +11520,18 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
     monkeypatch.setattr(cli.engines, "ENGINES", orig)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "test engine"))
-    row = {"safe_context": ceiling, "artifact_id": "artifact:test"}
+    row = {"safe_context": ceiling, "artifact_id": "artifact:test",
+           "methodology_key": _TEST_METHOD_KEY,
+           "engine_fingerprint": _TEST_ENGINE_FP}
     monkeypatch.setattr(
         cli.db, "get_characterization",
         lambda _con, _mk, engine, _model: row if engine == engine_key else None)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine",
         lambda _con, _mk, engine, _model, **_kwargs: row if engine == engine_key else None)
+    monkeypatch.setattr(
+        cli, "_current_reuse_identity",
+        lambda *_args: (_TEST_METHOD_KEY, _TEST_ENGINE_FP, None))
 
     saved = {}
 
@@ -11444,6 +11560,26 @@ def _wire_benchmark(monkeypatch, *, ceiling=8000, score=0.75, items=None, engine
                                calibration_model_cached=lambda m: True)  # cached -> skip pre-fetch (#109)
     monkeypatch.setattr(cli, "get_backend", lambda b: bk)
     return saved
+
+
+def test_benchmark_lookup_requires_current_method_and_engine_identity(monkeypatch):
+    _wire_benchmark(monkeypatch)
+    row = {"safe_context": 8000, "artifact_id": "artifact:test",
+           "methodology_key": _TEST_METHOD_KEY,
+           "engine_fingerprint": _TEST_ENGINE_FP}
+    seen = {}
+
+    def lookup(*_args, **kwargs):
+        seen.update(kwargs)
+        return row
+
+    monkeypatch.setattr(cli.db, "get_reusable_characterization_for_engine", lookup)
+
+    plan, error = cli._native_benchmark_plan("org/m", "mlx", 9000)
+
+    assert plan is None and "exceeds" in error
+    assert seen["methodology_key"] == _TEST_METHOD_KEY
+    assert seen["engine_fingerprint"] == _TEST_ENGINE_FP
 
 
 _OLLAMA_BENCHMARK_POLICY = {
@@ -11830,7 +11966,9 @@ def test_render_benchmark_refuses_reusable_row_without_safe_ceiling(
 def test_render_benchmark_explicit_refuses_display_only_ceiling(
         make_console, monkeypatch):
     _wire_benchmark(monkeypatch)
-    row = {"safe_context": 8000, "artifact_id": "artifact:test"}
+    row = {"safe_context": 8000, "artifact_id": "artifact:test",
+           "methodology_key": _TEST_METHOD_KEY,
+           "engine_fingerprint": _TEST_ENGINE_FP}
     monkeypatch.setattr(cli.db, "get_characterization", lambda *_a: row)
     monkeypatch.setattr(
         cli.db, "get_reusable_characterization_for_engine", lambda *_a, **_k: None)
