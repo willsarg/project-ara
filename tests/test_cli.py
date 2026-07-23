@@ -2118,6 +2118,44 @@ def test_profile_model_wont_fit(make_console, monkeypatch, set_platform):
     assert "won't fit" in buf.getvalue()
 
 
+def test_profile_model_size_unknown_with_current_budget(
+        make_console, monkeypatch, set_platform):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=8.0, chip="Test CPU"))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
+    monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: None)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, model="org/unknown-size") == 0
+
+    out = buf.getvalue()
+    assert "unknown" in out
+    assert "model size is unavailable" in out
+    assert "won't fit" not in out
+    assert "weights alone exceed" not in out
+
+
+def test_profile_model_size_unknown_json_reason(monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform, _machine(
+        backend="cpu", ram_total_gb=8.0, chip="Test CPU"))
+    monkeypatch.setattr(cli.catalog, "describe",
+                        lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
+    monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
+    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: None)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, model="org/unknown-size") == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["weights_gb"] is None
+    assert fit["fits"] is None
+    assert fit["reason"] == "size_unknown"
+
+
 def test_profile_model_fits_unknown_architecture(make_console, monkeypatch, set_platform):
     # Describable + fits, but missing dims → no slope → "fits" with an honest unknown-context note.
     _wire_profile(monkeypatch, set_platform, _machine(

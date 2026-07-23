@@ -87,9 +87,12 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     Engine-free: the weights footprint is estimated by the caller (≈ on-disk size); the KV growth
     is the analytic fp16 slope from the model's architecture. ``binding`` reports what limits the
     context — ``"context_window"`` (the budget covers the model's whole window) or ``"memory"``
-    (the budget binds first) — or None when the slope can't be estimated. ``fits`` is False when
-    the weights alone exceed the budget, and None with ``reason="no_current_budget"`` when the
-    read-only seam has no admissible current budget.
+    (the budget binds first) — or None when the slope can't be estimated. ``fits`` is False only
+    when known weights equal or exceed the budget. It is None when the fit is unknowable:
+    ``reason="no_current_budget"`` when the read-only seam has no admissible current budget, or
+    ``reason="size_unknown"`` when the model footprint is unavailable. A model whose known
+    weights fit but whose KV slope cannot be derived remains ``fits=True`` with
+    ``reason="architecture_unknown"``.
 
     Units: *weights_gb* arrives in DECIMAL GB (on-disk bytes / 1e9 — the callers pass catalog /
     Hub sizes) while the budget and KV slope are binary GiB, so the weights are converted here
@@ -102,15 +105,23 @@ def model_fit(limits_dict: dict, meta: dict, weights_gb: float | None) -> dict:
     if budget is None:
         fits = None
         reason = "no_current_budget"
-    else:
-        fits = weights_gib is not None and weights_gib < budget
+    elif weights_gib is None:
+        fits = None
+        reason = "size_unknown"
+    elif weights_gib < budget:
+        fits = True
         reason = None
+    else:
+        fits = False
+        reason = "exceeds_safe_budget"
     slope = ramp.analytic_kv_slope_gb_per_k(meta.get("n_layers"), meta.get("kv_heads"),
                                             meta.get("head_dim"))
     est_context, binding = None, None
     if fits and slope:
         est_context, binding = ramp.decode_ceiling(
             weights_gib, slope, budget, max_context=meta.get("max_context"))
+    elif fits:
+        reason = "architecture_unknown"
     return {
         "weights_gb": weights_gib,
         "fits": fits,

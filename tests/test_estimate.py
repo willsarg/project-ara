@@ -229,6 +229,17 @@ def test_model_fit_weights_exceed_budget():
     fit = estimate.model_fit(lim, _META, weights_gb=8.0)
     assert fit["fits"] is False
     assert fit["est_context"] is None
+    assert fit["reason"] == "exceeds_safe_budget"
+
+
+def test_model_fit_without_weight_size_is_unknown():
+    fit = estimate.model_fit({"safe_budget_gb": 8.0}, _META, weights_gb=None)
+
+    assert fit["weights_gb"] is None
+    assert fit["fits"] is None
+    assert fit["est_context"] is None
+    assert fit["binding"] is None
+    assert fit["reason"] == "size_unknown"
 
 
 def test_model_fit_without_current_budget_is_unknown():
@@ -236,6 +247,13 @@ def test_model_fit_without_current_budget_is_unknown():
     assert fit["fits"] is None
     assert fit["est_context"] is None
     assert fit["binding"] is None
+    assert fit["reason"] == "no_current_budget"
+
+
+def test_model_fit_without_size_or_current_budget_reports_budget_unknown():
+    fit = estimate.model_fit({"safe_budget_gb": None}, _META, weights_gb=None)
+
+    assert fit["fits"] is None
     assert fit["reason"] == "no_current_budget"
 
 
@@ -247,6 +265,7 @@ def test_model_fit_weights_equal_budget_does_not_fit():
     lim = {"safe_budget_gb": probe["weights_gb"]}
     fit = estimate.model_fit(lim, _META, weights_gb=5.0)
     assert fit["fits"] is False
+    assert fit["reason"] == "exceeds_safe_budget"
 
 
 def test_model_fit_converts_decimal_weights_to_gib():
@@ -288,3 +307,4 @@ def test_model_fit_unknown_dims_gives_no_context_estimate():
     assert fit["fits"] is True
     assert fit["est_context"] is None         # can't estimate the slope → honest unknown
     assert fit["binding"] is None
+    assert fit["reason"] == "architecture_unknown"

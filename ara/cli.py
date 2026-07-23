@@ -2247,14 +2247,10 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                 })
                 continue
             if not fit["fits"]:
-                if fit["weights_gb"] is None:
-                    status, reason = "unrankable", "size_unknown"
-                else:
-                    status, reason = "excluded", "exceeds_safe_budget"
                 explanations.append({
                     "model_id": row["model_id"],
-                    "status": status,
-                    "reason": reason,
+                    "status": "excluded",
+                    "reason": fit["reason"] or "unknown",
                 })
                 continue
             if fit["est_context"] is None:
@@ -2262,7 +2258,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                 explanations.append({
                     "model_id": row["model_id"],
                     "status": "unrankable",
-                    "reason": "architecture_unknown",
+                    "reason": fit["reason"] or "unknown",
                 })
                 continue
             quant = row.get("quant") or scoring.quant_key(row["model_id"])
@@ -5332,17 +5328,30 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     """Render the per-model analytic verdict: does it fit, and what context does the budget hold?"""
     fit = _model_fit(lim, model)
     c.emit()
-    tag = ("  (unknown — no current budget)"
-           if lim.get("safe_budget_gb") is None else "  (estimated)")
+    if fit is not None and fit["reason"] == "size_unknown":
+        tag = "  (unknown — model size unavailable)"
+    elif lim.get("safe_budget_gb") is None:
+        tag = "  (unknown — no current budget)"
+    else:
+        tag = "  (estimated)"
     c.emit(c.section(f"  MODEL FIT: {model}") + c.style("dim", tag))
     if fit is None:
         c.emit(c.style("warn", f"  couldn't describe {model} — is it a valid repo / downloaded?"))
         c.emit()
         return
-    c.emit(c.field("weights", _fmt_gb(fit["weights_gb"], 1), "estimated in-memory footprint"))
+    weight_detail = (
+        "model size is unavailable"
+        if fit["weights_gb"] is None
+        else "estimated in-memory footprint"
+    )
+    c.emit(c.field("weights", _fmt_gb(fit["weights_gb"], 1), weight_detail))
     if fit["fits"] is None:
-        c.emit(c.field("verdict", "unknown", "no current governed memory budget",
-                       value_role="warn"))
+        detail = (
+            "model size is unavailable"
+            if fit["reason"] == "size_unknown"
+            else "no current governed memory budget"
+        )
+        c.emit(c.field("verdict", "unknown", detail, value_role="warn"))
     elif not fit["fits"]:
         c.emit(c.field("verdict", "won't fit", "weights alone exceed the estimated budget",
                        value_role="bad"))
@@ -5356,7 +5365,12 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     else:
         c.emit(c.field("verdict", "fits", "context estimate unavailable (unknown architecture)",
                        value_role="good"))
-    prefix = "  current budget unknown — run " if fit["fits"] is None else "  estimated — run "
+    if fit["reason"] == "no_current_budget":
+        prefix = "  current budget unknown — run "
+    elif fit["reason"] == "size_unknown":
+        prefix = "  model size unknown — run "
+    else:
+        prefix = "  estimated — run "
     c.emit(c.style("dim", prefix) + c.style("accent", f"ara characterize {model}")
            + c.style("dim", " to measure the real ceiling"))
     c.emit()
