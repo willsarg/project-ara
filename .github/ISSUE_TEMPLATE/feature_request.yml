@@ -9,7 +9,8 @@ body:
         Ideas welcome — especially **recon coverage** (a tool/app/model store/interpreter ARA
         doesn't know about), **new backends** (e.g. CUDA), or sharper readouts. Please keep
         ARA's boundaries in mind ([AGENTS.md](https://github.com/willsarg/project-ara/blob/main/AGENTS.md)):
-        recon is read-only, `profile` is consent-gated, and ARA stays advisory.
+        recon and `profile` stay engine-free and read-only; measurement is consent-gated in
+        `characterize`, which may download weights and load the engine/model. ARA stays advisory.
   - type: dropdown
     id: area
     attributes:
