@@ -4605,7 +4605,7 @@ def test_main_run_reads_exact_multiline_prompt_from_stdin(monkeypatch):
 def test_main_run_reads_exact_utf8_prompt_file(monkeypatch, tmp_path):
     rec = _capture_dispatch(monkeypatch)
     prompt_file = tmp_path / "prompt.txt"
-    prompt_file.write_text("first line\ncaf\u00e9\n", encoding="utf-8")
+    prompt_file.write_bytes(b"first line\ncaf\xc3\xa9\n")
 
     assert _run_main(
         monkeypatch, ["run", "org/m", "--prompt-file", str(prompt_file)]) == 0

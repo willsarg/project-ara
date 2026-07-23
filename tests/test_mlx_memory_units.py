@@ -145,6 +145,37 @@ def test_external_supervisor_samples_host_and_qualifies_peak() -> None:
     assert result["telemetry"]["compression_delta"]["compressions"] == 2
 
 
+def test_terminate_process_group_falls_back_without_killpg(monkeypatch) -> None:
+    calls = []
+
+    class Process:
+        pid = 123
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def terminate():
+            calls.append("terminate")
+
+        @staticmethod
+        def kill():
+            calls.append("kill")
+
+        @staticmethod
+        def wait(timeout=None):
+            calls.append(("wait", timeout))
+            if timeout is not None:
+                raise probe.subprocess.TimeoutExpired("worker", timeout)
+
+    monkeypatch.delattr(probe.os, "killpg")
+
+    probe._terminate_process_group(Process())
+
+    assert calls == ["terminate", ("wait", 2), "kill", ("wait", None)]
+
+
 def test_external_supervisor_kills_process_group_at_boundary(monkeypatch) -> None:
     snapshots = iter([_snapshot(100), _snapshot(120)])
     killed = []
