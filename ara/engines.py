@@ -35,11 +35,12 @@ from ara import engine_env, engine_identity
 _SOURCE_VERSION = re.compile(
     r"^v?(\d+)\.(\d+)\.(\d+)-(\d+)-g([0-9a-f]+)(-dirty)?$"
 )
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _source_checkout_version() -> str | None:
     """Derive the live VCS version when this module is running from a Git checkout."""
-    root = Path(__file__).resolve().parent.parent
+    root = _SOURCE_ROOT
     if not (root / ".git").exists():
         return None
     try:

@@ -16,7 +16,7 @@ def _version_checkout(monkeypatch, tmp_path):
     root = tmp_path / "checkout"
     (root / ".git").mkdir(parents=True)
     (root / "ara").mkdir()
-    monkeypatch.setattr(engines, "__file__", str(root / "ara" / "engines.py"))
+    monkeypatch.setattr(engines, "_SOURCE_ROOT", root)
     monkeypatch.setattr(
         engines.metadata,
         "version",
@@ -74,7 +74,7 @@ def test_ara_version_marks_dirty_development_checkout(monkeypatch, tmp_path):
 def test_ara_version_keeps_metadata_outside_a_git_checkout(monkeypatch, tmp_path):
     root = tmp_path / "installed"
     (root / "ara").mkdir(parents=True)
-    monkeypatch.setattr(engines, "__file__", str(root / "ara" / "engines.py"))
+    monkeypatch.setattr(engines, "_SOURCE_ROOT", root)
     monkeypatch.setattr(engines.metadata, "version", lambda name: "1.2.3")
     monkeypatch.setattr(
         subprocess,
