@@ -4559,6 +4559,67 @@ def test_run_json(monkeypatch, capsys):
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["completion"] == "hello" and payload["safe_context"] == 8192
+    assert payload["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "cpu",
+        "backend": "cpu",
+        "mode": "automatic",
+        "reason": "the portable CPU characterization was the best reusable governed option",
+    }
+
+
+def test_run_verbose_explains_engine_selection(make_console, monkeypatch):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *a, **k: {"completion": "hello"},
+    )
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+
+    assert ("selected cpu (cpu) because the portable CPU characterization was the best "
+            "reusable governed option") in buf.getvalue()
+
+
+def test_run_json_identifies_explicit_engine_choice(monkeypatch, capsys):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *a, **k: {"completion": "hello"},
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_run(
+        c,
+        "org/m",
+        prompt="hi",
+        engine="cpu",
+        as_json=True,
+        assume_yes=True,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["engine_selection"] == {
+        "requested": "cpu",
+        "resolved_engine": "cpu",
+        "backend": "cpu",
+        "mode": "explicit",
+        "reason": "the user selected --engine cpu",
+    }
+
+
+def test_engine_selection_rendering_uses_captured_record(
+        make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    selected = cli.resolve_engine(None)
+    record = cli.engine_selection_record(None, selected)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    c, buf = make_console()
+
+    cli._emit_engine_selection(c, record)
+
+    assert "selected mlx (apple)" in buf.getvalue()
+    assert "CUDA" not in buf.getvalue()
 
 
 def test_run_usage_without_prompt(make_console, monkeypatch):
@@ -7296,6 +7357,32 @@ def test_render_characterize_json(monkeypatch, capsys, store):
     assert data["safe_context"] == 9000
     assert data["engine"] == "mlx"
     assert "decode_context" in data
+    assert data["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "mlx",
+        "backend": "apple",
+        "mode": "automatic",
+        "reason": "the machine matched the Apple Silicon backend",
+    }
+
+
+def test_render_characterize_verbose_explains_engine_selection(
+        make_console, monkeypatch, store):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda m: {
+            "model": m,
+            "safe_context": 9000,
+            "decode_context": None,
+            "points": [],
+        },
+    )
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_characterize(c, "org/M") == 0
+
+    assert ("selected mlx (apple) because the machine matched the Apple Silicon backend"
+            in buf.getvalue())
 
 
 def test_render_characterize_json_stdout_is_one_document_even_on_first_calibration(
@@ -12604,7 +12691,30 @@ def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
     c = cli.Console(color=False, stream=sys.stderr)
     rc = cli.render_benchmark(c, "org/m", use_case="extraction", as_json=True, assume_yes=True)
     assert rc == 0
-    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stale_ceiling"] is True
+    assert payload["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "mlx",
+        "backend": "apple",
+        "mode": "automatic",
+        "reason": "the mlx characterization had the largest reusable measured safe context",
+    }
+
+
+def test_render_benchmark_verbose_explains_engine_selection(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_benchmark(
+        c,
+        "org/m",
+        use_case="extraction",
+        assume_yes=True,
+    ) == 0
+
+    assert ("selected mlx (apple) because the mlx characterization had the largest "
+            "reusable measured safe context") in buf.getvalue()
 
 
 def test_render_benchmark_lower_ctx_preserves_ceiling_staleness(monkeypatch, capsys):

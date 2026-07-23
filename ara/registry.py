@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import typing
+from dataclasses import dataclass
 
 from ara import detect, engines
 
@@ -23,6 +24,62 @@ class EngineSelection(typing.NamedTuple):
     backend: str
     engine_key: str
     package: str
+
+
+@dataclass(frozen=True)
+class EngineSelectionRecord:
+    """Immutable explanation captured from the same selection that controls execution."""
+
+    requested: str
+    resolved_engine: str
+    backend: str
+    mode: str
+    reason: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "requested": self.requested,
+            "resolved_engine": self.resolved_engine,
+            "backend": self.backend,
+            "mode": self.mode,
+            "reason": self.reason,
+        }
+
+
+_AUTOMATIC_REASONS = {
+    "apple": "the machine matched the Apple Silicon backend",
+    "cuda": "the machine matched the NVIDIA CUDA backend",
+    "cpu": "no supported accelerator was detected, so ARA used the portable CPU fallback",
+}
+
+
+def engine_selection_record(
+    requested: str | None,
+    selection: EngineSelection,
+    *,
+    automatic_reason: str | None = None,
+) -> EngineSelectionRecord:
+    """Describe *selection* without re-reading hardware or resolving the engine again."""
+    automatic = requested is None or requested == "auto"
+    if automatic:
+        reason = automatic_reason or _AUTOMATIC_REASONS.get(
+            selection.backend,
+            f"automatic resolution selected the {selection.backend} backend",
+        )
+        return EngineSelectionRecord(
+            requested="auto",
+            resolved_engine=selection.engine_key,
+            backend=selection.backend,
+            mode="automatic",
+            reason=reason,
+        )
+    return EngineSelectionRecord(
+        requested=selection.engine_key,
+        resolved_engine=selection.engine_key,
+        backend=selection.backend,
+        mode="explicit",
+        reason=f"the user selected --engine {selection.engine_key}",
+    )
 
 
 def resolve_engine(engine: str | None) -> EngineSelection:

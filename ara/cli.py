@@ -33,7 +33,15 @@ from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
 from ara.locking import MeasurementBusy
-from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
+from ara.registry import (
+    EngineSelection,
+    EngineSelectionRecord,
+    UnknownEngine,
+    engine_selection_record,
+    engine_status,
+    get_backend,
+    resolve_engine,
+)
 from ara.ui import Console
 
 
@@ -44,6 +52,35 @@ def _hf_hint(c: Console, as_json: bool) -> None:
     if not as_json and not hf_auth.has_token():
         c.emit(c.style("dim", "  tip: run ") + c.style("accent", "ara hf login")
                + c.style("dim", " for higher rate limits + faster downloads"))
+
+
+def _emit_engine_selection(c: Console, record: EngineSelectionRecord) -> None:
+    """Render a captured decision without consulting machine state again."""
+    c.emit(c.style(
+        "dim",
+        f"  selected {record.resolved_engine} ({record.backend}) because {record.reason}",
+    ))
+
+
+def _governed_engine_selection(
+    requested: str | None,
+    engine_key: str,
+    backend: str,
+) -> EngineSelectionRecord:
+    """Explain a final governed candidate chosen from reusable characterization evidence."""
+    automatic_reason = None
+    if requested is None or requested == "auto":
+        automatic_reason = (
+            "the portable CPU characterization was the best reusable governed option"
+            if backend == "cpu"
+            else f"the {engine_key} characterization had the largest reusable measured "
+                 "safe context"
+        )
+    return engine_selection_record(
+        requested,
+        EngineSelection(backend, engine_key, engines.ENGINES[engine_key]["package"]),
+        automatic_reason=automatic_reason,
+    )
 
 
 _CMD_W = 16
@@ -1685,6 +1722,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
+    selection_record = engine_selection_record(engine, sel)
     if not acquire.valid_model_ref(model):
         msg = (f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                f"or a local .gguf file path")
@@ -1722,6 +1760,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         bk, sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
         kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     if c.verbose and not as_json:
+        _emit_engine_selection(c, selection_record)
         c.emit(c.field("engine", sel.engine_key, engine_label))
         c.emit(c.field("KV cache", kv_quant))
     progress = (not as_json) and sys.stderr.isatty()
@@ -1900,6 +1939,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
+                     "engine_selection": selection_record.as_dict(),
                      "direct_context": direct_context,
                      "fitted_context": fitted_context,
                      "methodology_key": methodology_key,
@@ -2682,6 +2722,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
         "key": key,
         "backend": backend,
         "bk": bk,
+        "engine_selection": _governed_engine_selection(engine, key, backend),
         "row": row,
         "safe": safe,
         "ceiling_measured_at": row.get("measured_at"),
@@ -2733,9 +2774,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     ceiling_measured_at = plan["ceiling_measured_at"]
     characterized_artifact_id = plan["artifact_id"]
     evidence_model = plan["evidence_model"]
+    selection_record = plan.get("engine_selection")
     native_authority_key = None if ollama_mode else plan["measurement_authority"]
     mk = profile.machine_key()
 
+    if c.verbose and not as_json and selection_record is not None:
+        _emit_engine_selection(c, selection_record)
     stale_ceiling = (
         False
         if ollama_mode else
@@ -2968,6 +3012,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if selection_record is not None:
+            payload["engine_selection"] = selection_record.as_dict()
         if ollama_mode:
             payload["concurrency_scope"] = (
                 "ARA governs these requests; outside Ollama clients remain concurrent")
@@ -3436,6 +3482,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         sel = resolve_engine(engine)
     except UnknownEngine:
         return err(f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}")
+    selection_record = engine_selection_record(engine, sel)
     if not prompt or not prompt.strip():
         return err("usage: ara run <model> <prompt>")
     if max_tokens <= 0:
@@ -3659,6 +3706,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 return err(f"the live memory authority for {engine_key} changed during "
                            f"selection — re-run: ara characterize {model} --engine {engine_key}")
             selected_authority_key = selected_authority.key
+            selection_record = _governed_engine_selection(
+                engine, engine_key, backend)
 
     characterized_ceiling = safe
     if ctx is not None and (msg := _ctx_gate_msg(ctx, characterized_ceiling, model)):
@@ -3686,6 +3735,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
                    f"re-run: ara characterize {model}")
 
+    if c.verbose and not as_json:
+        _emit_engine_selection(c, selection_record)
     if not as_json:
         _emit_run_context(c, characterized_ceiling, effective_context)
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
@@ -3738,6 +3789,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err("run failed: engine returned an invalid completion")
     if as_json:
         print(json.dumps({"model": model, "engine": engine_key,
+                          "engine_selection": selection_record.as_dict(),
                           "safe_context": characterized_ceiling,
                           "characterized_ceiling": characterized_ceiling,
                           "effective_context": effective_context,
