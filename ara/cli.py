@@ -5593,6 +5593,13 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
 _HELP_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
+class _RunPromptArgument(click.Argument):
+    """Keep the established usage spelling while alternate prompt sources omit this value."""
+
+    def make_metavar(self, ctx: click.Context) -> str:
+        return "PROMPT..."
+
+
 def _mark_json(ctx: click.Context, as_json: bool) -> Console:
     """Record output mode only after Click has accepted a real command invocation."""
     ctx.find_root().meta["as_json"] = as_json
@@ -5978,7 +5985,7 @@ def _click_recommend(ctx: click.Context, use_case: str | None,
 @_click_cli.command("run", context_settings=_HELP_SETTINGS,
                     epilog='Example:\n  ara run org/model "Explain this" --json')
 @click.argument("model")
-@click.argument("prompt", nargs=-1)
+@click.argument("prompt", nargs=-1, cls=_RunPromptArgument)
 @click.option("--prompt-file", type=click.Path(path_type=Path), metavar="PATH",
               help="Read a UTF-8 prompt from PATH (maximum 1 MiB).")
 @click.option("--ctx", "run_ctx", type=click.IntRange(min=1), metavar="N",
