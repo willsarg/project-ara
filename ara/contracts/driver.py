@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from ara import acquire, catalog, methodology
+from ara.contracts import preflight as preflight_contract
 from ara.contracts import ramp, worker
 
 
@@ -42,8 +43,6 @@ def _rungs(schedule: list[int], max_context: int | None) -> list[int]:
     """
     if max_context is None:
         return list(schedule)
-    if max_context <= 0:
-        return []
     rungs = {c for c in schedule if c <= max_context} | {max_context}
     if len(rungs) < 2:
         anchor = max(1, max_context // 2)
@@ -62,10 +61,10 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     (e.g. ~1.06 for q8_0, ~0.56 for q4_0) so the decode estimate reflects the cache actually in
     use; the driver stays engine-agnostic — it just takes a byte count, not a quant name.
     """
-    est = preflight(model)
-    if "error" in est:
+    est = preflight_contract.parse(preflight(model))
+    if isinstance(est, preflight_contract.PreflightError):
         return {"model": model, "safe_context": None, "direct_context": None,
-                "fitted_context": None, "points": [], "error": est["error"]}
+                "fitted_context": None, "points": [], "error": est.error}
 
     def measure_fn(ctx: int):
         m = worker.parse(measure(model, ctx))
@@ -76,16 +75,16 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
         # absolute footprint is ref_baseline + delta. If that reached the budget, stop
         # escalating and don't trust higher contexts — even though L1 predicted it safe.
         if not m.refused and m.mem_gb is not None \
-                and est["ref_baseline_gb"] + m.mem_gb >= est["budget_gb"]:
+                and est.ref_baseline_gb + m.mem_gb >= est.budget_gb:
             return worker.Measurement(context=ctx, mem_gb=None, refused=True,
                                       reason="ARA L2: measured at/over safe budget",
                                       telemetry=m.telemetry)
         return m
 
-    rungs = _rungs(schedule, est["max_context"])
-    res = ramp.run(measure_fn, rungs, est["base_gb"], est["slope_gb_per_k"],
-                   est["budget_gb"], ref_baseline_gb=est["ref_baseline_gb"],
-                   max_context=est["max_context"])
+    rungs = _rungs(schedule, est.max_context)
+    res = ramp.run(measure_fn, rungs, est.base_gb, est.slope_gb_per_k,
+                   est.budget_gb, ref_baseline_gb=est.ref_baseline_gb,
+                   max_context=est.max_context)
     decode_context = None
     if res.fit is not None:
         meta = catalog.describe(_describe_ref(model)) or {}
@@ -94,8 +93,8 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
             kv_dtype_bytes=kv_dtype_bytes)
         if kv_slope:
             decode_context, _ = ramp.decode_ceiling(
-                res.fit.intercept_gb, kv_slope, est["budget_gb"],
-                est["ref_baseline_gb"], est["max_context"])
+                res.fit.intercept_gb, kv_slope, est.budget_gb,
+                est.ref_baseline_gb, est.max_context)
     points = []
     for context, mem_gb in res.points:
         point = {"context": context, "mem_gb": mem_gb}
@@ -122,6 +121,6 @@ def characterize(model: str, *, preflight: Callable[[str], dict],
     if res.safe_context is None:
         # Surface the stop reason and budget numbers so callers can explain the null — e.g.
         # "all contexts predicted over safe budget" — rather than silently emitting bare null.
-        out["base_gb"] = est.get("base_gb")
-        out["budget_gb"] = est.get("budget_gb")
+        out["base_gb"] = est.base_gb
+        out["budget_gb"] = est.budget_gb
     return out

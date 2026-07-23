@@ -12,6 +12,8 @@ methodology is independent of any one engine.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from ara import catalog, methodology
@@ -110,8 +112,8 @@ def test_window_below_smallest_rung_gets_a_lower_anchor():
 
 
 def test_degenerate_window_never_probes_above_it():
-    # Pathological window of 0 must never produce a probe above the window (the anchor that
-    # guarantees ≥2 points is suppressed when it would exceed max_context).
+    # A worker must report either an unknown window (None) or a positive context limit.
+    # Zero is a malformed protocol value and must fail before any model probe is dispatched.
     seen: list[int] = []
     est = _est(max_context=0)
 
@@ -119,8 +121,83 @@ def test_degenerate_window_never_probes_above_it():
         seen.append(ctx)
         return {"context": ctx, "mem_gb": 1.0}
 
-    driver.characterize("m", preflight=lambda m: est, measure=measure, schedule=[2000, 4000])
-    assert all(c <= 0 for c in seen)          # never probed above the model's window
+    with pytest.raises(ValueError, match="preflight.*max_context"):
+        driver.characterize("m", preflight=lambda m: est, measure=measure,
+                            schedule=[2000, 4000])
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "field"),
+    [
+        pytest.param(_est(base_gb=math.nan), "base_gb", id="nan-base"),
+        pytest.param(_est(base_gb=math.inf), "base_gb", id="infinite-base"),
+        pytest.param(_est(base_gb=True), "base_gb", id="boolean-base"),
+        pytest.param(_est(slope_gb_per_k=-0.1), "slope_gb_per_k", id="negative-slope"),
+        pytest.param(_est(budget_gb="36"), "budget_gb", id="string-budget"),
+        pytest.param(_est(ref_baseline_gb=-0.1), "ref_baseline_gb",
+                     id="negative-baseline"),
+        pytest.param(_est(base_gb=1.0, ref_baseline_gb=2.0), "ref_baseline_gb",
+                     id="baseline-above-base"),
+        pytest.param(_est(max_context=1.5), "max_context", id="fractional-window"),
+        pytest.param(_est(max_context=True), "max_context", id="boolean-window"),
+        pytest.param({k: v for k, v in _est().items() if k != "budget_gb"},
+                     "budget_gb", id="missing-budget"),
+        pytest.param({**_est(), "future_shape": 1}, "future_shape", id="unknown-field"),
+        pytest.param({"error": ""}, "error", id="empty-error"),
+        pytest.param({"error": "not cached", "base_gb": 1.0}, "base_gb",
+                     id="mixed-error-and-estimate"),
+        pytest.param(_est(n_layers=0, fit_layers=0, vram_budget_gb=8.0,
+                          ram_budget_gb=36.0), "n_layers", id="zero-layers"),
+        pytest.param(_est(n_layers=32, fit_layers=33, vram_budget_gb=8.0,
+                          ram_budget_gb=36.0), "fit_layers", id="too-many-fit-layers"),
+        pytest.param(_est(n_layers=32, fit_layers=16, vram_budget_gb=math.nan,
+                          ram_budget_gb=36.0), "vram_budget_gb", id="nan-vram-budget"),
+        pytest.param(_est(n_layers=32, fit_layers=16, vram_budget_gb=8.0,
+                          ram_budget_gb=35.0), "ram_budget_gb",
+                     id="ram-budget-disagrees-with-driver-budget"),
+        pytest.param(_est(n_layers=32), "fit_layers", id="partial-cuda-gguf-extension"),
+    ],
+)
+def test_rejects_malformed_preflight_before_dispatch(payload, field):
+    dispatched: list[int] = []
+
+    def measure(_model, context):
+        dispatched.append(context)
+        return {"context": context, "mem_gb": 1.0}
+
+    with pytest.raises(ValueError, match=rf"preflight.*{field}"):
+        driver.characterize("org/model", preflight=lambda _model: payload,
+                            measure=measure, schedule=[2000, 4000])
+    assert dispatched == []
+
+
+def test_rejects_non_object_preflight_before_dispatch():
+    dispatched: list[int] = []
+
+    def measure(_model, context):
+        dispatched.append(context)
+        return {"context": context, "mem_gb": 1.0}
+
+    with pytest.raises(ValueError, match="preflight.*object"):
+        driver.characterize("org/model", preflight=lambda _model: [],
+                            measure=measure, schedule=[2000, 4000])
+    assert dispatched == []
+
+
+def test_accepts_the_known_cuda_gguf_preflight_extension():
+    est = _est(
+        n_layers=32,
+        fit_layers=16,
+        vram_budget_gb=8.0,
+        ram_budget_gb=36.0,
+    )
+
+    result = driver.characterize(
+        "org/model", preflight=lambda _model: est,
+        measure=_linear(5.0, 1.0), schedule=[2000, 4000])
+
+    assert result["direct_context"] == 4000
 
 
 def test_none_when_preflight_errors():
