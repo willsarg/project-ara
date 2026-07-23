@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import sys
 
+import pytest
+
 from ara import registry
 
 
@@ -129,6 +131,58 @@ def test_resolve_engine_mlx_explicit(monkeypatch):
 def test_resolve_engine_bogus_raises(monkeypatch):
     """resolve_engine with an unknown engine name raises UnknownEngine."""
     monkeypatch.setattr(registry.detect, "backend_name", lambda: "cpu")
-    import pytest
     with pytest.raises(registry.UnknownEngine):
         registry.resolve_engine("bogus")
+
+
+@pytest.mark.parametrize(
+    ("backend", "engine_key", "reason"),
+    [
+        ("apple", "mlx", "the machine matched the Apple Silicon backend"),
+        ("cuda", "cuda", "the machine matched the NVIDIA CUDA backend"),
+        ("cpu", "cpu",
+         "no supported accelerator was detected, so ARA used the portable CPU fallback"),
+    ],
+)
+def test_automatic_engine_selection_record_explains_captured_backend(
+        monkeypatch, backend, engine_key, reason):
+    monkeypatch.setattr(registry.detect, "backend_name", lambda: backend)
+
+    selection = registry.resolve_engine("auto")
+    record = registry.engine_selection_record("auto", selection)
+
+    assert record.as_dict() == {
+        "requested": "auto",
+        "resolved_engine": engine_key,
+        "backend": backend,
+        "mode": "automatic",
+        "reason": reason,
+    }
+
+
+def test_explicit_engine_selection_record_identifies_user_choice(monkeypatch):
+    monkeypatch.setattr(registry.detect, "backend_name", lambda: "cuda")
+
+    selection = registry.resolve_engine("cpu")
+    record = registry.engine_selection_record("cpu", selection)
+
+    assert record.as_dict() == {
+        "requested": "cpu",
+        "resolved_engine": "cpu",
+        "backend": "cpu",
+        "mode": "explicit",
+        "reason": "the user selected --engine cpu",
+    }
+
+
+def test_engine_selection_record_does_not_reinspect_changed_machine_state(monkeypatch):
+    backends = iter(("apple", "cuda"))
+    monkeypatch.setattr(registry.detect, "backend_name", lambda: next(backends))
+
+    selection = registry.resolve_engine(None)
+    record = registry.engine_selection_record(None, selection)
+
+    assert record.resolved_engine == "mlx"
+    assert record.backend == "apple"
+    assert "Apple Silicon backend" in record.reason
+    assert registry.detect.backend_name() == "cuda"

@@ -33,7 +33,15 @@ from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
 from ara.locking import MeasurementBusy
-from ara.registry import UnknownEngine, engine_status, get_backend, resolve_engine
+from ara.registry import (
+    EngineSelection,
+    EngineSelectionRecord,
+    UnknownEngine,
+    engine_selection_record,
+    engine_status,
+    get_backend,
+    resolve_engine,
+)
 from ara.ui import Console
 
 
@@ -44,6 +52,35 @@ def _hf_hint(c: Console, as_json: bool) -> None:
     if not as_json and not hf_auth.has_token():
         c.emit(c.style("dim", "  tip: run ") + c.style("accent", "ara hf login")
                + c.style("dim", " for higher rate limits + faster downloads"))
+
+
+def _emit_engine_selection(c: Console, record: EngineSelectionRecord) -> None:
+    """Render a captured decision without consulting machine state again."""
+    c.emit(c.style(
+        "dim",
+        f"  selected {record.resolved_engine} ({record.backend}) because {record.reason}",
+    ))
+
+
+def _governed_engine_selection(
+    requested: str | None,
+    engine_key: str,
+    backend: str,
+) -> EngineSelectionRecord:
+    """Explain a final governed candidate chosen from reusable characterization evidence."""
+    automatic_reason = None
+    if requested is None or requested == "auto":
+        automatic_reason = (
+            "the portable CPU characterization was the best reusable governed option"
+            if backend == "cpu"
+            else f"the {engine_key} characterization had the largest reusable measured "
+                 "safe context"
+        )
+    return engine_selection_record(
+        requested,
+        EngineSelection(backend, engine_key, engines.ENGINES[engine_key]["package"]),
+        automatic_reason=automatic_reason,
+    )
 
 
 _CMD_W = 16
@@ -1685,6 +1722,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         msg = f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}"
         print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
         return 1
+    selection_record = engine_selection_record(engine, sel)
     if not acquire.valid_model_ref(model):
         msg = (f"invalid model {model!r} — expected a Hugging Face repo id (org/name) "
                f"or a local .gguf file path")
@@ -1722,6 +1760,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         bk, sel.backend, flash_attn=flash_attn, flash_attn_optin=flash_attn_optin,
         kv_quant=kv_quant, weight_quant=weight_quant, prefill_chunk=prefill_chunk)
     if c.verbose and not as_json:
+        _emit_engine_selection(c, selection_record)
         c.emit(c.field("engine", sel.engine_key, engine_label))
         c.emit(c.field("KV cache", kv_quant))
     progress = (not as_json) and sys.stderr.isatty()
@@ -1900,6 +1939,7 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
 
     if as_json:
         out: dict = {"model": model, "engine": sel.engine_key, "safe_context": ceiling,
+                     "engine_selection": selection_record.as_dict(),
                      "direct_context": direct_context,
                      "fitted_context": fitted_context,
                      "methodology_key": methodology_key,
@@ -2103,7 +2143,7 @@ def render_models(c: Console, *, as_json: bool = False, want=None) -> None:
 
 
 def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None = None,
-                     engine: str | None = None) -> int:
+                     engine: str | None = None, explain: bool = False) -> int:
     """Analytic recommendations — which cataloged models fit this machine, ranked by the context
     the estimated budget supports (most first), marking those already characterized here.
 
@@ -2152,7 +2192,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         else:
             lim = estimate.limits(detect.machine(), measured=measured)
         if (engine_identity.canonical_engine(selected_engine) == "mlx"
-                and lim["safe_budget_gb"] is None):
+                and lim["safe_budget_gb"] is None and not explain):
             msg = "no current MLX budget is available for a safe ranking"
             print(json.dumps({"error": msg})) if as_json else c.emit(
                 c.style("bad", f"  {msg}"))
@@ -2161,14 +2201,36 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         best = _best_ceilings(evidence_con)  # current without crossing the engine seam
 
         recs = []
+        explanations = []
         unrankable = 0                    # weights fit, but we can't read the arch to estimate context
         models = catalog.all_models(cache_con)
         for row in models:
             fit = estimate.model_fit(lim, row, row.get("weights_gb"))
+            if fit["fits"] is None:
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": "unrankable",
+                    "reason": fit["reason"] or "unknown",
+                })
+                continue
             if not fit["fits"]:
+                if fit["weights_gb"] is None:
+                    status, reason = "unrankable", "size_unknown"
+                else:
+                    status, reason = "excluded", "exceeds_safe_budget"
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": status,
+                    "reason": reason,
+                })
                 continue
             if fit["est_context"] is None:
                 unrankable += 1           # honest: count it rather than drop it silently
+                explanations.append({
+                    "model_id": row["model_id"],
+                    "status": "unrankable",
+                    "reason": "architecture_unknown",
+                })
                 continue
             quant = row.get("quant") or scoring.quant_key(row["model_id"])
             recs.append({"model_id": row["model_id"], "modality": row.get("modality"),
@@ -2239,6 +2301,18 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
                                      "run_scores": r["score"].run_scores,
                                      "evidence_warning": r["score"].evidence_warning,
                                      "inversion": r["score"].inversion})} for r in recs]
+        if explain:
+            recs = [{
+                **r,
+                "status": "recommended",
+                "reason": (
+                    "measurement_stale"
+                    if r["historical_characterization"]
+                    else "use_case_score_unavailable"
+                    if use_case is not None and r.get("score") is None
+                    else None
+                ),
+            } for r in recs] + explanations
         print(json.dumps(recs, indent=2))
         return 0
 
@@ -2246,6 +2320,26 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
         if unrankable:
             c.emit(c.style("dim", f"  {unrankable} more fit but can't be ranked "
                                    "(architecture unknown) — try ara profile --model <model>"))
+
+    def _explanation_section() -> None:
+        if not explain or not explanations:
+            return
+        labels = {
+            "exceeds_safe_budget": "exceeds safe budget",
+            "no_current_budget": "no current budget",
+            "size_unknown": "size unknown",
+            "architecture_unknown": "architecture unknown",
+            "artifact_unresolved": "artifact unresolved",
+            "measurement_stale": "measurement stale",
+            "use_case_score_unavailable": "use-case score unavailable",
+            "unknown": "reason unknown",
+        }
+        c.emit()
+        c.emit(c.section("  EXCLUDED / UNRANKABLE"))
+        for item in explanations:
+            reason = labels.get(item["reason"], "reason unknown")
+            c.emit("  " + c.style("metric", item["model_id"])
+                   + c.style("dim", f"  {item['status']} · {reason}"))
 
     c.emit()
     sub = ("  (estimated — fits this machine, most context first)" if use_case is None
@@ -2266,6 +2360,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             c.emit(c.style("dim", "  nothing in the catalog fits the estimated budget — "
                                   "try a smaller / more-quantized model"))
         _unrankable_note()
+        _explanation_section()
         c.emit()
         return 0
     for r in recs:
@@ -2334,6 +2429,7 @@ def render_recommend(c: Console, *, as_json: bool = False, use_case: str | None 
             parts = ", ".join(f"{r['quant']}(~{r['est_context']} tok)" for r in ordered)
             c.emit(c.style("dim", f"    {base}: {parts}"))
     _unrankable_note()
+    _explanation_section()
     c.emit()
     return 0
 
@@ -2626,6 +2722,7 @@ def _native_benchmark_plan(model: str, engine: str | None,
         "key": key,
         "backend": backend,
         "bk": bk,
+        "engine_selection": _governed_engine_selection(engine, key, backend),
         "row": row,
         "safe": safe,
         "ceiling_measured_at": row.get("measured_at"),
@@ -2677,9 +2774,12 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     ceiling_measured_at = plan["ceiling_measured_at"]
     characterized_artifact_id = plan["artifact_id"]
     evidence_model = plan["evidence_model"]
+    selection_record = plan.get("engine_selection")
     native_authority_key = None if ollama_mode else plan["measurement_authority"]
     mk = profile.machine_key()
 
+    if c.verbose and not as_json and selection_record is not None:
+        _emit_engine_selection(c, selection_record)
     stale_ceiling = (
         False
         if ollama_mode else
@@ -2912,6 +3012,8 @@ def render_benchmark(c: Console, model: str, *, use_case: str, engine: str | Non
     if as_json:
         payload: dict = {"model": model, "use_case": use_case, "score": score,
                          "sample_size": n, "engine": key, "stored": True}
+        if selection_record is not None:
+            payload["engine_selection"] = selection_record.as_dict()
         if ollama_mode:
             payload["concurrency_scope"] = (
                 "ARA governs these requests; outside Ollama clients remain concurrent")
@@ -3380,6 +3482,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         sel = resolve_engine(engine)
     except UnknownEngine:
         return err(f"unknown engine {engine!r} — try one of: {', '.join(engines.ENGINES)}")
+    selection_record = engine_selection_record(engine, sel)
     if not prompt or not prompt.strip():
         return err("usage: ara run <model> <prompt>")
     if max_tokens <= 0:
@@ -3603,6 +3706,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
                 return err(f"the live memory authority for {engine_key} changed during "
                            f"selection — re-run: ara characterize {model} --engine {engine_key}")
             selected_authority_key = selected_authority.key
+            selection_record = _governed_engine_selection(
+                engine, engine_key, backend)
 
     characterized_ceiling = safe
     if ctx is not None and (msg := _ctx_gate_msg(ctx, characterized_ceiling, model)):
@@ -3630,6 +3735,8 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err(f"the measured ceiling for {model} is not bound to an exact artifact — "
                    f"re-run: ara characterize {model}")
 
+    if c.verbose and not as_json:
+        _emit_engine_selection(c, selection_record)
     if not as_json:
         _emit_run_context(c, characterized_ceiling, effective_context)
     # Consent before load (a courtesy — the ceiling already makes it wall-safe). Interactive only;
@@ -3682,6 +3789,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
         return err("run failed: engine returned an invalid completion")
     if as_json:
         print(json.dumps({"model": model, "engine": engine_key,
+                          "engine_selection": selection_record.as_dict(),
                           "safe_context": characterized_ceiling,
                           "characterized_ceiling": characterized_ceiling,
                           "effective_context": effective_context,
@@ -5511,6 +5619,88 @@ def _ollama_doctor_report() -> dict:
 _DOCTOR_TABLES = ("calibrations", "characterizations", "profiles", "benchmark_results")
 
 
+def _database_health(con: sqlite3.Connection) -> dict:
+    """Assess an already read-only ARA store without changing or repairing it."""
+    health = {
+        "status": "healthy",
+        "presence": "present",
+        "readable": True,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+    try:
+        tables = {
+            row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        health["schema_version"] = con.execute("PRAGMA user_version").fetchone()[0]
+        if not tables.intersection(_DOCTOR_TABLES):
+            health.update(status="unknown", presence="uninitialized",
+                          schema_supported=False)
+        else:
+            health["schema_supported"] = health["schema_version"] == db.SCHEMA_VERSION
+    except sqlite3.Error as exc:
+        health.update(status="degraded", readable=False, error=str(exc))
+        return health
+
+    try:
+        quick_rows = con.execute("PRAGMA quick_check").fetchall()
+        messages = [str(row[0]) for row in quick_rows]
+        if messages == ["ok"]:
+            health["quick_check"] = {"status": "passed", "messages": []}
+        else:
+            health["quick_check"] = {"status": "failed", "messages": messages}
+    except sqlite3.Error as exc:
+        health["quick_check"] = {"status": "failed", "messages": [str(exc)]}
+
+    try:
+        violations = [
+            {"table": row[0], "rowid": row[1], "parent": row[2], "fkid": row[3]}
+            for row in con.execute("PRAGMA foreign_key_check").fetchall()
+        ]
+        health["foreign_key_check"] = {
+            "status": "failed" if violations else "passed",
+            "violations": violations,
+        }
+    except sqlite3.Error as exc:
+        health["foreign_key_check"] = {
+            "status": "failed",
+            "violations": [{"error": str(exc)}],
+        }
+
+    if (health["presence"] == "present"
+            and (health["schema_supported"] is False
+                 or health["quick_check"]["status"] == "failed"
+                 or health["foreign_key_check"]["status"] == "failed")):
+        health["status"] = "degraded"
+    return health
+
+
+def _missing_database_health() -> dict:
+    return {
+        "status": "unknown",
+        "presence": "missing",
+        "readable": None,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+
+
+def _unreadable_database_health(path: Path, exc: BaseException) -> dict:
+    health = _missing_database_health()
+    health.update(
+        status="degraded",
+        presence="present",
+        readable=False,
+        error=f"database problem at {path}: {exc}",
+    )
+    return health
+
+
 def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
                   as_json: bool = False) -> int:
     """``ara doctor``: this machine's identity (``machine_key``) and the count of stored records
@@ -5522,47 +5712,98 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
     installed build and one minimal device operation. Spec 2026-07-04-machine-key-stabilization."""
     mk = profile.machine_key()
     path = db._db_path()
-    try:
-        with db.connected() as con:
-            rekeyed = db._rekey_legacy(con) if rekey else None
-            counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key=?",  # noqa: S608
-                                     (mk,)).fetchone()[0] for t in _DOCTOR_TABLES}
-            other = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE machine_key<>?",  # noqa: S608
-                                    (mk,)).fetchone()[0] for t in _DOCTOR_TABLES)
-            schema_version = con.execute("PRAGMA user_version").fetchone()[0]
-            characterization_rows = (db.list_characterizations_for_display(con, mk)
-                                     if engines else [])
-    except (OSError, sqlite3.Error) as exc:
-        msg = f"database problem at {path}: {exc}"
-        print(json.dumps({"error": msg, "database": str(path)})) if as_json \
-            else c.emit(c.style("bad", f"  {msg}"))
-        return 1
+    rekeyed = None
+    counts: dict[str, int | None] = dict.fromkeys(_DOCTOR_TABLES)
+    other: int | None = None
+    characterization_rows = []
+    database_health = _missing_database_health()
+    if rekey:
+        try:
+            with db.connected() as con:
+                rekeyed = db._rekey_legacy(con)
+        except (OSError, sqlite3.Error) as exc:
+            database_health = _unreadable_database_health(path, exc)
+    if database_health["readable"] is not False and path.is_file():
+        try:
+            with db.connected_readonly() as con:
+                database_health = _database_health(con)
+                try:
+                    counts = {
+                        table: con.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE machine_key=?",  # noqa: S608
+                            (mk,),
+                        ).fetchone()[0]
+                        for table in _DOCTOR_TABLES
+                    }
+                    other = sum(
+                        con.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE machine_key<>?",  # noqa: S608
+                            (mk,),
+                        ).fetchone()[0]
+                        for table in _DOCTOR_TABLES
+                    )
+                    characterization_rows = (
+                        db.list_characterizations_for_display(con, mk) if engines else [])
+                except sqlite3.Error:
+                    counts = dict.fromkeys(_DOCTOR_TABLES)
+                    other = None
+                    characterization_rows = []
+        except (OSError, sqlite3.Error) as exc:
+            database_health = _unreadable_database_health(path, exc)
     ollama_report = _ollama_doctor_report()
     engine_reports = (engine_audit.audit_installed(
         host_features=detect._cpu_features(), characterization_rows=characterization_rows)
         if engines else None)
     if as_json:
         out: dict = {"machine_key": mk, "counts": counts, "other_keys_rows": other,
-                     "ollama": ollama_report}
+                     "database_health": database_health, "ollama": ollama_report}
         if rekey:
             out["rekeyed_rows"] = rekeyed
         if engine_reports is not None:
             out["engines"] = engine_reports
         if c.verbose:
-            out.update(database=str(path), schema_version=schema_version)
+            out.update(database=str(path),
+                       schema_version=database_health["schema_version"])
         print(json.dumps(out))
-        return 0
-    if rekey:
+        return 1 if database_health["status"] == "degraded" else 0
+    if rekey and rekeyed is not None:
         c.emit(c.style("good" if rekeyed else "dim",
                        f"  rekeyed {rekeyed} legacy row(s) to the versioned machine_key format"))
     c.emit(c.style("accent", "  machine  ") + c.style("dim", mk))
     for name, n in counts.items():
-        c.emit(f"    {name:<18} {n}")
+        c.emit(f"    {name:<18} {n if n is not None else 'unknown'}")
     if other:
         c.emit(c.style("dim", f"    ({other} row(s) under other machine keys — not this box)"))
     if c.verbose:
         c.emit(f"    {'database':<20} {path}")
-        c.emit(f"    {'schema version':<20} {schema_version}")
+        c.emit(f"    {'schema version':<20} {database_health['schema_version']}")
+    c.emit(c.section("  DATABASE HEALTH"))
+    summary_role = ("good" if database_health["status"] == "healthy"
+                    else "warn" if database_health["status"] == "degraded" else "dim")
+    readable = ("readable" if database_health["readable"] is True
+                else "not readable" if database_health["readable"] is False
+                else "not initialized")
+    c.emit(c.style(
+        summary_role,
+        f"    {database_health['status']} · {database_health['presence']} · "
+        f"{readable}",
+    ))
+    if database_health.get("error"):
+        c.emit(c.style("dim", f"    {database_health['error']}"))
+    if database_health["readable"]:
+        supported = ("supported" if database_health["schema_supported"] else "unsupported")
+        c.emit(c.style(
+            "dim",
+            f"    schema {database_health['schema_version']} · {supported}",
+        ))
+        quick = database_health["quick_check"]
+        foreign = database_health["foreign_key_check"]
+        c.emit(c.style("dim", f"    quick check · {quick['status']}"))
+        c.emit(c.style("dim", f"    foreign keys · {foreign['status']}"))
+        for message in quick["messages"]:
+            c.emit(c.style("warn", f"      {message}"))
+        for violation in foreign["violations"]:
+            c.emit(c.style("warn", f"      {violation}"))
     if ollama_report["findings"]:
         c.emit(c.section("  OLLAMA"))
         for finding in ollama_report["findings"]:
@@ -5587,7 +5828,7 @@ def render_doctor(c: Console, *, rekey: bool = False, engines: bool = False,
             for finding in report["findings"]:
                 c.emit(c.style("warn", f"      {finding['code'].replace('_', ' ')}")
                        + c.style("dim", f" — {finding['detail']}"))
-    return 0
+    return 1 if database_health["status"] == "degraded" else 0
 
 
 _HELP_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -5902,13 +6143,15 @@ def _click_models_search(ctx: click.Context, query: tuple[str, ...],
               help="Select the MLX analytic lane or rank artifacts in Ollama.")
 @click.option("--use-case", metavar="USE_CASE",
               help="Rank by capability evidence: extraction, reasoning, rag, agentic, or coding.")
+@click.option("--explain", is_flag=True,
+              help="Also report excluded and unrankable cached models.")
 @_json_verbose_options
 @click.pass_context
 def _click_models_recommend(ctx: click.Context, engine: str | None, use_case: str | None,
-                            verbose: bool, as_json: bool) -> int:
+                            explain: bool, verbose: bool, as_json: bool) -> int:
     """Rank cached models by estimated usable context or capability evidence."""
     return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case,
-                            engine=engine)
+                            engine=engine, explain=explain)
 
 
 @_click_models.command("show", context_settings=_HELP_SETTINGS)
@@ -5973,13 +6216,16 @@ def _click_profile(ctx: click.Context, model: str | None, engine: str | None,
 
 @_click_cli.command("recommend", hidden=True, context_settings=_HELP_SETTINGS)
 @click.option("--use-case", help="Rank by a measured capability dimension.")
+@click.option("--explain", is_flag=True,
+              help="Also report excluded and unrankable cached models.")
 @_json_verbose_options
 @click.pass_context
 def _click_recommend(ctx: click.Context, use_case: str | None,
-                     verbose: bool, as_json: bool) -> int:
+                     explain: bool, verbose: bool, as_json: bool) -> int:
     """Rank cached models that fit this machine."""
     _warn_deprecated("recommend", "models recommend")
-    return render_recommend(_mark_json(ctx, as_json), as_json=as_json, use_case=use_case)
+    return render_recommend(
+        _mark_json(ctx, as_json), as_json=as_json, use_case=use_case, explain=explain)
 
 
 @_click_cli.command("run", context_settings=_HELP_SETTINGS,

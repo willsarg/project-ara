@@ -129,9 +129,10 @@ def _capture_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "render_profile",
                         lambda c, **kw: (rec.update(profile=kw) or 0))
     monkeypatch.setattr(cli, "render_recommend",
-                        lambda c, as_json=False, use_case=None, engine=None:
+                        lambda c, as_json=False, use_case=None, engine=None, explain=False:
                         (rec.update(recommend=as_json, recommend_uc=use_case,
-                                    recommend_engine=engine) or 0))
+                                    recommend_engine=engine,
+                                    recommend_explain=explain) or 0))
     monkeypatch.setattr(cli, "render_run",
                         lambda c, model, **kw: (rec.update(run={"model": model, **kw}) or 0))
     monkeypatch.setattr(cli, "render_serve",
@@ -306,6 +307,239 @@ def test_render_doctor_json_reports_key_and_counts(
     assert out["machine_key"] == "ara1|C|G|32|Linux"
     assert out["counts"]["characterizations"] == 1      # only this machine's rows
     assert out["other_keys_rows"] >= 1                    # foreign/legacy rows counted separately
+    assert out["ollama"] == doctor_ollama_clean
+    assert out["database_health"] == {
+        "status": "healthy",
+        "presence": "present",
+        "readable": True,
+        "schema_version": 7,
+        "schema_supported": True,
+        "quick_check": {"status": "passed", "messages": []},
+        "foreign_key_check": {"status": "passed", "violations": []},
+    }
+
+
+def test_render_doctor_reports_missing_database_without_creating_it(
+        tmp_path, monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+    path = tmp_path / "missing" / "ara.db"
+    monkeypatch.setenv("ARA_DB_PATH", str(path))
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "ara1|C|G|32|Linux")
+    monkeypatch.setattr(
+        db,
+        "connected",
+        lambda: pytest.fail("default doctor must not open a writable connection"),
+    )
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"] == {
+        "status": "unknown",
+        "presence": "missing",
+        "readable": None,
+        "schema_version": None,
+        "schema_supported": None,
+        "quick_check": {"status": "not_run", "messages": []},
+        "foreign_key_check": {"status": "not_run", "violations": []},
+    }
+    assert out["ollama"] == doctor_ollama_clean
+    assert not path.exists()
+
+
+def test_database_health_reports_uninitialized_store():
+    con = sqlite3.connect(":memory:")
+    try:
+        health = cli._database_health(con)
+    finally:
+        con.close()
+
+    assert health["status"] == "unknown"
+    assert health["presence"] == "uninitialized"
+    assert health["readable"] is True
+    assert health["schema_supported"] is False
+    assert health["quick_check"]["status"] == "passed"
+    assert health["foreign_key_check"]["status"] == "passed"
+
+
+def test_database_health_reports_schema_read_error():
+    class BrokenConnection:
+        def execute(self, _statement):
+            raise sqlite3.DatabaseError("schema unreadable")
+
+    health = cli._database_health(BrokenConnection())
+
+    assert health["status"] == "degraded"
+    assert health["readable"] is False
+    assert health["error"] == "schema unreadable"
+
+
+@pytest.mark.parametrize(
+    ("pragma", "check_name", "detail_name"),
+    [
+        ("PRAGMA quick_check", "quick_check", "messages"),
+        ("PRAGMA foreign_key_check", "foreign_key_check", "violations"),
+    ],
+)
+def test_database_health_reports_integrity_pragma_error(
+        store, pragma, check_name, detail_name):
+    class Connection:
+        def execute(self, statement, parameters=()):
+            if statement == pragma:
+                raise sqlite3.DatabaseError("integrity check unavailable")
+            return store.execute(statement, parameters)
+
+    health = cli._database_health(Connection())
+
+    assert health["status"] == "degraded"
+    assert health[check_name]["status"] == "failed"
+    assert "integrity check unavailable" in str(health[check_name][detail_name])
+
+
+def test_render_doctor_reports_unsupported_schema_read_only(
+        store, monkeypatch, capsys, doctor_ollama_clean):
+    store.execute("PRAGMA user_version = 99")
+    store.commit()
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 1
+
+    health = json.loads(capsys.readouterr().out)["database_health"]
+    assert health["status"] == "degraded"
+    assert health["schema_version"] == 99
+    assert health["schema_supported"] is False
+    assert store.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+@pytest.mark.parametrize(
+    ("pragma", "rows", "check_name", "detail_name"),
+    [
+        ("PRAGMA quick_check", [("database disk image is malformed",)],
+         "quick_check", "messages"),
+        ("PRAGMA foreign_key_check", [("child", 1, "parent", 0)],
+         "foreign_key_check", "violations"),
+    ],
+)
+def test_render_doctor_reports_failed_integrity_check_and_continues(
+        store, monkeypatch, capsys, doctor_ollama_clean,
+        pragma, rows, check_name, detail_name):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Result:
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement == pragma:
+                return Result()
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def failed_check():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", failed_check)
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "degraded"
+    assert out["database_health"][check_name]["status"] == "failed"
+    assert out["database_health"][check_name][detail_name]
+    assert out["ollama"] == doctor_ollama_clean
+
+
+def test_render_doctor_human_lists_integrity_findings(
+        store, monkeypatch, make_console, doctor_ollama_clean):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement == "PRAGMA quick_check":
+                return Result([("damaged page",)])
+            if statement == "PRAGMA foreign_key_check":
+                return Result([("child", 1, "parent", 0)])
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def failed_checks():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", failed_checks)
+    c, buf = make_console()
+
+    assert cli.render_doctor(c) == 1
+
+    out = buf.getvalue()
+    assert "damaged page" in out
+    assert "'table': 'child'" in out
+
+
+def test_render_doctor_continues_when_record_counts_are_unreadable(
+        store, monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement.startswith("SELECT COUNT(*)"):
+                raise sqlite3.DatabaseError("counts unreadable")
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def broken_counts():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", broken_counts)
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "healthy"
+    assert set(out["counts"].values()) == {None}
+    assert out["other_keys_rows"] is None
+    assert out["ollama"] == doctor_ollama_clean
+
+
+def test_render_doctor_reports_rekey_connection_failure_and_continues(
+        monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+
+    @contextlib.contextmanager
+    def broken_store():
+        raise sqlite3.DatabaseError("rekey unavailable")
+        yield
+
+    monkeypatch.setattr(db, "connected", broken_store)
+
+    assert cli.render_doctor(
+        cli.Console.from_env(), rekey=True, as_json=True) == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "degraded"
+    assert "rekey unavailable" in out["database_health"]["error"]
+    assert out["rekeyed_rows"] is None
     assert out["ollama"] == doctor_ollama_clean
 
 
@@ -559,26 +793,30 @@ def test_ollama_doctor_warns_for_non_loopback_endpoint(monkeypatch):
 
 
 @pytest.mark.parametrize("as_json", [False, True])
-def test_render_doctor_reports_database_failure(monkeypatch, make_console, capsys, as_json):
+def test_render_doctor_reports_database_failure(
+        monkeypatch, make_console, capsys, doctor_ollama_clean, as_json):
     from ara import db
+    db._db_path().parent.mkdir(parents=True, exist_ok=True)
+    db._db_path().write_text("not a database")
 
     @contextlib.contextmanager
     def broken_store():
         raise sqlite3.DatabaseError("file is not a database")
         yield  # pragma: no cover - contextmanager requires an iterator
 
-    monkeypatch.setattr(db, "connected", broken_store)
+    monkeypatch.setattr(db, "connected_readonly", broken_store)
     c, buf = make_console()
 
     assert cli.render_doctor(c, as_json=as_json) == 1
 
     rendered = capsys.readouterr().out if as_json else buf.getvalue()
-    assert "database problem" in rendered
+    assert "DATABASE HEALTH" in rendered or '"database_health"' in rendered
     assert "file is not a database" in rendered
     if as_json:
         payload = json.loads(rendered)
-        assert payload["error"].startswith("database problem")
-        assert payload["database"] == str(db._db_path())
+        assert payload["database_health"]["status"] == "degraded"
+        assert payload["database_health"]["readable"] is False
+        assert payload["ollama"]["findings"] == []
     else:
         assert str(db._db_path()) in rendered
 
@@ -678,9 +916,9 @@ def test_main_model_detail_filters_preserve_not_applicable_warning(monkeypatch, 
     (["models", "search", "smol model", "--json", "-v"],
      {"query": "smol model", "as_json": True}),
     (["models", "recommend", "--use-case", "coding", "--json", "--verbose"],
-     {"as_json": True, "use_case": "coding", "engine": None}),
+     {"as_json": True, "use_case": "coding", "engine": None, "explain": False}),
     (["models", "recommend", "--engine", "ollama", "--json"],
-     {"as_json": True, "use_case": None, "engine": "ollama"}),
+     {"as_json": True, "use_case": None, "engine": "ollama", "explain": False}),
     (["models", "show", "org/m", "--json", "-v"],
      {"model_id": "org/m", "as_json": True, "engine": None}),
     (["models", "show", "qwen3:0.6b", "--engine", "ollama", "--json"],
@@ -705,6 +943,19 @@ def test_models_subcommands_dispatch_to_existing_renderers(monkeypatch, argv, ex
         )
     assert _run_main(monkeypatch, argv) == 0
     assert seen == expected
+
+
+def test_models_recommend_explain_dispatches(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli,
+        "render_recommend",
+        lambda c, **kwargs: seen.update(**kwargs) or 0,
+    )
+
+    assert _run_main(monkeypatch, ["models", "recommend", "--explain"]) == 0
+
+    assert seen["explain"] is True
 
 
 # --no-flash-attn flag threading (vulkan FA is on by default). Slug: 2026-06-25-vulkan-flash-attention
@@ -3179,6 +3430,99 @@ def test_recommend_excludes_models_that_dont_fit(make_console, monkeypatch, set_
     assert "org/Fits" in out and "org/TooBig" not in out
 
 
+def test_recommend_explain_json_accounts_for_every_cached_model(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [
+            _model_row("org/Fits", weights_gb=4.0),
+            _model_row("org/TooBig", weights_gb=200.0),
+            _model_row("org/UnknownSize", weights_gb=None),
+            _model_row("org/UnknownArchitecture", weights_gb=4.0, n_layers=None),
+        ],
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    by_model = {
+        item["model_id"]: item for item in json.loads(capsys.readouterr().out)
+    }
+    assert by_model["org/Fits"]["status"] == "recommended"
+    assert by_model["org/Fits"]["reason"] is None
+    assert by_model["org/TooBig"]["status"] == "excluded"
+    assert by_model["org/TooBig"]["reason"] == "exceeds_safe_budget"
+    assert by_model["org/UnknownSize"]["status"] == "unrankable"
+    assert by_model["org/UnknownSize"]["reason"] == "size_unknown"
+    assert by_model["org/UnknownArchitecture"]["status"] == "unrankable"
+    assert by_model["org/UnknownArchitecture"]["reason"] == "architecture_unknown"
+
+
+def test_recommend_explain_reports_unknown_budget(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [_model_row("org/UnknownBudget", weights_gb=4.0)],
+        machine=_machine(backend="cpu", ram_total_gb=None),
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == [{
+        "model_id": "org/UnknownBudget",
+        "status": "unrankable",
+        "reason": "no_current_budget",
+    }]
+
+
+def test_recommend_explain_marks_stale_measurement_on_recommended_model(
+        monkeypatch, set_platform, capsys):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [_model_row("org/StaleMeasurement", weights_gb=4.0)],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_best_ceiling_history",
+        lambda con: {"org/StaleMeasurement": (4096, "cpu", None, {}, "old-artifact")},
+    )
+    monkeypatch.setattr(cli, "_best_ceilings", lambda con: {})
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_recommend(c, as_json=True, explain=True) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["model_id"] == "org/StaleMeasurement"
+    assert payload[0]["status"] == "recommended"
+    assert payload[0]["reason"] == "measurement_stale"
+
+
+def test_recommend_explain_human_separates_non_recommendations(
+        make_console, monkeypatch, set_platform):
+    _wire_recommend(
+        monkeypatch,
+        set_platform,
+        [
+            _model_row("org/Fits", weights_gb=4.0),
+            _model_row("org/TooBig", weights_gb=200.0),
+            _model_row("org/Unknown", weights_gb=4.0, n_layers=None),
+        ],
+    )
+    c, buf = make_console()
+
+    assert cli.render_recommend(c, explain=True) == 0
+
+    out = buf.getvalue()
+    assert "RECOMMENDED MODELS" in out
+    assert "EXCLUDED / UNRANKABLE" in out
+    assert "org/TooBig" in out and "exceeds safe budget" in out
+    assert "org/Unknown" in out and "architecture unknown" in out
+
+
 def test_recommend_memory_bound_label(make_console, monkeypatch, set_platform):
     # A tiny CPU budget binds before a huge window → ranked, but not "full window".
     _wire_recommend(monkeypatch, set_platform,
@@ -4353,6 +4697,67 @@ def test_run_json(monkeypatch, capsys):
     assert cli.render_run(c, "org/m", prompt="hi", as_json=True, assume_yes=True) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["completion"] == "hello" and payload["safe_context"] == 8192
+    assert payload["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "cpu",
+        "backend": "cpu",
+        "mode": "automatic",
+        "reason": "the portable CPU characterization was the best reusable governed option",
+    }
+
+
+def test_run_verbose_explains_engine_selection(make_console, monkeypatch):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *a, **k: {"completion": "hello"},
+    )
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_run(c, "org/m", prompt="hi", assume_yes=True) == 0
+
+    assert ("selected cpu (cpu) because the portable CPU characterization was the best "
+            "reusable governed option") in buf.getvalue()
+
+
+def test_run_json_identifies_explicit_engine_choice(monkeypatch, capsys):
+    _wire_run(
+        monkeypatch,
+        characterization=_CHAR,
+        generate=lambda *a, **k: {"completion": "hello"},
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_run(
+        c,
+        "org/m",
+        prompt="hi",
+        engine="cpu",
+        as_json=True,
+        assume_yes=True,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["engine_selection"] == {
+        "requested": "cpu",
+        "resolved_engine": "cpu",
+        "backend": "cpu",
+        "mode": "explicit",
+        "reason": "the user selected --engine cpu",
+    }
+
+
+def test_engine_selection_rendering_uses_captured_record(
+        make_console, monkeypatch):
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    selected = cli.resolve_engine(None)
+    record = cli.engine_selection_record(None, selected)
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "cuda")
+    c, buf = make_console()
+
+    cli._emit_engine_selection(c, record)
+
+    assert "selected mlx (apple)" in buf.getvalue()
+    assert "CUDA" not in buf.getvalue()
 
 
 def test_run_usage_without_prompt(make_console, monkeypatch):
@@ -7090,6 +7495,32 @@ def test_render_characterize_json(monkeypatch, capsys, store):
     assert data["safe_context"] == 9000
     assert data["engine"] == "mlx"
     assert "decode_context" in data
+    assert data["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "mlx",
+        "backend": "apple",
+        "mode": "automatic",
+        "reason": "the machine matched the Apple Silicon backend",
+    }
+
+
+def test_render_characterize_verbose_explains_engine_selection(
+        make_console, monkeypatch, store):
+    _wire_characterize(
+        monkeypatch,
+        characterize=lambda m: {
+            "model": m,
+            "safe_context": 9000,
+            "decode_context": None,
+            "points": [],
+        },
+    )
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_characterize(c, "org/M") == 0
+
+    assert ("selected mlx (apple) because the machine matched the Apple Silicon backend"
+            in buf.getvalue())
 
 
 def test_render_characterize_json_stdout_is_one_document_even_on_first_calibration(
@@ -12398,7 +12829,30 @@ def test_render_benchmark_json_flags_stale_ceiling(monkeypatch, capsys):
     c = cli.Console(color=False, stream=sys.stderr)
     rc = cli.render_benchmark(c, "org/m", use_case="extraction", as_json=True, assume_yes=True)
     assert rc == 0
-    assert json.loads(capsys.readouterr().out)["stale_ceiling"] is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stale_ceiling"] is True
+    assert payload["engine_selection"] == {
+        "requested": "auto",
+        "resolved_engine": "mlx",
+        "backend": "apple",
+        "mode": "automatic",
+        "reason": "the mlx characterization had the largest reusable measured safe context",
+    }
+
+
+def test_render_benchmark_verbose_explains_engine_selection(make_console, monkeypatch):
+    _wire_benchmark(monkeypatch, ceiling=8000, score=0.5)
+    c, buf = make_console(verbose=True)
+
+    assert cli.render_benchmark(
+        c,
+        "org/m",
+        use_case="extraction",
+        assume_yes=True,
+    ) == 0
+
+    assert ("selected mlx (apple) because the mlx characterization had the largest "
+            "reusable measured safe context") in buf.getvalue()
 
 
 def test_render_benchmark_lower_ctx_preserves_ceiling_staleness(monkeypatch, capsys):

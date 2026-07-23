@@ -226,6 +226,8 @@ CREATE TABLE IF NOT EXISTS profiles (
 """ + _MODEL_ARTIFACTS_DDL + _CHARACTERIZATIONS_DDL.format(
     table="characterizations") + _BENCHMARK_RESULTS_DDL.format(table="benchmark_results")
 
+SCHEMA_VERSION = 7
+
 
 def _db_path() -> Path:
     """Where the store lives — ``ARA_DB_PATH`` if set (tests), else the OS data dir."""
