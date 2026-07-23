@@ -333,7 +333,16 @@ def render_landing(c: Console) -> None:
     c.emit(_cmd(c, "ara detect --models", "catalog models physically cached on this machine"))
     c.emit(_cmd(c, "ara profile", "estimate this machine's capability (analytic — no engine)"))
     c.emit(_cmd(c, "ara models recommend", "catalog models that fit, ranked by usable context"))
-    c.emit(_cmd(c, "ara serve <model>", "stand it up safely on Ollama + hand back the endpoint"))
+    if engine_key == "mlx":
+        c.emit(_cmd(
+            c, "ara serve <model> --engine mlx",
+            "serve it through the MLX engine you installed",
+        ))
+    else:
+        c.emit(_cmd(
+            c, "ara serve <model>",
+            "serve it through an existing Ollama installation",
+        ))
     c.emit(_cmd(c, "ara benchmark <model>", "run a capability probe and store the measured score"))
     c.emit(_cmd(c, "ara hub", "host the coordinator that ARA nodes phone home to"))
     c.emit(_cmd(c, "ara node <sub>", "run ARA as a push-only daemon that phones home (enroll/run/install/…)"))

@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from importlib import metadata
@@ -31,15 +32,56 @@ from pathlib import Path
 from ara import engine_env, engine_identity
 
 
-def _ara_version() -> str:
-    """The installed project-ara version (also behind ``ara --version``), or a sentinel when running
-    from an un-installed source tree with no distribution metadata. Stamped into an engine env at
-    install and compared on the next ``ara install`` to detect a stale engine package — a newer ARA
-    wheel carries newer nested engine source that must reach a box that already has the env."""
+_SOURCE_VERSION = re.compile(
+    r"^v?(\d+)\.(\d+)\.(\d+)-(\d+)-g([0-9a-f]+)(-dirty)?$"
+)
+
+
+def _source_checkout_version() -> str | None:
+    """Derive the live VCS version when this module is running from a Git checkout."""
+    root = Path(__file__).resolve().parent.parent
+    if not (root / ".git").exists():
+        return None
     try:
-        return metadata.version("project-ara")
+        result = subprocess.run(
+            [
+                "git", "-C", str(root), "describe", "--tags", "--long", "--dirty",
+                "--match", "v[0-9]*", "--abbrev=9",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    match = _SOURCE_VERSION.fullmatch(result.stdout.strip())
+    if match is None:
+        return None
+
+    major, minor, patch, distance, revision, dirty = match.groups()
+    if int(distance) == 0:
+        version = f"{major}.{minor}.{patch}"
+    else:
+        version = f"{major}.{minor}.{int(patch) + 1}.dev{distance}+g{revision}"
+    if dirty:
+        version += ".dirty" if "+" in version else "+dirty"
+    return version
+
+
+def _ara_version() -> str:
+    """Return the current ARA version for display and engine-environment freshness checks.
+
+    Installed wheels trust their immutable distribution metadata. Editable source checkouts refresh
+    that metadata from Git so pulling a newer commit also invalidates stale bundled engine code.
+    """
+    try:
+        installed = metadata.version("project-ara")
     except metadata.PackageNotFoundError:
         return "0+unknown"
+    return _source_checkout_version() or installed
 
 # Short, stable handles → how to install each. ``backend`` is both the adapter module name and
 # the isolated env name. ``available`` is False for engines whose suite isn't shippable yet.

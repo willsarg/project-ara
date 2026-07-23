@@ -3,8 +3,124 @@
 """engines.py — the engine catalog + isolated-env install lifecycle (`ara install`)."""
 from __future__ import annotations
 
+import subprocess
+
 import ara.engines as engines
 from ara import acquire
+
+
+# --------------------------------------------------------------------------- #
+# _ara_version() — installed metadata, refreshed from a live source checkout
+# --------------------------------------------------------------------------- #
+def _version_checkout(monkeypatch, tmp_path):
+    root = tmp_path / "checkout"
+    (root / ".git").mkdir(parents=True)
+    (root / "ara").mkdir()
+    monkeypatch.setattr(engines, "__file__", str(root / "ara" / "engines.py"))
+    monkeypatch.setattr(
+        engines.metadata,
+        "version",
+        lambda name: "0.1.4.dev25+g817b74883.d20260723",
+    )
+    return root
+
+
+def _describe(monkeypatch, output: str, *, returncode: int = 0):
+    def fake_run(command, **kwargs):
+        assert command[0:2] == ["git", "-C"]
+        assert command[3:] == [
+            "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*",
+            "--abbrev=9",
+        ]
+        assert kwargs == {
+            "capture_output": True,
+            "text": True,
+            "timeout": 2,
+            "check": False,
+        }
+        return subprocess.CompletedProcess(command, returncode, output, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_ara_version_refreshes_stale_editable_metadata_from_vcs(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "v0.1.3-45-g795d89443\n")
+
+    assert engines._ara_version() == "0.1.4.dev45+g795d89443"
+
+
+def test_ara_version_uses_exact_source_tag(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "v0.2.0-0-g795d89443\n")
+
+    assert engines._ara_version() == "0.2.0"
+
+
+def test_ara_version_marks_dirty_exact_tag(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "v0.2.0-0-g795d89443-dirty\n")
+
+    assert engines._ara_version() == "0.2.0+dirty"
+
+
+def test_ara_version_marks_dirty_development_checkout(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "v0.1.3-45-g795d89443-dirty\n")
+
+    assert engines._ara_version() == "0.1.4.dev45+g795d89443.dirty"
+
+
+def test_ara_version_keeps_metadata_outside_a_git_checkout(monkeypatch, tmp_path):
+    root = tmp_path / "installed"
+    (root / "ara").mkdir(parents=True)
+    monkeypatch.setattr(engines, "__file__", str(root / "ara" / "engines.py"))
+    monkeypatch.setattr(engines.metadata, "version", lambda name: "1.2.3")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git must not run")),
+    )
+
+    assert engines._ara_version() == "1.2.3"
+
+
+def test_ara_version_keeps_metadata_when_git_describe_fails(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "", returncode=128)
+
+    assert engines._ara_version() == "0.1.4.dev25+g817b74883.d20260723"
+
+
+def test_ara_version_keeps_metadata_for_unrecognized_tag_shape(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    _describe(monkeypatch, "release-candidate-4-g795d89443\n")
+
+    assert engines._ara_version() == "0.1.4.dev25+g817b74883.d20260723"
+
+
+def test_ara_version_keeps_metadata_when_git_is_unavailable(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("git")),
+    )
+
+    assert engines._ara_version() == "0.1.4.dev25+g817b74883.d20260723"
+
+
+def test_ara_version_keeps_metadata_when_git_times_out(monkeypatch, tmp_path):
+    _version_checkout(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["git"], 2)
+        ),
+    )
+
+    assert engines._ara_version() == "0.1.4.dev25+g817b74883.d20260723"
 
 
 # --------------------------------------------------------------------------- #
