@@ -15,6 +15,73 @@ def _installed(monkeypatch, *, version="0.1.3", schema=None):
     monkeypatch.setattr(engine_audit.engines, "_ara_version", lambda: "0.1.3")
 
 
+def _characterize_ready_report() -> dict:
+    return {
+        "installation": {"status": "matched", "detail": "engine stamps match"},
+        "build": {"status": "matched", "detail": "build matches this host"},
+        "runtime": {"status": "matched", "detail": "device operation completed"},
+        "workload": {"status": "not_verified", "detail": "not characterized yet"},
+        "fingerprint": "engine:v2:sha256:test",
+    }
+
+
+def test_characterize_readiness_accepts_only_the_no_model_dimensions():
+    assert engine_audit.characterize_readiness_failure(
+        _characterize_ready_report()) is None
+
+
+@pytest.mark.parametrize(
+    ("dimension", "status"),
+    [
+        ("installation", "stale"),
+        ("build", "mismatch"),
+        ("runtime", "unknown"),
+    ],
+)
+def test_characterize_readiness_reports_the_first_unmatched_dimension(
+        dimension, status):
+    report = _characterize_ready_report()
+    report[dimension] = {
+        "status": status,
+        "detail": f"{dimension} was observed as {status}",
+    }
+
+    assert engine_audit.characterize_readiness_failure(report) == {
+        "dimension": dimension,
+        "status": status,
+        "detail": f"{dimension} was observed as {status}",
+    }
+
+
+def test_characterize_readiness_rejects_missing_or_unexplained_dimensions():
+    report = _characterize_ready_report()
+    del report["installation"]
+    assert engine_audit.characterize_readiness_failure(report) == {
+        "dimension": "installation",
+        "status": "unknown",
+        "detail": "audit did not report installation readiness",
+    }
+
+    report = _characterize_ready_report()
+    report["build"] = {"status": None}
+    assert engine_audit.characterize_readiness_failure(report) == {
+        "dimension": "build",
+        "status": "unknown",
+        "detail": "audit did not explain build readiness",
+    }
+
+
+def test_characterize_readiness_requires_a_nonempty_fingerprint():
+    report = _characterize_ready_report()
+    report["fingerprint"] = None
+
+    assert engine_audit.characterize_readiness_failure(report) == {
+        "dimension": "fingerprint",
+        "status": "unknown",
+        "detail": "cannot identify the installed engine build",
+    }
+
+
 def test_cpu_audit_matches_reported_host_simd(monkeypatch):
     _installed(monkeypatch)
     monkeypatch.setattr(engine_audit, "_probe", lambda _key, _backend: {

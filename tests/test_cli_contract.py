@@ -104,6 +104,7 @@ def mocked_world(monkeypatch, store):
     monkeypatch.setattr(cli, "get_backend", lambda b=None: _FakeBackend())
     monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: {
         "key": "mlx", "package_version": "0.32.0",
+        "installation": {"status": "matched", "detail": "engine stamps match"},
         "build": {"status": "matched"}, "runtime": {"status": "matched"},
         "fingerprint": "engine:v1:sha256:contract",
     })

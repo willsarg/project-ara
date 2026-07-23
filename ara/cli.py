@@ -1753,6 +1753,23 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
                    + c.style("accent", f"ara install --engine {sel.engine_key}"))
         return 1
     bk = get_backend(sel.backend)
+    # Characterize is an explicit action, so a bounded no-model runtime audit is allowed here.
+    # It must precede cache/download/calibration/model work: a stale or mismatched engine is not a
+    # safe measurement target merely because the audit could still construct a fingerprint.
+    host_features = detect._cpu_features()
+    engine_report_before = engine_audit.audit_engine(
+        sel.engine_key, host_features=host_features)
+    readiness_failure = engine_audit.characterize_readiness_failure(
+        engine_report_before)
+    if readiness_failure is not None:
+        msg = (
+            f"cannot characterize with {sel.engine_key}: engine audit "
+            f"{readiness_failure['dimension']} is {readiness_failure['status']} — "
+            f"{readiness_failure['detail']}"
+        )
+        print(json.dumps({"error": msg})) if as_json else c.emit(
+            c.style("bad", f"  {msg}"))
+        return 1
     authority_before = measurement_authority.current_measurement_authority(
         sel.engine_key)
     if authority_before is None:
@@ -1833,13 +1850,6 @@ def render_characterize(c: Console, model: str, *, engine: str | None = None,
         artifact_id_before = _artifact_identity_for_plan(evidence_model, prefetch_size)
         if artifact_id_before is None:
             msg = f"cannot identify the exact artifact characterized for {model} — result not stored"
-            print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
-            return 1
-        host_features = detect._cpu_features()
-        engine_report_before = engine_audit.audit_engine(
-            sel.engine_key, host_features=host_features)
-        if engine_report_before.get("fingerprint") is None:
-            msg = "cannot identify the installed engine build — result not stored"
             print(json.dumps({"error": msg})) if as_json else c.emit(c.style("bad", f"  {msg}"))
             return 1
         try:

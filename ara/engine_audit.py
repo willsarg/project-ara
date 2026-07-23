@@ -16,6 +16,9 @@ from typing import Any
 from ara import engine_env, engines
 
 
+CHARACTERIZE_REQUIRED_DIMENSIONS = ("installation", "build", "runtime")
+
+
 _LLAMA_PROBE = r"""
 import importlib.metadata as metadata
 import json
@@ -370,6 +373,45 @@ def audit_installed(*, host_features: list[str] | None = None,
         reports.append(audit_engine(
             key, host_features=host_features, characterization_rows=relevant))
     return reports
+
+
+def characterize_readiness_failure(report: dict[str, Any]) -> dict[str, str] | None:
+    """Return the first no-model readiness fact that forbids characterization.
+
+    Characterization itself establishes workload verification, so only installation,
+    build, and runtime must already be matched.  The fingerprint is separately required
+    because all resulting calibration and workload evidence must bind to an exact build.
+    """
+    for dimension in CHARACTERIZE_REQUIRED_DIMENSIONS:
+        state = report.get(dimension)
+        if not isinstance(state, dict):
+            return {
+                "dimension": dimension,
+                "status": "unknown",
+                "detail": f"audit did not report {dimension} readiness",
+            }
+        raw_status = state.get("status")
+        status = (raw_status.strip()
+                  if isinstance(raw_status, str) and raw_status.strip()
+                  else "unknown")
+        if status != "matched":
+            raw_detail = state.get("detail")
+            detail = (raw_detail.strip()
+                      if isinstance(raw_detail, str) and raw_detail.strip()
+                      else f"audit did not explain {dimension} readiness")
+            return {
+                "dimension": dimension,
+                "status": status,
+                "detail": detail,
+            }
+    fingerprint = report.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        return {
+            "dimension": "fingerprint",
+            "status": "unknown",
+            "detail": "cannot identify the installed engine build",
+        }
+    return None
 
 
 def characterization_evidence(report: dict[str, Any]) -> dict[str, Any]:

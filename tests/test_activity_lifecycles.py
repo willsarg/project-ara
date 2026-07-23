@@ -136,6 +136,7 @@ def _wire_characterize(monkeypatch, backend):
         cli.staleness, "pinned_model_ref", lambda model, _artifact, **_kwargs: model)
     monkeypatch.setattr(cli.engine_audit, "audit_engine", lambda *_args, **_kwargs: {
         "key": "cpu", "package_version": "0.3.34",
+        "installation": {"status": "matched"},
         "build": {"status": "matched"}, "runtime": {"status": "matched"},
         "fingerprint": "engine:v1:sha256:test",
     })

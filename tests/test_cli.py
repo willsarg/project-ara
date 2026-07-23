@@ -7126,6 +7126,63 @@ def test_render_characterize_refuses_unidentifiable_engine_build(
     assert "cannot identify the installed engine build" in buf.getvalue()
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_render_characterize_refuses_failed_readiness_before_engine_or_model_work(
+        make_console, store, monkeypatch, capsys, as_json):
+    calls: list[str] = []
+
+    class Backend:
+        def calibration_model_cached(self, _model):
+            calls.append("cache")
+            return True
+
+        def download_calibration_model(self, _model, *, progress=False):
+            calls.append("download")
+
+        def calibrate(self):
+            calls.append("calibrate")
+            return {"overhead_gb": 1.0}
+
+        def characterize(self, model, **_kwargs):
+            calls.append("characterize")
+            return _evidenced_characterization({
+                "model": model,
+                "safe_context": 4096,
+                "decode_context": None,
+                "points": [],
+            })
+
+    monkeypatch.setattr(cli.detect, "backend_name", lambda: "apple")
+    monkeypatch.setattr(cli.detect, "_cpu_features", lambda: ["NEON"])
+    monkeypatch.setattr(cli, "engine_status", lambda _backend=None: (True, "MLX engine"))
+    monkeypatch.setattr(cli, "get_backend", lambda _backend=None: Backend())
+    monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    monkeypatch.setattr(cli.catalog, "remember", lambda _con, _model: None)
+    audit = {
+        **_matched_engine_audit(),
+        "installation": {
+            "status": "stale",
+            "detail": "engine stamps do not match the current ARA release",
+        },
+    }
+
+    def audit_engine(_key, *, host_features):
+        assert host_features == ["NEON"]
+        calls.append("audit")
+        return audit
+
+    monkeypatch.setattr(cli.engine_audit, "audit_engine", audit_engine)
+    c, buf = make_console()
+
+    assert cli.render_characterize(c, "org/Model", as_json=as_json) == 1
+
+    output = capsys.readouterr().out if as_json else buf.getvalue()
+    assert "installation" in output
+    assert "stale" in output
+    assert "engine stamps do not match" in output
+    assert calls == ["audit"]
+
+
 def test_render_characterize_loads_immutable_pinned_artifact(
         make_console, store, monkeypatch):
     seen = {}
