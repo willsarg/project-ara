@@ -14,11 +14,20 @@ _ROOT = Path(__file__).resolve().parent.parent
 _ENGINE_PACKAGES = _ROOT / "ara" / "_engine_packages"
 
 
-def test_sdist_excludes_coordinator_build_artifacts():
+def test_sdist_excludes_coordinator_local_artifacts():
     manifest = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     excludes = set(manifest["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"])
 
-    assert {"/coordinator/node_modules", "/coordinator/.next"} <= excludes
+    assert {
+        "/coordinator/node_modules",
+        "/coordinator/.next",
+        "/coordinator/out",
+        "/coordinator/*.tsbuildinfo",
+        "/coordinator/coverage",
+        "/coordinator/data",
+        "/coordinator/.env",
+        "/coordinator/.env.local",
+    } <= excludes
 
 
 def test_wheel_carries_only_the_coordinator_runtime_build_context():

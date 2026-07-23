@@ -60,8 +60,17 @@ packages = ["ara"]
 
 [tool.hatch.build.targets.sdist]
 # Hatch reads the repository-root build configuration, not the coordinator's nested .gitignore.
-# Keep local JavaScript installs/build output out of PyPI source archives.
-exclude = ["/coordinator/node_modules", "/coordinator/.next"]
+# Keep local installs, build/test output, runtime state, and secrets out of PyPI source archives.
+exclude = [
+    "/coordinator/node_modules",
+    "/coordinator/.next",
+    "/coordinator/out",
+    "/coordinator/*.tsbuildinfo",
+    "/coordinator/coverage",
+    "/coordinator/data",
+    "/coordinator/.env",
+    "/coordinator/.env.local",
+]
 
 # Test/dev tooling. The suite runs without an installed engine on purpose — it proves the
 # core stays engine-free while exercising the subprocess seams with test doubles.
