@@ -347,6 +347,55 @@ def test_render_doctor_reports_missing_database_without_creating_it(
     assert not path.exists()
 
 
+def test_database_health_reports_uninitialized_store():
+    con = sqlite3.connect(":memory:")
+    try:
+        health = cli._database_health(con)
+    finally:
+        con.close()
+
+    assert health["status"] == "unknown"
+    assert health["presence"] == "uninitialized"
+    assert health["readable"] is True
+    assert health["schema_supported"] is False
+    assert health["quick_check"]["status"] == "passed"
+    assert health["foreign_key_check"]["status"] == "passed"
+
+
+def test_database_health_reports_schema_read_error():
+    class BrokenConnection:
+        def execute(self, _statement):
+            raise sqlite3.DatabaseError("schema unreadable")
+
+    health = cli._database_health(BrokenConnection())
+
+    assert health["status"] == "degraded"
+    assert health["readable"] is False
+    assert health["error"] == "schema unreadable"
+
+
+@pytest.mark.parametrize(
+    ("pragma", "check_name", "detail_name"),
+    [
+        ("PRAGMA quick_check", "quick_check", "messages"),
+        ("PRAGMA foreign_key_check", "foreign_key_check", "violations"),
+    ],
+)
+def test_database_health_reports_integrity_pragma_error(
+        store, pragma, check_name, detail_name):
+    class Connection:
+        def execute(self, statement, parameters=()):
+            if statement == pragma:
+                raise sqlite3.DatabaseError("integrity check unavailable")
+            return store.execute(statement, parameters)
+
+    health = cli._database_health(Connection())
+
+    assert health["status"] == "degraded"
+    assert health[check_name]["status"] == "failed"
+    assert "integrity check unavailable" in str(health[check_name][detail_name])
+
+
 def test_render_doctor_reports_unsupported_schema_read_only(
         store, monkeypatch, capsys, doctor_ollama_clean):
     store.execute("PRAGMA user_version = 99")
@@ -402,6 +451,95 @@ def test_render_doctor_reports_failed_integrity_check_and_continues(
     assert out["database_health"]["status"] == "degraded"
     assert out["database_health"][check_name]["status"] == "failed"
     assert out["database_health"][check_name][detail_name]
+    assert out["ollama"] == doctor_ollama_clean
+
+
+def test_render_doctor_human_lists_integrity_findings(
+        store, monkeypatch, make_console, doctor_ollama_clean):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement == "PRAGMA quick_check":
+                return Result([("damaged page",)])
+            if statement == "PRAGMA foreign_key_check":
+                return Result([("child", 1, "parent", 0)])
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def failed_checks():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", failed_checks)
+    c, buf = make_console()
+
+    assert cli.render_doctor(c) == 1
+
+    out = buf.getvalue()
+    assert "damaged page" in out
+    assert "'table': 'child'" in out
+
+
+def test_render_doctor_continues_when_record_counts_are_unreadable(
+        store, monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+    actual_readonly = db.connected_readonly
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, statement, parameters=()):
+            if statement.startswith("SELECT COUNT(*)"):
+                raise sqlite3.DatabaseError("counts unreadable")
+            return self.con.execute(statement, parameters)
+
+    @contextlib.contextmanager
+    def broken_counts():
+        with actual_readonly() as con:
+            yield Connection(con)
+
+    monkeypatch.setattr(db, "connected_readonly", broken_counts)
+
+    assert cli.render_doctor(cli.Console.from_env(), as_json=True) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "healthy"
+    assert set(out["counts"].values()) == {None}
+    assert out["other_keys_rows"] is None
+    assert out["ollama"] == doctor_ollama_clean
+
+
+def test_render_doctor_reports_rekey_connection_failure_and_continues(
+        monkeypatch, capsys, doctor_ollama_clean):
+    from ara import db
+
+    @contextlib.contextmanager
+    def broken_store():
+        raise sqlite3.DatabaseError("rekey unavailable")
+        yield
+
+    monkeypatch.setattr(db, "connected", broken_store)
+
+    assert cli.render_doctor(
+        cli.Console.from_env(), rekey=True, as_json=True) == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["database_health"]["status"] == "degraded"
+    assert "rekey unavailable" in out["database_health"]["error"]
+    assert out["rekeyed_rows"] is None
     assert out["ollama"] == doctor_ollama_clean
 
 
