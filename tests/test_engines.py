@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import types
 
 import ara.engines as engines
 from ara import acquire
@@ -163,6 +164,169 @@ def test_for_hardware_picks_cuda_when_nvidia_smi_present(monkeypatch):
     monkeypatch.setattr(engines.shutil, "which",
                         lambda n: "C:/Windows/System32/nvidia-smi.exe" if n == "nvidia-smi" else None)
     assert engines.for_hardware() == "cuda"
+
+
+def _compat_machine(*, system="Linux", arch="x86_64", accel_kind="none",
+                    vram_gb=None, gpus=()):
+    return types.SimpleNamespace(
+        system=system,
+        arch=arch,
+        accel=types.SimpleNamespace(kind=accel_kind, vram_gb=vram_gb),
+        gpus=list(gpus),
+    )
+
+
+def test_engine_compatibility_keeps_cpu_as_the_portable_fallback():
+    result = engines.classify_compatibility(
+        "cpu", _compat_machine(system="", arch="", accel_kind="none"))
+
+    assert result.status == "compatible"
+    assert result.reason == "portable_cpu_fallback"
+
+
+def test_engine_compatibility_accepts_mlx_only_on_apple_silicon():
+    compatible = engines.classify_compatibility(
+        "mlx", _compat_machine(system="Darwin", arch="arm64", accel_kind="apple"))
+    incompatible = engines.classify_compatibility(
+        "mlx", _compat_machine(system="Linux", arch="aarch64", accel_kind="none"))
+
+    assert (compatible.status, compatible.reason) == (
+        "compatible", "apple_silicon_detected")
+    assert (incompatible.status, incompatible.reason) == (
+        "incompatible", "requires_apple_silicon")
+
+
+def test_engine_compatibility_keeps_mlx_unknown_without_platform_facts():
+    result = engines.classify_compatibility(
+        "mlx", _compat_machine(system="", arch="", accel_kind="apple"))
+
+    assert (result.status, result.reason) == ("unknown", "platform_unknown")
+
+
+def test_engine_compatibility_accepts_verified_windows_cuda():
+    result = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="AMD64", accel_kind="nvidia", vram_gb=8.0))
+
+    assert result.status == "compatible"
+    assert result.reason == "nvidia_cuda_detected"
+
+
+def test_engine_compatibility_rejects_cuda_without_an_nvidia_gpu():
+    result = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="AMD64", accel_kind="none"))
+
+    assert result.status == "incompatible"
+    assert result.reason == "nvidia_gpu_unavailable"
+
+
+def test_engine_compatibility_keeps_cuda_unknown_without_vram_authority():
+    result = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="AMD64", accel_kind="nvidia", vram_gb=None))
+
+    assert result.status == "unknown"
+    assert result.reason == "nvidia_vram_unknown"
+
+
+def test_engine_compatibility_covers_cuda_platform_and_hardware_unknowns():
+    no_platform = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="", arch="", accel_kind="nvidia", vram_gb=8.0))
+    wrong_arch = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="arm64", accel_kind="nvidia", vram_gb=8.0))
+    unknown_gpu = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="AMD64", accel_kind="unknown",
+            gpus=[types.SimpleNamespace(
+                vendor="unknown", usable_backend=None, vram_gb=None)]))
+    gpu_inventory = engines.classify_compatibility(
+        "cuda", _compat_machine(
+            system="Windows", arch="AMD64", accel_kind="none",
+            gpus=[types.SimpleNamespace(
+                vendor="nvidia", usable_backend="cuda", vram_gb=16.0)]))
+
+    assert (no_platform.status, no_platform.reason) == (
+        "unknown", "platform_unknown")
+    assert (wrong_arch.status, wrong_arch.reason) == (
+        "incompatible", "unsupported_architecture")
+    assert (unknown_gpu.status, unknown_gpu.reason) == (
+        "unknown", "nvidia_gpu_unknown")
+    assert (gpu_inventory.status, gpu_inventory.reason) == (
+        "compatible", "nvidia_cuda_detected")
+
+
+def test_engine_compatibility_accepts_observed_vulkan_runtime():
+    gpu = types.SimpleNamespace(
+        vendor="amd", usable_backend="vulkan", vram_gb=2.0)
+
+    result = engines.classify_compatibility(
+        "vulkan", _compat_machine(gpus=[gpu]))
+
+    assert result.status == "compatible"
+    assert result.reason == "vulkan_runtime_detected"
+
+
+def test_engine_compatibility_rejects_vulkan_on_apple_silicon():
+    result = engines.classify_compatibility(
+        "vulkan", _compat_machine(
+            system="Darwin", arch="arm64", accel_kind="apple"))
+
+    assert result.status == "incompatible"
+    assert result.reason == "unsupported_platform"
+
+
+def test_engine_compatibility_covers_vulkan_unknown_and_incompatible_facts():
+    no_platform = engines.classify_compatibility(
+        "vulkan", _compat_machine(system="", arch=""))
+    wrong_arch = engines.classify_compatibility(
+        "vulkan", _compat_machine(system="Linux", arch="arm64"))
+    no_gpu = engines.classify_compatibility(
+        "vulkan", _compat_machine(accel_kind="none", gpus=[]))
+    no_runtime = engines.classify_compatibility(
+        "vulkan", _compat_machine(gpus=[
+            types.SimpleNamespace(
+                vendor="amd", usable_backend=None, vram_gb=8.0)]))
+    unknown_runtime = engines.classify_compatibility(
+        "vulkan", _compat_machine(accel_kind="nvidia", gpus=[]))
+
+    assert (no_platform.status, no_platform.reason) == (
+        "unknown", "platform_unknown")
+    assert (wrong_arch.status, wrong_arch.reason) == (
+        "incompatible", "unsupported_architecture")
+    assert (no_gpu.status, no_gpu.reason) == (
+        "incompatible", "vulkan_gpu_unavailable")
+    assert (no_runtime.status, no_runtime.reason) == (
+        "incompatible", "vulkan_runtime_unavailable")
+    assert (unknown_runtime.status, unknown_runtime.reason) == (
+        "unknown", "vulkan_runtime_unknown")
+
+
+def test_engine_compatibility_accepts_cuda_gguf_hardware_separately_from_capacity():
+    result = engines.classify_compatibility(
+        "cuda-gguf", _compat_machine(
+            system="Linux", arch="x86_64", accel_kind="nvidia", vram_gb=12.0))
+
+    assert result.status == "compatible"
+    assert result.reason == "nvidia_partial_offload_detected"
+
+
+def test_engine_compatibility_rejects_cuda_gguf_on_an_unsupported_platform():
+    result = engines.classify_compatibility(
+        "cuda-gguf", _compat_machine(
+            system="Darwin", arch="arm64", accel_kind="nvidia", vram_gb=12.0))
+
+    assert (result.status, result.reason) == (
+        "incompatible", "unsupported_platform")
+    assert "x86_64 Linux and Windows" in result.detail
+
+
+def test_engine_compatibility_returns_typed_unknown_for_an_unclassified_engine():
+    result = engines.classify_compatibility("future", _compat_machine())
+
+    assert (result.status, result.reason) == ("unknown", "unknown_engine")
 
 
 def test_catalog_has_only_canonical_public_engine_keys():

@@ -1941,6 +1941,248 @@ def test_profile_explicit_cpu_uses_system_ram_on_cuda_host(
     assert payload["wall_gb"] == 64.0
 
 
+def test_profile_rejects_incompatible_explicit_engine_without_capacity_or_fit(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Darwin", arch="arm64", backend="apple",
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal"),
+        gpus=[GpuInfo(
+            vendor="apple", name="Apple M4 Pro GPU", integrated=True,
+            compute_runtime="Metal", usable_backend="mlx")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: pytest.fail("an incompatible engine must not calculate model fit"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="vulkan", model="org/model") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"] == {
+        "status": "incompatible",
+        "reason": "unsupported_platform",
+        "detail": "Vulkan is supported only on x86_64 Linux and Windows hosts.",
+    }
+    assert payload["basis"] == "unknown"
+    assert payload["wall_gb"] is None
+    assert payload["safe_budget_gb"] is None
+    assert payload["current_governed_budget"]["status"] == "unknown"
+    assert payload["current_governed_budget"]["reason"] == "engine_incompatible"
+    assert payload["model_fit"]["fits"] is None
+    assert payload["model_fit"]["reason"] == "engine_incompatible"
+
+
+def test_profile_rejects_cuda_on_a_cpu_only_machine(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Windows", arch="AMD64", backend="cpu", chip="Test CPU",
+        accel=Accelerator("none", "Test CPU", None, None),
+        gpus=[],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cuda") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"]["status"] == "incompatible"
+    assert payload["compatibility"]["reason"] == "nvidia_gpu_unavailable"
+    assert payload["wall_gb"] is None
+    assert payload["safe_budget_gb"] is None
+
+
+def test_profile_reports_compatible_cuda_vram_capacity(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Windows", arch="AMD64", backend="cuda", ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "RTX 2070", 8.0, "CUDA"),
+        gpus=[GpuInfo(
+            vendor="nvidia", name="RTX 2070", vram_gb=8.0,
+            compute_runtime="CUDA 12.8", usable_backend="cuda")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cuda") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"]["status"] == "compatible"
+    assert payload["compatibility"]["reason"] == "nvidia_cuda_detected"
+    assert payload["capacity_shape"] == "single_wall"
+    assert payload["total_gb"] == 8.0
+    assert payload["wall_gb"] == 8.0
+    assert payload["safe_budget_gb"] == 6.0
+    assert payload["basis"] == "estimated"
+
+
+def test_profile_keeps_cuda_capacity_unknown_when_vram_is_missing(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Windows", arch="AMD64", backend="cuda", ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "Mystery NVIDIA GPU", None, "CUDA"),
+        gpus=[GpuInfo(
+            vendor="nvidia", name="Mystery NVIDIA GPU",
+            compute_runtime="CUDA", usable_backend="cuda")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cuda") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"]["status"] == "unknown"
+    assert payload["compatibility"]["reason"] == "nvidia_vram_unknown"
+    assert payload["basis"] == "unknown"
+    assert payload["wall_gb"] is None
+    assert payload["safe_budget_gb"] is None
+    assert payload["current_governed_budget"]["reason"] == (
+        "engine_compatibility_unknown")
+
+
+def test_profile_reports_compatible_vulkan_from_read_only_runtime_facts(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cpu", chip="Ryzen APU",
+        ram_total_gb=32.0, accel=Accelerator("none", "Ryzen APU", None, None),
+        gpus=[GpuInfo(
+            vendor="amd", name="Radeon 780M", vram_gb=2.0, gtt_gb=16.0,
+            integrated=True, compute_runtime="Vulkan 1.4 · RADV",
+            usable_backend="vulkan")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="vulkan") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"]["status"] == "compatible"
+    assert payload["compatibility"]["reason"] == "vulkan_runtime_detected"
+    assert payload["wall_gb"] == 32.0
+    assert payload["safe_budget_gb"] == 30.0
+
+
+def test_profile_keeps_cuda_gguf_as_an_explicit_two_wall_unknown(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cuda", chip="Ryzen 9",
+        ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "RTX 4070", 12.0, "CUDA"),
+        gpus=[GpuInfo(
+            vendor="nvidia", name="RTX 4070", vram_gb=12.0,
+            compute_runtime="CUDA 12.8", usable_backend="cuda")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True, engine="cuda-gguf") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatibility"]["status"] == "compatible"
+    assert payload["capacity_shape"] == "two_wall"
+    assert payload["basis"] == "unknown"
+    assert payload["wall_gb"] is None
+    assert payload["safe_budget_gb"] is None
+    assert payload["current_governed_budget"]["reason"] == (
+        "two_wall_capacity_unavailable")
+    assert payload["memory_walls"] == {
+        "system": {
+            "kind": "system_ram",
+            "observed_total_gib": 64.0,
+            "safe_budget_gib": None,
+        },
+        "accelerator": {
+            "kind": "vram",
+            "observed_total_gib": 12.0,
+            "safe_budget_gib": None,
+        },
+    }
+
+
+def test_profile_text_explains_incompatible_engine_without_numeric_limits(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Darwin", arch="arm64", backend="apple",
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal"),
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cuda") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "ENGINE COMPATIBILITY" in out
+    assert "incompatible" in out
+    assert "CUDA is supported only on NVIDIA GPUs on Windows" in out
+    assert "memory wall 48.0 GiB" not in out
+    assert "safe budget 46.0 GiB" not in out
+
+
+def test_profile_text_skips_model_assessment_for_an_incompatible_engine(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Darwin", arch="arm64", backend="apple",
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal"),
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: pytest.fail("incompatible engine model fit must remain uncomputed"))
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cuda", model="org/model") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "MODEL FIT: org/model" in out
+    assert "unknown — engine capacity unavailable" in out
+    assert "selected engine is incompatible" in out
+    assert "ara characterize org/model" not in out
+
+
+def test_profile_text_explains_unknown_cuda_compatibility(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Windows", arch="AMD64", backend="cuda", ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "Mystery NVIDIA GPU", None, "CUDA"),
+        gpus=[GpuInfo(
+            vendor="nvidia", name="Mystery NVIDIA GPU",
+            compute_runtime="CUDA", usable_backend="cuda")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cuda") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "compatibility unknown" in out
+    assert "nvidia_vram_unknown" in out
+    assert "engine compatibility could not be established" in out
+
+
+def test_profile_text_explains_cuda_gguf_two_wall_capacity(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cuda", chip="Ryzen 9",
+        ram_total_gb=64.0,
+        accel=Accelerator("nvidia", "RTX 4070", 12.0, "CUDA"),
+        gpus=[GpuInfo(
+            vendor="nvidia", name="RTX 4070", vram_gb=12.0,
+            compute_runtime="CUDA 12.8", usable_backend="cuda")],
+    )
+    _wire_profile(monkeypatch, set_platform, machine)
+    c, buf = make_console()
+
+    assert cli.render_profile(c, engine="cuda-gguf") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "compatibility compatible" in out
+    assert "system RAM observed 64.0 GiB" in out
+    assert "VRAM observed 12.0 GiB" in out
+    assert "no safe two-wall budget" in out
+    assert "requires a governed VRAM and system-RAM two-wall calculation" in out
+
+
 def test_profile_text_names_selected_engine(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform)
     c, buf = make_console()

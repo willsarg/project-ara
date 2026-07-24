@@ -248,6 +248,153 @@ class AutoDecision:
     nvidia_smi: str | None
 
 
+@dataclass(frozen=True)
+class EngineCompatibility:
+    """Read-only compatibility verdict for one explicit engine and machine snapshot."""
+
+    status: str
+    reason: str
+    detail: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "detail": self.detail,
+        }
+
+
+def _compatibility(status: str, reason: str, detail: str) -> EngineCompatibility:
+    return EngineCompatibility(status, reason, detail)
+
+
+def _nvidia_facts(machine) -> tuple[bool | None, float | None]:
+    """Return NVIDIA presence and observed VRAM from an existing detect snapshot."""
+    accel = getattr(machine, "accel", None)
+    accel_kind = getattr(accel, "kind", None)
+    accel_vram = getattr(accel, "vram_gb", None)
+    gpus = list(getattr(machine, "gpus", ()) or ())
+    nvidia_gpus = [gpu for gpu in gpus if getattr(gpu, "vendor", None) == "nvidia"]
+    vram_values = [
+        value
+        for value in (
+            accel_vram if accel_kind == "nvidia" else None,
+            *(getattr(gpu, "vram_gb", None) for gpu in nvidia_gpus),
+        )
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+    ]
+    if accel_kind == "nvidia" or nvidia_gpus:
+        return True, max(vram_values) if vram_values else None
+    if accel_kind in {"none", "apple"} and not any(
+            getattr(gpu, "vendor", "unknown") == "unknown" for gpu in gpus):
+        return False, None
+    return None, None
+
+
+def classify_compatibility(engine: str, machine) -> EngineCompatibility:
+    """Classify an engine using only facts already observed by :func:`detect.machine`.
+
+    Compatibility and capacity are intentionally separate. In particular, ``cuda-gguf`` may be
+    compatible with the hardware while profile still lacks an engine-free two-wall RAM/VRAM
+    capacity estimate.
+    """
+    system = getattr(machine, "system", None)
+    arch = str(getattr(machine, "arch", "") or "").lower()
+    x86_64 = arch in {"amd64", "x86_64"}
+
+    if engine == "cpu":
+        return _compatibility(
+            "compatible", "portable_cpu_fallback",
+            "The CPU engine is the portable fallback and does not require a GPU.")
+
+    if engine == "mlx":
+        if not system or not arch:
+            return _compatibility(
+                "unknown", "platform_unknown",
+                "ARA could not confirm the operating system and architecture.")
+        if system == "Darwin" and arch in {"arm64", "aarch64"}:
+            return _compatibility(
+                "compatible", "apple_silicon_detected",
+                "Darwin on Arm identifies an Apple Silicon host.")
+        return _compatibility(
+            "incompatible", "requires_apple_silicon",
+            "MLX requires an Apple Silicon Mac.")
+
+    if engine in {"cuda", "cuda-gguf"}:
+        label = "CUDA" if engine == "cuda" else "CUDA GGUF partial offload"
+        supported_systems = {"Windows"} if engine == "cuda" else {"Linux", "Windows"}
+        if not system or not arch:
+            return _compatibility(
+                "unknown", "platform_unknown",
+                "ARA could not confirm the operating system and architecture.")
+        if system not in supported_systems:
+            detail = (
+                "CUDA is supported only on NVIDIA GPUs on Windows."
+                if engine == "cuda"
+                else "CUDA GGUF partial offload is supported only on x86_64 Linux and Windows.")
+            return _compatibility("incompatible", "unsupported_platform", detail)
+        if not x86_64:
+            return _compatibility(
+                "incompatible", "unsupported_architecture",
+                f"{label} requires an x86_64 host.")
+        nvidia_present, vram_gb = _nvidia_facts(machine)
+        if nvidia_present is False:
+            return _compatibility(
+                "incompatible", "nvidia_gpu_unavailable",
+                f"{label} requires an NVIDIA GPU, but none was detected.")
+        if nvidia_present is None:
+            return _compatibility(
+                "unknown", "nvidia_gpu_unknown",
+                "ARA could not determine whether a compatible NVIDIA GPU is present.")
+        if vram_gb is None:
+            return _compatibility(
+                "unknown", "nvidia_vram_unknown",
+                "An NVIDIA GPU was detected, but its VRAM capacity is unknown.")
+        if engine == "cuda":
+            return _compatibility(
+                "compatible", "nvidia_cuda_detected",
+                "A supported Windows NVIDIA GPU and its VRAM were detected.")
+        return _compatibility(
+            "compatible", "nvidia_partial_offload_detected",
+            "A supported NVIDIA GPU and system-RAM overflow path were detected.")
+
+    if engine == "vulkan":
+        if not system or not arch:
+            return _compatibility(
+                "unknown", "platform_unknown",
+                "ARA could not confirm the operating system and architecture.")
+        if system not in {"Linux", "Windows"}:
+            return _compatibility(
+                "incompatible", "unsupported_platform",
+                "Vulkan is supported only on x86_64 Linux and Windows hosts.")
+        if not x86_64:
+            return _compatibility(
+                "incompatible", "unsupported_architecture",
+                "The Vulkan engine requires an x86_64 host.")
+        gpus = list(getattr(machine, "gpus", ()) or ())
+        if any(getattr(gpu, "usable_backend", None) == "vulkan" for gpu in gpus):
+            return _compatibility(
+                "compatible", "vulkan_runtime_detected",
+                "A usable Vulkan GPU runtime was detected.")
+        accel_kind = getattr(getattr(machine, "accel", None), "kind", None)
+        if not gpus and accel_kind == "none":
+            return _compatibility(
+                "incompatible", "vulkan_gpu_unavailable",
+                "The Vulkan engine requires a compatible GPU, but none was detected.")
+        if gpus and all(
+                getattr(gpu, "vendor", "unknown") != "unknown" for gpu in gpus):
+            return _compatibility(
+                "incompatible", "vulkan_runtime_unavailable",
+                "No detected GPU has a usable Vulkan runtime.")
+        return _compatibility(
+            "unknown", "vulkan_runtime_unknown",
+            "ARA could not confirm a usable Vulkan GPU runtime.")
+
+    return _compatibility(
+        "unknown", "unknown_engine",
+        f"ARA has no compatibility classifier for engine {engine!r}.")
+
+
 def decide_auto(*, system: str, machine: str, nvidia_smi: str | None) -> AutoDecision:
     """Choose an automatic engine from already-observed host facts."""
     if system == "Darwin" and machine == "arm64":

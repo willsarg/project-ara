@@ -1098,6 +1098,48 @@ def render_mlx(c: Console, *, as_json: bool = False, want=None) -> None:
 # characterize (measures — crosses the seam into the engine)
 # --------------------------------------------------------------------------- #
 def _emit_limits(c: Console, m: dict) -> None:
+    compatibility = m.get("compatibility")
+    capacity_reason = m.get("budget_reason")
+    if compatibility is not None and (
+            compatibility["status"] != "compatible"
+            or capacity_reason == "two_wall_capacity_unavailable"):
+        c.emit()
+        c.emit(c.section("  ENGINE COMPATIBILITY") + c.style("dim", "  (engine-free)"))
+        c.emit(c.field("engine", m["engine"], label_width=20))
+        role = (
+            "good" if compatibility["status"] == "compatible"
+            else "bad" if compatibility["status"] == "incompatible"
+            else "warn"
+        )
+        c.emit(c.field(
+            "compatibility", compatibility["status"], compatibility["detail"],
+            value_role=role, label_width=20))
+        c.emit(c.field(
+            "reason", compatibility["reason"], label_width=20))
+        if capacity_reason == "two_wall_capacity_unavailable":
+            walls = m["memory_walls"]
+            c.emit(c.field(
+                "capacity", "unknown",
+                "a truthful partial-offload estimate must govern VRAM and system RAM together",
+                value_role="warn", label_width=20))
+            c.emit(c.field(
+                "system RAM observed",
+                _fmt_gb(walls["system"]["observed_total_gib"], 1),
+                "observation only · no safe two-wall budget",
+                label_width=20))
+            c.emit(c.field(
+                "VRAM observed",
+                _fmt_gb(walls["accelerator"]["observed_total_gib"], 1),
+                "observation only · no safe two-wall budget",
+                label_width=20))
+        else:
+            c.emit(c.field(
+                "current capacity", "unknown",
+                "no numeric wall or safe budget is authorized for this engine selection",
+                value_role="warn", label_width=20))
+        c.emit()
+        return
+
     if m.get("engine") == "mlx" and m.get("basis") == "unknown":
         c.emit()
         c.emit(c.section("  MEMORY AUTHORITY") + c.style("dim", "  (engine-free)"))
@@ -5328,6 +5370,21 @@ def _model_fit(lim: dict, model: str) -> dict | None:
     ``recommend`` uses, so the two compute identically with no network call); only when the
     catalog has no weight for it do we fall back to the HF API (``acquire.repo_size_gb``). Returns
     None when the model can't be described (bad repo / not cached)."""
+    unavailable_reason = lim.get("budget_reason")
+    if unavailable_reason in {
+            "engine_incompatible",
+            "engine_compatibility_unknown",
+            "two_wall_capacity_unavailable",
+    }:
+        return {
+            "weights_gb": None,
+            "fits": None,
+            "est_context": None,
+            "max_context": None,
+            "binding": None,
+            "reason": unavailable_reason,
+        }
+
     meta = catalog.describe(model)
     if meta is None:
         return None
@@ -5347,7 +5404,17 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     """Render the per-model analytic verdict: does it fit, and what context does the budget hold?"""
     fit = _model_fit(lim, model)
     c.emit()
-    if fit is not None and fit["reason"] == "size_unknown":
+    unavailable_details = {
+        "engine_incompatible": (
+            "the selected engine is incompatible with the observed machine"),
+        "engine_compatibility_unknown": (
+            "ARA could not establish that the selected engine is compatible"),
+        "two_wall_capacity_unavailable": (
+            "ARA has no engine-free two-wall VRAM and system-RAM estimate"),
+    }
+    if fit is not None and fit["reason"] in unavailable_details:
+        tag = "  (unknown — engine capacity unavailable)"
+    elif fit is not None and fit["reason"] == "size_unknown":
         tag = "  (unknown — model size unavailable)"
     elif fit is not None and fit["reason"] == "insufficient_memory":
         tag = "  (unknown — insufficient memory)"
@@ -5368,13 +5435,18 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     c.emit(c.field("weights", _fmt_gb(fit["weights_gb"], 1), weight_detail))
     if fit["fits"] is None:
         detail = (
-            "model size is unavailable"
+            unavailable_details[fit["reason"]]
+            if fit["reason"] in unavailable_details
+            else "model size is unavailable"
             if fit["reason"] == "size_unknown"
             else "the observed memory wall does not exceed ARA's safety reserve"
             if fit["reason"] == "insufficient_memory"
             else "no current governed memory budget"
         )
         c.emit(c.field("verdict", "unknown", detail, value_role="warn"))
+        if fit["reason"] in unavailable_details:
+            c.emit()
+            return
     elif not fit["fits"]:
         c.emit(c.field("verdict", "won't fit", "weights alone exceed the estimated budget",
                        value_role="bad"))
@@ -5421,6 +5493,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         return 1
 
     m = detect.machine()
+    compatibility = engines.classify_compatibility(sel.engine_key, m)
     # Stored calibration history cannot be proven current without crossing the engine seam to
     # audit the exact installed build. Profile stays engine-free, so history is display-only.
     measured = None
@@ -5442,6 +5515,38 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         )
     lim = {"engine": sel.engine_key,
            **estimate.limits(m, measured=measured, backend=sel.backend)}
+    capacity_shape = "two_wall" if sel.engine_key == "cuda-gguf" else "single_wall"
+    memory_walls = None
+    if capacity_shape == "two_wall":
+        memory_walls = {
+            "system": {
+                "kind": "system_ram",
+                "observed_total_gib": m.ram_total_gb,
+                "safe_budget_gib": None,
+            },
+            "accelerator": {
+                "kind": "vram",
+                "observed_total_gib": m.accel.vram_gb,
+                "safe_budget_gib": None,
+            },
+        }
+    unavailable_reason = None
+    if compatibility.status == "incompatible":
+        unavailable_reason = "engine_incompatible"
+    elif compatibility.status == "unknown":
+        unavailable_reason = "engine_compatibility_unknown"
+    elif capacity_shape == "two_wall":
+        unavailable_reason = "two_wall_capacity_unavailable"
+    if unavailable_reason is not None:
+        lim.update(
+            wall_gb=None,
+            safe_budget_gb=None,
+            calibrated=False,
+            calibrated_at=None,
+            basis="unknown",
+            budget_status="unknown",
+            budget_reason=unavailable_reason,
+        )
     historical_measurement = None
     if historical is not None:
         wall_bytes = historical.get("wall_bytes")
@@ -5461,6 +5566,9 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
             "measurement_reason": historical_validation_error,
         }
     lim.update(
+        compatibility=compatibility.as_dict(),
+        capacity_shape=capacity_shape,
+        memory_walls=memory_walls,
         memory_unit="GiB",
         wall_bytes=(measured or {}).get("wall_bytes"),
         safe_budget_bytes=(measured or {}).get("safe_budget_bytes"),
@@ -5492,7 +5600,23 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     else:
         # Profile never audits an engine build, so it can only report an analytic estimate or an
         # unknown current budget; stored measurements remain display-only history.
-        if lim["budget_reason"] == "insufficient_memory":
+        if lim["budget_reason"] == "engine_incompatible":
+            c.emit(c.style(
+                "warn",
+                "  no capacity estimate — the selected engine is incompatible with this machine",
+            ))
+        elif lim["budget_reason"] == "engine_compatibility_unknown":
+            c.emit(c.style(
+                "warn",
+                "  no capacity estimate — engine compatibility could not be established",
+            ))
+        elif lim["budget_reason"] == "two_wall_capacity_unavailable":
+            c.emit(c.style(
+                "warn",
+                "  no model-fit estimate — CUDA GGUF requires a governed VRAM and system-RAM "
+                "two-wall calculation",
+            ))
+        elif lim["budget_reason"] == "insufficient_memory":
             c.emit(c.style(
                 "warn",
                 "  insufficient memory — the observed wall does not exceed ARA's "

@@ -110,7 +110,7 @@ def limits(machine, measured: dict | None = None, *, sharded: bool = False,
     if not _nonnegative_number(wall):
         wall = None
     safe_budget = max(wall - MARGIN_GB, 0.0) if wall is not None else None
-    basis = "unknown" if selected_backend == "apple" else "estimated"
+    basis = "unknown" if wall is None else "estimated"
     budget_status, budget_reason = _budget_status(safe_budget, basis)
     measurement_reason = (
         measurement_validation_error(measured) if measured is not None else None)
