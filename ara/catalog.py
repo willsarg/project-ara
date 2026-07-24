@@ -16,7 +16,7 @@ import struct
 
 import gguf
 
-from ara import db
+from ara import acquire, db
 
 
 def _read_config(model_id: str) -> dict | None:
@@ -80,6 +80,105 @@ def _cached_gguf_path(model_id: str) -> str | None:
         return str(min(gguf_files, key=lambda f: f.size_on_disk).file_path)
     except Exception:
         return None
+
+
+def _cached_artifact_names(model_id: str) -> list[str] | None:
+    """Return current cached filenames, ``[]`` when uncached, or ``None`` on probe failure."""
+    from huggingface_hub import scan_cache_dir
+
+    try:
+        repo = next(
+            (item for item in scan_cache_dir().repos
+             if item.repo_id == model_id and item.repo_type == "model"),
+            None,
+        )
+        if repo is None:
+            return []
+        return [
+            file.file_name
+            for revision in repo.revisions
+            if "main" in getattr(revision, "refs", ())
+            for file in revision.files
+        ]
+    except Exception:
+        return None
+
+
+def artifact_evidence(model_id: str) -> dict:
+    """Resolve an artifact kind from exact, read-only evidence without choosing a bare GGUF quant."""
+    if acquire.is_local_gguf(model_id):
+        return {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "local_path",
+            "reason": None,
+        }
+    if acquire.valid_repo_gguf_ref(model_id):
+        return {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "exact_selector",
+            "reason": None,
+        }
+    if not acquire.valid_model_id(model_id):
+        return {
+            "status": "unresolved",
+            "kind": None,
+            "source": "input",
+            "reason": "invalid_model_reference",
+        }
+
+    names = _cached_artifact_names(model_id)
+    if names is None:
+        return {
+            "status": "unresolved",
+            "kind": None,
+            "source": "local_cache",
+            "reason": "artifact_evidence_unavailable",
+        }
+    if not names:
+        return {
+            "status": "unresolved",
+            "kind": None,
+            "source": "local_cache",
+            "reason": "artifact_not_cached",
+        }
+    gguf = any(
+        name.lower().endswith(".gguf")
+        and not os.path.basename(name).lower().startswith("mmproj")
+        for name in names
+    )
+    transformers = any(
+        name.lower().endswith((".safetensors", ".bin"))
+        for name in names
+    )
+    if gguf and transformers:
+        return {
+            "status": "unresolved",
+            "kind": "mixed",
+            "source": "local_cache",
+            "reason": "ambiguous_formats",
+        }
+    if gguf:
+        return {
+            "status": "unresolved",
+            "kind": "gguf",
+            "source": "local_cache",
+            "reason": "exact_gguf_selector_required",
+        }
+    if transformers:
+        return {
+            "status": "resolved",
+            "kind": "transformers",
+            "source": "local_cache",
+            "reason": None,
+        }
+    return {
+        "status": "unresolved",
+        "kind": None,
+        "source": "local_cache",
+        "reason": "weight_artifact_unavailable",
+    }
 
 
 def _gguf_fields(path: str):

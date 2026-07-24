@@ -1806,6 +1806,21 @@ def _wire_profile(monkeypatch, set_platform, machine=None):
     monkeypatch.setattr(cli.detect, "machine", lambda: selected_machine)
     monkeypatch.setattr(cli.detect, "backend_name", lambda: selected_machine.backend)
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
+    default_kind = (
+        "gguf"
+        if selected_machine.backend in {"cpu", "vulkan", "cuda_gguf"}
+        else "transformers"
+    )
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "resolved",
+            "kind": default_kind,
+            "source": "test_fixture",
+            "reason": None,
+        },
+    )
 
 
 def test_profile_never_loads_an_engine(make_console, monkeypatch, set_platform, store):
@@ -2388,12 +2403,242 @@ def test_profile_model_fits_full_window(make_console, monkeypatch, set_platform)
         backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: 4.0)
     c, buf = make_console()
     assert cli.render_profile(c, model="org/small") == 0
     out = buf.getvalue()
     assert "MODEL FIT: org/small" in out
     assert "full 8192 ctx" in out
+
+
+def test_profile_json_rejects_transformers_artifact_for_cpu_without_estimating(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Darwin", arch="arm64", backend="apple",
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal"))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "resolved",
+            "kind": "transformers",
+            "source": "local_cache",
+            "reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: pytest.fail("unsupported formats must not reach metadata fit"))
+    monkeypatch.setattr(
+        cli.acquire, "repo_size_gb",
+        lambda _model: pytest.fail("unsupported formats must not reach remote sizing"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="cpu",
+        model="mlx-community/Qwen3-0.6B-4bit") == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["fits"] is None
+    assert fit["reason"] == "unsupported_format"
+    assert fit["artifact_compatibility"] == {
+        "status": "incompatible",
+        "reason": "unsupported_format",
+        "engine": "cpu",
+        "required_formats": ["gguf"],
+        "observed_format": "transformers",
+        "evidence_source": "local_cache",
+        "evidence_reason": None,
+        "compatible_engine": "mlx",
+    }
+
+
+def test_profile_json_rejects_gguf_artifact_for_mlx(
+        monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "exact_selector",
+            "reason": None,
+        },
+    )
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="mlx",
+        model="org/repo:Model-Q4_K_M.gguf") == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["fits"] is None
+    assert fit["reason"] == "unsupported_format"
+    assert fit["artifact_compatibility"]["compatible_engine"] == "cpu"
+
+
+def test_profile_json_supports_local_gguf_for_cpu(
+        tmp_path, monkeypatch, set_platform, capsys):
+    local = tmp_path / "Model-Q4_K_M.gguf"
+    local.write_bytes(b"x" * 1000)
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cpu", chip="Test CPU",
+        accel=Accelerator("none", "Test CPU", None, None))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog, "artifact_evidence",
+        lambda model: {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "local_path",
+            "reason": None,
+        } if model == str(local) else pytest.fail("unexpected model"))
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: dict(
+            n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get", lambda _con, _model: None)
+    monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda _model: None)
+    monkeypatch.setattr(
+        cli.acquire, "repo_size_gb",
+        lambda _model: pytest.fail("a local GGUF must use its selected file size"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="cpu", model=str(local)) == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["fits"] is True
+    assert fit["artifact_compatibility"]["status"] == "compatible"
+    assert fit["artifact_compatibility"]["observed_format"] == "gguf"
+
+
+def test_profile_json_supports_exact_gguf_selector_for_cpu(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cpu", chip="Test CPU",
+        accel=Accelerator("none", "Test CPU", None, None))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "exact_selector",
+            "reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: dict(
+            n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
+    monkeypatch.setattr(cli.catalog, "get", lambda _con, _model: None)
+    monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda _model: None)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda _model: 4.0)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="cpu",
+        model="org/repo:Model-Q4_K_M.gguf") == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["fits"] is True
+    assert fit["artifact_compatibility"]["evidence_source"] == "exact_selector"
+
+
+def test_profile_json_keeps_ambiguous_bare_repo_unresolved(
+        monkeypatch, set_platform, capsys):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cpu", chip="Test CPU",
+        accel=Accelerator("none", "Test CPU", None, None))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "unresolved",
+            "kind": "gguf",
+            "source": "local_cache",
+            "reason": "exact_gguf_selector_required",
+        },
+    )
+    monkeypatch.setattr(
+        cli.catalog, "describe",
+        lambda _model: pytest.fail("unresolved artifact must not be fitted"))
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(
+        c, as_json=True, engine="cpu", model="org/bare-GGUF") == 0
+
+    fit = json.loads(capsys.readouterr().out)["model_fit"]
+    assert fit["fits"] is None
+    assert fit["reason"] == "artifact_unresolved"
+    assert fit["artifact_compatibility"]["observed_format"] == "gguf"
+    assert fit["artifact_compatibility"]["evidence_reason"] == (
+        "exact_gguf_selector_required")
+
+
+def test_profile_text_keeps_ambiguous_bare_repo_unresolved(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Linux", arch="x86_64", backend="cpu", chip="Test CPU",
+        accel=Accelerator("none", "Test CPU", None, None))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "unresolved",
+            "kind": "gguf",
+            "source": "local_cache",
+            "reason": "exact_gguf_selector_required",
+        },
+    )
+    c, buf = make_console()
+
+    assert cli.render_profile(
+        c, engine="cpu", model="org/bare-GGUF") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "unknown — artifact unresolved" in out
+    assert "artifact status unknown exact_gguf_selector_required" in out
+    assert "compatible next step" not in out
+
+
+def test_profile_text_explains_artifact_format_mismatch_and_next_step(
+        make_console, monkeypatch, set_platform):
+    machine = _machine(
+        system="Darwin", arch="arm64", backend="apple",
+        accel=Accelerator("apple", "Apple M4 Pro GPU", None, "Metal"))
+    _wire_profile(monkeypatch, set_platform, machine)
+    monkeypatch.setattr(
+        cli.catalog,
+        "artifact_evidence",
+        lambda _model: {
+            "status": "resolved",
+            "kind": "transformers",
+            "source": "local_cache",
+            "reason": None,
+        },
+    )
+    c, buf = make_console()
+
+    assert cli.render_profile(
+        c, engine="cpu", model="mlx-community/Qwen3-0.6B-4bit") == 0
+
+    out = " ".join(buf.getvalue().split())
+    assert "selected engine cpu" in out
+    assert "required format GGUF" in out
+    assert "observed format Transformers" in out
+    assert "unsupported" in out
+    assert (
+        "ara profile --engine mlx --model mlx-community/Qwen3-0.6B-4bit"
+        in out
+    )
+    assert "verdict fits" not in out
 
 
 def test_profile_model_apple_fit_is_unknown_without_current_budget(
@@ -2419,7 +2664,7 @@ def test_profile_model_context_limited(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, _machine(backend="cpu", ram_total_gb=8.0))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=131072))
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: 4.0)
     c, buf = make_console()
     assert cli.render_profile(c, model="org/big-ctx") == 0
     assert "context-limited" in buf.getvalue()
@@ -2429,7 +2674,7 @@ def test_profile_model_wont_fit(make_console, monkeypatch, set_platform):
     _wire_profile(monkeypatch, set_platform, _machine(backend="cpu", ram_total_gb=8.0))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 20.0)   # weights > budget
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: 20.0)   # weights > budget
     c, buf = make_console()
     assert cli.render_profile(c, model="org/huge") == 0
     assert "won't fit" in buf.getvalue()
@@ -2443,6 +2688,7 @@ def test_profile_model_size_unknown_with_current_budget(
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
     monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: None)
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: None)
     c, buf = make_console()
 
@@ -2462,6 +2708,7 @@ def test_profile_model_size_unknown_json_reason(monkeypatch, set_platform, capsy
                         lambda m: dict(n_layers=32, kv_heads=8, head_dim=128, max_context=8192))
     monkeypatch.setattr(cli.catalog, "get", lambda con, m: None)
     monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: None)
     monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: None)
     c = cli.Console(color=False, stream=sys.stderr)
 
@@ -2479,7 +2726,7 @@ def test_profile_model_fits_unknown_architecture(make_console, monkeypatch, set_
         backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
                         lambda m: dict(n_layers=None, kv_heads=None, head_dim=None, max_context=8192))
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: 4.0)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: 4.0)
     c, buf = make_console()
     assert cli.render_profile(c, model="org/odd") == 0
     assert "context estimate unavailable" in buf.getvalue()
@@ -2511,8 +2758,9 @@ def test_profile_model_uses_cataloged_weight_no_network(
     assert "full 8192 ctx" in buf.getvalue()        # the 4.0 GB cataloged weight drove the fit
 
 
-def test_profile_model_falls_back_to_network_when_uncataloged(make_console, monkeypatch, set_platform):
-    # No catalog weight (model not cataloged, or weights_gb None) → fall back to repo_size_gb.
+def test_profile_model_falls_back_to_gguf_metadata_when_uncataloged(
+        make_console, monkeypatch, set_platform):
+    # No catalog weight (model not cataloged, or weights_gb None) → size the selected GGUF.
     _wire_profile(monkeypatch, set_platform, _machine(
         backend="cpu", ram_total_gb=48.0, chip="Test CPU"))
     monkeypatch.setattr(cli.catalog, "describe",
@@ -2522,7 +2770,7 @@ def test_profile_model_falls_back_to_network_when_uncataloged(make_console, monk
                         lambda con, m: pytest.fail("profile wrote to the model catalog"))
     monkeypatch.setattr(cli.catalog, "_cache_size_gb", lambda m: None)
     called = []
-    monkeypatch.setattr(cli.acquire, "repo_size_gb", lambda m: called.append(m) or 4.0)
+    monkeypatch.setattr(cli.acquire, "gguf_size_gb", lambda m: called.append(m) or 4.0)
     c, buf = make_console()
     assert cli.render_profile(c, model="org/fresh") == 0
     assert called == ["org/fresh"]                   # network fallback fired

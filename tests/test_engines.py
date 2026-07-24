@@ -329,6 +329,66 @@ def test_engine_compatibility_returns_typed_unknown_for_an_unclassified_engine()
     assert (result.status, result.reason) == ("unknown", "unknown_engine")
 
 
+def test_artifact_compatibility_covers_supported_transformers_and_gguf():
+    apple = _compat_machine(
+        system="Darwin", arch="arm64", accel_kind="apple")
+
+    mlx = engines.classify_artifact_compatibility(
+        "mlx",
+        {"status": "resolved", "kind": "transformers",
+         "source": "local_cache", "reason": None},
+        apple,
+    )
+    cpu = engines.classify_artifact_compatibility(
+        "cpu",
+        {"status": "resolved", "kind": "gguf",
+         "source": "exact_selector", "reason": None},
+        apple,
+    )
+
+    assert (mlx.status, mlx.reason, mlx.observed_format) == (
+        "compatible", "supported_format", "transformers")
+    assert (cpu.status, cpu.reason, cpu.observed_format) == (
+        "compatible", "supported_format", "gguf")
+
+
+def test_artifact_compatibility_reports_cross_format_and_safe_next_engine():
+    apple = _compat_machine(
+        system="Darwin", arch="arm64", accel_kind="apple")
+
+    cpu_transformer = engines.classify_artifact_compatibility(
+        "cpu",
+        {"status": "resolved", "kind": "transformers",
+         "source": "local_cache", "reason": None},
+        apple,
+    )
+    mlx_gguf = engines.classify_artifact_compatibility(
+        "mlx",
+        {"status": "resolved", "kind": "gguf",
+         "source": "local_path", "reason": None},
+        apple,
+    )
+
+    assert (cpu_transformer.status, cpu_transformer.reason) == (
+        "incompatible", "unsupported_format")
+    assert cpu_transformer.compatible_engine == "mlx"
+    assert mlx_gguf.compatible_engine == "cpu"
+
+
+def test_artifact_compatibility_preserves_unresolved_evidence():
+    result = engines.classify_artifact_compatibility(
+        "cpu",
+        {"status": "unresolved", "kind": "gguf",
+         "source": "local_cache", "reason": "exact_gguf_selector_required"},
+        _compat_machine(),
+    )
+
+    assert (result.status, result.reason) == ("unknown", "artifact_unresolved")
+    assert result.observed_format == "gguf"
+    assert result.evidence_reason == "exact_gguf_selector_required"
+    assert result.compatible_engine is None
+
+
 def test_catalog_has_only_canonical_public_engine_keys():
     assert "mlx" in engines.ENGINES and "cuda" in engines.ENGINES
     assert "wmx" not in engines.ENGINES and "wcx" not in engines.ENGINES

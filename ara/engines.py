@@ -264,6 +264,32 @@ class EngineCompatibility:
         }
 
 
+@dataclass(frozen=True)
+class ArtifactCompatibility:
+    """Compatibility between one exact model artifact and a selected engine."""
+
+    status: str
+    reason: str
+    engine: str
+    required_formats: tuple[str, ...]
+    observed_format: str | None
+    evidence_source: str
+    evidence_reason: str | None
+    compatible_engine: str | None
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "engine": self.engine,
+            "required_formats": list(self.required_formats),
+            "observed_format": self.observed_format,
+            "evidence_source": self.evidence_source,
+            "evidence_reason": self.evidence_reason,
+            "compatible_engine": self.compatible_engine,
+        }
+
+
 def _compatibility(status: str, reason: str, detail: str) -> EngineCompatibility:
     return EngineCompatibility(status, reason, detail)
 
@@ -393,6 +419,37 @@ def classify_compatibility(engine: str, machine) -> EngineCompatibility:
     return _compatibility(
         "unknown", "unknown_engine",
         f"ARA has no compatibility classifier for engine {engine!r}.")
+
+
+def classify_artifact_compatibility(
+        engine: str, evidence: dict, machine) -> ArtifactCompatibility:
+    """Compare resolved artifact evidence with the selected engine's declared model kinds."""
+    required = tuple(ENGINES.get(engine, {}).get("model_kinds", ()))
+    observed = evidence.get("kind")
+    source = str(evidence.get("source") or "unknown")
+    evidence_reason = evidence.get("reason")
+    if evidence.get("status") != "resolved" or observed not in {"gguf", "transformers"}:
+        return ArtifactCompatibility(
+            "unknown", "artifact_unresolved", engine, required, observed, source,
+            evidence_reason, None)
+    if observed in required:
+        return ArtifactCompatibility(
+            "compatible", "supported_format", engine, required, observed, source,
+            evidence_reason, None)
+
+    compatible_engine = next(
+        (
+            key
+            for key, spec in ENGINES.items()
+            if key != engine
+            and observed in spec.get("model_kinds", ())
+            and classify_compatibility(key, machine).status == "compatible"
+        ),
+        None,
+    )
+    return ArtifactCompatibility(
+        "incompatible", "unsupported_format", engine, required, observed, source,
+        evidence_reason, compatible_engine)
 
 
 def decide_auto(*, system: str, machine: str, nvidia_smi: str | None) -> AutoDecision:

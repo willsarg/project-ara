@@ -206,6 +206,109 @@ def _make_file(name, path, size):
     return _types.SimpleNamespace(file_name=name, file_path=path, size_on_disk=size)
 
 
+def test_artifact_evidence_resolves_local_gguf_and_exact_selector(tmp_path):
+    local = tmp_path / "Model-Q4_K_M.gguf"
+    local.write_bytes(b"gguf")
+
+    assert catalog.artifact_evidence(str(local)) == {
+        "status": "resolved",
+        "kind": "gguf",
+        "source": "local_path",
+        "reason": None,
+    }
+    assert catalog.artifact_evidence(
+        "org/repo:Model-Q4_K_M.gguf") == {
+            "status": "resolved",
+            "kind": "gguf",
+            "source": "exact_selector",
+            "reason": None,
+        }
+
+
+def test_artifact_evidence_resolves_cached_transformers_weights(monkeypatch):
+    files = [
+        _make_file("config.json", "/cache/config.json", 100),
+        _make_file("model-00001-of-00002.safetensors", "/cache/one", 1000),
+        _make_file("model-00002-of-00002.safetensors", "/cache/two", 1000),
+    ]
+    repo = _make_repo("org/transformer", "model", files)
+    monkeypatch.setattr(
+        "huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+
+    assert catalog.artifact_evidence("org/transformer") == {
+        "status": "resolved",
+        "kind": "transformers",
+        "source": "local_cache",
+        "reason": None,
+    }
+
+
+def test_artifact_evidence_keeps_bare_gguf_repo_unresolved(monkeypatch):
+    files = [
+        _make_file("Model-Q4_K_M.gguf", "/cache/q4.gguf", 1000),
+        _make_file("Model-Q8_0.gguf", "/cache/q8.gguf", 2000),
+    ]
+    repo = _make_repo("org/gguf", "model", files)
+    monkeypatch.setattr(
+        "huggingface_hub.scan_cache_dir", lambda: _make_cache([repo]))
+
+    assert catalog.artifact_evidence("org/gguf") == {
+        "status": "unresolved",
+        "kind": "gguf",
+        "source": "local_cache",
+        "reason": "exact_gguf_selector_required",
+    }
+
+
+def test_artifact_evidence_keeps_mixed_or_incomplete_repo_unresolved(monkeypatch):
+    mixed = _make_repo("org/mixed", "model", [
+        _make_file("model.safetensors", "/cache/model.safetensors", 1000),
+        _make_file("Model-Q4_K_M.gguf", "/cache/model.gguf", 500),
+    ])
+    incomplete = _make_repo("org/incomplete", "model", [
+        _make_file("config.json", "/cache/config.json", 100),
+    ])
+    monkeypatch.setattr(
+        "huggingface_hub.scan_cache_dir",
+        lambda: _make_cache([mixed, incomplete]))
+
+    assert catalog.artifact_evidence("org/mixed") == {
+        "status": "unresolved",
+        "kind": "mixed",
+        "source": "local_cache",
+        "reason": "ambiguous_formats",
+    }
+    assert catalog.artifact_evidence("org/incomplete") == {
+        "status": "unresolved",
+        "kind": None,
+        "source": "local_cache",
+        "reason": "weight_artifact_unavailable",
+    }
+
+
+def test_artifact_evidence_handles_uncached_invalid_and_probe_failure(monkeypatch):
+    monkeypatch.setattr(
+        "huggingface_hub.scan_cache_dir", lambda: _make_cache([]))
+    assert catalog.artifact_evidence("org/missing") == {
+        "status": "unresolved",
+        "kind": None,
+        "source": "local_cache",
+        "reason": "artifact_not_cached",
+    }
+    assert catalog.artifact_evidence("../bad") == {
+        "status": "unresolved",
+        "kind": None,
+        "source": "input",
+        "reason": "invalid_model_reference",
+    }
+
+    monkeypatch.setattr(
+        "huggingface_hub.scan_cache_dir",
+        lambda: (_ for _ in ()).throw(RuntimeError("broken cache")))
+    assert catalog.artifact_evidence("org/broken")["reason"] == (
+        "artifact_evidence_unavailable")
+
+
 def test_cached_gguf_path_returns_smallest(monkeypatch):
     big = _make_file("big.gguf", "/cache/big.gguf", 2000)
     small = _make_file("small.gguf", "/cache/small.gguf", 500)

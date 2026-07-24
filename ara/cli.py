@@ -5362,7 +5362,7 @@ def _emit_characterized(c: Console, engine_key: str | None) -> None:
     c.emit()
 
 
-def _model_fit(lim: dict, model: str) -> dict | None:
+def _model_fit(lim: dict, model: str, machine) -> dict | None:
     """Analytic fit for *model* against the estimated limits — no engine, no model load.
 
     Combines the model's architecture (for the KV slope) with its weight footprint. The weight
@@ -5385,6 +5385,19 @@ def _model_fit(lim: dict, model: str) -> dict | None:
             "reason": unavailable_reason,
         }
 
+    artifact = engines.classify_artifact_compatibility(
+        lim["engine"], catalog.artifact_evidence(model), machine).as_dict()
+    if artifact["status"] != "compatible":
+        return {
+            "weights_gb": None,
+            "fits": None,
+            "est_context": None,
+            "max_context": None,
+            "binding": None,
+            "reason": artifact["reason"],
+            "artifact_compatibility": artifact,
+        }
+
     meta = catalog.describe(model)
     if meta is None:
         return None
@@ -5393,16 +5406,21 @@ def _model_fit(lim: dict, model: str) -> dict | None:
         with db.connected_readonly() as con:
             row = catalog.get(con, model)
     weights_gb = row.get("weights_gb") if row else None
-    if weights_gb is None:
+    if weights_gb is None and artifact["observed_format"] == "gguf":
+        weights_gb = acquire.gguf_size_gb(model)
+    if weights_gb is None and artifact["observed_format"] == "transformers":
         weights_gb = catalog._cache_size_gb(model)
-    if weights_gb is None:
+    if weights_gb is None and artifact["observed_format"] == "transformers":
         weights_gb = acquire.repo_size_gb(model)
-    return estimate.model_fit(lim, meta, weights_gb)
+    return {
+        **estimate.model_fit(lim, meta, weights_gb),
+        "artifact_compatibility": artifact,
+    }
 
 
-def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
+def _emit_model_fit(c: Console, lim: dict, model: str, machine) -> None:
     """Render the per-model analytic verdict: does it fit, and what context does the budget hold?"""
-    fit = _model_fit(lim, model)
+    fit = _model_fit(lim, model, machine)
     c.emit()
     unavailable_details = {
         "engine_incompatible": (
@@ -5411,8 +5429,16 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
             "ARA could not establish that the selected engine is compatible"),
         "two_wall_capacity_unavailable": (
             "ARA has no engine-free two-wall VRAM and system-RAM estimate"),
+        "unsupported_format": (
+            "the selected engine cannot load the observed artifact format"),
+        "artifact_unresolved": (
+            "the exact model artifact format could not be resolved"),
     }
-    if fit is not None and fit["reason"] in unavailable_details:
+    if fit is not None and fit["reason"] == "unsupported_format":
+        tag = "  (unknown — unsupported artifact format)"
+    elif fit is not None and fit["reason"] == "artifact_unresolved":
+        tag = "  (unknown — artifact unresolved)"
+    elif fit is not None and fit["reason"] in unavailable_details:
         tag = "  (unknown — engine capacity unavailable)"
     elif fit is not None and fit["reason"] == "size_unknown":
         tag = "  (unknown — model size unavailable)"
@@ -5425,6 +5451,36 @@ def _emit_model_fit(c: Console, lim: dict, model: str) -> None:
     c.emit(c.section(f"  MODEL FIT: {model}") + c.style("dim", tag))
     if fit is None:
         c.emit(c.style("warn", f"  couldn't describe {model} — is it a valid repo / downloaded?"))
+        c.emit()
+        return
+    artifact = fit.get("artifact_compatibility")
+    if artifact is not None and artifact["status"] != "compatible":
+        format_labels = {
+            "gguf": "GGUF",
+            "transformers": "Transformers",
+            "mixed": "mixed",
+        }
+        required = ", ".join(
+            format_labels.get(kind, kind) for kind in artifact["required_formats"]
+        ) or "unknown"
+        observed = format_labels.get(
+            artifact["observed_format"], artifact["observed_format"] or "unknown")
+        c.emit(c.field("selected engine", artifact["engine"], label_width=20))
+        c.emit(c.field("required format", required, label_width=20))
+        c.emit(c.field("observed format", observed, label_width=20))
+        c.emit(c.field(
+            "artifact status", artifact["status"],
+            artifact["evidence_reason"] or artifact["reason"],
+            value_role="bad" if artifact["status"] == "incompatible" else "warn",
+            label_width=20))
+        if artifact["compatible_engine"] is not None:
+            c.emit(c.style("dim", "  compatible next step: ")
+                   + c.style(
+                       "accent",
+                       f"ara profile --engine {artifact['compatible_engine']} --model {model}"))
+        c.emit(c.field(
+            "verdict", "unknown", unavailable_details[fit["reason"]],
+            value_role="warn", label_width=20))
         c.emit()
         return
     weight_detail = (
@@ -5588,7 +5644,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     if as_json:
         payload = {**lim}
         if model is not None:
-            payload["model_fit"] = _model_fit(lim, model)
+            payload["model_fit"] = _model_fit(lim, model, m)
         print(json.dumps(payload, indent=2))
         return 0
 
@@ -5596,7 +5652,7 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
     _emit_characterized(c, sel.engine_key)   # models ARA has already measured here
 
     if model is not None:
-        _emit_model_fit(c, lim, model)
+        _emit_model_fit(c, lim, model, m)
     else:
         # Profile never audits an engine build, so it can only report an analytic estimate or an
         # unknown current budget; stored measurements remain display-only history.
