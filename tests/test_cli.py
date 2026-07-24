@@ -6581,6 +6581,238 @@ def test_ollama_measure_ceiling_refuses_additional_resident_model(monkeypatch):
         )
 
 
+def test_managed_ollama_measurement_cleans_each_rung_before_the_next(monkeypatch):
+    state = {"ctx": None}
+    events = []
+    _wire_ollama_probe(monkeypatch)
+
+    def create(name, _model, ctx):
+        state["ctx"] = ctx
+        events.append(("create", name, ctx))
+        return True
+
+    def digest(name):
+        if name == "base":
+            return "a" * 64
+        return ("b" if state["ctx"] == 2048 else "c") * 64
+
+    monkeypatch.setattr(cli.ollama, "create", create)
+    monkeypatch.setattr(cli.ollama, "manifest_digest", digest)
+    monkeypatch.setattr(
+        cli.ollama,
+        "probe_generate",
+        lambda name, ctx: events.append(("generate", name, ctx)) or True)
+    monkeypatch.setattr(cli.ollama, "ps", lambda *_a: [{
+        "name": "probe:latest",
+        "digest": digest("probe"),
+        "context_length": state["ctx"],
+        "size": 10,
+        "size_vram": 10,
+    }])
+    monkeypatch.setattr(
+        cli,
+        "_record_ollama_probe_ownership",
+        lambda **fields: events.append(
+            ("record", fields["probe"], fields["context"],
+             fields["probe_artifact_id"])))
+    monkeypatch.setattr(
+        cli,
+        "_cleanup_ollama_probe",
+        lambda name, artifact: events.append(
+            ("cleanup", name, artifact)) or None)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint(
+            "http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: authority)
+
+    best, points = _measure_ollama(
+        "base", 4096, "probe",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        provenance={}, authority=authority, managed=True)
+
+    assert best == 4096 and [point["fit"] for point in points] == [True, True]
+    assert [event[:3] for event in events] == [
+        ("create", "probe", 2048),
+        ("record", "probe", 2048),
+        ("generate", "probe", 2048),
+        ("cleanup", "probe", "ollama-manifest-sha256:" + "b" * 64),
+        ("create", "probe", 4096),
+        ("record", "probe", 4096),
+        ("generate", "probe", 4096),
+        ("cleanup", "probe", "ollama-manifest-sha256:" + "c" * 64),
+    ]
+
+
+def test_managed_ollama_measurement_cleans_an_interrupted_rung(monkeypatch):
+    _wire_ollama_probe(monkeypatch)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint(
+            "http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: authority)
+    monkeypatch.setattr(cli.ollama, "create", lambda *_args: True)
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: ("a" if name == "base" else "b") * 64)
+    monkeypatch.setattr(
+        cli.ollama, "probe_generate",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    monkeypatch.setattr(cli, "_record_ollama_probe_ownership", lambda **_fields: None)
+    cleaned = []
+    monkeypatch.setattr(
+        cli, "_cleanup_ollama_probe",
+        lambda name, artifact: cleaned.append((name, artifact)) or None)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        _measure_ollama(
+            "base", 2048, "probe",
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+            authority=authority, managed=True)
+
+    assert cleaned == [(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)]
+
+
+def test_managed_ollama_measurement_requires_exact_authority():
+    with pytest.raises(ValueError, match="exact base and runtime authority"):
+        _measure_ollama("base", 2048, "probe", managed=True)
+
+
+def test_managed_ollama_measurement_surfaces_cleanup_failure(monkeypatch):
+    _wire_ollama_probe(monkeypatch)
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint(
+            "http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    monkeypatch.setattr(cli.ollama, "runtime_authority", lambda _endpoint: authority)
+    monkeypatch.setattr(cli.ollama, "create", lambda *_args: True)
+    monkeypatch.setattr(
+        cli.ollama, "manifest_digest",
+        lambda name: ("a" if name == "base" else "b") * 64)
+    monkeypatch.setattr(
+        cli.ollama, "probe_generate",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    monkeypatch.setattr(cli, "_record_ollama_probe_ownership", lambda **_fields: None)
+    monkeypatch.setattr(
+        cli, "_cleanup_ollama_probe", lambda *_args: "runner remained resident")
+
+    with pytest.raises(RuntimeError, match="probe cleanup failed.*runner remained"):
+        _measure_ollama(
+            "base", 2048, "probe",
+            base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+            authority=authority, managed=True)
+
+
+def test_recorded_ollama_probe_ownership_is_exact_and_durable(store):
+    authority = cli.ollama.OllamaRuntimeAuthority(
+        endpoint=cli.ollama.OllamaEndpoint(
+            "http://127.0.0.1:11434", "loopback"),
+        server_version="0.30.10",
+        server_instance_id="one",
+        configured_num_parallel=1,
+        configured_num_parallel_authority="exact_version_default",
+    )
+    artifact = "ollama-manifest-sha256:" + "b" * 64
+    base_artifact = "ollama-manifest-sha256:" + "a" * 64
+
+    cli._record_ollama_probe_ownership(
+        probe="probe", probe_artifact_id=artifact,
+        base_model="base", base_artifact_id=base_artifact,
+        context=2048, authority=authority)
+
+    candidate = _local_ollama_model("probe", digest="b" * 64)
+    assert cli._ollama_probe_is_owned(
+        candidate, probe="probe", base_model="base",
+        base_artifact_id=base_artifact, allowed_contexts=[2048, 4096],
+        endpoint=authority.endpoint.url)
+    assert not cli._ollama_probe_is_owned(
+        candidate, probe="probe", base_model="other",
+        base_artifact_id=base_artifact, allowed_contexts=[2048, 4096],
+        endpoint=authority.endpoint.url)
+
+
+def test_ollama_probe_ownership_requires_candidate_and_readable_ledger(
+        tmp_path, monkeypatch):
+    fields = {
+        "probe": "probe",
+        "base_model": "base",
+        "base_artifact_id": "ollama-manifest-sha256:" + "a" * 64,
+        "allowed_contexts": [2048],
+        "endpoint": "http://127.0.0.1:11434",
+    }
+    assert not cli._ollama_probe_is_owned(
+        _local_ollama_model("other", digest="b" * 64), **fields)
+
+    candidate = _local_ollama_model("probe", digest="b" * 64)
+    monkeypatch.setattr(cli.db, "_db_path", lambda: tmp_path / "absent.sqlite3")
+    assert not cli._ollama_probe_is_owned(candidate, **fields)
+
+    (tmp_path / "absent.sqlite3").touch()
+
+    @contextlib.contextmanager
+    def unreadable():
+        raise sqlite3.OperationalError("unreadable")
+        yield
+
+    monkeypatch.setattr(cli.db, "connected_readonly", unreadable)
+    assert not cli._ollama_probe_is_owned(candidate, **fields)
+
+
+def test_recover_ollama_probe_garbage_collects_only_exact_owned_artifact(monkeypatch):
+    candidate = _local_ollama_model("probe", digest="b" * 64)
+    cleaned = []
+    monkeypatch.setattr(cli, "_ollama_probe_is_owned", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        cli, "_cleanup_ollama_probe",
+        lambda name, artifact: cleaned.append((name, artifact)) or None)
+
+    error = cli._recover_ollama_probe(
+        candidate, probe="probe", base_model="base",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        allowed_contexts=[2048, 4096],
+        endpoint="http://127.0.0.1:11434")
+
+    assert error is None
+    assert cleaned == [(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)]
+
+
+def test_recover_ollama_probe_refuses_unproven_or_unidentified_artifact(monkeypatch):
+    monkeypatch.setattr(cli, "_ollama_probe_is_owned", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        cli, "_cleanup_ollama_probe",
+        lambda *_a, **_k: pytest.fail("cleaned an unproven probe"))
+
+    unproven = cli._recover_ollama_probe(
+        _local_ollama_model("probe", digest="b" * 64),
+        probe="probe", base_model="base",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        allowed_contexts=[2048],
+        endpoint="http://127.0.0.1:11434")
+    unidentified = cli._recover_ollama_probe(
+        _local_ollama_model("probe"),
+        probe="probe", base_model="base",
+        base_artifact_id="ollama-manifest-sha256:" + "a" * 64,
+        allowed_contexts=[2048],
+        endpoint="http://127.0.0.1:11434")
+
+    assert "not proven ARA-owned" in unproven
+    assert "digest is unavailable" in unidentified
+
+
 def test_cleanup_ollama_probe_refuses_retargeted_manifest(monkeypatch):
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "c" * 64)
     monkeypatch.setattr(cli.ollama, "load",
@@ -6592,19 +6824,57 @@ def test_cleanup_ollama_probe_refuses_retargeted_manifest(monkeypatch):
     assert "identity changed" in error and "refused" in error
 
 
-def test_cleanup_ollama_probe_retains_exact_manifest_while_runner_is_resident(monkeypatch):
-    monkeypatch.setattr(cli.ollama, "load",
-                        lambda *_a, **_k: pytest.fail("expired shared runner"))
+def test_cleanup_ollama_probe_expires_exact_owned_runner_then_deletes(monkeypatch):
+    calls = []
     monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    observations = iter([
+        [cli.ollama.OllamaProcess(name="probe", digest="b" * 64)],
+        [],
+    ])
+    monkeypatch.setattr(cli.ollama, "processes", lambda: next(observations))
     monkeypatch.setattr(
-        cli.ollama,
-        "processes",
-        lambda: [cli.ollama.OllamaProcess(name="probe", digest="b" * 64)],
-    )
+        cli.ollama, "load",
+        lambda name, keep_alive: calls.append(("unload", name, keep_alive)) or {
+            "done": True})
     monkeypatch.setattr(
-        cli.ollama, "delete", lambda _name: pytest.fail("orphaned resident probe"))
+        cli.ollama, "delete",
+        lambda name: calls.append(("delete", name)) or True)
     assert cli._cleanup_ollama_probe(
         "probe", "ollama-manifest-sha256:" + "b" * 64) is None
+    assert calls == [("unload", "probe", 0), ("delete", "probe")]
+
+
+def test_cleanup_ollama_probe_refuses_when_exact_runner_cannot_be_expired(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    resident = [cli.ollama.OllamaProcess(name="probe", digest="b" * 64)]
+    monkeypatch.setattr(cli.ollama, "processes", lambda: resident)
+    monkeypatch.setattr(
+        cli.ollama, "load", lambda *_a, **_k: {"done": True})
+    monkeypatch.setattr(
+        cli.ollama, "delete",
+        lambda _name: pytest.fail("deleted a still-resident probe"))
+
+    assert "still resident" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+
+
+def test_cleanup_ollama_probe_refuses_failed_or_unverifiable_runner_expiry(monkeypatch):
+    monkeypatch.setattr(cli.ollama, "manifest_digest", lambda _name: "b" * 64)
+    resident = [cli.ollama.OllamaProcess(name="probe", digest="b" * 64)]
+    monkeypatch.setattr(cli.ollama, "processes", lambda: resident)
+    monkeypatch.setattr(cli.ollama, "load", lambda *_args, **_fields: None)
+    monkeypatch.setattr(
+        cli.ollama, "delete",
+        lambda _name: pytest.fail("deleted a probe after failed expiry"))
+    assert "couldn't expire" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
+
+    observations = iter([resident, None])
+    monkeypatch.setattr(cli.ollama, "processes", lambda: next(observations))
+    monkeypatch.setattr(
+        cli.ollama, "load", lambda *_args, **_fields: {"done": True})
+    assert "couldn't verify" in cli._cleanup_ollama_probe(
+        "probe", "ollama-manifest-sha256:" + "b" * 64)
 
 
 def test_cleanup_ollama_probe_deletes_exact_manifest_when_not_resident(monkeypatch):
@@ -6964,7 +7234,38 @@ def test_characterize_ollama_refuses_preexisting_content_addressed_probe(
                         lambda *_a, **_k: pytest.fail("deleted preexisting probe"))
     c, buf = make_console()
     assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 1
-    assert "probe" in buf.getvalue() and "already exists" in buf.getvalue()
+    assert all(text in buf.getvalue() for text in (
+        "probe", "already exists", "not proven ARA-owned"))
+
+
+def test_characterize_ollama_recovers_exact_owned_probe_before_retry(
+        store, monkeypatch, make_console):
+    _wire_char_ollama(monkeypatch)
+    artifact = "ollama-manifest-sha256:" + "a" * 64
+    probe = cli._governed_name(
+        "qwen3:0.6b", artifact_id=artifact, context=8192) + "-probe"
+    monkeypatch.setattr(
+        cli.ollama, "inventory",
+        lambda _t=2.0: [
+            _local_ollama_model("qwen3:0.6b", digest="a" * 64),
+            _local_ollama_model(probe, digest="b" * 64),
+        ],
+    )
+    recovered = []
+    monkeypatch.setattr(
+        cli, "_recover_ollama_probe",
+        lambda candidate, **fields: recovered.append((candidate, fields)) or None)
+    measured = []
+    monkeypatch.setattr(
+        cli, "_ollama_measure_ceiling",
+        lambda *_args, **fields: measured.append(fields) or (4096, []))
+
+    c, _buf = make_console()
+    assert cli.render_characterize(c, "qwen3:0.6b", engine="ollama") == 0
+    assert recovered[0][0].digest == "b" * 64
+    assert recovered[0][1]["base_artifact_id"] == artifact
+    assert recovered[0][1]["allowed_contexts"] == [2048, 4096, 8192]
+    assert measured[0]["managed"] is True
 
 
 def test_characterize_ollama_refuses_when_final_probe_inventory_is_unavailable(

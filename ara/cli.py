@@ -3904,6 +3904,7 @@ def render_run(c: Console, model: str, *, prompt: str | None = None, engine: str
 # llama.cpp-class runtime can allocate differently, so cross-runtime ceilings never transfer.
 _OLLAMA_ARTIFACT_PREFIX = "ollama-manifest-sha256:"
 _OLLAMA_DERIVED_POLICY_VERSION = "ollama-derived-v2"
+_OLLAMA_PROBE_OWNERSHIP_SCHEMA = "ollama-characterization-probe-v1"
 
 
 def _ollama_governed_endpoint() -> tuple[ollama.OllamaEndpoint, str | None]:
@@ -3957,6 +3958,113 @@ def _ollama_artifact_id(model: str, *, record: ollama.OllamaModel | None = None)
     """Manifest identity from a supplied inventory record, or a fresh snapshot when omitted."""
     digest = record.digest if record is not None else ollama.manifest_digest(model)
     return _OLLAMA_ARTIFACT_PREFIX + digest if digest else None
+
+
+def _record_ollama_probe_ownership(
+    *,
+    probe: str,
+    probe_artifact_id: str,
+    base_model: str,
+    base_artifact_id: str,
+    context: int,
+    authority: ollama.OllamaRuntimeAuthority,
+) -> None:
+    """Durably bind one exact throwaway manifest to the ARA operation that created it."""
+
+    facts = {
+        "schema": _OLLAMA_PROBE_OWNERSHIP_SCHEMA,
+        "probe": probe,
+        "base_model": base_model,
+        "base_artifact_id": base_artifact_id,
+        "context": context,
+        "endpoint": authority.endpoint.url,
+    }
+    with db.connected() as con:
+        db.upsert_model_artifact(
+            con,
+            probe_artifact_id,
+            probe,
+            artifact_source="ollama",
+            artifact_confidence="observed_digest",
+            format="gguf",
+            facts=facts,
+            evidence={
+                "owner": "ara",
+                "purpose": "characterization_probe",
+            },
+        )
+
+
+def _ollama_probe_is_owned(
+    candidate: ollama.OllamaModel,
+    *,
+    probe: str,
+    base_model: str,
+    base_artifact_id: str,
+    allowed_contexts: Sequence[int],
+    endpoint: str | None,
+) -> bool:
+    """Return whether durable evidence proves this exact installed probe belongs to ARA."""
+
+    if candidate.name not in {probe, probe + ":latest"} or candidate.digest is None:
+        return False
+    artifact_id = _OLLAMA_ARTIFACT_PREFIX + candidate.digest
+    if not db._db_path().is_file():
+        return False
+    try:
+        with db.connected_readonly() as con:
+            row = db.get_model_artifact(con, artifact_id)
+    except (OSError, sqlite3.Error):
+        return False
+    if row is None:
+        return False
+    facts = row.get("facts")
+    evidence = row.get("evidence")
+    context = facts.get("context") if isinstance(facts, dict) else None
+    return (
+        row.get("logical_model_id") == probe
+        and row.get("artifact_source") == "ollama"
+        and row.get("artifact_confidence") == "observed_digest"
+        and row.get("format") == "gguf"
+        and isinstance(facts, dict)
+        and facts.get("schema") == _OLLAMA_PROBE_OWNERSHIP_SCHEMA
+        and facts.get("probe") == probe
+        and facts.get("base_model") == base_model
+        and facts.get("base_artifact_id") == base_artifact_id
+        and isinstance(context, int)
+        and not isinstance(context, bool)
+        and context in allowed_contexts
+        and facts.get("endpoint") == endpoint
+        and isinstance(evidence, dict)
+        and evidence.get("owner") == "ara"
+        and evidence.get("purpose") == "characterization_probe"
+    )
+
+
+def _recover_ollama_probe(
+    candidate: ollama.OllamaModel,
+    *,
+    probe: str,
+    base_model: str,
+    base_artifact_id: str,
+    allowed_contexts: Sequence[int],
+    endpoint: str | None,
+) -> str | None:
+    """Garbage-collect a prior exact ARA probe, refusing anything not durably owned."""
+
+    if candidate.digest is None:
+        return "probe already exists but its digest is unavailable; refused cleanup"
+    if not _ollama_probe_is_owned(
+        candidate,
+        probe=probe,
+        base_model=base_model,
+        base_artifact_id=base_artifact_id,
+        allowed_contexts=allowed_contexts,
+        endpoint=endpoint,
+    ):
+        return "probe already exists but is not proven ARA-owned; refused cleanup"
+    artifact_id = _OLLAMA_ARTIFACT_PREFIX + candidate.digest
+    return _cleanup_ollama_probe(probe, artifact_id)
 
 
 def _ollama_safe_ceiling(
@@ -4043,7 +4151,8 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
                             provenance: dict | None = None,
                             authority: ollama.OllamaRuntimeAuthority | None = None,
                             model_size_bytes: int | None = None,
-                            model_info: dict | None = None):
+                            model_info: dict | None = None,
+                            managed: bool = False):
     """Ramp Ollama to the largest context proven safe against every physical memory wall.
 
     Each rung performs one bounded generated token with truncation and shifting disabled, then
@@ -4051,6 +4160,8 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
     snapshots. CPU, unified memory, full accelerator residency, and partial offload are evaluated
     according to their actual walls; unknown topology fails closed.
     """
+    if managed and (base_artifact_id is None or authority is None):
+        raise ValueError("managed Ollama probes require exact base and runtime authority")
     best, points = None, []
     previous_context, previous_digest = None, None
     for ctx in _ollama_ramp_contexts(max_ctx):
@@ -4072,57 +4183,78 @@ def _ollama_measure_ceiling(model: str, max_ctx: int, probe: str, *,
         if (base_artifact_id is not None
                 and _ollama_artifact_id(model) != base_artifact_id):
             raise RuntimeError("base manifest changed before probe creation")
-        if not ollama.create(probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
-            break
         probe_artifact_id = None
-        if base_artifact_id is not None or provenance is not None:
+        try:
+            if not ollama.create(
+                    probe, model, ctx):     # couldn't bake this rung — stop, keep what fit
+                break
             if provenance is not None:
                 provenance["created"] = True
-            probe_artifact_id = _ollama_artifact_id(probe)
-            if probe_artifact_id is None:
-                raise RuntimeError("created probe manifest could not be identified")
-            if provenance is not None:
-                provenance["artifact_id"] = probe_artifact_id
+                if managed:
+                    provenance.update(cleaned=False, context=ctx)
+            if base_artifact_id is not None or provenance is not None or managed:
+                probe_artifact_id = _ollama_artifact_id(probe)
+                if probe_artifact_id is None:
+                    raise RuntimeError("created probe manifest could not be identified")
+                if provenance is not None:
+                    provenance["artifact_id"] = probe_artifact_id
+            if managed:
+                _record_ollama_probe_ownership(
+                    probe=probe,
+                    probe_artifact_id=probe_artifact_id,
+                    base_model=model,
+                    base_artifact_id=base_artifact_id,
+                    context=ctx,
+                    authority=authority,
+                )
             if (base_artifact_id is not None
                     and _ollama_artifact_id(model) != base_artifact_id):
                 raise RuntimeError("base manifest changed during probe creation")
-        if not ollama.probe_generate(probe, ctx):
-            point = ollama_evidence.failed_characterization_point(
-                ctx, "generation_failed")
-            point["preload_admission"] = admission.as_dict()
-            points.append(point)
-            break
-        if authority is not None and ollama.runtime_authority(authority.endpoint) != authority:
-            raise RuntimeError("Ollama runtime authority changed during measurement")
-        processes = ollama.processes()
-        after = ollama_evidence.capture_memory_snapshot()
-        expected_digest = (probe_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
-                           if probe_artifact_id is not None else None)
-        residency_error = _ollama_residency_error(
-            processes, allowed_name=probe, allowed_digest=expected_digest,
-            allowed_context=ctx, require_target=True)
-        if residency_error is not None:
-            previous_runner_remains = (
-                previous_context is not None
-                and _ollama_residency_error(
-                    processes, allowed_name=probe, allowed_digest=previous_digest,
-                    allowed_context=previous_context, require_target=True) is None
-            )
-            if processes == [] or previous_runner_remains:
+            if not ollama.probe_generate(probe, ctx):
                 point = ollama_evidence.failed_characterization_point(
-                    ctx, "effective_residency_unverified")
+                    ctx, "generation_failed")
                 point["preload_admission"] = admission.as_dict()
                 points.append(point)
                 break
-            raise RuntimeError(residency_error)
-        process = processes[0]
-        point = ollama_evidence.characterization_point(before, after, process, ctx)
-        point["preload_admission"] = admission.as_dict()
-        points.append(point)
-        if not point["fit"]:                         # hit/failed to verify the wall — stop safely
-            break
-        best = ctx
-        previous_context, previous_digest = ctx, expected_digest
+            if authority is not None and ollama.runtime_authority(
+                    authority.endpoint) != authority:
+                raise RuntimeError("Ollama runtime authority changed during measurement")
+            processes = ollama.processes()
+            after = ollama_evidence.capture_memory_snapshot()
+            expected_digest = (probe_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
+                               if probe_artifact_id is not None else None)
+            residency_error = _ollama_residency_error(
+                processes, allowed_name=probe, allowed_digest=expected_digest,
+                allowed_context=ctx, require_target=True)
+            if residency_error is not None:
+                previous_runner_remains = (
+                    previous_context is not None
+                    and _ollama_residency_error(
+                        processes, allowed_name=probe, allowed_digest=previous_digest,
+                        allowed_context=previous_context, require_target=True) is None
+                )
+                if processes == [] or previous_runner_remains:
+                    point = ollama_evidence.failed_characterization_point(
+                        ctx, "effective_residency_unverified")
+                    point["preload_admission"] = admission.as_dict()
+                    points.append(point)
+                    break
+                raise RuntimeError(residency_error)
+            process = processes[0]
+            point = ollama_evidence.characterization_point(before, after, process, ctx)
+            point["preload_admission"] = admission.as_dict()
+            points.append(point)
+            if not point["fit"]:                     # hit/failed to verify the wall — stop safely
+                break
+            best = ctx
+            previous_context, previous_digest = ctx, expected_digest
+        finally:
+            if managed and probe_artifact_id is not None:
+                cleanup_error = _cleanup_ollama_probe(probe, probe_artifact_id)
+                if provenance is not None:
+                    provenance["cleaned"] = cleanup_error is None
+                if cleanup_error is not None:
+                    raise RuntimeError(f"probe cleanup failed: {cleanup_error}")
     return best, points
 
 
@@ -4183,7 +4315,7 @@ def _ollama_characterization_config(
 
 
 def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
-    """Delete an idle probe, or retain its exact manifest while its runner is resident."""
+    """Expire and delete only the exact probe manifest created by this ARA operation."""
     if _ollama_artifact_id(probe) != expected_artifact_id:
         return "probe manifest identity changed; refused delete"
     processes = ollama.processes()
@@ -4194,7 +4326,15 @@ def _cleanup_ollama_probe(probe: str, expected_artifact_id: str) -> str | None:
     if residents:
         expected_digest = expected_artifact_id.removeprefix(_OLLAMA_ARTIFACT_PREFIX)
         if len(processes) == 1 and residents[0].digest == expected_digest:
-            return None
+            if ollama.load(probe, keep_alive=0) is None:
+                return "couldn't expire exact probe runner; refused delete"
+            remaining = ollama.processes()
+            if remaining is None:
+                return "couldn't verify probe runner expiry; refused delete"
+            if any(process.name in accepted_names for process in remaining):
+                return "exact probe runner is still resident; refused delete"
+            return _delete_exact_ollama_model(
+                probe, label="probe", expected_artifact_id=expected_artifact_id)
         return "probe residency identity changed; refused delete"
     return _delete_exact_ollama_model(
         probe, label="probe", expected_artifact_id=expected_artifact_id)
@@ -4272,25 +4412,37 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     cleanup_error = None
     measurement_error = None
     provenance: dict = {}
+    rungs = _ollama_ramp_contexts(max_ctx)
     try:
         with locking.ollama_setup_lock(endpoint.url, probe):
-            residency_error = _ollama_residency_error(ollama.processes())
-            if residency_error is not None:
-                return err(residency_error)
             latest_models = ollama.inventory()
             if latest_models is None:
                 return err("couldn't recheck Ollama model names before characterization — "
                            "refusing to risk a probe collision.")
-            if ollama.find_model(latest_models, probe) is not None:
-                return err(f"Ollama characterization probe {probe!r} already exists — refusing "
-                           "to overwrite or delete it.")
+            existing_probe = ollama.find_model(latest_models, probe)
+            if existing_probe is not None:
+                recovery_error = _recover_ollama_probe(
+                    existing_probe,
+                    probe=probe,
+                    base_model=model,
+                    base_artifact_id=artifact_id,
+                    allowed_contexts=rungs,
+                    endpoint=endpoint.url,
+                )
+                if recovery_error is not None:
+                    return err(
+                        f"Ollama characterization probe {probe!r} already exists; "
+                        f"{recovery_error}")
+            residency_error = _ollama_residency_error(ollama.processes())
+            if residency_error is not None:
+                return err(residency_error)
             with activity.track("characterizing", model):
                 try:
                     best, points = _ollama_measure_ceiling(
                         model, max_ctx, probe, base_artifact_id=artifact_id,
                         provenance=provenance, authority=authority,
                         model_size_bytes=record.size_bytes,
-                        model_info=model_info)
+                        model_info=model_info, managed=True)
                 except (SystemExit, Exception) as exc:
                     measurement_error = exc
                 finally:
@@ -4298,7 +4450,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
                     if probe_artifact_id is None and provenance.get("created"):
                         cleanup_error = ("probe ownership could not be proven; ARA refused "
                                          "destructive cleanup")
-                    elif probe_artifact_id is not None:
+                    elif probe_artifact_id is not None and not provenance.get("cleaned"):
                         cleanup_error = _cleanup_ollama_probe(probe, probe_artifact_id)
     except locking.OllamaSetupBusy as exc:
         return err(str(exc))
@@ -4320,7 +4472,7 @@ def _render_characterize_ollama(c: Console, model: str, *, as_json: bool) -> int
     if isinstance(probe_artifact_id, str):
         config["characterization_probe_name"] = probe
         config["characterization_probe_artifact_id"] = probe_artifact_id
-        config["characterization_probe_context"] = max_ctx
+        config["characterization_probe_context"] = provenance.get("context", max_ctx)
     with db.connected() as con:
         db.save_characterization(con, profile.machine_key(), "ollama", model,
                                  safe_context=best, points=points, measured_at=None,
