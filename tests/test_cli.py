@@ -15,6 +15,7 @@ import types
 import pytest
 
 import ara.cli as cli
+from ara import targets
 from ara.detect import Accelerator, Machine, ModelStore, Runtime
 from ara.hardware import (BoardInfo, CpuInfo, Drive, GpuInfo, MemoryInfo, MemoryModule,
                           StorageInfo)
@@ -2812,19 +2813,151 @@ def test_profile_unknown_engine_errors(make_console, monkeypatch):
     assert "unknown engine" in buf.getvalue().lower()
 
 
-def test_emit_characterized_shows_stored_models(make_console, store, monkeypatch):
+def _profile_history_row(**over):
+    config = over.pop("config", {})
+    model_id = over.pop("model_id", "org/Model")
+    engine = over.pop("engine", "cpu")
+    base = {
+        "model_id": model_id,
+        "logical_model_id": model_id,
+        "engine": engine,
+        "runtime": "llamacpp" if engine == "cpu" else "mlx",
+        "backend": "cpu" if engine == "cpu" else "apple",
+        "artifact_id": "hf:org/Model@abcdef7:manifest",
+        "artifact_confidence": "manifest_hash",
+        "config": config,
+        "config_key": targets.characterization_config_key(engine, config),
+        "safe_context": 16000,
+        "direct_context": 16000,
+        "fitted_context": 20000,
+        "decode_context": None,
+        "stopped_reason": "memory_wall",
+        "reusable": True,
+        "measured_at": "2026-07-20T12:00:00+00:00",
+        "environment_key": "environment:v1:unscoped",
+        "authority_key": "authority:v1:unscoped",
+        "memory_unit": "GiB",
+        "methodology_key": "methodology:v1:sha256:test",
+        "engine_fingerprint": "engine:v2:sha256:test",
+    }
+    base.update(over)
+    return base
+
+
+def test_profile_characterization_view_keeps_reusable_evidence_unverified(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+
+    view = cli._profile_characterization_view(
+        _profile_history_row(), "cpu")
+
+    assert view["status"] == "reusable_unverified"
+    assert view["authorization"] == "none"
+    assert view["persisted_reusable"] is True
+    assert view["artifact_status"] == "current"
+    assert view["configuration_status"] == "current"
+    assert view["reasons"] == ["live_engine_identity_unverified"]
+
+
+def test_profile_characterization_view_keeps_mlx_authority_historical(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    row = _profile_history_row(
+        engine="mlx", runtime="mlx", backend="apple",
+        authority_key="mlx-memory-authority:old")
+
+    view = cli._profile_characterization_view(row, "mlx")
+
+    assert view["status"] == "historical_unverified"
+    assert view["authorization"] == "none"
+    assert "memory_authority_unverified" in view["reasons"]
+    assert "live_engine_identity_unverified" in view["reasons"]
+
+
+def test_profile_characterization_view_labels_legacy_migration(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    row = _profile_history_row(
+        reusable=False,
+        artifact_id="legacy-unverified:v1:abc",
+        artifact_confidence="legacy_unverified",
+        authority_key=cli.measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY,
+        memory_unit="legacy-unit-unknown",
+        methodology_key="legacy-unknown",
+        engine_fingerprint=cli.db.LEGACY_ENGINE_FINGERPRINT,
+    )
+
+    view = cli._profile_characterization_view(row, "mlx")
+
+    assert view["status"] == "migrated"
+    assert view["persisted_reusable"] is False
+    assert {
+        "persisted_non_reusable",
+        "artifact_evidence_weak",
+        "artifact_not_current",
+        "legacy_memory_authority",
+        "legacy_methodology",
+        "legacy_engine_fingerprint",
+    }.issubset(view["reasons"])
+
+
+def test_profile_characterization_view_detects_artifact_and_config_drift(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: False)
+    row = _profile_history_row(config_key="cfg:v1:stale")
+
+    view = cli._profile_characterization_view(row, "cpu")
+
+    assert view["status"] == "stale"
+    assert view["artifact_status"] == "not_current"
+    assert view["configuration_status"] == "drifted"
+    assert "artifact_not_current" in view["reasons"]
+    assert "configuration_drift" in view["reasons"]
+
+
+def test_profile_characterization_view_keeps_null_ceiling_as_refused_history(monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    row = _profile_history_row(
+        safe_context=None, direct_context=None, fitted_context=None,
+        stopped_reason="model_did_not_fit")
+
+    view = cli._profile_characterization_view(row, "cpu")
+
+    assert view["status"] == "refused_or_unfit"
+    assert view["direct_context"] is None
+    assert "no_successful_ceiling" in view["reasons"]
+    assert view["authorization"] == "none"
+
+
+def test_profile_characterization_view_labels_untracked_configuration_display_only(
+        monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    row = _profile_history_row(config=None)
+
+    view = cli._profile_characterization_view(row, "cpu")
+
+    assert view["status"] == "display_only"
+    assert view["configuration_status"] == "untracked"
+    assert "configuration_untracked" in view["reasons"]
+
+
+def test_emit_characterized_shows_stored_models_as_history(
+        make_console, store, monkeypatch):
     monkeypatch.setattr(cli.profile, "machine_key", lambda: "mkey")
     cli.db.save_characterization(
         store, "mkey", "cuda", "org/SmolLM", safe_context=16000,
         direct_context=16000, fitted_context=20000, points=[], decode_context=None)
     cli.db.save_characterization(store, "mkey", "cuda", "org/Unbound", safe_context=None, points=[],
-                                 decode_context=None)
+                                 decode_context=None, stopped_reason="model_did_not_fit")
+    cli.db.save_characterization(
+        store, "mkey", "cuda", "org/Unexplained", safe_context=None,
+        points=[], decode_context=None)
     c, buf = make_console()
     cli._emit_characterized(c, "cuda")
     out = buf.getvalue()
-    assert "CHARACTERIZED" in out and "SmolLM" in out and "16000" in out
+    assert "CHARACTERIZATION HISTORY" in out
+    assert "org/SmolLM" in out and "16000" in out
     assert "20000 fitted (advisory)" in out
-    assert "—" in out               # the None-ceiling model
+    assert "no successful ceiling · stopped model_did_not_fit" in out
+    assert "org/Unexplained" in out
+    assert "authorization none" in " ".join(out.split())
+    assert "current capability" not in out
 
 
 def test_emit_characterized_empty_shows_nothing(make_console, store, monkeypatch):
@@ -2838,6 +2971,57 @@ def test_emit_characterized_none_engine_key(make_console):
     c, buf = make_console()
     cli._emit_characterized(c, None)
     assert buf.getvalue() == ""
+
+
+def test_emit_characterized_keeps_duplicate_basenames_unambiguous(
+        make_console, monkeypatch):
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    history = [
+        {
+            **cli._profile_characterization_view(
+                _profile_history_row(
+                    model_id="alpha/Same", artifact_id="hf:alpha/Same@aaaaaaa:one"),
+                "cpu"),
+        },
+        {
+            **cli._profile_characterization_view(
+                _profile_history_row(
+                    model_id="beta/Same", artifact_id="hf:beta/Same@bbbbbbb:two"),
+                "cpu"),
+        },
+    ]
+    c, buf = make_console()
+
+    cli._emit_characterized(c, "cpu", history=history)
+
+    out = buf.getvalue()
+    assert "alpha/Same" in out and "beta/Same" in out
+    assert "hf:alpha/Same@aaaaaaa:one" in out
+    assert "hf:beta/Same@bbbbbbb:two" in out
+
+
+def test_profile_json_and_text_share_typed_characterization_history(
+        make_console, monkeypatch, set_platform, capsys):
+    _wire_profile(monkeypatch, set_platform)
+    monkeypatch.setattr(cli.staleness, "artifact_matches", lambda *_a: True)
+    history = [cli._profile_characterization_view(
+        _profile_history_row(engine="mlx", runtime="mlx", backend="apple"), "mlx")]
+    monkeypatch.setattr(
+        cli, "_profile_characterization_history",
+        lambda _engine: history)
+    c = cli.Console(color=False, stream=sys.stderr)
+
+    assert cli.render_profile(c, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["characterization_history"] == history
+    assert payload["characterization_history"][0]["authorization"] == "none"
+
+    text_console, text_buffer = make_console()
+    assert cli.render_profile(text_console) == 0
+    text = text_buffer.getvalue()
+    assert history[0]["model_id"] in text
+    assert history[0]["status"] in text
+    assert "authorization none" in " ".join(text.split())
 
 
 # --------------------------------------------------------------------------- #

@@ -28,7 +28,7 @@ from ara import (acquire, activity, apps, benchmark, catalog, db, detect, engine
                  hub_server,
                  hf_auth, locking, measurement_authority, mlx, ollama, ollama_evidence,
                  profile, calibration, methodology, pythons, scoring, serialize,
-                 staleness, versions)
+                 staleness, targets, versions)
 from ara.contracts import ramp
 from ara.engines import _ara_version    # single source of truth (also stamps engine envs)
 from ara.engine_env import EngineEnvError
@@ -5335,30 +5335,170 @@ def render_uninstall(c: Console, *, engine: str = "auto", as_json: bool = False)
     return 0 if result.status in ("removed", "absent") else 1
 
 
-def _emit_characterized(c: Console, engine_key: str | None) -> None:
-    """Show models ARA has characterized on this machine + engine (from the store)."""
+_STRONG_ARTIFACT_CONFIDENCE = frozenset({
+    "strong", "observed_digest", "manifest_hash",
+})
+
+
+def _profile_characterization_view(row: dict, engine_key: str) -> dict:
+    """Classify one stored row without crossing profile's engine-free authority boundary."""
+    direct = row.get("direct_context", row.get("safe_context"))
+    artifact_id = row.get("artifact_id")
+    artifact_current = staleness.artifact_matches(
+        row["model_id"], artifact_id)
+    config = row.get("config")
+    expected_config_key = (
+        targets.characterization_config_key(engine_key, config)
+        if isinstance(config, dict) else None
+    )
+    configuration_current = (
+        expected_config_key is not None
+        and row.get("config_key") == expected_config_key
+    )
+    persisted_reusable = row.get("reusable") is True
+    artifact_confidence = row.get("artifact_confidence")
+    reasons = []
+
+    if direct is None:
+        reasons.append("no_successful_ceiling")
+    if not persisted_reusable:
+        reasons.append("persisted_non_reusable")
+    if artifact_confidence not in _STRONG_ARTIFACT_CONFIDENCE:
+        reasons.append("artifact_evidence_weak")
+    if not artifact_current:
+        reasons.append("artifact_not_current")
+    if config is None:
+        reasons.append("configuration_untracked")
+    elif not configuration_current:
+        reasons.append("configuration_drift")
+
+    authority_key = row.get("authority_key")
+    if authority_key == measurement_authority.LEGACY_UNIT_UNKNOWN_AUTHORITY_KEY:
+        reasons.append("legacy_memory_authority")
+    elif (engine_identity.canonical_engine(engine_key) == "mlx"
+          or authority_key != measurement_authority.UNSCOPED_AUTHORITY_KEY):
+        reasons.append("memory_authority_unverified")
+    if row.get("memory_unit") != "GiB":
+        reasons.append("legacy_memory_unit")
+    if row.get("methodology_key") == "legacy-unknown":
+        reasons.append("legacy_methodology")
+    if row.get("engine_fingerprint") == db.LEGACY_ENGINE_FINGERPRINT:
+        reasons.append("legacy_engine_fingerprint")
+
+    legacy_reasons = {
+        "legacy_memory_authority",
+        "legacy_memory_unit",
+        "legacy_methodology",
+        "legacy_engine_fingerprint",
+    }
+    drift_reasons = {"artifact_not_current", "configuration_drift"}
+    if direct is None:
+        status = "refused_or_unfit"
+    elif legacy_reasons.intersection(reasons):
+        status = "migrated"
+    elif drift_reasons.intersection(reasons):
+        status = "stale"
+    elif engine_identity.canonical_engine(engine_key) == "mlx":
+        status = "historical_unverified"
+    elif (persisted_reusable
+          and artifact_confidence in _STRONG_ARTIFACT_CONFIDENCE
+          and configuration_current):
+        status = "reusable_unverified"
+    else:
+        status = "display_only"
+    if status in {"historical_unverified", "reusable_unverified"}:
+        reasons.append("live_engine_identity_unverified")
+
+    return {
+        "target_id": "|".join(str(value or "unknown") for value in (
+            artifact_id,
+            row.get("config_key"),
+            authority_key,
+            row.get("methodology_key"),
+            row.get("engine_fingerprint"),
+        )),
+        "model_id": row["model_id"],
+        "engine": engine_key,
+        "runtime": row.get("runtime"),
+        "backend": row.get("backend"),
+        "artifact_id": artifact_id,
+        "artifact_confidence": artifact_confidence,
+        "artifact_status": "current" if artifact_current else "not_current",
+        "config_key": row.get("config_key"),
+        "config": config,
+        "configuration_status": "current" if configuration_current else (
+            "untracked" if config is None else "drifted"),
+        "environment_key": row.get("environment_key"),
+        "authority_key": authority_key,
+        "memory_unit": row.get("memory_unit"),
+        "methodology_key": row.get("methodology_key"),
+        "engine_fingerprint": row.get("engine_fingerprint"),
+        "persisted_reusable": persisted_reusable,
+        "authorization": "none",
+        "status": status,
+        "reasons": reasons,
+        "safe_context": row.get("safe_context"),
+        "direct_context": direct,
+        "fitted_context": row.get("fitted_context"),
+        "decode_context": row.get("decode_context"),
+        "stopped_reason": row.get("stopped_reason"),
+        "measured_at": row.get("measured_at"),
+    }
+
+
+def _profile_characterization_history(engine_key: str | None) -> list[dict]:
+    """Read and type display history without migrating state or probing an engine."""
     if engine_key is None or not db._db_path().is_file():
-        return
+        return []
     with db.connected_readonly() as con:
         rows = db.list_characterizations(con, profile.machine_key(), engine_key)
-    if not rows:
+    return [_profile_characterization_view(row, engine_key) for row in rows]
+
+
+def _emit_characterized(
+        c: Console, engine_key: str | None, *, history: list[dict] | None = None) -> None:
+    """Render explicitly non-authorizing characterization history."""
+    if engine_key is None:
         return
-    c.emit(c.section("  CHARACTERIZED MODELS"))
-    for r in rows:
-        name = r["model_id"].split("/")[-1]
-        direct = r.get("direct_context", r["safe_context"])
+    history = (
+        _profile_characterization_history(engine_key)
+        if history is None else history
+    )
+    if not history:
+        return
+    c.emit(c.section("  CHARACTERIZATION HISTORY")
+           + c.style("dim", "  (display only · profile does not re-attest engines)"))
+    for r in history:
+        direct = r["direct_context"]
         if direct:
-            dc = r.get("decode_context")
-            ceiling = f"~{direct} directly tested"
-            fitted = r.get("fitted_context")
+            dc = r["decode_context"]
+            ceiling = f"~{direct} historical direct test"
+            fitted = r["fitted_context"]
             if fitted and fitted > direct:
                 ceiling += f"  · ~{fitted} fitted (advisory)"
             if dc and dc > direct:
                 ceiling += f"  · ~{dc} stream-only (est.)"
         else:
-            ceiling = "—"
-        c.emit("  " + c.style("metric", name) + c.style("dim", "  →  ")
-               + c.style("good", ceiling))
+            ceiling = "no successful ceiling"
+            if r["stopped_reason"]:
+                ceiling += f" · stopped {r['stopped_reason']}"
+        c.emit("  " + c.style("metric", r["model_id"]))
+        c.emit("    " + c.style("dim", ceiling))
+        status_role = (
+            "bad" if r["status"] in {"stale", "refused_or_unfit"}
+            else "warn" if r["status"] in {"migrated", "historical_unverified"}
+            else "dim"
+        )
+        c.emit("    " + c.style(
+            status_role, f"status {r['status']} · authorization {r['authorization']}"))
+        c.emit("    " + c.style(
+            "dim", f"artifact {r['artifact_id'] or 'unknown'} · "
+                   f"config {r['config_key'] or 'unknown'}"))
+        c.emit("    " + c.style(
+            "dim", f"authority {r['authority_key'] or 'unknown'} · "
+                   f"methodology {r['methodology_key'] or 'unknown'} · "
+                   f"engine fingerprint {r['engine_fingerprint'] or 'unknown'}"))
+        c.emit("    " + c.style("dim", "reasons " + ", ".join(r["reasons"])))
     c.emit()
 
 
@@ -5640,16 +5780,21 @@ def render_profile(c: Console, *, as_json: bool = False, model: str | None = Non
         },
         historical_measurement=historical_measurement,
     )
+    characterization_history = _profile_characterization_history(sel.engine_key)
 
     if as_json:
-        payload = {**lim}
+        payload = {
+            **lim,
+            "characterization_history": characterization_history,
+        }
         if model is not None:
             payload["model_fit"] = _model_fit(lim, model, m)
         print(json.dumps(payload, indent=2))
         return 0
 
     _emit_limits(c, lim)
-    _emit_characterized(c, sel.engine_key)   # models ARA has already measured here
+    _emit_characterized(
+        c, sel.engine_key, history=characterization_history)
 
     if model is not None:
         _emit_model_fit(c, lim, model, m)
