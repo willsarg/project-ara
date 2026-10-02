@@ -7,7 +7,7 @@
 # digest. (The example above is version-agnostic on purpose so it can't drift from the FROM lines.)
 
 # ---- deps: install node modules (incl. compiling better-sqlite3's native binding) -------------
-FROM node:26-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb AS deps
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS deps
 WORKDIR /app
 # better-sqlite3 builds from source → needs python3 + a C++ toolchain.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci
 
 # ---- builder: produce .next/standalone ---------------------------------------------------------
-FROM node:26-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb AS builder
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -24,7 +24,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # ---- runner: slim runtime image ----------------------------------------------------------------
-FROM node:26-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406a4d41d5824c5bb8beb AS runner
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
